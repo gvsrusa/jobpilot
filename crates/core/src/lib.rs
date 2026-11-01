@@ -7,6 +7,7 @@ pub mod db;
 pub mod documents;
 pub mod error;
 pub mod knowledge;
+pub mod parse;
 pub mod paths;
 pub mod profile;
 pub mod recovery;
