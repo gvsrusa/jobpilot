@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CompareTable } from "@/components/CompareTable";
 import { DraftEditor } from "@/components/DraftEditor";
 import { ErrorAlert } from "@/components/ErrorAlert";
+import { KnowledgeSection } from "@/components/KnowledgeSection";
 import { PageHeading } from "@/components/PageHeading";
 import { Button } from "@/components/ui/button";
 import {
@@ -225,6 +226,7 @@ export function ResumesView() {
       setOriginalId(null);
       setSelected(0);
       void refresh();
+      void client.resetQueries({ queryKey: ["knowledge"] });
     },
   });
   const remove = useMutation({
@@ -295,6 +297,12 @@ export function ResumesView() {
       <ErrorAlert
         error={cancelled(importResume.error) ?? jobs.error ?? drafts.error ?? ai.error ?? compare.error ?? remove.error}
       />
+      {importResume.data && (
+        <p role="status" className="text-sm">
+          {importResume.data.items} lines imported. Approve the true ones under Knowledge below:
+          a draft can only use approved lines.
+        </p>
+      )}
       {importResume.data && importResume.data.warnings.length > 0 && (
         <ul className="list-disc pl-5 text-sm">
           {importResume.data.warnings.map((w) => (
@@ -405,6 +413,11 @@ export function ResumesView() {
             <Button variant="outline" size="sm" onClick={() => setEditor({ note: null })}>
               Open editor
             </Button>
+            {backendEnabled(ai.data) && job && current.job_text_id !== job.id && (
+              <Button size="sm" disabled={generate.isPending} onClick={() => generate.mutate()}>
+                Generate
+              </Button>
+            )}
           </div>
 
           {compare.isPending && <p className="text-sm text-muted-foreground">Checking the evidence...</p>}
@@ -465,6 +478,8 @@ export function ResumesView() {
           )}
         </section>
       )}
+
+      <KnowledgeSection />
 
       {editor && (
         <DraftEditor

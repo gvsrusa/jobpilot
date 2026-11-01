@@ -94,6 +94,8 @@ For each backend in fallback order, a provider is eligible only if all of these 
 
 Ineligible providers are skipped, and the reason is logged. Fallback never widens consent: a task the user approved for Ollama does not move to a remote provider because Ollama failed.
 
+Providers run in the stored `ai.order`, then every enabled provider it leaves out, so enabling a provider is enough to route it and the AI screen shows the same order the router uses. When every provider passes, `manual_required` names what would change the result: the reason from a real attempt (`not_logged_in`, `prompt_too_large`), else `consent_needed` when consent alone held a provider back, else `provider_unavailable` when one is on but cannot be reached, else `no_ai`.
+
 ### Timeouts and retries
 
 - A timeout cancels the attempt and kills any child process.
@@ -170,6 +172,7 @@ Data categories: `job_text`, `company_text`, `profile_basic`, `resume_text`, `ca
 Rules:
 
 - Consent is per category. A task needing an unconsented category is skipped for that provider.
+- A restore revokes every external consent record, and audits it as `consent_revoked_by_restore`. Consent is a decision made now, so a backup cannot bring one back.
 - Revoking takes effect before the next call and writes an audit row. In-flight calls are cancelled. Revocation does not recall data already sent; the screen says so.
 - If a register row's verdict changes in a release, affected records are suspended until the user re-confirms.
 - Records are local, appear in export (FR-2.7), and are removed by delete-all (FR-2.8). The [database schema](database-schema.md) gains the table in the 0.4 migration.

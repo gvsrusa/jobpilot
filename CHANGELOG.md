@@ -17,12 +17,14 @@ Candidate and local AI. See `docs/releases/0.2.0.md` for what was and was not ex
 - Resume import from PDF and DOCX, a knowledge base, pasted job texts normalized as untrusted, and resume and cover letter drafts with claim-level evidence. Unsupported claims are stored flagged and block export. DOCX and PDF export, versions, and comparison.
 - Task router with Ollama (local models only, hardware fit, user-started downloads, embeddings), Claude Code (headless, `--tools "" --allowedTools StructuredOutput`, consent required), and No-AI.
 - Terminal panel running the bundled `jobpilot` CLI as a sidecar, with a restricted line interpreter and a launcher for the user's `claude`.
-- Profile, Resumes, and AI views; new CLI commands `profile`, `prefs`, `kb`, `job`, `resume`, `letter`, `ai`, `data recovery-key`.
+- Profile, Resumes (with a Knowledge section to approve, mark, add, and remove items), and AI views; new CLI commands `profile`, `prefs`, `kb`, `job`, `resume`, `letter`, `ai`, `data recovery-key`.
 - Migrations 0002 to 0005.
 - CI builds the sidecar and skips the real `claude` smoke and fixture generator.
 
 ### Changed
-- Restore reports the backup's key state first and keeps the outgoing key.
+- Restore reports the backup's key state first and keeps the outgoing key, and revokes external AI consent, audited as `consent_revoked_by_restore`.
+- An enabled AI provider is routed whether or not `ai.order` names it, after the stored order. The AI screen shows that order.
+- A task that ends `manual_required` says why: `consent_needed` or `provider_unavailable`, not `no_ai`, when one of those is the cause.
 - Delete-all also removes this root's data keys from the credential store.
 
 ## [0.1.0] - unreleased

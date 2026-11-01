@@ -19,6 +19,15 @@ Release 0.1 is the foundation. Release 0.2 adds your candidate profile and a fir
 
 Claude Code note: JobPilot starts your installed `claude` and never reads or stores its login. Anthropic's consumer terms may allow training on your content unless you opt out; the consent screen says so. The owner of this project has waived subscription-policy concerns for personal use and accepts that risk. You should decide that for yourself.
 
+### First run with Claude Code
+
+1. Install Claude Code, then run `claude` once, in a terminal or the panel, to sign in. JobPilot never sees that login.
+2. In Profile, enter the name and email a resume should carry.
+3. On the AI screen, under Claude Code, choose Review consent, then Allow what drafting needs (job text, basic profile, resume text), and confirm the system dialog. That records your consent and turns Claude Code on. A restore revokes it, so you give it again after one.
+4. On the Resumes screen, choose Import resume.
+5. In Knowledge, read the imported lines. Mark anything about visas, citizenship, or pay as sensitive, then use Approve all from this resume, or approve line by line. A draft can only use approved lines.
+6. Choose Paste a job posting, then Generate. Check each line against its evidence, then export.
+
 Not built yet: job discovery, matching, career memory, application automation, other AI providers. See [milestones](docs/milestones.md).
 
 ## Installing (unsigned)

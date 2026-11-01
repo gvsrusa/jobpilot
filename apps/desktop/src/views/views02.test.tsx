@@ -292,6 +292,41 @@ describe("resumes", () => {
     expect(screen.getByText(/approve some knowledge items first/i)).toBeInTheDocument();
   });
 
+  const OLLAMA_UP = aiWith({ ollama: { state: "running", url: "http://127.0.0.1:11434", version: "1", models: [] } });
+
+  it("no_evidence_points_at_the_knowledge_section", async () => {
+    resumeBackend({
+      resume_list: () => [],
+      ai_status: () => OLLAMA_UP,
+      resume_generate: () => {
+        throw { code: "manual_required", message: "this needs manual work: no_evidence" };
+      },
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    await user.click(await screen.findByRole("button", { name: "Generate" }));
+    expect(await screen.findByText(/Knowledge section of this screen/)).toBeInTheDocument();
+    expect(screen.queryByText(/kb approve/)).toBeNull();
+  });
+
+  it.each([
+    ["consent_needed", /does not cover this task/],
+    ["provider_unavailable", /cannot be reached/],
+  ])("manual_required_%s_is_not_called_switched_off", async (reason, text) => {
+    resumeBackend({
+      resume_list: () => [],
+      ai_status: () => OLLAMA_UP,
+      resume_generate: () => {
+        throw { code: "manual_required", message: `this needs manual work: ${reason}` };
+      },
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    await user.click(await screen.findByRole("button", { name: "Generate" }));
+    expect(await screen.findByText(text)).toBeInTheDocument();
+    expect(screen.queryByText(/switched on/)).toBeNull();
+  });
+
   it("failure_reasons_are_explained", async () => {
     resumeBackend({
       resume_list: () => [],
@@ -326,6 +361,169 @@ describe("resumes", () => {
       lineageId: null,
       doc: { name: "Ada Lovelace", contact: ["ada@example.com"], summary: [], sections: [] },
     });
+  });
+});
+
+describe("knowledge", () => {
+  const CV = draft({ id: "u1", lineage_id: "U", origin: "uploaded", job_text_id: null, title: "My CV" });
+  const parsed = (id: string, body: string, over: Partial<KnowledgeItem> = {}): KnowledgeItem => ({
+    ...item(id, body),
+    kind: "experience",
+    source: "parsed",
+    source_ref: `draft:u1#line:${id}`,
+    approved: false,
+    ...over,
+  });
+  const CLAUDE_READY = aiWith({
+    claude_code: { available: true, path: "/opt/claude", consent: ["job_text", "profile_basic", "resume_text"] },
+    enabled: { ollama: true, claude_code: true },
+    order: ["ollama", "claude_code"],
+  });
+
+  /** Items that answer to the commands, as the core would. */
+  function store(start: KnowledgeItem[]) {
+    let items = start;
+    return {
+      kb_list: () => items,
+      kb_approve: ({ id, approved }: Record<string, unknown>) => {
+        items = items.map((k) => (k.id === id ? { ...k, approved: approved as boolean } : k));
+      },
+      kb_mark_sensitive: ({ id, marked }: Record<string, unknown>) => {
+        items = items.map((k) => (k.id === id ? { ...k, marked_sensitive: marked as boolean } : k));
+      },
+      kb_remove: ({ id }: Record<string, unknown>) => {
+        items = items.filter((k) => k.id !== id);
+      },
+      kb_add: ({ kind, body }: Record<string, unknown>) => {
+        const added = { ...item("n1", String(body)), kind: String(kind) };
+        items = [added, ...items];
+        return added;
+      },
+      approved: () => items.filter((k) => k.approved).map((k) => k.id),
+    };
+  }
+
+  it("import_then_approve_then_generate_reaches_the_model", async () => {
+    let imported = false;
+    const kb = store([]);
+    const lines = [parsed("p1", "Led 4 engineers"), parsed("p2", "Shipped billing")];
+    let items = kb;
+    const generated = draft({ id: "g1", lineage_id: "G" });
+    const b = resumeBackend({
+      ai_status: () => CLAUDE_READY,
+      resume_list: () => (imported ? [CV] : []),
+      resume_import: () => {
+        imported = true;
+        items = store(lines);
+        return { draft_id: "u1", lineage_id: "U", items: 2, warnings: [] };
+      },
+      resume_compare: () => ({ ...COMPARE, generated: [], blocked: 0 }),
+      kb_list: () => items.kb_list(),
+      kb_approve: (args) => items.kb_approve(args),
+      // The core's own rule: nothing approved, nothing is sent.
+      resume_generate: () => {
+        if (items.approved().length === 0) {
+          throw { code: "manual_required", message: "this needs manual work: no_evidence" };
+        }
+        return { draft: generated, blocked: 0, provider: "claude_code" };
+      },
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    await user.click(await screen.findByRole("button", { name: "Import resume..." }));
+    expect(await screen.findByText("Led 4 engineers")).toBeInTheDocument();
+    expect(screen.getByText(/From My CV/)).toBeInTheDocument();
+    expect(screen.getByText(/2 lines imported/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Approve all from this resume" }));
+    await waitFor(() => expect(count(b, "kb_approve")).toBe(2));
+    expect(b.calls.filter((c) => c.cmd === "kb_approve").map((c) => c.args)).toEqual([
+      { id: "p1", approved: true },
+      { id: "p2", approved: true },
+    ]);
+
+    await user.click(await screen.findByRole("button", { name: "Generate" }));
+    await waitFor(() => expect(count(b, "resume_generate")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "resume_generate")?.args).toEqual({ jobTextId: "j1" });
+    expect(screen.queryByText(/Nothing was generated/)).toBeNull();
+  });
+
+  it("approve_all_skips_what_a_draft_could_not_cite_anyway", async () => {
+    const kb = store([
+      parsed("p1", "Open line"),
+      parsed("p2", "Already fine", { approved: true }),
+      parsed("p3", "Marked", { marked_sensitive: true }),
+      parsed("p4", "", { locked: true, marked_sensitive: true }),
+    ]);
+    const b = resumeBackend({ ...kb, resume_list: () => [CV] });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    await user.click(await screen.findByRole("button", { name: "Approve all from this resume" }));
+    await waitFor(() => expect(count(b, "kb_approve")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "kb_approve")?.args).toEqual({ id: "p1", approved: true });
+  });
+
+  it("nothing_is_approved_until_the_user_presses", async () => {
+    const b = resumeBackend({ ...store([parsed("p1", "Open line")]), resume_list: () => [CV] });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    await screen.findByText("Open line");
+    expect(screen.getByText("Not approved")).toBeInTheDocument();
+    expect(count(b, "kb_approve")).toBe(0);
+  });
+
+  it("each_item_can_be_approved_marked_and_removed", async () => {
+    const b = resumeBackend({ ...store([parsed("p1", "Open line")]), resume_list: () => [CV] });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    const row = (await screen.findByText("Open line")).closest("li")!;
+    await user.click(within(row).getByRole("button", { name: "Approve" }));
+    await waitFor(() => expect(within(row).getByRole("button", { name: "Unapprove" })).toBeInTheDocument());
+
+    await user.click(within(row).getByRole("button", { name: "Mark sensitive" }));
+    await waitFor(() => expect(count(b, "kb_mark_sensitive")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "kb_mark_sensitive")?.args).toEqual({ id: "p1", marked: true });
+
+    await user.click(await within(row).findByRole("button", { name: "Remove" }));
+    expect(count(b, "kb_remove")).toBe(0);
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(count(b, "kb_remove")).toBe(1));
+    await waitFor(() => expect(screen.queryByText("Open line")).toBeNull());
+  });
+
+  it("add_stores_a_typed_item_shown_as_the_users_own", async () => {
+    const b = resumeBackend({ ...store([]), resume_list: () => [] });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    const add = await screen.findByRole("button", { name: "Add" });
+    expect(add).toBeDisabled();
+    await user.selectOptions(screen.getByLabelText("Kind of item"), "skill");
+    await user.type(screen.getByLabelText("New item"), "Rust");
+    await user.click(add);
+    await waitFor(() => expect(count(b, "kb_add")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "kb_add")?.args).toEqual({ kind: "skill", body: "Rust" });
+    expect(await screen.findByText("Added by you")).toBeInTheDocument();
+  });
+
+  it("a_locked_item_shows_no_text_and_cannot_be_marked", async () => {
+    resumeBackend({
+      kb_list: () => [parsed("p1", "", { locked: true, marked_sensitive: true })],
+      resume_list: () => [CV],
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    const row = (await screen.findByText("Locked, see Recovery")).closest("li")!;
+    expect(within(row).getByRole("button", { name: "Unmark sensitive" })).toBeDisabled();
+    expect(within(row).getByRole("button", { name: "Approve" })).toBeDisabled();
+  });
+
+  it("item_text_is_shown_as_text", async () => {
+    resumeBackend({ kb_list: () => [parsed("p1", "<b>bold</b> line")], resume_list: () => [CV] });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    expect(await screen.findByText("<b>bold</b> line")).toBeInTheDocument();
+    expect(document.querySelector("b")).toBeNull();
   });
 });
 
@@ -411,6 +609,74 @@ describe("ai", () => {
     expect(b.calls.find((c) => c.cmd === "ai_enable")?.args).toEqual({ provider: "claude_code", enabled: true });
   });
 
+  const claudeUp = (consent: AiStatus["claude_code"]["consent"]) =>
+    aiWith({ claude_code: { available: true, path: "/opt/claude", consent } });
+  const consentBackend = (consent: AiStatus["claude_code"]["consent"]) =>
+    backend({ ai_status: () => claudeUp(consent), ai_consent_give: () => undefined, ai_enable: () => undefined });
+
+  it("consent_names_what_drafting_needs_and_ticks_nothing_until_pressed", async () => {
+    const b = consentBackend(null);
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    await user.click(await screen.findByRole("button", { name: "Review consent..." }));
+    const dialog = within(await screen.findByRole("dialog"));
+    expect(dialog.getByText(/need Job text, Basic profile, and Resume text/)).toBeInTheDocument();
+    for (const box of dialog.getAllByRole("checkbox")) expect(box).not.toBeChecked();
+    expect(count(b, "ai_consent_give")).toBe(0);
+
+    await user.click(dialog.getByRole("button", { name: "Allow what drafting needs" }));
+
+    await waitFor(() => expect(count(b, "ai_consent_give")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_consent_give")?.args).toEqual({
+      provider: "claude_code",
+      categories: ["job_text", "profile_basic", "resume_text"],
+    });
+    await waitFor(() => expect(count(b, "ai_enable")).toBe(1));
+  });
+
+  it("a_refused_native_confirm_gives_nothing_and_does_not_enable", async () => {
+    const b = backend({
+      ai_status: () => claudeUp(null),
+      ai_consent_give: () => {
+        throw { code: "cancelled", message: "cancelled" };
+      },
+      ai_enable: () => undefined,
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    await user.click(await screen.findByRole("button", { name: "Review consent..." }));
+    await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Allow what drafting needs" }));
+    await waitFor(() => expect(count(b, "ai_consent_give")).toBe(1));
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    expect(count(b, "ai_enable")).toBe(0);
+  });
+
+  it("partial_consent_says_what_is_missing_and_can_be_widened", async () => {
+    const b = consentBackend(["job_text"]);
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    expect(await screen.findByText(/Drafting also needs Basic profile, Resume text/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Review consent..." }));
+    const dialog = within(await screen.findByRole("dialog"));
+    expect(dialog.getByLabelText("Job text")).toBeChecked();
+    expect(dialog.getByLabelText("Resume text")).not.toBeChecked();
+    await user.click(dialog.getByRole("button", { name: "Allow what drafting needs" }));
+    await waitFor(() => expect(count(b, "ai_consent_give")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_consent_give")?.args).toEqual({
+      provider: "claude_code",
+      categories: ["job_text", "profile_basic", "resume_text"],
+    });
+  });
+
+  it("full_consent_asks_for_nothing_more", async () => {
+    consentBackend(["job_text", "profile_basic", "resume_text"]);
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    await screen.findByRole("button", { name: "Revoke consent" });
+    expect(screen.queryByText(/Drafting also needs/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Review consent..." })).toBeNull();
+  });
+
   it("ai_claude_not_found_offers_the_native_picker", async () => {
     const b = backend({ ai_status: () => AI_OFF, ai_set_claude_path: () => undefined });
     const { user } = renderApp();
@@ -465,8 +731,18 @@ describe("ai", () => {
     expect(screen.queryByText(/needs a network/)).toBeNull();
   });
 
+  it("ai_order_shows_only_what_the_router_will_try", async () => {
+    backend({ ai_status: () => AI_OFF });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const order = within(await screen.findByRole("region", { name: "Order" }));
+    expect(order.getByText("ollama")).toBeInTheDocument();
+    expect(order.queryByText("claude_code")).toBeNull();
+  });
+
   it("ai_order_moves_a_provider_and_saves", async () => {
-    const b = backend({ ai_status: () => AI_OFF, ai_set_order: () => undefined });
+    const both = aiWith({ order: ["ollama", "claude_code"], enabled: { ollama: true, claude_code: true } });
+    const b = backend({ ai_status: () => both, ai_set_order: () => undefined });
     const { user } = renderApp();
     await go(user, "AI", /AI/);
     await user.click(await screen.findByRole("button", { name: "Move claude_code up" }));
@@ -545,6 +821,15 @@ describe("data", () => {
     const { user } = renderApp();
     await go(user, "Data", "Data and privacy");
     expect(await screen.findByText(/The restored backup's key \(kb\) is not on this computer/)).toBeInTheDocument();
+  });
+
+  it("restore_dialog_says_consent_is_revoked", async () => {
+    const info = { path: "/home/me/jobpilot/backups/manual-1", created_at: "2026-11-01T10:00:00Z", schema_version: 5 };
+    backend({ backup_list: () => [info] });
+    const { user } = renderApp();
+    await go(user, "Data", "Data and privacy");
+    await user.click((await screen.findAllByRole("button", { name: /^Restore/ }))[0]);
+    expect(await screen.findByText(/consent you gave to Claude Code is revoked/i)).toBeInTheDocument();
   });
 
   it("data_export_warns_before_writing_sensitive_fields", async () => {

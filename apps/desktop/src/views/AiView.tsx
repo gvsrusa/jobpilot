@@ -54,6 +54,11 @@ const CATEGORIES: [DataCategory, string][] = [
   ["career_memory", "Career memory answers"],
 ];
 
+/** Core's `DRAFT_DATA`. Claude Code is skipped for drafting unless consent covers all three. */
+const DRAFTING: DataCategory[] = ["job_text", "profile_basic", "resume_text"];
+
+const labelOf = (category: DataCategory) => CATEGORIES.find(([value]) => value === category)?.[1] ?? category;
+
 const PROVIDERS: Record<Provider, string> = { ollama: "Ollama", claude_code: "Claude Code" };
 
 function Section(props: { id: string; title: string; children: ReactNode }) {
@@ -67,14 +72,15 @@ function Section(props: { id: string; title: string; children: ReactNode }) {
   );
 }
 
-function ConsentDialog({ onClose }: { onClose(): void }) {
+/** `given` is the active record: `ai_consent_give` replaces it, so what it holds starts ticked. */
+function ConsentDialog({ given, onClose }: { given: DataCategory[]; onClose(): void }) {
   const client = useQueryClient();
-  const [picked, setPicked] = useState<DataCategory[]>([]);
+  const [picked, setPicked] = useState<DataCategory[]>(given);
   const toggle = (c: DataCategory, on: boolean) => setPicked(on ? [...picked, c] : picked.filter((p) => p !== c));
   // Rust shows its own native confirmation inside `ai_consent_give`; enabling follows it.
   const give = useMutation({
-    mutationFn: async () => {
-      await ipc.aiConsentGive("claude_code", picked);
+    mutationFn: async (categories: DataCategory[]) => {
+      await ipc.aiConsentGive("claude_code", categories);
       await ipc.aiEnable("claude_code", true);
     },
     onSuccess: async () => {
@@ -82,20 +88,36 @@ function ConsentDialog({ onClose }: { onClose(): void }) {
       onClose();
     },
   });
+  const allowDrafting = () => {
+    const categories = [...picked, ...DRAFTING.filter((c) => !picked.includes(c))];
+    setPicked(categories);
+    give.mutate(categories);
+  };
   return (
     <Dialog open onOpenChange={(open) => !open && !give.isPending && onClose()}>
       <DialogContent showCloseButton={false}>
         <DialogHeader>
           <DialogTitle>Share data with Claude Code (your own login)</DialogTitle>
-          <DialogDescription>Nothing is sent until you confirm. No kind of data is ticked for you.</DialogDescription>
+          <DialogDescription>
+            Nothing is sent until you confirm. Only what you already allowed starts ticked.
+          </DialogDescription>
         </DialogHeader>
         <form
           className="grid gap-3"
           onSubmit={(e) => {
             e.preventDefault();
-            give.mutate();
+            give.mutate(picked);
           }}
         >
+          <div className="grid justify-items-start gap-1.5 text-sm">
+            <p>
+              Resumes and cover letters need {DRAFTING.slice(0, -1).map(labelOf).join(", ")}, and{" "}
+              {labelOf(DRAFTING[DRAFTING.length - 1])}. With fewer, Claude Code is skipped for them.
+            </p>
+            <Button type="button" variant="outline" size="sm" disabled={give.isPending} onClick={allowDrafting}>
+              Allow what drafting needs
+            </Button>
+          </div>
           <fieldset className="grid gap-1.5">
             <legend className="mb-1 text-sm">Allow these kinds of data to be sent:</legend>
             {CATEGORIES.map(([value, label]) => (
@@ -172,9 +194,8 @@ export function AiView() {
   const s: AiStatus | undefined = ai.data;
   const running = s?.ollama.state === "running" ? s.ollama : null;
   const installed = running?.models.filter((m) => m.local) ?? [];
-  const order: Provider[] = s
-    ? [...(s.order as Provider[]), ...(["ollama", "claude_code"] as const).filter((p) => !s.order.includes(p))]
-    : [];
+  const order = (s?.order ?? []) as Provider[];
+  const lacking = DRAFTING.filter((c) => !s?.claude_code.consent?.includes(c));
   const move = (index: number, by: number) => {
     const next = [...order];
     [next[index], next[index + by]] = [next[index + by], next[index]];
@@ -368,6 +389,22 @@ export function AiView() {
                   Consent given for: {s.claude_code.consent.join(", ") || "nothing"}. Consumer Terms
                   allow training unless the user opts out.
                 </p>
+                {lacking.length > 0 && (
+                  <div className="flex items-center gap-3">
+                    <span>
+                      Drafting also needs {lacking.map(labelOf).join(", ")}. Claude Code is skipped
+                      for drafting until you allow them.
+                    </span>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={!s.claude_code.available}
+                      onClick={() => setConsent(true)}
+                    >
+                      Review consent...
+                    </Button>
+                  </div>
+                )}
                 <div className="flex items-center gap-3">
                   <label className="flex items-center gap-2">
                     <input
@@ -446,7 +483,7 @@ export function AiView() {
           )}
         </ConfirmDialog>
       )}
-      {consent && <ConsentDialog onClose={() => setConsent(false)} />}
+      {consent && <ConsentDialog given={s?.claude_code.consent ?? []} onClose={() => setConsent(false)} />}
     </div>
   );
 }

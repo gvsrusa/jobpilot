@@ -42,6 +42,10 @@ export function RestoreDialog({ target, onClose }: { target: RestoreTarget; onCl
         current data is saved first as pre-restore-{"{stamp}"}, so you can undo this by restoring
         that snapshot. A backup from an older version is updated to this version.
       </p>
+      <p>
+        Any consent you gave to Claude Code is revoked by a restore, so nothing leaves this computer
+        until you give it again on the AI screen.
+      </p>
     </ConfirmDialog>
   );
 }

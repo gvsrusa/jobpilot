@@ -11,9 +11,17 @@ const REASONS: [word: string, text: string][] = [
   ],
   [
     "no_evidence",
-    "Nothing to write from yet: approve some knowledge items first (in the terminal panel, `kb list` then `kb approve <id>`)",
+    "Nothing to write from yet: approve some knowledge items first, in the Knowledge section of this screen",
   ],
-  ["no_ai", "No AI provider is switched on, so nothing was generated"],
+  [
+    "consent_needed",
+    "Claude Code is on, but your consent does not cover this task. On the AI screen, choose Review consent, then Allow what drafting needs",
+  ],
+  [
+    "provider_unavailable",
+    "An AI provider is on but cannot be reached. Check the AI screen: start Ollama, or point JobPilot at claude",
+  ],
+  ["no_ai", "No AI provider could take this task, so nothing was generated"],
   ["no_embedding_model", "No embedding model is set on the AI screen"],
 ];
 
