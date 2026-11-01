@@ -67,11 +67,14 @@ pub enum Command {
 impl Command {
     /// The terminal panel's input has no shell to clear its marker with, and script in the
     /// webview can write to it. So it refuses what could leak a key or destroy data, what
-    /// the app confirms in a native dialog, and what changes what runs or starts a download
-    /// (M-14). Revoking consent stays: it only ever takes something away.
+    /// the app confirms in a native dialog, what changes what runs or starts a download, and
+    /// what reads or writes a path the caller names (M-14). Revoking consent stays: it only
+    /// ever takes something away.
     pub fn refused_in_panel(&self) -> bool {
         use ai::{AiCommand, ConsentCommand};
         use data::{BackupCommand, DataCommand};
+        use profile::JobCommand;
+        use resume::{ExportArgs, LetterCommand, ResumeCommand};
         matches!(
             self,
             Command::Backup(BackupCommand::Restore { .. })
@@ -89,6 +92,12 @@ impl Command {
                         | DataCommand::RecoveryKey(_)
                         | DataCommand::DiscardLocked { .. }
                 )
+                | Command::Job(JobCommand::Paste { file: Some(_), .. })
+                | Command::Resume(
+                    ResumeCommand::Import { .. }
+                        | ResumeCommand::Export(ExportArgs { out: Some(_), .. })
+                )
+                | Command::Letter(LetterCommand::Export(ExportArgs { out: Some(_), .. }))
         )
     }
 }
@@ -254,18 +263,21 @@ mod tests {
         ("kb unmark i", false),
         ("kb search q", false),
         ("job paste t", false),
+        ("job paste t --file /f", true),
         ("job list", false),
         ("job show i", false),
-        ("resume import /r", false),
+        ("resume import /r", true),
         ("resume list", false),
         ("resume versions l", false),
         ("resume generate j", false),
         ("resume compare d", false),
         ("resume export d --format pdf", false),
+        ("resume export d --format pdf --out /o", true),
         ("resume edit-claim c --text t", false),
         ("resume remove-claim c", false),
         ("letter generate j", false),
         ("letter export d --format pdf", false),
+        ("letter export d --format pdf --out /o", true),
         ("ai status", false),
         ("ai models", false),
         ("ai pull m", true),
@@ -287,13 +299,25 @@ mod tests {
         }
     }
 
-    fn leaves(command: &clap::Command, path: &str, found: &mut Vec<String>) {
+    /// Each leaf's path, and whether it takes an argument that is a file path.
+    fn leaves(command: &clap::Command, path: &str, found: &mut Vec<(String, bool)>) {
         if command.get_subcommands().next().is_none() {
-            found.push(path.trim_start().to_string());
+            let paths = clap::builder::ValueParser::path_buf().type_id();
+            let takes_path = command
+                .get_arguments()
+                .any(|arg| arg.get_value_parser().type_id() == paths);
+            found.push((path.trim_start().to_string(), takes_path));
         }
         for sub in command.get_subcommands() {
             leaves(sub, &format!("{path} {}", sub.get_name()), found);
         }
+    }
+
+    fn rows_of<'a>(path: &'a str) -> impl Iterator<Item = &'static (&'static str, bool)> + 'a {
+        PANEL.iter().filter(move |(line, _)| {
+            line.strip_prefix(path)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+        })
     }
 
     #[test]
@@ -301,13 +325,15 @@ mod tests {
         let mut found = Vec::new();
         leaves(&Cli::command(), "", &mut found);
         // The shell refuses a nested shell itself, by name.
-        found.retain(|path| path != "shell");
-        for path in found {
-            let named = |(line, _): &&(&str, bool)| {
-                line.strip_prefix(path.as_str())
-                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
-            };
-            assert!(PANEL.iter().find(named).is_some(), "not classified: {path}");
+        found.retain(|(path, _)| path != "shell");
+        for (path, takes_path) in found {
+            assert!(rows_of(&path).next().is_some(), "not classified: {path}");
+            // Script in the webview must never name a file, for reading or for writing.
+            let refused = rows_of(&path).any(|(_, refused)| *refused);
+            assert!(
+                !takes_path || refused,
+                "takes a path, has no refused row: {path}"
+            );
         }
     }
 

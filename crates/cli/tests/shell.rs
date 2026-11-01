@@ -283,6 +283,32 @@ fn the_panel_can_still_revoke_consent() {
     assert_eq!(status["claude_code"]["consent"], serde_json::Value::Null);
 }
 
+/// The webview types here, so it must not name a file to read or write (M-14). `job show`
+/// prints to the panel, so a file read into a posting would reach the webview.
+#[test]
+fn the_panel_never_reads_or_writes_a_given_path() {
+    let (dir, home) = fresh_home();
+    let secret = dir.path().join("secret.txt");
+    std::fs::write(&secret, "the-secret-text").unwrap();
+    let written = dir.path().join("written");
+    let (secret, written) = (secret.display(), written.display());
+    let lines = format!(
+        "job paste t --file {secret}\n\
+         resume import {secret}\n\
+         resume export d --format pdf --out {written}\n\
+         letter export d --format pdf --out {written}\n\
+         job list --json\n\
+         exit\n"
+    );
+
+    let out = text(&session(&home, lines.as_bytes(), &[]));
+
+    let refused = format!("error[panel_refused]: {REFUSAL}");
+    assert_eq!(out.matches(&refused).count(), 4, "{out}");
+    assert!(!out.contains("the-secret-text"), "{out}");
+    assert!(!dir.path().join("written").exists());
+}
+
 fn stored_path(home: &Path) -> Option<serde_json::Value> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -310,6 +336,63 @@ fn claude_path_setter_rejects_relative_and_oddly_named_paths() {
     }
 }
 
+/// Written straight into the data folder, as a tampered database would be.
+fn store_path(home: &Path, path: &str) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let db = jobpilot_core::Db::open(&jobpilot_core::AppPaths::new(home))
+            .await
+            .unwrap();
+        jobpilot_core::settings::set(&db, "ai.claude_path", &serde_json::json!(path))
+            .await
+            .unwrap();
+        db.close().await;
+    });
+}
+
+/// `PATH` with a stand-in `claude` first. Returns the folder to pass as `PATH`.
+fn path_with_claude(dir: &Path) -> PathBuf {
+    let found = dir.join("on-path");
+    mock_wrapper(&found, &dir.join("args"));
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let dirs = std::iter::once(found).chain(std::env::split_paths(&path));
+    PathBuf::from(std::env::join_paths(dirs).unwrap())
+}
+
+/// An update removes `versions/<old>`, which must not take Claude Code away.
+#[test]
+fn a_stored_path_that_is_gone_falls_through_to_discovery() {
+    let (dir, home) = fresh_home();
+    let gone = dir.path().join("claude/versions/2.1.0");
+    store_path(&home, gone.to_str().unwrap());
+    let path = path_with_claude(dir.path());
+
+    let out = text(&session(&home, b"claude --version\n", &[("PATH", &path)]));
+
+    assert!(out.contains("2.1.316 (mock)"), "{out}");
+}
+
+/// Discovery could find one, and that must not make a bad setting look fine.
+#[test]
+fn a_stored_path_with_a_wrong_name_stays_an_error_even_when_it_is_gone() {
+    let (dir, home) = fresh_home();
+    let path = path_with_claude(dir.path());
+    for wrong in [
+        dir.path().join("no-such-program"),
+        PathBuf::from("rel/claude"),
+    ] {
+        store_path(&home, wrong.to_str().unwrap());
+
+        let out = text(&session(&home, b"claude --version\n", &[("PATH", &path)]));
+
+        assert!(out.contains("ai.claude_path"), "{out}");
+        assert!(!out.contains("(mock)"), "{out}");
+    }
+}
+
 #[test]
 fn a_stored_path_not_named_claude_is_never_run() {
     let (dir, home) = fresh_home();
@@ -332,21 +415,7 @@ fn a_stored_path_not_named_claude_is_never_run() {
         .unwrap();
         evil
     };
-    // Written straight into the data folder, as a tampered database would be.
-    let value = serde_json::json!(evil.to_str().unwrap());
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let db = jobpilot_core::Db::open(&jobpilot_core::AppPaths::new(&home))
-            .await
-            .unwrap();
-        jobpilot_core::settings::set(&db, "ai.claude_path", &value)
-            .await
-            .unwrap();
-        db.close().await;
-    });
+    store_path(&home, evil.to_str().unwrap());
     let out = text(&session(&home, b"claude\nstatus\n", &[]));
     assert!(out.contains("ai.claude_path"), "{out}");
     assert!(!canary.exists());

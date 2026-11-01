@@ -76,7 +76,7 @@ pub struct ExportArgs {
     template: TemplateArg,
     /// Defaults to the exports folder in the data folder.
     #[arg(long)]
-    out: Option<PathBuf>,
+    pub out: Option<PathBuf>,
 }
 
 fn draft_line(d: &Draft) -> String {

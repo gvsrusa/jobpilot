@@ -439,8 +439,8 @@ pub fn has_claude_name(path: &Path) -> bool {
 /// The native installer's `.../claude/versions/<version>`, where its `claude` link points.
 /// The macOS open panel resolves links and rfd has no switch for that, so a picked link
 /// comes back as this file.
-// ponytail: a path stored this way ends with that release, and `find_binary` then reports it
-// as wrong. Choosing the new release fixes it; the link cannot be stored from the picker.
+// ponytail: a path stored this way ends with that release: an update removes the file, and
+// `find_binary` goes back to discovery. The link cannot be stored from the picker.
 fn is_release(path: &Path, name: &str) -> bool {
     let folder_is = |level: usize, wanted: &str| {
         let folder = path.ancestors().nth(level).and_then(Path::file_name);
@@ -453,14 +453,17 @@ fn is_release(path: &Path, name: &str) -> bool {
 
 /// Order: `JOBPILOT_CLAUDE_BIN`, the `ai.claude_path` setting, `PATH`, the usual install
 /// folders, then one lookup through the owner's login shell. GUI launches on macOS carry a
-/// minimal `PATH`, which is why the last two exist. A setting that is set but wrong is an
-/// error, never a silent fall through to something else.
+/// minimal `PATH`, which is why the last two exist. A setting that names something else is an
+/// error, never a silent fall through. One that is well formed and whose file is gone is
+/// skipped: an update removes the release it named, and discovery is what an unset path gets.
 pub async fn find_binary(db: Option<&Db>) -> std::result::Result<PathBuf, String> {
     if let Some(bin) = std::env::var_os("JOBPILOT_CLAUDE_BIN").filter(|bin| !bin.is_empty()) {
         return checked(PathBuf::from(bin), "JOBPILOT_CLAUDE_BIN");
     }
-    if let Some(bin) = path_setting(db).await {
-        return checked(PathBuf::from(bin), PATH_SETTING);
+    if let Some(bin) = path_setting(db).await.map(PathBuf::from)
+        && !is_gone(&bin)
+    {
+        return checked(bin, PATH_SETTING);
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
     if let Some(found) = search(
@@ -475,6 +478,12 @@ pub async fn find_binary(db: Option<&Db>) -> std::result::Result<PathBuf, String
         return Ok(found);
     }
     Err(not_found())
+}
+
+/// A path that could be Claude Code's, and that the file system says is not there. A path it
+/// cannot answer for stays an error, as does any other name.
+fn is_gone(bin: &Path) -> bool {
+    bin.is_absolute() && has_claude_name(bin) && matches!(bin.try_exists(), Ok(false))
 }
 
 /// A failure to read the setting just means discovery continues without it.
