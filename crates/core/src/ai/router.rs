@@ -273,6 +273,12 @@ impl Router {
             let clock = Instant::now();
             let result = bounded(call(), limit, task.cancel).await;
             record.duration_ms = i64::try_from(clock.elapsed().as_millis()).unwrap_or(i64::MAX);
+            // A reply racing the cancel loses: a cancelled task never returns output.
+            let result = if task.cancel.is_cancelled() {
+                Err(Error::Cancelled)
+            } else {
+                result
+            };
 
             let error = match result {
                 Ok(value) => {
@@ -306,6 +312,9 @@ impl Router {
 /// A task no provider may run, whatever it declares. Sensitive values never travel beside
 /// untrusted text, because that text can steer the model that reads them.
 fn refusal(spec: &TaskSpec) -> Option<&'static str> {
+    if spec.task == TaskType::Embed {
+        return Some("embed_is_not_a_completion");
+    }
     (spec.categories.contains(&DataCategory::Sensitive) && carries_untrusted_text(spec))
         .then_some("sensitive_with_untrusted_text")
 }
@@ -434,6 +443,8 @@ async fn log_no_ai(task: &Task<'_>, outcome: &str, reason: Option<&str>) -> Resu
     log(task, row("no_ai", attempt, outcome, reason, task.db).await?).await
 }
 
+// ponytail: task_runs is never pruned. A task writes a few rows, and export reads them all
+// into memory, so add retention if the table passes 100,000 rows.
 async fn log(task: &Task<'_>, row: Row<'_>) -> Result<()> {
     sqlx::query(
         "INSERT INTO task_runs (id, task_type, provider, data_categories, started_at, \

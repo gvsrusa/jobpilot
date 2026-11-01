@@ -57,6 +57,8 @@ struct Mock {
     hang_in_probe: bool,
     /// Revokes this provider's consent during its first call.
     revoke_during_call: Option<SqlitePool>,
+    /// Cancels the task during each call, so the reply races the cancel.
+    cancel_during_call: Option<CancellationToken>,
     counters: Arc<Counters>,
 }
 
@@ -75,6 +77,7 @@ impl Mock {
             availability: Availability::Available,
             hang_in_probe: false,
             revoke_during_call: None,
+            cancel_during_call: None,
             counters: Arc::default(),
         }
     }
@@ -109,6 +112,9 @@ impl Mock {
 
     fn next(&self) -> Option<Reply> {
         self.counters.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(cancel) = &self.cancel_during_call {
+            cancel.cancel();
+        }
         self.replies.lock().unwrap().pop_front()
     }
 }
@@ -722,6 +728,37 @@ async fn timeout_kills_attempt_and_moves_on() {
 }
 
 #[tokio::test]
+async fn declared_timeout_bounds_an_attempt_without_an_override() {
+    let (_tmp, db) = setup().await;
+    let mut slow = Mock::ollama(vec![Reply::Hang, Reply::Hang]);
+    slow.declaration.timeout = Duration::from_millis(100);
+    let router = Router::with_providers(vec![slow.boxed()]);
+
+    let started = Instant::now();
+    assert_eq!(parse_job(&router, &db).await, manual("no_ai"));
+
+    assert!(started.elapsed() < Duration::from_millis(500));
+}
+
+#[tokio::test]
+async fn attempt_rows_record_how_long_the_attempt_took() {
+    let (_tmp, db) = setup().await;
+    let slow = Mock::ollama(vec![Reply::Hang, Reply::Hang]);
+    let router =
+        Router::with_providers(vec![slow.boxed()]).with_timeout(Duration::from_millis(100));
+
+    parse_job(&router, &db).await;
+
+    let durations: Vec<i64> =
+        sqlx::query_scalar("SELECT duration_ms FROM task_runs WHERE provider = 'ollama'")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(durations.len(), 2);
+    assert!(durations.iter().all(|ms| *ms >= 50), "{durations:?}");
+}
+
+#[tokio::test]
 async fn hanging_availability_probe_cannot_outlive_the_timeout() {
     let (_tmp, db) = setup().await;
     let mut slow = Mock::ollama(vec![text(JOB)]);
@@ -784,6 +821,62 @@ async fn already_cancelled_task_sends_nothing() {
     assert_eq!(calls(&counters), 0);
 }
 
+/// A valid reply finishing in the same poll as the cancel still ends `Cancelled`.
+#[tokio::test]
+async fn reply_racing_a_cancel_is_not_returned() {
+    let (_tmp, db) = setup().await;
+    let cancel = CancellationToken::new();
+    let mut mock = Mock::ollama(vec![text(JOB)]);
+    mock.cancel_during_call = Some(cancel.clone());
+    let router = Router::with_providers(vec![mock.boxed()]);
+
+    let outcome = router
+        .run(&db, "gui", TaskType::ParseJob, prompt(), cancel)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, Outcome::Cancelled);
+    let last = rows(&db).await.pop().unwrap();
+    assert_eq!(last, ("ollama".into(), 1, "cancelled".into(), None));
+}
+
+/// Nothing left to try, but the user cancelled: that is not a request for manual work.
+#[tokio::test]
+async fn cancel_wins_over_the_no_ai_fallback() {
+    let (_tmp, db) = setup().await;
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let outcome = Router::with_providers(Vec::new())
+        .run(&db, "gui", TaskType::ParseJob, prompt(), cancel)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, Outcome::Cancelled);
+    assert_eq!(
+        rows(&db).await,
+        vec![("no_ai".into(), 0, "cancelled".into(), None)]
+    );
+}
+
+#[tokio::test]
+async fn embed_cancel_wins_over_the_no_ai_fallback() {
+    let (_tmp, db) = setup().await;
+    with_embedding_model(&db).await;
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let result = Router::with_providers(Vec::new())
+        .embed(&db, &["a".to_string()], cancel)
+        .await;
+
+    assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+    assert_eq!(
+        rows(&db).await,
+        vec![("no_ai".into(), 0, "cancelled".into(), None)]
+    );
+}
+
 #[tokio::test]
 async fn external_call_writes_an_audit_row_without_prompt() {
     let (_tmp, db) = setup().await;
@@ -807,6 +900,36 @@ async fn external_call_writes_an_audit_row_without_prompt() {
         json!({"provider": CLAUDE, "categories": ["job_text"]})
     );
     assert!(!calls[0].detail.to_string().contains(SENTINEL));
+}
+
+/// The audit row comes first: a call that cannot be audited does not happen.
+#[tokio::test]
+async fn failed_audit_write_stops_the_send() {
+    let (_tmp, db) = setup().await;
+    let job_text = [DataCategory::JobText];
+    consent::give(&db, CLAUDE, &job_text, "2026-11-01", "gui")
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE audit_log")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let claude = Mock::claude(vec![text(JOB)]);
+    let counters = claude.counters();
+    let router = Router::with_providers(vec![claude.boxed()]);
+
+    let result = router
+        .run(
+            &db,
+            "gui",
+            TaskType::ParseJob,
+            prompt(),
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert!(matches!(result, Err(Error::Db(_))), "{result:?}");
+    assert_eq!(calls(&counters), 0);
 }
 
 #[tokio::test]
@@ -1002,14 +1125,90 @@ fn task_specs_match_the_design() {
             spec.required,
             [Capability::StructuredOutput, Capability::NoTools]
         );
-        assert!(spec.categories.contains(&DataCategory::JobText));
         assert_eq!(spec.attempts, 2);
     }
+    assert_eq!(spec(TaskType::ParseJob).categories, [DataCategory::JobText]);
+    let drafting = [
+        DataCategory::JobText,
+        DataCategory::ProfileBasic,
+        DataCategory::ResumeText,
+    ];
+    assert_eq!(spec(TaskType::DraftResume).categories, drafting);
+    assert_eq!(spec(TaskType::DraftCoverLetter).categories, drafting);
     let embed = spec(TaskType::Embed);
     assert_eq!(embed.schema, "");
     assert_eq!(
         embed.required,
         [Capability::Embeddings, Capability::LocalExecution]
+    );
+    assert_eq!(
+        embed.categories,
+        [DataCategory::ResumeText, DataCategory::CareerMemory]
+    );
+}
+
+/// Task 17's documented `consent give` must be enough for both drafting tasks.
+#[tokio::test]
+async fn documented_consent_unlocks_claude_drafting() {
+    let (_tmp, db) = setup().await;
+    let documented = [
+        DataCategory::JobText,
+        DataCategory::ResumeText,
+        DataCategory::ProfileBasic,
+    ];
+    consent::give(&db, CLAUDE, &documented, "2026-11-01", "cli")
+        .await
+        .unwrap();
+    let letter = json!({"paragraphs": []}).to_string();
+    for (task, reply) in [
+        (TaskType::DraftResume, draft()),
+        (TaskType::DraftCoverLetter, letter),
+    ] {
+        let router = Router::with_providers(vec![Mock::claude(vec![text(&reply)]).boxed()]);
+        let outcome = router
+            .run(&db, "cli", task, prompt(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(is_ok(&outcome, ProviderId::ClaudeCode, 1), "{outcome:?}");
+    }
+}
+
+/// Embedding has no schema and takes no prompt: only `Router::embed` may run it.
+#[tokio::test]
+async fn run_refuses_the_embed_task_up_front() {
+    let (_tmp, db) = setup().await;
+    let mock = Mock::ollama(vec![text("{}")]);
+    let counters = mock.counters();
+    let router = Router::with_providers(vec![mock.boxed()]);
+
+    let outcome = router
+        .run(
+            &db,
+            "gui",
+            TaskType::Embed,
+            prompt(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let reason = "embed_is_not_a_completion";
+    assert_eq!(
+        outcome,
+        Outcome::Failed {
+            reason: reason.into()
+        }
+    );
+    assert_eq!(calls(&counters), 0);
+    assert_eq!(counters.probes.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        rows(&db).await,
+        vec![(
+            "router".into(),
+            0,
+            "refused".into(),
+            Some(reason.to_string())
+        )]
     );
 }
 

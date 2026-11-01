@@ -66,7 +66,6 @@ const DRAFT_DATA: &[DataCategory] = &[
     DataCategory::JobText,
     DataCategory::ProfileBasic,
     DataCategory::ResumeText,
-    DataCategory::CareerMemory,
 ];
 
 static PARSE_JOB: TaskSpec = TaskSpec {
