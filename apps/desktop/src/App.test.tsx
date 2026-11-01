@@ -27,6 +27,58 @@ describe("shell", () => {
   });
 });
 
+describe("terminal panel", () => {
+  const panel = () => screen.queryByText("jobpilot CLI only");
+
+  it("ctrl_backquote_toggles_the_panel_and_keeps_the_session", async () => {
+    const api = backend();
+    const { user } = renderApp();
+    await screen.findByRole("heading", { name: "Status" });
+    expect(panel()).not.toBeVisible();
+    expect(count(api, "pty_open")).toBe(0);
+
+    await user.keyboard("{Control>}[Backquote]{/Control}");
+    expect(panel()).toBeVisible();
+    await waitFor(() => expect(count(api, "pty_open")).toBe(1));
+    expect(document.activeElement).toHaveClass("xterm-helper-textarea");
+
+    await user.keyboard("{Control>}[Backquote]{/Control}");
+    expect(panel()).not.toBeVisible();
+    await user.keyboard("{Control>}[Backquote]{/Control}");
+    expect(panel()).toBeVisible();
+    expect(count(api, "pty_open")).toBe(1);
+  });
+
+  it("button_opens_it_and_close_panel_ends_the_session", async () => {
+    const api = backend();
+    const { user } = renderApp();
+    await user.click(await screen.findByRole("button", { name: "Terminal" }));
+    await waitFor(() => expect(count(api, "pty_open")).toBe(1));
+    await user.click(screen.getByRole("button", { name: "Close panel" }));
+    expect(panel()).not.toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Terminal" }));
+    await waitFor(() => expect(count(api, "pty_open")).toBe(2));
+  });
+
+  it("f6_walks_main_nav_terminal_buttons_main", async () => {
+    const api = backend();
+    const { user } = renderApp();
+    const heading = await screen.findByRole("heading", { name: "Status" });
+    await user.keyboard("{Control>}[Backquote]{/Control}");
+    await waitFor(() => expect(count(api, "pty_open")).toBe(1));
+    await user.click(heading);
+    heading.focus();
+    await user.keyboard("{F6}");
+    expect(screen.getByRole("button", { name: "Status" })).toHaveFocus();
+    await user.keyboard("{F6}");
+    expect(document.activeElement).toHaveClass("xterm-helper-textarea");
+    await user.keyboard("{F6}");
+    expect(screen.getByRole("button", { name: "Clear" })).toHaveFocus();
+    await user.keyboard("{F6}");
+    expect(heading).toHaveFocus();
+  });
+});
+
 describe("recovery", () => {
   it("shows_recovery_screen when status is recovery", async () => {
     backend({ status: () => recovery("schema_too_new", "data schema 9, app 1") });

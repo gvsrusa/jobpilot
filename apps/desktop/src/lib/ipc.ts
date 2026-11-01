@@ -1,5 +1,6 @@
 // ponytail: hand-kept in sync with commands.rs; add tauri-specta when the command count makes drift a real problem.
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 
 /** What every failed command rejects with (jobpilot-core `Error`). */
@@ -63,6 +64,31 @@ export const ipc = {
   secretNames: () => invoke<string[]>("secret_names"),
   auditRecent: (limit: number) => invoke<AuditEntry[]>("audit_recent", { limit }),
 };
+
+export function ptyOpen(cols: number, rows: number): Promise<void> {
+  return invoke("pty_open", { cols, rows });
+}
+
+/** `Array.from`: `invoke` JSON-encodes a `Uint8Array` as a map, which `Vec<u8>` refuses. */
+export function ptyWrite(data: Uint8Array): Promise<void> {
+  return invoke("pty_write", { data: Array.from(data) });
+}
+
+export function ptyResize(cols: number, rows: number): Promise<void> {
+  return invoke("pty_resize", { cols, rows });
+}
+
+export function ptyClose(): Promise<void> {
+  return invoke("pty_close");
+}
+
+export function onPtyData(cb: (bytes: Uint8Array) => void): Promise<() => void> {
+  return listen<number[]>("pty:data", (event) => cb(Uint8Array.from(event.payload)));
+}
+
+export function onPtyExit(cb: (code: number | null) => void): Promise<() => void> {
+  return listen<number | null>("pty:exit", (event) => cb(event.payload));
+}
 
 /** The folder picker for a backup. Returns null when the user cancels. */
 export async function pickFolder(): Promise<string | null> {

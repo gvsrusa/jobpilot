@@ -82,6 +82,10 @@ export function backend(overrides: Record<string, Handler> = {}): Backend {
     audit_recent: () => [],
     settings_get: () => null,
     settings_set: () => undefined,
+    pty_open: () => undefined,
+    pty_write: () => undefined,
+    pty_resize: () => undefined,
+    pty_close: () => undefined,
   };
   let current: Status | undefined;
   mockIPC((cmd, args) => {
@@ -95,7 +99,7 @@ export function backend(overrides: Record<string, Handler> = {}): Backend {
     const result = handler(payload);
     if (isStatus(result)) current = result;
     return result;
-  });
+  }, { shouldMockEvents: true });
   return { calls };
 }
 

@@ -38,6 +38,10 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         secret_delete,
         secret_names,
         audit_recent,
+        crate::pty::pty_open,
+        crate::pty::pty_write,
+        crate::pty::pty_resize,
+        crate::pty::pty_close,
     ]
 }
 
@@ -241,8 +245,11 @@ pub async fn audit_recent(state: State<'_, AppState>, limit: i64) -> Result<Vec<
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::fs::{self, File};
     use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use jobpilot_core::{AppPaths, Db, Error, backup};
     use serde_json::{Value, json};
@@ -251,10 +258,11 @@ mod tests {
         INVOKE_KEY, MockRuntime, get_ipc_response, mock_builder, mock_context, noop_assets,
     };
     use tauri::webview::InvokeRequest;
-    use tauri::{App, Manager, WebviewWindow, WebviewWindowBuilder};
+    use tauri::{App, Listener, Manager, WebviewWindow, WebviewWindowBuilder, WindowEvent};
     use tempfile::TempDir;
 
     use super::handler;
+    use crate::pty::{self, MAX_WRITE_BYTES, PtyState};
     use crate::state::{AppState, StartupError};
 
     const OPENS: &str = "schema_too_new";
@@ -279,6 +287,8 @@ mod tests {
     fn harness(tmp: TempDir, paths: AppPaths, state: AppState) -> Harness {
         let app = mock_builder()
             .manage(state)
+            .manage(PtyState::default())
+            .on_window_event(pty::on_window_event)
             .invoke_handler(handler())
             .build(mock_context(noop_assets()))
             .unwrap();
@@ -863,5 +873,448 @@ mod tests {
         assert_eq!(h.code("backup_list", json!({})), "unavailable");
         assert_eq!(h.code("backup_restore", restore(&source)), "unavailable");
         assert_eq!(h.code("data_delete", delete("DELETE", true)), "unavailable");
+    }
+
+    // The PTY tests drive the real debug CLI: `cargo build -p jobpilot-cli` first (a
+    // workspace test run builds it). Wide, so ConPTY does not wrap a long temp path.
+    const SIZE: (u16, u16) = (400, 40);
+    const PTY_WAIT: Duration = Duration::from_secs(20);
+
+    /// What the webview would see of one terminal session.
+    struct Panel<'a> {
+        harness: &'a Harness,
+        data: Arc<Mutex<Vec<u8>>>,
+        exits: Arc<Mutex<Vec<Value>>>,
+        answered: Cell<usize>,
+    }
+
+    impl<'a> Panel<'a> {
+        fn listening(harness: &'a Harness) -> Self {
+            let data = Arc::new(Mutex::new(Vec::new()));
+            let exits = Arc::new(Mutex::new(Vec::new()));
+            let sink = data.clone();
+            harness.window.listen("pty:data", move |event| {
+                let bytes: Vec<u8> = serde_json::from_str(event.payload()).unwrap();
+                sink.lock().unwrap().extend(bytes);
+            });
+            let sink = exits.clone();
+            harness.window.listen("pty:exit", move |event| {
+                sink.lock()
+                    .unwrap()
+                    .push(serde_json::from_str(event.payload()).unwrap());
+            });
+            Panel {
+                harness,
+                data,
+                exits,
+                answered: Cell::new(0),
+            }
+        }
+
+        fn open(harness: &'a Harness) -> Self {
+            let panel = Panel::listening(harness);
+            let (cols, rows) = SIZE;
+            invoke(
+                &harness.window,
+                "pty_open",
+                json!({ "cols": cols, "rows": rows }),
+            )
+            .expect("build the CLI first: cargo build -p jobpilot-cli");
+            panel.wait_for("jobpilot> ");
+            panel
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.data.lock().unwrap()).into_owned()
+        }
+
+        fn mark(&self) -> usize {
+            self.data.lock().unwrap().len()
+        }
+
+        fn send(&self, bytes: &[u8]) -> Result<Value, Value> {
+            invoke(&self.harness.window, "pty_write", json!({ "data": bytes }))
+        }
+
+        /// Enter, as xterm.js sends it.
+        fn line(&self, line: &str) {
+            self.send(format!("{line}\r").as_bytes()).unwrap();
+        }
+
+        fn wait_for(&self, needle: &str) -> String {
+            self.wait_after(0, needle)
+        }
+
+        fn wait_after(&self, mark: usize, needle: &str) -> String {
+            let until = Instant::now() + PTY_WAIT;
+            loop {
+                let seen = self.data.lock().unwrap()[mark..].to_vec();
+                let text = String::from_utf8_lossy(&seen).into_owned();
+                if text.contains(needle) {
+                    return text;
+                }
+                // ConPTY asks where the cursor is before it paints; xterm.js answers this.
+                let asked = text.matches("\x1b[6n").count();
+                if mark == 0 && asked > self.answered.get() {
+                    self.answered.set(asked);
+                    self.send(b"\x1b[1;1R").unwrap();
+                }
+                assert!(Instant::now() < until, "no {needle:?} in {text:?}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn close(&self) {
+            invoke(&self.harness.window, "pty_close", json!({})).unwrap();
+        }
+    }
+
+    impl Drop for Panel<'_> {
+        fn drop(&mut self) {
+            self.harness.app.state::<PtyState>().close();
+        }
+    }
+
+    #[cfg(unix)]
+    fn running(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(windows)]
+    fn running(pid: u32) -> bool {
+        let filter = format!("PID eq {pid}");
+        let listed = std::process::Command::new("tasklist")
+            .args(["/FI", &filter, "/NH"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&listed.stdout).contains(&pid.to_string())
+    }
+
+    fn wait_gone(pid: u32) {
+        let until = Instant::now() + PTY_WAIT;
+        while running(pid) {
+            assert!(Instant::now() < until, "process {pid} still runs");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A stand-in for `claude` at a path the app was told in `ai.claude_path`.
+    #[cfg(unix)]
+    fn fake_claude(harness: &Harness, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = harness._tmp.path().join("fake");
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("claude");
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let set = json!({ "key": "ai.claude_path", "value": path });
+        invoke(&harness.window, "settings_set", set).unwrap();
+        path
+    }
+
+    #[test]
+    fn pty_write_without_session_is_unavailable() {
+        let h = ready();
+        let written = invoke(&h.window, "pty_write", json!({ "data": [97] }));
+        assert_eq!(code_of(written), "unavailable");
+        let resized = invoke(&h.window, "pty_resize", json!({ "cols": 80, "rows": 24 }));
+        assert_eq!(code_of(resized), "unavailable");
+        // Closing nothing is fine: the panel does it before every open.
+        invoke(&h.window, "pty_close", json!({})).unwrap();
+    }
+
+    #[test]
+    fn pty_write_over_the_limit_is_refused_before_anything_else() {
+        let h = ready();
+        let data = vec![b'x'; MAX_WRITE_BYTES + 1];
+        let refused = invoke(&h.window, "pty_write", json!({ "data": data }));
+        assert_eq!(code_of(refused), "too_large");
+        let panel = Panel::open(&h);
+        let refused = panel.send(&vec![b'x'; MAX_WRITE_BYTES + 1]);
+        assert_eq!(code_of(refused), "too_large");
+        panel.send(&vec![b'x'; MAX_WRITE_BYTES]).unwrap();
+    }
+
+    #[test]
+    fn pty_open_spawns_shell_and_echoes_prompt() {
+        let h = ready();
+        let panel = Panel::open(&h);
+        assert!(panel.text().contains("jobpilot> "));
+        assert!(h.app.state::<PtyState>().pid().is_some());
+    }
+
+    #[test]
+    fn pty_open_refuses_a_zero_size() {
+        let h = ready();
+        let refused = invoke(&h.window, "pty_open", json!({ "cols": 0, "rows": 24 }));
+        assert_eq!(code_of(refused), "validation");
+        assert!(h.app.state::<PtyState>().pid().is_none());
+    }
+
+    /// The webview names a size and nothing else: extra arguments do not exist for it.
+    #[test]
+    fn webview_cannot_choose_what_the_pty_runs() {
+        let h = ready();
+        let marker = h._tmp.path().join("ran");
+        let (cols, rows) = SIZE;
+        let script = format!("touch {}", marker.display());
+        let panel = Panel::listening(&h);
+        let args = json!({
+            "cols": cols,
+            "rows": rows,
+            "command": "/bin/sh",
+            "program": "/bin/sh",
+            "args": ["-c", script],
+            "argv": ["/bin/sh", "-c", script],
+            "shell": "/bin/sh",
+            "cwd": "/",
+            "env": { "JOBPILOT_PANEL": "" },
+        });
+        invoke(&h.window, "pty_open", args).unwrap();
+        panel.wait_for("jobpilot> ");
+        panel.line("not-a-command");
+        panel.wait_for("not-a-command");
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn a_line_never_reaches_a_system_shell() {
+        let h = ready();
+        let panel = Panel::open(&h);
+        let marker = h._tmp.path().join("ran");
+        let mark = panel.mark();
+        panel.line(&format!("sh -c \"echo hi > {}\"", marker.display()));
+        panel.wait_after(mark, "error");
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn sessions_are_capped_at_one() {
+        let h = ready();
+        let panel = Panel::open(&h);
+        let pid = h.app.state::<PtyState>().pid();
+        let again = invoke(&h.window, "pty_open", json!({ "cols": 80, "rows": 24 }));
+        assert_eq!(code_of(again), "refused");
+        assert_eq!(h.app.state::<PtyState>().pid(), pid);
+        panel.close();
+    }
+
+    #[test]
+    fn pty_close_kills_child() {
+        let h = ready();
+        let panel = Panel::open(&h);
+        let pid = h.app.state::<PtyState>().pid().unwrap();
+        assert!(running(pid));
+        panel.close();
+        assert_eq!(h.app.state::<PtyState>().pid(), None);
+        wait_gone(pid);
+        assert_eq!(code_of(panel.send(b"x")), "unavailable");
+    }
+
+    #[test]
+    fn window_destroy_kills_the_session() {
+        let h = ready();
+        let panel = Panel::open(&h);
+        let pid = h.app.state::<PtyState>().pid().unwrap();
+        // The mock runtime dispatches no window events, so this calls the handler `run` installs.
+        let window = h.window.as_ref().window();
+        pty::on_window_event(&window, &WindowEvent::Focused(false));
+        assert_eq!(h.app.state::<PtyState>().pid(), Some(pid));
+        pty::on_window_event(&window, &WindowEvent::Destroyed);
+        wait_gone(pid);
+        assert_eq!(h.app.state::<PtyState>().pid(), None);
+        drop(panel);
+    }
+
+    /// Output belongs to the window that opened the session.
+    #[test]
+    fn output_goes_only_to_the_window_that_opened_it() {
+        let h = ready();
+        let other = WebviewWindowBuilder::new(&h.app, "other", Default::default())
+            .build()
+            .unwrap();
+        let leaked = Arc::new(Mutex::new(0));
+        for event in ["pty:data", "pty:exit"] {
+            let sink = leaked.clone();
+            other.listen(event, move |_| *sink.lock().unwrap() += 1);
+        }
+        let panel = Panel::open(&h);
+        panel.line("exit");
+        wait_until(|| !panel.exits.lock().unwrap().is_empty());
+        assert_eq!(*leaked.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn exit_is_reported_and_the_next_open_works() {
+        let h = ready();
+        let panel = Panel::open(&h);
+        panel.line("exit");
+        wait_until(|| !panel.exits.lock().unwrap().is_empty());
+        assert_eq!(*panel.exits.lock().unwrap(), [json!(0)]);
+        assert_eq!(h.app.state::<PtyState>().pid(), None);
+        assert_eq!(code_of(panel.send(b"x")), "unavailable");
+        let next = Panel::open(&h);
+        next.close();
+    }
+
+    /// A closed session says nothing, or its exit would end the session after it.
+    #[test]
+    fn a_closed_session_stays_silent() {
+        let h = ready();
+        let panel = Panel::open(&h);
+        let pid = h.app.state::<PtyState>().pid().unwrap();
+        panel.close();
+        wait_gone(pid);
+        let mark = panel.mark();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(panel.mark(), mark);
+        assert!(panel.exits.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pty_child_env_has_panel_marker_and_home() {
+        let h = ready();
+        let panel = Panel::open(&h);
+        let root = serde_json::to_string(h.paths.root()).unwrap();
+        panel.line("jobpilot status --json");
+        panel.wait_for(&root);
+
+        let mark = panel.mark();
+        panel.line("data delete --confirm DELETE");
+        panel.wait_after(mark, "panel_refused");
+        assert!(h.paths.root().exists());
+    }
+
+    /// With the terminal's foreground job gone, the prompt must still answer.
+    #[test]
+    fn ctrl_c_at_the_prompt_leaves_the_shell_running() {
+        let h = ready();
+        let panel = Panel::open(&h);
+        let pid = h.app.state::<PtyState>().pid().unwrap();
+        panel.send(b"\x03").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(running(pid));
+        let mark = panel.mark();
+        panel.line("jobpilot status --json");
+        panel.wait_after(mark, "schema");
+        assert_eq!(h.app.state::<PtyState>().pid(), Some(pid));
+    }
+
+    /// Ctrl-C is a byte until the terminal driver makes it a signal, so this needs the PTY.
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_c_reaches_the_foreground_child_and_the_shell_survives() {
+        let h = ready();
+        fake_claude(
+            &h,
+            "trap 'echo got-interrupt; exit 7' INT\necho claude-ready\nwhile :; do sleep 0.05; done",
+        );
+        let panel = Panel::open(&h);
+        let pid = h.app.state::<PtyState>().pid().unwrap();
+        panel.line("claude");
+        panel.wait_for("claude-ready");
+        panel.send(b"\x03").unwrap();
+        panel.wait_for("got-interrupt");
+        panel.wait_for("exited with code 7");
+        let mark = panel.mark();
+        panel.line("jobpilot status --json");
+        panel.wait_after(mark, "schema");
+        assert_eq!(h.app.state::<PtyState>().pid(), Some(pid));
+    }
+
+    /// The owner's session: found from the setting, with the terminal and its size.
+    #[cfg(unix)]
+    #[test]
+    fn claude_starts_inside_the_panel_on_its_own_terminal() {
+        let h = ready();
+        fake_claude(
+            &h,
+            "test -t 0 && test -t 1 && echo on-a-tty\nstty size\necho \"term=$TERM\"\necho \"leak=[$CARGO_PKG_NAME]\"",
+        );
+        let panel = Panel::open(&h);
+        panel.line("claude");
+        panel.wait_for("on-a-tty");
+        let (cols, rows) = SIZE;
+        panel.wait_for(&format!("{rows} {cols}"));
+        panel.wait_for("term=xterm-256color");
+        // Cargo set this for the test process, so it stands for all the app's own variables.
+        panel.wait_for("leak=[]");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pty_resize_reaches_the_terminal() {
+        let h = ready();
+        fake_claude(&h, "stty size\nread line\nstty size\n");
+        let panel = Panel::open(&h);
+        panel.line("claude");
+        let (cols, rows) = SIZE;
+        panel.wait_for(&format!("{rows} {cols}"));
+        invoke(&h.window, "pty_resize", json!({ "cols": 91, "rows": 33 })).unwrap();
+        panel.line("");
+        panel.wait_for("33 91");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pty_close_takes_a_running_claude_with_it() {
+        let h = ready();
+        let pid_file = h._tmp.path().join("claude.pid");
+        fake_claude(
+            &h,
+            &format!(
+                "echo $$ > {}\necho claude-ready\nexec sleep 300",
+                pid_file.display()
+            ),
+        );
+        let panel = Panel::open(&h);
+        panel.line("claude");
+        panel.wait_for("claude-ready");
+        let pid = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(running(pid));
+        panel.close();
+        wait_gone(pid);
+    }
+
+    /// `pty_write` runs on the main thread, so a child that stops reading must not stall
+    /// the window; and Close must still work with input stuck behind it.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_stops_reading_never_blocks_the_caller() {
+        let h = ready();
+        // Raw, so the driver holds the input: a line-mode terminal drops what overflows.
+        fake_claude(&h, "stty raw -echo\necho claude-ready\nexec sleep 300");
+        let panel = Panel::open(&h);
+        let pid = h.app.state::<PtyState>().pid().unwrap();
+        panel.line("claude");
+        panel.wait_for("claude-ready");
+        let started = Instant::now();
+        let refused = (0..1000)
+            .map(|_| panel.send(&vec![b'x'; MAX_WRITE_BYTES]))
+            .find(Result::is_err);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(code_of(refused.expect("the queue must fill")), "refused");
+        panel.close();
+        wait_gone(pid);
+    }
+
+    fn wait_until(done: impl Fn() -> bool) {
+        let until = Instant::now() + PTY_WAIT;
+        while !done() {
+            assert!(Instant::now() < until, "timed out");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn code_of(result: Result<Value, Value>) -> String {
+        result.unwrap_err()["code"].as_str().unwrap().to_owned()
     }
 }

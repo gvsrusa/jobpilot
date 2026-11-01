@@ -1,0 +1,168 @@
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { emit } from "@tauri-apps/api/event";
+import { mockIPC } from "@tauri-apps/api/mocks";
+import { describe, expect, it, vi } from "vitest";
+import { ptyWrite } from "@/lib/ipc";
+import { TerminalPanel } from "./TerminalPanel";
+
+type Call = { cmd: string; args: Record<string, unknown> };
+
+function backend(overrides: Record<string, () => unknown> = {}) {
+  const calls: Call[] = [];
+  mockIPC(
+    (cmd, args) => {
+      calls.push({ cmd, args: args as Call["args"] });
+      return overrides[cmd]?.();
+    },
+    { shouldMockEvents: true },
+  );
+  const of = (cmd: string) => calls.filter((call) => call.cmd === cmd);
+  return { calls, of };
+}
+
+const terminalInput = () => document.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea")!;
+
+function panel(onClose = vi.fn()) {
+  return {
+    onClose,
+    user: userEvent.setup(),
+    ...render(
+      <>
+        <main>
+          <h1 tabIndex={-1}>View</h1>
+        </main>
+        <TerminalPanel open onClose={onClose} />
+      </>,
+    ),
+  };
+}
+
+describe("TerminalPanel", () => {
+  it("renders_header_footer_and_empty_hint", async () => {
+    const { of } = backend();
+    panel();
+    expect(screen.getByText("Terminal")).toBeInTheDocument();
+    expect(screen.getByText("jobpilot CLI only")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clear" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Close panel" })).toBeInTheDocument();
+    expect(screen.getByText("Runs the same services as the app. Output is not saved.")).toBeInTheDocument();
+    expect(screen.getByText("Type `jobpilot --help`.")).toBeInTheDocument();
+    await waitFor(() => expect(of("pty_open")).toHaveLength(1));
+  });
+
+  it("opens_with_a_size_and_nothing_else", async () => {
+    const { of } = backend();
+    panel();
+    await waitFor(() => expect(of("pty_open")).toHaveLength(1));
+    expect(Object.keys(of("pty_open")[0].args).sort()).toEqual(["cols", "rows"]);
+  });
+
+  it("stays_closed_until_first_opened", async () => {
+    const { of } = backend();
+    render(<TerminalPanel open={false} onClose={vi.fn()} />);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(of("pty_open")).toHaveLength(0);
+    expect(screen.queryByText("Terminal")).not.toBeVisible();
+  });
+
+  it("f6_moves_focus_out_of_the_terminal", async () => {
+    const { of } = backend();
+    panel();
+    await waitFor(() => expect(of("pty_open")).toHaveLength(1));
+    terminalInput().focus();
+    expect(terminalInput()).toHaveFocus();
+    // A real keyCode, or xterm.js would have nothing to send even if it saw the key.
+    fireEvent.keyDown(terminalInput(), { key: "F6", code: "F6", keyCode: 117 });
+    expect(screen.getByRole("button", { name: "Clear" })).toHaveFocus();
+    expect(of("pty_write")).toHaveLength(0);
+  });
+
+  it("keys_go_to_the_pty_as_bytes", async () => {
+    const { of } = backend();
+    panel();
+    await waitFor(() => expect(of("pty_open")).toHaveLength(1));
+    terminalInput().focus();
+    // As the webview fires it: user-event gives no real keyCode for a held Control.
+    fireEvent.keyDown(terminalInput(), { key: "c", code: "KeyC", keyCode: 67, ctrlKey: true });
+    await waitFor(() => expect(of("pty_write")).not.toHaveLength(0));
+    expect(of("pty_write")[0].args).toEqual({ data: [3] });
+  });
+
+  it("ptyWrite_sends_an_array", async () => {
+    const { of } = backend();
+    await ptyWrite(new TextEncoder().encode("hé"));
+    expect(of("pty_write")[0].args).toEqual({ data: [104, 195, 169] });
+  });
+
+  it("output_reaches_the_terminal_and_clear_empties_it", async () => {
+    const { of } = backend();
+    const { user } = panel();
+    await waitFor(() => expect(of("pty_open")).toHaveLength(1));
+    await emit("pty:data", [...new TextEncoder().encode("hello from the shell\r\n")]);
+    await waitFor(() =>
+      expect(document.querySelector(".xterm-rows")?.textContent).toContain("hello from the shell"),
+    );
+    await user.click(screen.getByRole("button", { name: "Clear" }));
+    await waitFor(() =>
+      expect(document.querySelector(".xterm-rows")?.textContent).not.toContain("hello"),
+    );
+  });
+
+  it("failed_open_shows_code_and_restart", async () => {
+    let fail = true;
+    const { of } = backend({
+      pty_open: () => {
+        if (fail) throw { code: "unavailable", message: "not available on this system" };
+      },
+    });
+    const { user } = panel();
+    expect(await screen.findByRole("alert")).toHaveTextContent("code: unavailable");
+    fail = false;
+    await user.click(screen.getByRole("button", { name: "Restart" }));
+    await waitFor(() => expect(of("pty_open")).toHaveLength(2));
+    await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+  });
+
+  it("refused_paste_keeps_the_session", async () => {
+    const { of } = backend({
+      pty_write: () => {
+        throw { code: "too_large", message: "too large: the limit is 65536 bytes" };
+      },
+    });
+    const { user } = panel();
+    await waitFor(() => expect(of("pty_open")).toHaveLength(1));
+    terminalInput().focus();
+    await user.keyboard("a");
+    expect(await screen.findByRole("alert")).toHaveTextContent("code: too_large");
+    expect(screen.queryByRole("button", { name: "Restart" })).not.toBeInTheDocument();
+  });
+
+  it("exit_offers_restart", async () => {
+    const { of } = backend();
+    const { user } = panel();
+    await waitFor(() => expect(of("pty_open")).toHaveLength(1));
+    await emit("pty:exit", 0);
+    await user.click(await screen.findByRole("button", { name: "Restart" }));
+    await waitFor(() => expect(of("pty_open")).toHaveLength(2));
+  });
+
+  it("close_calls_pty_close", async () => {
+    const { of } = backend();
+    const { user, onClose } = panel();
+    await waitFor(() => expect(of("pty_open")).toHaveLength(1));
+    const before = of("pty_close").length;
+    await user.click(screen.getByRole("button", { name: "Close panel" }));
+    await waitFor(() => expect(of("pty_close").length).toBeGreaterThan(before));
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("unmount_ends_the_session", async () => {
+    const { of } = backend();
+    const { unmount } = panel();
+    await waitFor(() => expect(of("pty_open")).toHaveLength(1));
+    const before = of("pty_close").length;
+    unmount();
+    await waitFor(() => expect(of("pty_close").length).toBeGreaterThan(before));
+  });
+});

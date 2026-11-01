@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "pnpm build && node scripts/sidecar.mjs",
     "frontendDist": "../dist"
   },
   "app": {
@@ -25,6 +25,7 @@
   "bundle": {
     "active": true,
     "targets": ["dmg", "nsis", "msi"],
+    "externalBin": ["binaries/jobpilot"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
