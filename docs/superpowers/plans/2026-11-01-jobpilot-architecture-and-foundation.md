@@ -387,7 +387,7 @@ CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEX
 CREATE TABLE audit_log (id INTEGER PRIMARY KEY, at TEXT NOT NULL, actor TEXT NOT NULL,
   action TEXT NOT NULL, target TEXT, detail TEXT NOT NULL DEFAULT '{}');
 CREATE TABLE secret_index (name TEXT PRIMARY KEY, created_at TEXT NOT NULL);
-CREATE TABLE documents (id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL,
+CREATE TABLE documents (seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, title TEXT NOT NULL, body TEXT NOT NULL,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 ```
 
