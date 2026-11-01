@@ -318,12 +318,30 @@ pub async fn discard_locked(db: &Db, confirm_key_id: &str, actor: &str) -> Resul
         ));
     }
 
-    // ponytail: only work_authorization holds ciphertext so far. Task 7 adds knowledge
-    // marked bodies here, in `crypto::held_key_ids`, and in `other_ciphertext`.
+    // ponytail: work_authorization and marked knowledge bodies hold ciphertext. A later
+    // ciphertext column is cleared here, and joins `crypto::held_key_ids` and
+    // `other_ciphertext`.
     sqlx::query("DELETE FROM work_authorization WHERE key_id = ?")
         .bind(&old)
         .execute(&mut *write)
         .await?;
+    // A cleared knowledge item keeps its row, marked and empty, as its other fields are
+    // not secret. Its embedding came from the lost text, so it goes too.
+    sqlx::query(
+        "DELETE FROM embeddings WHERE item_id IN \
+         (SELECT id FROM knowledge_items WHERE key_id = ? AND body_enc IS NOT NULL)",
+    )
+    .bind(&old)
+    .execute(&mut *write)
+    .await?;
+    sqlx::query(
+        "UPDATE knowledge_items SET body_enc = NULL, key_id = NULL, approved = 0, \
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE key_id = ? AND body_enc IS NOT NULL",
+    )
+    .bind(&old)
+    .execute(&mut *write)
+    .await?;
 
     let new_key_id = new.as_ref().map(|(key, _)| key.key_id().to_owned());
     match &new {
@@ -368,12 +386,14 @@ pub async fn discard_locked(db: &Db, confirm_key_id: &str, actor: &str) -> Resul
 }
 
 async fn other_ciphertext(executor: impl sqlx::SqliteExecutor<'_>, key_id: &str) -> Result<bool> {
-    Ok(
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM work_authorization WHERE key_id <> ?)")
-            .bind(key_id)
-            .fetch_one(executor)
-            .await?,
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM work_authorization WHERE key_id <> ?1) \
+         OR EXISTS (SELECT 1 FROM knowledge_items \
+                    WHERE body_enc IS NOT NULL AND key_id <> ?1)",
     )
+    .bind(key_id)
+    .fetch_one(executor)
+    .await?)
 }
 
 #[cfg(test)]

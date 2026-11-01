@@ -205,23 +205,32 @@ impl DataKey {
 
 /// The table and column in the associated data of a `work_authorization` value.
 pub(crate) const AUTHORIZATION_AAD: (&str, &str) = ("work_authorization", "row");
+/// The table and column in the associated data of a marked knowledge body.
+pub(crate) const KNOWLEDGE_AAD: (&str, &str) = ("knowledge_items", "body_enc");
 
 /// What shows that a stored value is a key id's key.
 pub(crate) enum Proof {
     /// `data_keys.key_check`.
     KeyCheck(Vec<u8>),
     /// Ciphertext under an id with no key row: a trial decrypt stands in for the key-check.
-    Sealed { row_id: String, ciphertext: Vec<u8> },
+    Sealed {
+        table: &'static str,
+        column: &'static str,
+        row_id: String,
+        ciphertext: Vec<u8>,
+    },
 }
 
 impl Proof {
     fn holds(&self, key: &DataKey) -> bool {
         match self {
             Proof::KeyCheck(key_check) => key.opens(key_check),
-            Proof::Sealed { row_id, ciphertext } => {
-                let (table, column) = AUTHORIZATION_AAD;
-                key.decrypt(table, column, row_id, ciphertext).is_ok()
-            }
+            Proof::Sealed {
+                table,
+                column,
+                row_id,
+                ciphertext,
+            } => key.decrypt(table, column, row_id, ciphertext).is_ok(),
         }
     }
 }
@@ -330,15 +339,17 @@ async fn existing_key(db: &Db) -> Result<Option<Found>> {
 }
 
 /// The key ids that hold ciphertext.
-// ponytail: only work_authorization holds ciphertext so far. Every later ciphertext column
-// joins this query, `sample_of`, the check in `add_first_key` and `reactivate`, and the
-// delete in `recovery::discard_locked`.
+// ponytail: work_authorization and marked knowledge bodies hold ciphertext. Every later
+// ciphertext column joins this query, `sample_of`, the check in `add_first_key` and
+// `reactivate`, and the delete and check in `recovery::discard_locked`.
 pub(crate) async fn held_key_ids(db: &Db) -> Result<Vec<String>> {
-    Ok(
-        sqlx::query_scalar("SELECT DISTINCT key_id FROM work_authorization ORDER BY key_id")
-            .fetch_all(&db.pool)
-            .await?,
+    Ok(sqlx::query_scalar(
+        "SELECT key_id FROM work_authorization \
+         UNION SELECT key_id FROM knowledge_items WHERE body_enc IS NOT NULL \
+         ORDER BY key_id",
     )
+    .fetch_all(&db.pool)
+    .await?)
 }
 
 /// What can prove `key_id`: its key-check, or with no key row, a value sealed under it.
@@ -362,7 +373,29 @@ async fn sample_of(db: &Db, key_id: &str) -> Result<Option<Proof>> {
     .bind(key_id)
     .fetch_optional(&db.pool)
     .await?;
-    Ok(row.map(|(row_id, ciphertext)| Proof::Sealed { row_id, ciphertext }))
+    if let Some((row_id, ciphertext)) = row {
+        let (table, column) = AUTHORIZATION_AAD;
+        return Ok(Some(Proof::Sealed {
+            table,
+            column,
+            row_id,
+            ciphertext,
+        }));
+    }
+    let row: Option<(String, Vec<u8>)> = sqlx::query_as(
+        "SELECT id, body_enc FROM knowledge_items \
+         WHERE key_id = ? AND body_enc IS NOT NULL LIMIT 1",
+    )
+    .bind(key_id)
+    .fetch_optional(&db.pool)
+    .await?;
+    let (table, column) = KNOWLEDGE_AAD;
+    Ok(row.map(|(row_id, ciphertext)| Proof::Sealed {
+        table,
+        column,
+        row_id,
+        ciphertext,
+    }))
 }
 
 /// The newest active key id. Reads no key.
@@ -518,7 +551,9 @@ async fn reactivate(db: &Db, key: DataKey, active: Option<&str>, held: &[String]
          WHERE (SELECT key_id FROM data_keys WHERE active = 1 \
                 ORDER BY created_at DESC, key_id LIMIT 1) IS ? \
          AND NOT EXISTS (SELECT 1 FROM work_authorization \
-                         WHERE key_id NOT IN (SELECT value FROM json_each(?)))",
+                         WHERE key_id NOT IN (SELECT value FROM json_each(?3))) \
+         AND NOT EXISTS (SELECT 1 FROM knowledge_items WHERE body_enc IS NOT NULL \
+                         AND key_id NOT IN (SELECT value FROM json_each(?3)))",
     )
     .bind(key.key_id())
     .bind(active)
@@ -610,7 +645,8 @@ async fn add_first_key(
         "INSERT INTO data_keys (key_id, created_at, key_check, active) \
          SELECT ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, 1 \
          WHERE NOT EXISTS (SELECT 1 FROM data_keys) \
-         AND NOT EXISTS (SELECT 1 FROM work_authorization)",
+         AND NOT EXISTS (SELECT 1 FROM work_authorization) \
+         AND NOT EXISTS (SELECT 1 FROM knowledge_items WHERE body_enc IS NOT NULL)",
     )
     .bind(key.key_id())
     .bind(key_check)
@@ -804,6 +840,8 @@ mod tests {
             .encrypt("work_authorization", "row", "PT", b"{}")
             .unwrap();
         let proof = |row_id: &str| Proof::Sealed {
+            table: AUTHORIZATION_AAD.0,
+            column: AUTHORIZATION_AAD.1,
             row_id: row_id.into(),
             ciphertext: sealed.clone(),
         };
