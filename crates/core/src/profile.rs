@@ -209,7 +209,7 @@ pub fn validate(basic: &ProfileBasic) -> Result<()> {
 
 /// Rows for `transfer::export_all`, and whether plaintext was written. Rows exist, so
 /// `crypto::state` makes no key here. With none, nothing is read or asked of the keychain.
-pub(crate) async fn export_authorization(db: &Db) -> Result<(String, bool)> {
+pub async fn export_authorization(db: &Db) -> Result<(String, bool)> {
     let held: i64 = sqlx::query_scalar("SELECT count(*) FROM work_authorization")
         .fetch_one(&db.pool)
         .await?;

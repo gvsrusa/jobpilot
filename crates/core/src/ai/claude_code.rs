@@ -75,6 +75,10 @@ impl ClaudeCode {
         ClaudeCode { bin, model }
     }
 
+    pub fn path(&self) -> &Path {
+        &self.bin
+    }
+
     /// The exact argument list. The job text is never in it: that goes to stdin (M-15).
     /// `--tools ""` removes the built-in tools, `--strict-mcp-config` keeps out MCP servers,
     /// `--disable-slash-commands` skills and commands, and an empty `--setting-sources` the

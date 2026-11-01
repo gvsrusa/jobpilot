@@ -1,14 +1,19 @@
 //! JobPilot CLI: a thin adapter over `jobpilot-core`. Parse, call core, print.
 
+mod ai;
+mod data;
+mod profile;
+mod resume;
+mod text;
+
 use std::io::Write;
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use jobpilot_core::{AppPaths, Db, Error, Result, app_schema_version, backup, documents, transfer};
-use serde_json::{Value, json};
+use jobpilot_core::{AppPaths, Db, Error, Result, recovery};
+use serde_json::Value;
 
-const ACTOR: &str = "cli";
+pub const ACTOR: &str = "cli";
 
 #[derive(Parser)]
 #[command(name = "jobpilot", version, about = "JobPilot AI command line")]
@@ -22,58 +27,64 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Show versions and the data folder.
+    /// Show versions, the data folder, the key state, and AI availability.
     Status,
     /// Manage documents.
     #[command(subcommand)]
-    Doc(DocCommand),
+    Doc(data::DocCommand),
     /// Manage backups.
     #[command(subcommand)]
-    Backup(BackupCommand),
-    /// Export or delete all data.
+    Backup(data::BackupCommand),
+    /// Export, delete, or recover data.
     #[command(subcommand)]
-    Data(DataCommand),
+    Data(data::DataCommand),
+    /// Name, places, and work authorization.
+    #[command(subcommand)]
+    Profile(profile::ProfileCommand),
+    /// Work modes and employment types.
+    #[command(subcommand)]
+    Prefs(profile::PrefsCommand),
+    /// Career knowledge items.
+    #[command(subcommand)]
+    Kb(profile::KbCommand),
+    /// Pasted job postings.
+    #[command(subcommand)]
+    Job(profile::JobCommand),
+    /// Resume drafts.
+    #[command(subcommand)]
+    Resume(resume::ResumeCommand),
+    /// Cover letter drafts.
+    #[command(subcommand)]
+    Letter(resume::LetterCommand),
+    /// AI providers, models, and consent.
+    #[command(subcommand)]
+    Ai(ai::AiCommand),
 }
 
-#[derive(Subcommand)]
-enum DocCommand {
-    List,
-    Add {
-        title: String,
-        #[arg(long, default_value = "")]
-        body: String,
-    },
-    Search {
-        query: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum BackupCommand {
-    Create,
-    List,
-    Restore { path: PathBuf },
-}
-
-#[derive(Subcommand)]
-enum DataCommand {
-    Export,
-    Delete {
-        /// Must be exactly DELETE.
-        #[arg(long)]
-        confirm: Option<String>,
-        #[arg(long)]
-        include_backups: bool,
-    },
+impl Command {
+    /// The terminal panel's input has no shell to clear its marker with, so what could
+    /// leak a key or destroy data is refused there.
+    fn refused_in_panel(&self) -> bool {
+        use data::{BackupCommand, DataCommand};
+        matches!(
+            self,
+            Command::Backup(BackupCommand::Restore { .. })
+                | Command::Data(
+                    DataCommand::Delete { .. }
+                        | DataCommand::RecoveryKey(_)
+                        | DataCommand::DiscardLocked { .. }
+                )
+        )
+    }
 }
 
 /// What a command prints: the JSON form and the text form.
-struct Output {
+pub struct Output {
     json: Value,
     text: String,
 }
 
-fn out(value: impl serde::Serialize, text: String) -> Result<Output> {
+pub fn out(value: impl serde::Serialize, text: String) -> Result<Output> {
     let json = serde_json::to_value(value).map_err(|e| Error::Io(std::io::Error::other(e)))?;
     Ok(Output { json, text })
 }
@@ -83,10 +94,11 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli.command).await {
         Ok(output) => {
+            // Stored and parsed text is untrusted: no escape reaches the terminal.
             let line = if cli.json {
-                output.json.to_string()
+                text::sanitize_value(output.json).to_string()
             } else {
-                output.text
+                text::sanitize(&output.text)
             };
             let written = if line.is_empty() {
                 Ok(())
@@ -102,28 +114,40 @@ async fn main() -> ExitCode {
             }
         }
         Err(error) => {
-            eprintln!("error[{}]: {error}", error.code());
+            eprintln!(
+                "error[{}]: {}",
+                error.code(),
+                text::sanitize(&message(&error))
+            );
             ExitCode::from(1)
         }
     }
 }
 
+fn message(error: &Error) -> String {
+    match error {
+        Error::PanelRefused => "Run this in an ordinary terminal, or use the app.".into(),
+        Error::ManualRequired(reason) if reason == "not_logged_in" => {
+            "Claude Code is not signed in. Run `claude` once to log in, then try again.".into()
+        }
+        other => other.to_string(),
+    }
+}
+
 async fn run(command: Command) -> Result<Output> {
+    if command.refused_in_panel() && recovery::panel_marker_set() {
+        return Err(Error::PanelRefused);
+    }
     let paths = AppPaths::from_env()?;
     match command {
         // These take the handle by value; each closes it on every path.
-        Command::Backup(BackupCommand::Restore { path }) => restore(&paths, &path).await,
-        Command::Data(DataCommand::Delete {
+        Command::Backup(data::BackupCommand::Restore { path }) => {
+            data::restore(&paths, &path).await
+        }
+        Command::Data(data::DataCommand::Delete {
             confirm,
             include_backups,
-        }) => {
-            let db = Db::open(&paths).await?;
-            transfer::delete_all(db, confirm.as_deref().unwrap_or(""), include_backups).await?;
-            out(
-                json!({ "deleted": true }),
-                "all JobPilot data deleted".into(),
-            )
-        }
+        }) => data::delete(&paths, confirm.as_deref(), include_backups).await,
         command => {
             let db = Db::open(&paths).await?;
             let result = with_db(&db, command).await;
@@ -133,89 +157,18 @@ async fn run(command: Command) -> Result<Output> {
     }
 }
 
-async fn restore(paths: &AppPaths, source: &std::path::Path) -> Result<Output> {
-    // When the data cannot open, restore is the recovery route, so go offline.
-    let db = match Db::open(paths).await {
-        Ok(db) => backup::restore(db, source, ACTOR).await?.db,
-        // Only failures of the database itself; `InUse` and `RootNotOwned` are real answers.
-        Err(Error::Db(_) | Error::MigrationFailed(_) | Error::SchemaTooNew { .. }) => {
-            backup::restore_offline(paths, source, ACTOR).await?.db
-        }
-        Err(error) => return Err(error),
-    };
-    db.close().await;
-    out(
-        json!({ "restored": true, "from": source }),
-        format!("restored from {}", source.display()),
-    )
-}
-
 async fn with_db(db: &Db, command: Command) -> Result<Output> {
     match command {
-        Command::Status => {
-            let schema = db.schema_version().await?;
-            out(
-                json!({
-                    "version": jobpilot_core::VERSION,
-                    "schema_version": schema,
-                    "app_schema_version": app_schema_version(),
-                    "root": db.paths().root(),
-                }),
-                format!(
-                    "jobpilot {}\nschema {schema}\ndata {}",
-                    jobpilot_core::VERSION,
-                    db.paths().root().display()
-                ),
-            )
-        }
-        Command::Doc(DocCommand::List) => {
-            let docs = documents::list(db).await?;
-            let text = docs
-                .iter()
-                .map(|d| format!("{}  {}", d.id, d.title))
-                .collect::<Vec<_>>()
-                .join("\n");
-            out(docs, text)
-        }
-        Command::Doc(DocCommand::Add { title, body }) => {
-            let doc = documents::create(db, &title, &body).await?;
-            let text = format!("added {}", doc.id);
-            out(doc, text)
-        }
-        Command::Doc(DocCommand::Search { query }) => {
-            let hits = documents::search(db, &query).await?;
-            let text = hits
-                .iter()
-                .map(|h| format!("{}  {}  {}", h.id, h.title, h.snippet))
-                .collect::<Vec<_>>()
-                .join("\n");
-            out(hits, text)
-        }
-        Command::Backup(BackupCommand::Create) => {
-            let info = backup::create(db, ACTOR).await?;
-            let text = format!("backup created at {}", info.path.display());
-            out(info, text)
-        }
-        Command::Backup(BackupCommand::List) => {
-            let list = backup::list(db.paths()).await?;
-            let text = list
-                .iter()
-                .map(|b| format!("{}  {}", b.created_at, b.path.display()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            out(list, text)
-        }
-        Command::Data(DataCommand::Export) => {
-            let path = transfer::export_all(db, ACTOR).await?;
-            out(
-                json!({ "path": path }),
-                format!("exported to {}", path.display()),
-            )
-        }
-        // Handled in `run`, which owns the handle.
-        Command::Backup(BackupCommand::Restore { .. })
-        | Command::Data(DataCommand::Delete { .. }) => {
-            unreachable!("handled before a borrowed handle exists")
-        }
+        Command::Status => data::status(db).await,
+        Command::Doc(command) => data::doc(db, command).await,
+        Command::Backup(command) => data::backup(db, command).await,
+        Command::Data(command) => data::data(db, command).await,
+        Command::Profile(command) => profile::profile(db, command).await,
+        Command::Prefs(command) => profile::prefs(db, command).await,
+        Command::Kb(command) => profile::kb(db, command).await,
+        Command::Job(command) => profile::job(db, command).await,
+        Command::Resume(command) => resume::resume(db, command).await,
+        Command::Letter(command) => resume::letter(db, command).await,
+        Command::Ai(command) => ai::ai(db, command).await,
     }
 }

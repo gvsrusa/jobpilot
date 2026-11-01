@@ -10,7 +10,12 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::db::Db;
+use crate::error::{Error, Result};
+use crate::hardware::{self, Hardware};
+use crate::settings;
+use claude_code::ClaudeCode;
+use ollama::OllamaStatus;
 
 pub mod claude_code;
 pub mod consent;
@@ -219,4 +224,114 @@ impl CancellationToken {
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::SeqCst)
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClaudeStatus {
+    pub available: bool,
+    pub path: Option<String>,
+    /// The categories the active consent record allows, if there is one.
+    pub consent: Option<Vec<DataCategory>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AiStatus {
+    pub ollama: OllamaStatus,
+    pub claude_code: ClaudeStatus,
+    pub hardware: Hardware,
+    pub order: Vec<String>,
+    pub enabled: serde_json::Value,
+    pub drafting_model: Option<String>,
+    pub embedding_model: Option<String>,
+}
+
+/// The provider names the settings accept.
+pub const PROVIDER_NAMES: &[&str] = &["ollama", "claude_code"];
+
+async fn text_setting(db: &Db, key: &str) -> Result<Option<String>> {
+    let value = settings::get(db, key).await?;
+    Ok(value.and_then(|v| v.as_str().map(str::to_string)))
+}
+
+/// What the screen and the CLI show: availability of both providers, hardware, and the
+/// settings the router reads. Probes loopback Ollama and runs `claude --version`; sends no
+/// text and needs no consent.
+pub async fn status(db: &Db) -> Result<AiStatus> {
+    let ollama = match router::ollama_from_settings(db).await? {
+        Some(ollama) => ollama.status().await,
+        None => OllamaStatus::Refused {
+            reason: "not_loopback".into(),
+        },
+    };
+    let consent = consent::active(db, &ProviderId::ClaudeCode.to_string()).await?;
+    let claude_code = match ClaudeCode::locate() {
+        Ok(claude) => ClaudeStatus {
+            available: matches!(claude.available().await, Availability::Available),
+            path: Some(claude.path().display().to_string()),
+            consent,
+        },
+        Err(_) => ClaudeStatus {
+            available: false,
+            path: None,
+            consent,
+        },
+    };
+    let order: Option<Vec<String>> = settings::get(db, "ai.order")
+        .await?
+        .and_then(|value| serde_json::from_value(value).ok());
+    let stored = settings::get(db, "ai.enabled").await?.unwrap_or_default();
+    let enabled = serde_json::json!({
+        "ollama": stored["ollama"].as_bool().unwrap_or(true),
+        "claude_code": stored["claude_code"].as_bool().unwrap_or(false),
+    });
+    Ok(AiStatus {
+        ollama,
+        claude_code,
+        hardware: hardware::detect(),
+        order: order.unwrap_or_else(|| vec!["ollama".into()]),
+        enabled,
+        drafting_model: text_setting(db, "ai.drafting_model").await?,
+        embedding_model: text_setting(db, "ai.embedding_model").await?,
+    })
+}
+
+fn known(name: &str) -> Result<()> {
+    if PROVIDER_NAMES.contains(&name) {
+        return Ok(());
+    }
+    Err(Error::Validation(
+        "a provider is ollama or claude_code".into(),
+    ))
+}
+
+/// Providers in the order the router tries them. Each name once.
+pub async fn set_order(db: &Db, order: &[String]) -> Result<()> {
+    order.iter().try_for_each(|name| known(name))?;
+    let mut seen: Vec<&String> = Vec::new();
+    for name in order {
+        if !seen.contains(&name) {
+            seen.push(name);
+        }
+    }
+    settings::set(db, "ai.order", &serde_json::json!(seen)).await
+}
+
+pub async fn set_enabled(db: &Db, provider: &str, on: bool) -> Result<()> {
+    known(provider)?;
+    let mut enabled = settings::get(db, "ai.enabled").await?.unwrap_or_default();
+    if !enabled.is_object() {
+        enabled = serde_json::json!({});
+    }
+    enabled[provider] = serde_json::Value::Bool(on);
+    settings::set(db, "ai.enabled", &enabled).await
+}
+
+/// `which` is `drafting` or `embedding`.
+pub async fn set_model(db: &Db, which: &str, model: &str) -> Result<()> {
+    let key = match which {
+        "drafting" => "ai.drafting_model",
+        "embedding" => "ai.embedding_model",
+        _ => return Err(Error::Validation("a model is drafting or embedding".into())),
+    };
+    settings::set(db, key, &serde_json::json!(model.trim())).await
 }

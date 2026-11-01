@@ -362,7 +362,7 @@ impl Router {
 }
 
 /// `None` when the address is refused.
-async fn ollama_from_settings(db: &Db) -> Result<Option<Ollama>> {
+pub async fn ollama_from_settings(db: &Db) -> Result<Option<Ollama>> {
     let text = async |key: &str| -> Result<Option<String>> {
         let value = settings::get(db, key).await?;
         Ok(value.and_then(|value| value.as_str().map(str::to_string)))
