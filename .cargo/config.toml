@@ -1,0 +1,4 @@
+# Keychain tests run against a throwaway service, never the app's own.
+# Cargo leaves a value already in the environment alone, so CI's own name wins.
+[env]
+JOBPILOT_SECRET_SERVICE = "jobpilot-test"

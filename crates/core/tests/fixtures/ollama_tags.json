@@ -1,0 +1,46 @@
+{
+  "models": [
+    {
+      "name": "gemma3:4b",
+      "model": "gemma3:4b",
+      "size": 3338801718,
+      "digest": "a2af6cc3eb7f",
+      "details": { "family": "gemma3", "parameter_size": "4.3B", "quantization_level": "Q4_K_M" }
+    },
+    {
+      "name": "gpt-oss:120b",
+      "size": 384,
+      "remote_model": "gpt-oss:120b",
+      "remote_host": "https://ollama.com:443",
+      "details": { "family": "gptoss", "parameter_size": "116.8B" }
+    },
+    {
+      "name": "x:cloud",
+      "size": 384,
+      "details": { "family": "x", "parameter_size": "" }
+    },
+    {
+      "name": "empty-size:1b",
+      "size": 0,
+      "details": { "family": "x", "parameter_size": "1B" }
+    },
+    {
+      "name": "cloudera:7b",
+      "size": 1000,
+      "details": { "family": "x", "parameter_size": "7B" }
+    },
+    {
+      "name": "blank-remote:1b",
+      "size": 1000,
+      "remote_model": "",
+      "remote_host": "",
+      "details": { "family": "x", "parameter_size": "1B" }
+    },
+    {
+      "name": "host-only:1b",
+      "size": 1000,
+      "remote_host": "https://elsewhere.example",
+      "details": { "family": "x", "parameter_size": "1B" }
+    }
+  ]
+}

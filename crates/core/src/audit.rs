@@ -1,6 +1,6 @@
 use serde::Serialize;
 use sqlx::Row;
-use sqlx::sqlite::SqlitePool;
+use sqlx::sqlite::SqliteExecutor;
 
 use crate::db::Db;
 use crate::error::Result;
@@ -26,10 +26,11 @@ pub async fn record(
     record_to(&db.pool, actor, action, target, detail).await
 }
 
-/// `record` for a database that is not the open one: a restore writes its row into
-/// the temporary copy, so the row exists only if that copy goes live.
+/// `record` for a database that is not the open one, where a restore writes its row
+/// into the temporary copy so it exists only if that copy goes live, or for an open
+/// transaction, so the row lands with the change it records.
 pub(crate) async fn record_to(
-    pool: &SqlitePool,
+    executor: impl SqliteExecutor<'_>,
     actor: &str,
     action: &str,
     target: Option<&str>,
@@ -43,7 +44,7 @@ pub(crate) async fn record_to(
     .bind(action)
     .bind(target)
     .bind(detail.to_string())
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }

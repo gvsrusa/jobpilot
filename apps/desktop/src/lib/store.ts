@@ -1,6 +1,6 @@
 import { create } from "zustand";
 
-export type View = "status" | "documents" | "data";
+export type View = "status" | "documents" | "data" | "profile" | "resumes" | "ai";
 
 export const useUiStore = create<{ view: View; setView(v: View): void }>((set) => ({
   view: "status",

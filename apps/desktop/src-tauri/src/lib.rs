@@ -1,9 +1,12 @@
 mod commands;
+mod native;
+mod pty;
 mod state;
 
 use jobpilot_core::AppPaths;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, RunEvent};
 
+use pty::PtyState;
 use state::AppState;
 
 fn focus_main_window(app: &AppHandle) {
@@ -23,6 +26,8 @@ pub fn run() {
             focus_main_window(app);
         }))
         .plugin(tauri_plugin_dialog::init())
+        .manage(PtyState::default())
+        .on_window_event(pty::on_window_event)
         .invoke_handler(commands::handler())
         .setup(|app| {
             let state = match AppPaths::from_env() {
@@ -32,6 +37,14 @@ pub fn run() {
             app.manage(state);
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if matches!(event, RunEvent::Exit) {
+                app.state::<PtyState>().close();
+                if let Some(state) = app.try_state::<AppState>() {
+                    tauri::async_runtime::block_on(state.shutdown());
+                }
+            }
+        });
 }

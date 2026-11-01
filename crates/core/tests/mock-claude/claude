@@ -1,0 +1,29 @@
+#!/bin/sh
+# Stands in for the real `claude` in tests. Each test's wrapper script sets MOCK_CLAUDE_*.
+if [ "$1" = "--version" ]; then
+    [ -n "$MOCK_CLAUDE_VERSION_SLEEP" ] && sleep "$MOCK_CLAUDE_VERSION_SLEEP"
+    echo "2.1.316 (mock)"
+    exit "${MOCK_CLAUDE_VERSION_EXIT:-0}"
+fi
+[ -n "$MOCK_CLAUDE_PID" ] && echo "$$" >> "$MOCK_CLAUDE_PID"
+[ -n "$MOCK_CLAUDE_CWD" ] && { pwd; ls -A; } > "$MOCK_CLAUDE_CWD"
+if [ -n "$MOCK_CLAUDE_SLEEP" ]; then
+    sleep "$MOCK_CLAUDE_SLEEP"
+    [ -n "$MOCK_CLAUDE_DONE" ] && : > "$MOCK_CLAUDE_DONE"
+fi
+if [ -n "$MOCK_CLAUDE_ARGS" ]; then
+    : > "$MOCK_CLAUDE_ARGS"
+    for arg in "$@"; do
+        printf '%s\n' "$arg" >> "$MOCK_CLAUDE_ARGS"
+    done
+fi
+if [ -n "$MOCK_CLAUDE_STDIN" ]; then
+    cat > "$MOCK_CLAUDE_STDIN"
+fi
+[ -n "$MOCK_CLAUDE_ENV" ] && env > "$MOCK_CLAUDE_ENV"
+if [ -n "$MOCK_CLAUDE_REPLY" ]; then
+    cat "$MOCK_CLAUDE_REPLY"
+else
+    printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"","structured_output":{"ok":true},"permission_denials":[]}'
+fi
+exit "${MOCK_CLAUDE_EXIT:-0}"

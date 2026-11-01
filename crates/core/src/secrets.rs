@@ -12,8 +12,10 @@
 // writers from two processes; hold the row in a transaction if that ever happens.
 
 use serde_json::json;
+use zeroize::Zeroizing;
 
 use crate::audit;
+use crate::crypto::KEY_ACCOUNT_PREFIX;
 use crate::db::Db;
 use crate::error::{Error, Result};
 
@@ -25,6 +27,7 @@ const SERVICE: &str = "io.github.gvsrusa.jobpilot";
 /// `delete_all` can find, never a keychain entry it cannot.
 pub async fn set(db: &Db, name: &str, value: &str, actor: &str) -> Result<()> {
     check_name(name)?;
+    refuse_data_key(name)?;
     let added = sqlx::query(
         "INSERT INTO secret_index (name, created_at) \
          VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
@@ -68,6 +71,7 @@ pub fn get(name: &str) -> Result<Option<String>> {
 /// `NotFound` when this root does not list `name`: the entry could belong to another
 /// root. The row outlives the keychain entry, so a failure here can be retried.
 pub async fn delete(db: &Db, name: &str, actor: &str) -> Result<()> {
+    refuse_data_key(name)?;
     let listed: Option<i64> = sqlx::query_scalar("SELECT 1 FROM secret_index WHERE name = ?")
         .bind(name)
         .fetch_optional(&db.pool)
@@ -79,6 +83,33 @@ pub async fn delete(db: &Db, name: &str, actor: &str) -> Result<()> {
     remove_all(vec![name.to_owned()]).await?;
     remove_row(db, name).await?;
     audit::record(db, actor, "secret_delete", Some(name), json!({})).await
+}
+
+/// Keychain only: a data key has no `secret_index` row and no `secret_set` audit, so it
+/// stays out of `names` and `delete`. Replaces any value at `name`, so callers pass a
+/// new name: a stored key must never be overwritten (threat model section 8).
+pub(crate) async fn store_key(name: &str, value: &str) -> Result<()> {
+    let (name, value) = (name.to_owned(), Zeroizing::new(value.to_owned()));
+    keychain(move || entry(&name)?.set_password(&value).map_err(secret_error)).await
+}
+
+/// Adds a key the caller has proven, and never replaces an entry. An entry that already
+/// holds this value is fine as it is; one holding anything else is `Refused`, because
+/// nothing here can say which of the two is worth keeping.
+// ponytail: the check and the write are two calls, as keyring has no create-only write.
+// Only another import of this same key can land between them, and it writes this value.
+pub(crate) async fn add_key(name: &str, value: &str) -> Result<()> {
+    let (name, value) = (name.to_owned(), Zeroizing::new(value.to_owned()));
+    keychain(move || match get(&name)?.map(Zeroizing::new) {
+        Some(stored) if stored == value => Ok(()),
+        Some(_) => Err(Error::Refused(
+            "the keychain holds another value for this key, and it is left as it is. \
+             Remove that entry to import this file"
+                .into(),
+        )),
+        None => entry(&name)?.set_password(&value).map_err(secret_error),
+    })
+    .await
 }
 
 pub async fn names(db: &Db) -> Result<Vec<String>> {
@@ -113,7 +144,14 @@ async fn remove_row(db: &Db, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Every keychain call passes through `entry`, so counting here covers them all.
+#[cfg(test)]
+pub(crate) static KEYCHAIN_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 fn entry(name: &str) -> Result<keyring::Entry> {
+    #[cfg(test)]
+    KEYCHAIN_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     check_name(name)?;
     keyring::Entry::new(&service(), name).map_err(secret_error)
 }
@@ -126,17 +164,37 @@ fn check_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// `JOBPILOT_SECRET_SERVICE` lets the real keychain tests stay clear of the app's own
-/// entries. Empty means unset, as with `JOBPILOT_HOME`.
+/// `set` and `delete` are open to the webview, and a key id is not secret: the audit log
+/// shows it. Replacing or removing that entry would destroy the only copy of the data
+/// key. Windows matches credential names without regard to case, so this does too.
+fn refuse_data_key(name: &str) -> Result<()> {
+    let prefix = name.get(..KEY_ACCOUNT_PREFIX.len());
+    if prefix.is_some_and(|prefix| prefix.eq_ignore_ascii_case(KEY_ACCOUNT_PREFIX)) {
+        return Err(Error::Refused(
+            "this name is reserved for the data key".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// `JOBPILOT_SECRET_SERVICE` lets the keychain tests stay clear of the app's own
+/// entries. Only debug and test builds read it: a release build must not let the
+/// environment point the app at another service, so it always uses `SERVICE`.
+// ponytail: one service per build, so no multi-profile secret namespaces.
 fn service() -> String {
-    std::env::var("JOBPILOT_SECRET_SERVICE")
-        .ok()
-        .filter(|service| !service.is_empty())
+    let honour = cfg!(any(test, debug_assertions));
+    resolve_service(std::env::var("JOBPILOT_SECRET_SERVICE").ok(), honour)
+}
+
+/// Empty means unset, as with `JOBPILOT_HOME`.
+fn resolve_service(requested: Option<String>, honour: bool) -> String {
+    requested
+        .filter(|service| honour && !service.is_empty())
         .unwrap_or_else(|| SERVICE.to_owned())
 }
 
 /// Keychain calls can block on a system prompt for as long as the user takes.
-async fn keychain<T, F>(work: F) -> Result<T>
+pub(crate) async fn keychain<T, F>(work: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
@@ -176,6 +234,28 @@ mod tests {
             let message = secret_error(error).to_string();
             assert!(!message.contains("hunter2"), "{message}");
         }
+    }
+
+    #[test]
+    fn only_data_key_names_are_reserved() {
+        for name in ["data-key-00112233aabbccdd", "DATA-KEY-x", "Data-Key-"] {
+            assert!(
+                matches!(refuse_data_key(name), Err(Error::Refused(_))),
+                "{name}"
+            );
+        }
+        for name in ["data-key", "openai", "my-data-key-1", "é"] {
+            assert!(refuse_data_key(name).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn resolve_service_honours_a_request_only_when_told() {
+        let asked = |value: &str| Some(value.to_owned());
+        assert_eq!(resolve_service(asked("x"), true), "x");
+        assert_eq!(resolve_service(asked("x"), false), SERVICE);
+        assert_eq!(resolve_service(asked(""), true), SERVICE);
+        assert_eq!(resolve_service(None, true), SERVICE);
     }
 
     #[test]

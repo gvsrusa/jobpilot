@@ -1,6 +1,6 @@
 # JobPilot AI: AI Provider Integration Specification
 
-Status: draft for owner approval. Date: 2026-11-01. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) section 3, [PRD](prd.md), and [policy register](policy-register.md). Nothing here is implemented yet. `TaskRouter` below is a contract description, not an API. The Rust design belongs to the 0.2 and 0.4 plans.
+Status: draft for owner approval, with the 0.2 implementation noted inline. Date: 2026-11-01. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) section 3, [PRD](prd.md), and [policy register](policy-register.md). Release 0.2 implements the router for Ollama, Claude Code, and No-AI; `Router` in `crates/core/src/ai/router.rs` is the Rust form of `TaskRouter` below. The other backends arrive in 0.4.
 
 Every statement about what a vendor permits comes from the [policy register](policy-register.md), which holds the quotes, URLs, and dates. That register is engineering review, not legal advice, and its entries must be re-read at each release. The owner decided on 2026-11-01 that JobPilot is a personal, non-commercial app and waived AI subscription policy concerns, accepting any account risk (decisions D1 and D4). The register's [owner decisions](policy-register.md#owner-decisions-2026-11-01) set what the product does with AI provider rows. The waiver covers vendor terms only: `no_tools`, the mode check, and consent all still apply.
 
@@ -11,7 +11,7 @@ FR-3.1 requires four backends. Users pick which are enabled. None is mandatory, 
 | Backend | Requirements | Release | What ships |
 |---|---|---|---|
 | Local AI | FR-3.2 to FR-3.8 | 0.2 | Ollama on the user's machine: model discovery, user-started downloads, hardware detection, structured outputs, embeddings. No data leaves the machine, so no consent record is needed for a model that runs locally under loopback Ollama. Ollama cloud models do not qualify, see routing check 2. |
-| Subscription AI | FR-3.9 to FR-3.14 | 0.4 (D1 decided) | Claude Code through the official `claude` CLI and its own login: a user-driven session in the terminal, and a headless backend (`claude -p` style) the router may call. Gemini CLI and Codex CLI adapters are optional and use whatever sign-in the installed CLI supports. A CLI that is not installed shows as unavailable. |
+| Subscription AI | FR-3.9 to FR-3.14 | 0.2 (Claude Code), 0.4 (optional Gemini CLI, Codex CLI) | Claude Code through the official `claude` CLI and its own login: a user-driven session in the terminal, and a headless backend (`claude -p` style) the router may call. Gemini CLI and Codex CLI adapters are optional and use whatever sign-in the installed CLI supports. A CLI that is not installed shows as unavailable. |
 | API providers | FR-3.15 to FR-3.19 | 0.4 (D4 decided) | OpenAI, Anthropic, Google (paid key), OpenRouter, and user-named endpoints. Under standard BYOK the first four are eligible subject to consent and capability checks; the consent screen shows the vendor's terms. Free Gemini keys, non-loopback endpoints, Vertex AI, and Ollama cloud models stay ineligible. Keys stay in the OS credential store (FR-2.9) and never cross IPC. |
 | No-AI fallback | FR-3.20 to FR-3.23 | 0.1, 0.5, 0.6 | Deterministic matching, FTS5 search, rule-based form mapping, manual editing. Always available and always last. |
 
@@ -74,7 +74,7 @@ Each task type declares:
 | Required capabilities | What a provider must declare, from the vocabulary above. | FR-3.26 |
 | Data categories | What this task sends. Used for the consent check. | FR-3.30 |
 | Automation mode | `reviewed` when a person reviews the result before anything is acted on (Manual, Copilot, ordinary drafting), or `unreviewed` for any step of an Autonomous submission. | FR-9.6 |
-| Timeout | Per attempt. Proposed defaults: 60 seconds for remote, 300 seconds for local. | FR-3.27 |
+| Timeout | Per attempt. Defaults: 180 seconds for Claude Code, 300 seconds for local. | FR-3.27 |
 | Retry policy | Attempt limit and which failures retry. | FR-3.28 |
 | Fallback order | User's ordered list of enabled backends, always ending in No-AI. | FR-3.29 |
 | No-AI behaviour | The deterministic path, or `manual_required` when none exists. | FR-3.20 to FR-3.23 |
@@ -94,12 +94,15 @@ For each backend in fallback order, a provider is eligible only if all of these 
 
 Ineligible providers are skipped, and the reason is logged. Fallback never widens consent: a task the user approved for Ollama does not move to a remote provider because Ollama failed.
 
+Providers run in the stored `ai.order`, then every enabled provider it leaves out, so enabling a provider is enough to route it and the AI screen shows the same order the router uses. When every provider passes, `manual_required` names what would change the result: the reason from a real attempt (`not_logged_in`, `prompt_too_large`), else `consent_needed` when consent alone held a provider back, else `provider_unavailable` when one is on but cannot be reached, else `no_ai`.
+
 ### Timeouts and retries
 
 - A timeout cancels the attempt and kills any child process.
 - Proposed retry limit: two attempts per provider.
-- Retry: network errors, 429 and 5xx responses, and one output-validation failure. Honor `Retry-After`.
-- Do not retry: authentication failures, policy refusals, consent refusals, cancellation, or a second validation failure. Move to the next provider.
+- Retry: for a local provider, network errors, 429 and 5xx responses, and one output-validation failure. Honor `Retry-After`. For an external provider, one output-validation failure only.
+- Do not retry: a timeout or network error on an external provider (the attempt may already have spent usage), authentication failures, policy refusals, consent refusals, cancellation, or a second validation failure. Move to the next provider.
+- A prompt whose estimate (UTF-8 bytes / 2, with system text and schema) passes a provider's context limit skips that provider, as does an overflow the provider reports. If nothing else takes the task, it ends `manual_required` with reason `prompt_too_large`. Ollama calls send `num_ctx`, `truncate: false`, and `shift: false`, so an overflow is an error and not a silent cut.
 - Usage-limit errors from a ChatGPT plan (`subscription_sharing_usage_limit_exceeded`) end that provider for the task and show the user a **Manage usage** link, as OpenAI's UI guidelines require.
 - `subscription_sharing_user_not_eligible` (403) ends that provider for the session. Explain the restriction to the user. OpenAI's guide says "do not repeat the same request or loop through OAuth".
 - Emergency pause (FR-12.8) cancels every in-flight task.
@@ -108,6 +111,33 @@ Ineligible providers are skipped, and the reason is logged. Fallback never widen
 
 A task ends in exactly one of: `ok` (validated output, provider, and attempt count), `manual_required`, `cancelled`, or `failed` (typed reason). Each attempt writes an execution log with task type, provider, data categories, duration, and outcome. Logs never contain prompts, outputs, or secrets. A call to an external provider writes an audit row (FR-12.7).
 
+## As built in 0.2
+
+The names below are the Rust names in `crates/core/src/ai/`. The vocabulary above is the contract; this is what the code does.
+
+| Contract term | 0.2 code |
+|---|---|
+| `TaskRouter` | `Router` (`router.rs`). `Router::from_settings(&Db)` builds it from the user's order and enabled flags; `run(db, task, prompt, cancel)` and `embed(...)` take the `Db`, so the router holds none. |
+| Task types | `TaskType::{ParseJob, DraftResume, DraftCoverLetter, Embed}` with one `TaskSpec` each (`mod.rs`). `semantic_match`, `map_form_field`, and `classify_answer` have no 0.2 task. |
+| Provider | trait `Provider` (`declaration`, `available`, `complete`, `embed`). Implementations: `Ollama`, `ClaudeCode`, `NoAi`. `ProviderId` has exactly those three variants, so a provider the owner decisions leave out has no way in. |
+| Results | `Outcome::{Ok, ManualRequired, Cancelled, Failed}`. |
+| Cancellation | one `CancellationToken` type, polled every 100 ms. Revoking consent, Ctrl-C, and app exit fire it, and a dropped attempt kills its child. |
+| Consent key | `ProviderId::ClaudeCode` displays as `claude_code/cli_login`, and that text is the `consent.provider` value. |
+
+**Ollama local-model detection.** A model counts as local only when its `/api/tags` row has no `remote_model` and no `remote_host` (absent or empty), `size > 0`, and a name that neither ends in `:cloud` nor contains `-cloud`. Any other row is remote: hidden from the screen and ineligible in routing check 2. The same rule gates the embedding model, so a `:cloud` embedding model cannot pass as local. A fixture test pins both cases. Evidence: https://docs.ollama.com/api/tags and https://docs.ollama.com/cloud, read 2026-11-01. Re-check at each release.
+
+**Claude Code argv.** The adapter runs the `claude` the user installed, found, in order, through `JOBPILOT_CLAUDE_BIN`, the `ai.claude_path` setting, the `PATH`, the usual install folders, and a login-shell lookup (a GUI launch does not inherit the shell's `PATH`). The job text goes to standard input and never to argv. The argument list is fixed:
+
+```text
+-p --output-format json --json-schema <schema> --tools "" --allowedTools StructuredOutput
+--strict-mcp-config --disable-slash-commands --setting-sources "" --no-session-persistence
+--permission-mode dontAsk --system-prompt <system> [--model <model>]
+```
+
+`--tools ""` removes every built-in tool. `--allowedTools StructuredOutput` keeps the one tool `--json-schema` needs to hand the reply back; `--disallowedTools "*"` was tried and turns the reply into free text (real run, 2.1.316). `--bare` is never used, because it ignores the OAuth login. The child runs in an empty temporary directory with an allow-listed environment, 180 seconds per attempt. A test pins the list (`argv_is_exactly_the_verified_list`), and an ignored smoke test (`real_claude_has_no_tools_smoke`, which also needs `JOBPILOT_REAL_CLAUDE_SMOKE=1`) checks a real `init` event for the tool list. The plugins the owner installed still appear in `init`; see the [threat model](security/threat-model.md#7-cli-adapters-and-untrusted-text).
+
+**Retries as built.** Ollama is retried on network errors, 429, 5xx, and one validation failure. Claude Code is retried once after a validation failure only, never after a timeout or a broken call, because the attempt may already have spent usage. A prompt over a provider's context limit skips it with `prompt_too_large`; Ollama reports an overflow as an error because the call sends `num_ctx`, `truncate: false`, and `shift: false`. The overflow wording was tested against a fake server only.
+
 ## Output validation
 
 All model output is untrusted (FR-12.6). Validation runs on every backend, including local.
@@ -115,11 +145,11 @@ All model output is untrusted (FR-12.6). Validation runs on every backend, inclu
 1. Size check, then parse as JSON. Output outside the schema fails.
 2. Validate against the task's JSON schema. Provider-side structured output helps but never replaces this step.
 3. Run task-specific checks:
-   - Every claim in generated material maps to evidence in the knowledge base, or the output is rejected (FR-7.11, FR-7.12).
+   - Every line of generated material is a claim that cites evidence ids from the list the prompt supplied (FR-7.11, FR-7.12). A reply whose claims do not match the document's lines, or that invents a heading, stores nothing and fails validation. A claim that cites no usable evidence (an id outside the list counts as none), or that states work authorization, is **stored flagged** (`no_evidence`, `authorization_statement`) and blocks export until the user edits or removes it. It is not rejected and not retried. Matching is by id and by word, so a paraphrase can pass; the user's review is the final control.
    - No output may state or imply work authorization or visa eligibility beyond what the user recorded (FR-4.10).
    - Answers classed sensitive or legally consequential go to the user for confirmation (FR-8.8).
    - URLs, file paths, and commands in output are data. Nothing in output triggers a tool, a shell command, or a navigation.
-4. On failure, retry once, then move to the next provider, then No-AI.
+4. On a failed size, JSON, or schema check, retry once, then move to the next provider, then No-AI. A flagged claim is not a failure of this kind: the draft is stored and the user resolves the flag.
 
 Untrusted input is handled separately (FR-12.3). Job postings and web pages go to the model inside marked data blocks, and text in them is never treated as instructions. Live examples exist: Remote OK job descriptions contain planted words and tags meant to catch automated applicants. The threat model owns the injection tests.
 
@@ -142,6 +172,7 @@ Data categories: `job_text`, `company_text`, `profile_basic`, `resume_text`, `ca
 Rules:
 
 - Consent is per category. A task needing an unconsented category is skipped for that provider.
+- A restore revokes every external consent record, and audits it as `consent_revoked_by_restore`. Consent is a decision made now, so a backup cannot bring one back.
 - Revoking takes effect before the next call and writes an audit row. In-flight calls are cancelled. Revocation does not recall data already sent; the screen says so.
 - If a register row's verdict changes in a release, affected records are suspended until the user re-confirms.
 - Records are local, appear in export (FR-2.7), and are removed by delete-all (FR-2.8). The [database schema](database-schema.md) gains the table in the 0.4 migration.

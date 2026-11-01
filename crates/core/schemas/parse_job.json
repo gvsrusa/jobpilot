@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "required": ["title", "company", "location", "remote", "skills", "seniority", "compensation"],
+  "properties": {
+    "title": { "type": "string", "maxLength": 500 },
+    "company": { "type": "string", "maxLength": 500 },
+    "location": { "type": "string", "maxLength": 500 },
+    "remote": { "type": "string", "enum": ["remote", "hybrid", "onsite", "unknown"] },
+    "skills": { "type": "array", "items": { "type": "string", "maxLength": 500 } },
+    "seniority": { "type": "string", "maxLength": 500 },
+    "compensation": { "type": "string", "maxLength": 500 }
+  },
+  "additionalProperties": false
+}

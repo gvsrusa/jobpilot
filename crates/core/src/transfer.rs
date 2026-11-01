@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 use sqlx::sqlite::SqlitePool;
 
-use crate::audit;
 use crate::backup::{
     blocking, remove_dir_if_present, remove_if_present, remove_restore_leftovers, sidecar,
 };
@@ -17,9 +16,12 @@ use crate::db::{
 };
 use crate::error::{Error, Result};
 use crate::paths::AppPaths;
+use crate::profile;
 use crate::secrets;
+use crate::{audit, crypto};
 
-/// Writes `exports/jobpilot-export-<stamp>/`, holding `data.json` and a copy of
+/// Writes `exports/jobpilot-export-<stamp>/`, holding `data.json`, `work_authorization.json`
+/// (plain when the key is unlocked, else a locked marker; callers warn first) and a copy of
 /// `documents/`. A folder under that name is always complete: it is built under a
 /// temporary name and renamed last.
 pub async fn export_all(db: &Db, actor: &str) -> Result<PathBuf> {
@@ -31,15 +33,18 @@ pub async fn export_all(db: &Db, actor: &str) -> Result<PathBuf> {
         "tables": read_tables(&db.pool).await?,
     });
     let text = serde_json::to_string_pretty(&data).map_err(io::Error::other)?;
+    let (authorization, sensitive_plain) = profile::export_authorization(db).await?;
 
     let (exports, documents) = (db.paths().exports(), db.paths().documents());
-    let dir =
-        tokio::task::spawn_blocking(move || write_export(&exports, &documents, &stamp, &text))
-            .await
-            .map_err(io::Error::other)??;
+    let dir = tokio::task::spawn_blocking(move || {
+        write_export(&exports, &documents, &stamp, &text, &authorization)
+    })
+    .await
+    .map_err(io::Error::other)??;
 
     let target = dir.to_string_lossy();
-    audit::record(db, actor, "export", Some(&target), json!({})).await?;
+    let detail = json!({ "sensitive_plain": sensitive_plain });
+    audit::record(db, actor, "export", Some(&target), detail).await?;
     Ok(dir)
 }
 
@@ -48,9 +53,11 @@ pub async fn export_all(db: &Db, actor: &str) -> Result<PathBuf> {
 /// `pragma_table_list` is `sqlite_master` plus each table's kind, and that kind is what
 /// leaves out FTS virtual and shadow tables, whatever a later migration names them.
 /// Their content is derived from the tables that are exported.
-// ponytail: all rows sit in memory at once, and `json_object` refuses BLOB columns and
-// tables wider than SQLite's function argument limit, so such a table fails the export
-// loudly. No table is either today; stream rows and encode BLOBs when one is.
+/// BLOB columns are left out: `json_object` refuses them, and a declared BLOB is
+/// ciphertext, a key-check, or a vector, none of which means anything in an export.
+// ponytail: all rows sit in memory at once, and `json_object` refuses tables wider than
+// SQLite's function argument limit, so such a table fails the export loudly. No table is
+// that wide today; stream rows when one is.
 async fn read_tables(pool: &SqlitePool) -> Result<Map<String, Value>> {
     let mut read = pool.begin().await?;
     let names: Vec<String> = sqlx::query_scalar(
@@ -62,11 +69,12 @@ async fn read_tables(pool: &SqlitePool) -> Result<Map<String, Value>> {
 
     let mut tables = Map::new();
     for name in names {
-        let columns: Vec<String> =
-            sqlx::query_scalar("SELECT name FROM pragma_table_info(?) ORDER BY cid")
-                .bind(&name)
-                .fetch_all(&mut *read)
-                .await?;
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info(?) WHERE upper(type) <> 'BLOB' ORDER BY cid",
+        )
+        .bind(&name)
+        .fetch_all(&mut *read)
+        .await?;
         let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(rows_sql(&name, &columns)))
             .fetch_all(&mut *read)
             .await?;
@@ -100,14 +108,33 @@ fn rows_sql(table: &str, columns: &[String]) -> String {
     )
 }
 
-fn write_export(exports: &Path, documents: &Path, stamp: &str, text: &str) -> Result<PathBuf> {
+fn write_export(
+    exports: &Path,
+    documents: &Path,
+    stamp: &str,
+    text: &str,
+    authorization: &str,
+) -> Result<PathBuf> {
     let name = format!("jobpilot-export-{stamp}");
     let temp = new_snapshot_dir(exports, &format!("tmp-{name}"))?;
-    let finished = fill_and_publish(&temp, exports, documents, &name, text);
+    let finished = fill_and_publish(&temp, exports, documents, &name, text, authorization);
     if finished.is_err() {
         let _ = fs::remove_dir_all(&temp);
     }
     Ok(finished?)
+}
+
+/// Owner-only on Unix: this file may hold plaintext work authorization.
+fn write_private(path: &Path, text: &str) -> io::Result<()> {
+    use io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(text.as_bytes())
 }
 
 fn fill_and_publish(
@@ -116,8 +143,10 @@ fn fill_and_publish(
     documents: &Path,
     name: &str,
     text: &str,
+    authorization: &str,
 ) -> io::Result<PathBuf> {
     fs::write(temp.join("data.json"), text)?;
+    write_private(&temp.join("work_authorization.json"), authorization)?;
     copy_dir(documents, &temp.join("documents"))?;
 
     let mut dir = exports.join(name);
@@ -130,8 +159,9 @@ fn fill_and_publish(
     Ok(dir)
 }
 
-/// Removes JobPilot's data under the root and its keychain entries. This cannot be
-/// undone, and it writes no audit row because it removes the log.
+/// Removes JobPilot's data under the root and its keychain entries: this root's data keys,
+/// active or not, then the API keys. This cannot be undone, and it writes no audit row
+/// because it removes the log.
 ///
 /// Consumes `db`. On any error the handle is closed, so callers run `Db::open` again.
 /// `confirm` must be exactly `"DELETE"`, and the root must still hold its marker. An
@@ -163,7 +193,20 @@ async fn names_to_erase(db: &Db, confirm: &str) -> Result<Vec<String>> {
     if !db.paths().marker().is_file() {
         return Err(Error::RootNotOwned(db.paths().root().to_path_buf()));
     }
-    secrets::names(db).await
+    // A key can have ciphertext and no row, and no other root's id is in either list. A
+    // restored row can hold any text, and on Windows a name that is too long fails before
+    // the store is asked, so it would fail every retry. No such id has an entry.
+    let mut key_ids: Vec<String> = sqlx::query_scalar("SELECT key_id FROM data_keys")
+        .fetch_all(&db.pool)
+        .await?;
+    key_ids.extend(crypto::held_key_ids(db).await?);
+    let mut names: Vec<String> = key_ids
+        .iter()
+        .filter(|id| crypto::is_key_id(id.as_bytes()))
+        .map(|id| crypto::account(id))
+        .collect();
+    names.extend(secrets::names(db).await?);
+    Ok(names)
 }
 
 /// The keychain goes first: a failure there must leave `secret_index` to retry from.
@@ -191,6 +234,7 @@ fn remove_files(paths: &AppPaths, include_backups: bool) -> io::Result<()> {
         remove_dir_if_present(&paths.backups())?;
     }
     remove_restore_leftovers(paths)?;
+    remove_if_present(&paths.swap_marker())?;
 
     let db = paths.db();
     for suffix in ["-wal", "-shm", "-journal"] {
@@ -221,5 +265,32 @@ mod tests {
         let db = Db::open(&paths).await.unwrap();
         delete_all(db, "DELETE", true).await.unwrap();
         assert!(!paths.db().exists());
+    }
+
+    #[tokio::test]
+    async fn only_real_key_ids_become_keychain_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::new(tmp.path().join("data"));
+        let db = Db::open(&paths).await.unwrap();
+        let long = "a".repeat(100_000);
+        for key_id in [long.as_str(), "", "ABCDEF0123456789", "00112233aabbccdd"] {
+            sqlx::query(
+                "INSERT INTO data_keys (key_id, created_at, key_check, active) \
+                 VALUES (?, 't', x'00', 0)",
+            )
+            .bind(key_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("INSERT INTO secret_index (name, created_at) VALUES ('openai', 't')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let names = names_to_erase(&db, "DELETE").await.unwrap();
+        db.close().await;
+
+        assert_eq!(names, ["data-key-00112233aabbccdd", "openai"]);
     }
 }

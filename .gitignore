@@ -2,5 +2,6 @@
 node_modules/
 target/
 dist/
+apps/desktop/src-tauri/binaries/
 .DS_Store
 .lean-ctx/

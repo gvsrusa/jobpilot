@@ -1,4 +1,14 @@
 fn main() {
+    // tauri-build would demand the release sidecar and then copy it over `target/debug/jobpilot`,
+    // the binary the CLI tests run. A release binary there ignores JOBPILOT_SECRET_SERVICE and
+    // would reach the real keychain, so only release builds, which bundle it, list it.
+    if std::env::var("PROFILE").is_ok_and(|profile| profile != "release")
+        && std::env::var_os("TAURI_CONFIG").is_none()
+    {
+        // SAFETY: the build script has one thread here.
+        unsafe { std::env::set_var("TAURI_CONFIG", r#"{"bundle":{"externalBin":[]}}"#) };
+    }
+
     let windows = std::env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "windows");
     let mut attributes = tauri_build::Attributes::new();
 

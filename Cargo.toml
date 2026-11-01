@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/core", "crates/cli", "apps/desktop/src-tauri"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -11,5 +11,6 @@ license = "Apache-2.0"
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
+# unwind, so a panic in a file parser is caught (catch_unwind) instead of ending the app
+panic = "unwind"
 strip = true

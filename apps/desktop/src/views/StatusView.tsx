@@ -2,13 +2,17 @@ import { useQuery } from "@tanstack/react-query";
 import { CopyPath } from "@/components/CopyPath";
 import { ErrorAlert } from "@/components/ErrorAlert";
 import { PageHeading } from "@/components/PageHeading";
+import { Button } from "@/components/ui/button";
 import { ipc } from "@/lib/ipc";
+import { describeKey, isLocked } from "@/lib/keys";
+import { useUiStore } from "@/lib/store";
 import { useStatus } from "@/lib/status";
 import { formatDate } from "@/lib/utils";
 
 export function StatusView() {
   const status = useStatus();
   const backups = useQuery({ queryKey: ["backups"], queryFn: ipc.backupList });
+  const setView = useUiStore((u) => u.setView);
   const s = status.data;
   const newest = backups.data?.map((b) => b.created_at).sort().pop();
   const count = backups.data?.length;
@@ -28,6 +32,15 @@ export function StatusView() {
           <dd className="flex items-center justify-between gap-3">
             <code className="break-all select-text">{s.data_root}</code>
             <CopyPath path={s.data_root} />
+          </dd>
+          <dt className="text-muted-foreground">Encryption key</dt>
+          <dd className="flex items-center justify-between gap-3">
+            <span>{describeKey(s.key_state)}</span>
+            {isLocked(s.key_state) && (
+              <Button size="sm" variant="outline" onClick={() => setView("data")}>
+                Open Data
+              </Button>
+            )}
           </dd>
           <dt className="text-muted-foreground">Backups</dt>
           <dd>

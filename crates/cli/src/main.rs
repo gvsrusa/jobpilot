@@ -1,79 +1,114 @@
 //! JobPilot CLI: a thin adapter over `jobpilot-core`. Parse, call core, print.
 
+mod ai;
+mod data;
+mod profile;
+mod resume;
+mod shell;
+mod text;
+
 use std::io::Write;
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use jobpilot_core::{AppPaths, Db, Error, Result, app_schema_version, backup, documents, transfer};
-use serde_json::{Value, json};
+use jobpilot_core::{AppPaths, Db, Error, Result, recovery};
+use serde_json::Value;
 
-const ACTOR: &str = "cli";
+pub const ACTOR: &str = "cli";
 
 #[derive(Parser)]
 #[command(name = "jobpilot", version, about = "JobPilot AI command line")]
-struct Cli {
+pub struct Cli {
     /// Print machine-readable JSON instead of text.
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
-    command: Command,
+    pub command: Command,
 }
 
 #[derive(Subcommand)]
-enum Command {
-    /// Show versions and the data folder.
+pub enum Command {
+    /// Show versions, the data folder, the key state, and AI availability.
     Status,
     /// Manage documents.
     #[command(subcommand)]
-    Doc(DocCommand),
+    Doc(data::DocCommand),
     /// Manage backups.
     #[command(subcommand)]
-    Backup(BackupCommand),
-    /// Export or delete all data.
+    Backup(data::BackupCommand),
+    /// Export, delete, or recover data.
     #[command(subcommand)]
-    Data(DataCommand),
+    Data(data::DataCommand),
+    /// Name, places, and work authorization.
+    #[command(subcommand)]
+    Profile(profile::ProfileCommand),
+    /// Work modes and employment types.
+    #[command(subcommand)]
+    Prefs(profile::PrefsCommand),
+    /// Career knowledge items.
+    #[command(subcommand)]
+    Kb(profile::KbCommand),
+    /// Pasted job postings.
+    #[command(subcommand)]
+    Job(profile::JobCommand),
+    /// Resume drafts.
+    #[command(subcommand)]
+    Resume(resume::ResumeCommand),
+    /// Cover letter drafts.
+    #[command(subcommand)]
+    Letter(resume::LetterCommand),
+    /// AI providers, models, and consent.
+    #[command(subcommand)]
+    Ai(ai::AiCommand),
+    /// Restricted prompt used by the app's terminal panel.
+    Shell,
 }
 
-#[derive(Subcommand)]
-enum DocCommand {
-    List,
-    Add {
-        title: String,
-        #[arg(long, default_value = "")]
-        body: String,
-    },
-    Search {
-        query: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum BackupCommand {
-    Create,
-    List,
-    Restore { path: PathBuf },
-}
-
-#[derive(Subcommand)]
-enum DataCommand {
-    Export,
-    Delete {
-        /// Must be exactly DELETE.
-        #[arg(long)]
-        confirm: Option<String>,
-        #[arg(long)]
-        include_backups: bool,
-    },
+impl Command {
+    /// The terminal panel's input has no shell to clear its marker with, and script in the
+    /// webview can write to it. So it refuses what could leak a key or destroy data, what
+    /// the app confirms in a native dialog, what changes what runs or starts a download, and
+    /// what reads or writes a path the caller names (M-14). Revoking consent stays: it only
+    /// ever takes something away.
+    pub fn refused_in_panel(&self) -> bool {
+        use ai::{AiCommand, ConsentCommand};
+        use data::{BackupCommand, DataCommand};
+        use profile::JobCommand;
+        use resume::{ExportArgs, LetterCommand, ResumeCommand};
+        matches!(
+            self,
+            Command::Backup(BackupCommand::Restore { .. })
+                | Command::Ai(
+                    AiCommand::ClaudePath { .. }
+                        | AiCommand::Consent(ConsentCommand::Give { .. })
+                        | AiCommand::Enable { .. }
+                        | AiCommand::Disable { .. }
+                        | AiCommand::Order { .. }
+                        | AiCommand::SetModel { .. }
+                        | AiCommand::Pull { .. }
+                )
+                | Command::Data(
+                    DataCommand::Delete { .. }
+                        | DataCommand::RecoveryKey(_)
+                        | DataCommand::DiscardLocked { .. }
+                )
+                | Command::Job(JobCommand::Paste { file: Some(_), .. })
+                | Command::Resume(
+                    ResumeCommand::Import { .. }
+                        | ResumeCommand::Export(ExportArgs { out: Some(_), .. })
+                )
+                | Command::Letter(LetterCommand::Export(ExportArgs { out: Some(_), .. }))
+        )
+    }
 }
 
 /// What a command prints: the JSON form and the text form.
-struct Output {
+pub struct Output {
     json: Value,
     text: String,
 }
 
-fn out(value: impl serde::Serialize, text: String) -> Result<Output> {
+pub fn out(value: impl serde::Serialize, text: String) -> Result<Output> {
     let json = serde_json::to_value(value).map_err(|e| Error::Io(std::io::Error::other(e)))?;
     Ok(Output { json, text })
 }
@@ -81,13 +116,24 @@ fn out(value: impl serde::Serialize, text: String) -> Result<Output> {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    if matches!(cli.command, Command::Shell) {
+        // Not through `run`: the panel itself starts this, marker set.
+        let input = tokio::io::BufReader::new(tokio::io::stdin());
+        return match shell::run(input, tokio::io::stdout()).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!(
+                    "error[{}]: {}",
+                    error.code(),
+                    text::sanitize(&message(&error))
+                );
+                ExitCode::from(1)
+            }
+        };
+    }
     match run(cli.command).await {
         Ok(output) => {
-            let line = if cli.json {
-                output.json.to_string()
-            } else {
-                output.text
-            };
+            let line = render(output, cli.json);
             let written = if line.is_empty() {
                 Ok(())
             } else {
@@ -102,28 +148,63 @@ async fn main() -> ExitCode {
             }
         }
         Err(error) => {
-            eprintln!("error[{}]: {error}", error.code());
+            eprintln!("{}", error_line(&error));
             ExitCode::from(1)
         }
     }
 }
 
-async fn run(command: Command) -> Result<Output> {
+/// Stored and parsed text is untrusted: no escape reaches the terminal.
+pub fn render(output: Output, json: bool) -> String {
+    if json {
+        text::sanitize_value(output.json).to_string()
+    } else {
+        text::sanitize(&output.text)
+    }
+}
+
+pub fn error_line(error: &Error) -> String {
+    format!(
+        "error[{}]: {}",
+        error.code(),
+        text::sanitize(&message(error))
+    )
+}
+
+fn message(error: &Error) -> String {
+    match error {
+        Error::PanelRefused => shell::REFUSAL.into(),
+        Error::ManualRequired(reason) if reason == "not_logged_in" => {
+            "Claude Code is not signed in. Run `claude` once to log in, then try again.".into()
+        }
+        Error::ManualRequired(reason) if reason == "consent_needed" => {
+            "Claude Code is on, but your consent does not cover this task. Give consent with \
+             `jobpilot ai consent give` in an ordinary terminal, or on the AI screen."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "provider_unavailable" => {
+            "An AI provider is on but cannot be reached. Check `jobpilot ai status`, or write \
+             this one yourself."
+                .into()
+        }
+        other => other.to_string(),
+    }
+}
+
+pub async fn run(command: Command) -> Result<Output> {
+    if command.refused_in_panel() && recovery::panel_marker_set() {
+        return Err(Error::PanelRefused);
+    }
     let paths = AppPaths::from_env()?;
     match command {
         // These take the handle by value; each closes it on every path.
-        Command::Backup(BackupCommand::Restore { path }) => restore(&paths, &path).await,
-        Command::Data(DataCommand::Delete {
+        Command::Backup(data::BackupCommand::Restore { path }) => {
+            data::restore(&paths, &path).await
+        }
+        Command::Data(data::DataCommand::Delete {
             confirm,
             include_backups,
-        }) => {
-            let db = Db::open(&paths).await?;
-            transfer::delete_all(db, confirm.as_deref().unwrap_or(""), include_backups).await?;
-            out(
-                json!({ "deleted": true }),
-                "all JobPilot data deleted".into(),
-            )
-        }
+        }) => data::delete(&paths, confirm.as_deref(), include_backups).await,
         command => {
             let db = Db::open(&paths).await?;
             let result = with_db(&db, command).await;
@@ -133,89 +214,143 @@ async fn run(command: Command) -> Result<Output> {
     }
 }
 
-async fn restore(paths: &AppPaths, source: &std::path::Path) -> Result<Output> {
-    // When the data cannot open, restore is the recovery route, so go offline.
-    let db = match Db::open(paths).await {
-        Ok(db) => backup::restore(db, source, ACTOR).await?,
-        // Only failures of the database itself; `InUse` and `RootNotOwned` are real answers.
-        Err(Error::Db(_) | Error::MigrationFailed(_) | Error::SchemaTooNew { .. }) => {
-            backup::restore_offline(paths, source, ACTOR).await?
-        }
-        Err(error) => return Err(error),
-    };
-    db.close().await;
-    out(
-        json!({ "restored": true, "from": source }),
-        format!("restored from {}", source.display()),
-    )
-}
-
 async fn with_db(db: &Db, command: Command) -> Result<Output> {
     match command {
-        Command::Status => {
-            let schema = db.schema_version().await?;
-            out(
-                json!({
-                    "version": jobpilot_core::VERSION,
-                    "schema_version": schema,
-                    "app_schema_version": app_schema_version(),
-                    "root": db.paths().root(),
-                }),
-                format!(
-                    "jobpilot {}\nschema {schema}\ndata {}",
-                    jobpilot_core::VERSION,
-                    db.paths().root().display()
-                ),
-            )
+        Command::Status => data::status(db).await,
+        Command::Doc(command) => data::doc(db, command).await,
+        Command::Backup(command) => data::backup(db, command).await,
+        Command::Data(command) => data::data(db, command).await,
+        Command::Profile(command) => profile::profile(db, command).await,
+        Command::Prefs(command) => profile::prefs(db, command).await,
+        Command::Kb(command) => profile::kb(db, command).await,
+        Command::Job(command) => profile::job(db, command).await,
+        Command::Resume(command) => resume::resume(db, command).await,
+        Command::Letter(command) => resume::letter(db, command).await,
+        Command::Ai(command) => ai::ai(db, command).await,
+        // `main` and the shell handle this before any command runs.
+        Command::Shell => Err(Error::PanelRefused),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::{CommandFactory, Parser};
+
+    use super::{Cli, Command};
+
+    /// Every leaf command, with whether the panel refuses it. Script in the webview can type
+    /// into the panel, so a command whose GUI twin needs a native dialog, or that changes
+    /// what runs, is refused there. A new command fails `every_command_is_classified` until
+    /// it is given a row here, which is the moment to ask which kind it is.
+    const PANEL: &[(&str, bool)] = &[
+        ("status", false),
+        ("doc list", false),
+        ("doc add t", false),
+        ("doc search q", false),
+        ("backup create", false),
+        ("backup list", false),
+        ("backup restore /b", true),
+        ("data export", false),
+        ("data delete --confirm DELETE", true),
+        ("data recovery-key export --out /k", true),
+        ("data recovery-key import /k", true),
+        ("data discard-locked --confirm id", true),
+        ("profile show", false),
+        ("profile set --name n", false),
+        ("profile add countries PT", false),
+        ("profile remove countries PT", false),
+        ("profile auth set PT", false),
+        ("profile auth remove PT", false),
+        ("prefs work-mode remote", false),
+        ("prefs employment add PT full-time", false),
+        ("prefs employment remove PT full-time", false),
+        ("kb list", false),
+        ("kb add note b", false),
+        ("kb remove i", false),
+        ("kb approve i", false),
+        ("kb unapprove i", false),
+        ("kb mark-sensitive i", false),
+        ("kb unmark i", false),
+        ("kb search q", false),
+        ("job paste t", false),
+        ("job paste t --file /f", true),
+        ("job list", false),
+        ("job show i", false),
+        ("resume import /r", true),
+        ("resume list", false),
+        ("resume versions l", false),
+        ("resume generate j", false),
+        ("resume compare d", false),
+        ("resume export d --format pdf", false),
+        ("resume export d --format pdf --out /o", true),
+        ("resume edit-claim c --text t", false),
+        ("resume remove-claim c", false),
+        ("letter generate j", false),
+        ("letter export d --format pdf", false),
+        ("letter export d --format pdf --out /o", true),
+        ("ai status", false),
+        ("ai models", false),
+        ("ai pull m", true),
+        ("ai set-model --drafting m", true),
+        ("ai order ollama", true),
+        ("ai enable claude_code", true),
+        ("ai disable claude_code", true),
+        ("ai claude-path /c", true),
+        ("ai consent give claude_code --categories job_text", true),
+        ("ai consent revoke claude_code", false),
+        ("ai index", false),
+    ];
+
+    fn parsed(line: &str) -> Command {
+        let argv = std::iter::once("jobpilot").chain(line.split(' '));
+        match Cli::try_parse_from(argv) {
+            Ok(cli) => cli.command,
+            Err(error) => panic!("{line}: {error}"),
         }
-        Command::Doc(DocCommand::List) => {
-            let docs = documents::list(db).await?;
-            let text = docs
-                .iter()
-                .map(|d| format!("{}  {}", d.id, d.title))
-                .collect::<Vec<_>>()
-                .join("\n");
-            out(docs, text)
+    }
+
+    /// Each leaf's path, and whether it takes an argument that is a file path.
+    fn leaves(command: &clap::Command, path: &str, found: &mut Vec<(String, bool)>) {
+        if command.get_subcommands().next().is_none() {
+            let paths = clap::builder::ValueParser::path_buf().type_id();
+            let takes_path = command
+                .get_arguments()
+                .any(|arg| arg.get_value_parser().type_id() == paths);
+            found.push((path.trim_start().to_string(), takes_path));
         }
-        Command::Doc(DocCommand::Add { title, body }) => {
-            let doc = documents::create(db, &title, &body).await?;
-            let text = format!("added {}", doc.id);
-            out(doc, text)
+        for sub in command.get_subcommands() {
+            leaves(sub, &format!("{path} {}", sub.get_name()), found);
         }
-        Command::Doc(DocCommand::Search { query }) => {
-            let hits = documents::search(db, &query).await?;
-            let text = hits
-                .iter()
-                .map(|h| format!("{}  {}  {}", h.id, h.title, h.snippet))
-                .collect::<Vec<_>>()
-                .join("\n");
-            out(hits, text)
+    }
+
+    fn rows_of<'a>(path: &'a str) -> impl Iterator<Item = &'static (&'static str, bool)> + 'a {
+        PANEL.iter().filter(move |(line, _)| {
+            line.strip_prefix(path)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+        })
+    }
+
+    #[test]
+    fn every_command_is_classified() {
+        let mut found = Vec::new();
+        leaves(&Cli::command(), "", &mut found);
+        // The shell refuses a nested shell itself, by name.
+        found.retain(|(path, _)| path != "shell");
+        for (path, takes_path) in found {
+            assert!(rows_of(&path).next().is_some(), "not classified: {path}");
+            // Script in the webview must never name a file, for reading or for writing.
+            let refused = rows_of(&path).any(|(_, refused)| *refused);
+            assert!(
+                !takes_path || refused,
+                "takes a path, has no refused row: {path}"
+            );
         }
-        Command::Backup(BackupCommand::Create) => {
-            let info = backup::create(db, ACTOR).await?;
-            let text = format!("backup created at {}", info.path.display());
-            out(info, text)
-        }
-        Command::Backup(BackupCommand::List) => {
-            let list = backup::list(db.paths()).await?;
-            let text = list
-                .iter()
-                .map(|b| format!("{}  {}", b.created_at, b.path.display()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            out(list, text)
-        }
-        Command::Data(DataCommand::Export) => {
-            let path = transfer::export_all(db, ACTOR).await?;
-            out(
-                json!({ "path": path }),
-                format!("exported to {}", path.display()),
-            )
-        }
-        // Handled in `run`, which owns the handle.
-        Command::Backup(BackupCommand::Restore { .. })
-        | Command::Data(DataCommand::Delete { .. }) => {
-            unreachable!("handled before a borrowed handle exists")
+    }
+
+    #[test]
+    fn the_panel_refuses_what_needs_a_user_gesture() {
+        for (line, refused) in PANEL {
+            assert_eq!(parsed(line).refused_in_panel(), *refused, "{line}");
         }
     }
 }

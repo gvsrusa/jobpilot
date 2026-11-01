@@ -1,12 +1,15 @@
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool};
 
+use crate::backup::{blocking, remove_if_present};
+use crate::crypto::KeyState;
 use crate::error::{Error, Result};
 use crate::paths::{APP_ID, AppPaths};
 
@@ -29,6 +32,7 @@ pub struct Db {
     pub pool: SqlitePool,
     lock: File,
     paths: AppPaths,
+    key_state: Mutex<KeyState>,
 }
 
 impl Db {
@@ -59,6 +63,7 @@ impl Db {
                         pool,
                         lock,
                         paths: paths.clone(),
+                        key_state: Mutex::new(KeyState::NotLoaded),
                     });
                 }
                 Ok(Some(_)) => {
@@ -94,6 +99,36 @@ impl Db {
 
     pub fn paths(&self) -> &AppPaths {
         &self.paths
+    }
+
+    /// The state from the last time the key was asked for, or `NotLoaded`. Never touches
+    /// the store, so it is safe anywhere. `Db::open` does not read the key:
+    /// `crypto::state` and `crypto::unlocked` do.
+    pub fn key_state(&self) -> KeyState {
+        self.key_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// True when a restore stopped during its renames, so documents and the database may
+    /// not match; its `pre-restore` snapshot holds what was there. A restore cannot be
+    /// running while this handle holds its lock, so only a crash leaves the marker.
+    pub fn swap_interrupted(&self) -> bool {
+        self.paths.swap_marker().exists()
+    }
+
+    /// The user has seen the warning. Anything but a clear stays until a restore finishes.
+    pub async fn clear_swap_warning(&self) -> Result<()> {
+        let marker = self.paths.swap_marker();
+        blocking(move || remove_if_present(&marker)).await
+    }
+
+    pub(crate) fn set_key_state(&self, state: KeyState) {
+        *self
+            .key_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = state;
     }
 }
 
@@ -312,7 +347,12 @@ pub(crate) fn new_snapshot_dir(parent: &Path, name: &str) -> Result<PathBuf> {
     }
 }
 
-pub(crate) fn copy_dir(from: &Path, to: &Path) -> io::Result<()> {
+/// Copies regular files and real folders, and skips the rest: a link can reach outside the
+/// root, and opening a FIFO waits for ever. `from` itself is the caller's to choose.
+// ponytail: each entry is checked by name and then opened, so a file swapped for a link
+// between the two is followed. Only another process of this user can do that, and it can
+// read these files anyway. Open with `O_NOFOLLOW` if documents ever come from elsewhere.
+pub fn copy_dir(from: &Path, to: &Path) -> io::Result<()> {
     fs::create_dir_all(to)?;
     let entries = match fs::read_dir(from) {
         Ok(entries) => entries,
@@ -322,9 +362,11 @@ pub(crate) fn copy_dir(from: &Path, to: &Path) -> io::Result<()> {
     for entry in entries {
         let entry = entry?;
         let target = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
+        // Reads the entry and not what it points at, and a junction counts as a link.
+        let kind = fs::symlink_metadata(entry.path())?.file_type();
+        if kind.is_dir() {
             copy_dir(&entry.path(), &target)?;
-        } else {
+        } else if kind.is_file() {
             fs::copy(entry.path(), target)?;
         }
     }

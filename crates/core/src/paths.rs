@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -49,6 +50,48 @@ impl AppPaths {
     pub fn marker(&self) -> PathBuf {
         self.root.join(".jobpilot-root")
     }
+
+    /// Exists while a restore renames files over the live ones, so one that outlives the
+    /// rename means the restore stopped partway.
+    pub fn swap_marker(&self) -> PathBuf {
+        self.root.join(".jobpilot-swap")
+    }
+
+    /// True when a file at `path` would land under the root, or that cannot be ruled out.
+    /// Resolves the parent folder, so a symlink or a `..` cannot hide the root, then looks
+    /// for the root among that folder's ancestors: by device and inode on Unix, as a
+    /// firmlink alias or a bind mount survives `canonicalize`, and by resolved path on
+    /// Windows. A folder that cannot be resolved counts as inside.
+    pub fn is_inside_root(&self, path: &Path) -> bool {
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let Ok(parent) = parent.canonicalize() else {
+            return true;
+        };
+        is_under(&parent, &self.root).unwrap_or(true)
+    }
+}
+
+/// `folder` is resolved, so its ancestors are real folders.
+#[cfg(unix)]
+fn is_under(folder: &Path, root: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = std::fs::metadata(root)?;
+    for ancestor in folder.ancestors() {
+        let seen = std::fs::metadata(ancestor)?;
+        if (seen.dev(), seen.ino()) == (root.dev(), root.ino()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(not(unix))]
+fn is_under(folder: &Path, root: &Path) -> io::Result<bool> {
+    Ok(folder.starts_with(root.canonicalize()?))
 }
 
 fn root_from(home: Option<OsString>) -> Result<PathBuf> {
@@ -75,6 +118,30 @@ mod tests {
         assert_eq!(paths.exports(), root.join("exports"));
         assert_eq!(paths.lock(), root.join("jobpilot.lock"));
         assert_eq!(paths.marker(), root.join(".jobpilot-root"));
+        assert_eq!(paths.swap_marker(), root.join(".jobpilot-swap"));
+    }
+
+    #[test]
+    fn inside_root_is_decided_on_resolved_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data");
+        std::fs::create_dir_all(root.join("exports")).unwrap();
+        std::fs::create_dir(tmp.path().join("data2")).unwrap();
+        let paths = AppPaths::new(&root);
+
+        assert!(paths.is_inside_root(&root.join("key.json")));
+        assert!(paths.is_inside_root(&root.join("exports/key.json")));
+        assert!(paths.is_inside_root(&tmp.path().join("data2/../data/key.json")));
+        assert!(!paths.is_inside_root(&tmp.path().join("key.json")));
+        assert!(
+            !paths.is_inside_root(&tmp.path().join("data2/key.json")),
+            "not a prefix"
+        );
+
+        // A bare file name lands in the working directory.
+        assert!(AppPaths::new(".").is_inside_root(Path::new("key.json")));
+        assert!(paths.is_inside_root(&tmp.path().join("missing/key.json")));
+        assert!(AppPaths::new(tmp.path().join("gone")).is_inside_root(&root.join("key.json")));
     }
 
     #[test]

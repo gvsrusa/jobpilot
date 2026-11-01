@@ -2,7 +2,7 @@ import type { ReactElement } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { mockIPC } from "@tauri-apps/api/mocks";
+import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import App from "./App";
 import { useUiStore } from "./lib/store";
 import type { BackupInfo, Document, Status } from "./lib/ipc";
@@ -13,10 +13,20 @@ export const READY: Status = {
   app_version: "0.1.0",
   data_root: "/home/me/jobpilot",
   error: null,
+  key_state: { state: "key_not_loaded" },
+  swap_interrupted: false,
+  recovery_key_exported: true,
+  restored_key_state: null,
 };
 
 export function recovery(code: string, message = `message for ${code}`): Status {
-  return { ...READY, state: "recovery", schema_version: null, error: { code, message } };
+  return {
+    ...READY,
+    state: "recovery",
+    schema_version: null,
+    error: { code, message },
+    key_state: null,
+  };
 }
 
 type Handler = (args: Record<string, unknown>) => unknown;
@@ -80,10 +90,16 @@ export function backend(overrides: Record<string, Handler> = {}): Backend {
       secrets.splice(secrets.indexOf(String(name)), 1);
     },
     audit_recent: () => [],
+    key_state: () => ({ state: "key_not_loaded" }),
     settings_get: () => null,
     settings_set: () => undefined,
+    pty_open: () => undefined,
+    pty_write: () => undefined,
+    pty_resize: () => undefined,
+    pty_close: () => undefined,
   };
   let current: Status | undefined;
+  mockWindows("main");
   mockIPC((cmd, args) => {
     const payload = (args ?? {}) as Record<string, unknown>;
     calls.push({ cmd, args: payload });
@@ -95,7 +111,7 @@ export function backend(overrides: Record<string, Handler> = {}): Backend {
     const result = handler(payload);
     if (isStatus(result)) current = result;
     return result;
-  });
+  }, { shouldMockEvents: true });
   return { calls };
 }
 

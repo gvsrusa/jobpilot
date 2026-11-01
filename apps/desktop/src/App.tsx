@@ -1,11 +1,15 @@
-import { useEffect, useRef, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { ErrorAlert } from "@/components/ErrorAlert";
+import { TerminalPanel } from "@/components/TerminalPanel";
 import { Button } from "@/components/ui/button";
 import { useUiStore, type View } from "@/lib/store";
 import { useStatus } from "@/lib/status";
 import { cn } from "@/lib/utils";
 import { DataView } from "@/views/DataView";
+import { AiView } from "@/views/AiView";
 import { DocumentsView } from "@/views/DocumentsView";
+import { ProfileView } from "@/views/ProfileView";
+import { ResumesView } from "@/views/ResumesView";
 import { RecoveryView } from "@/views/RecoveryView";
 import { StatusView } from "@/views/StatusView";
 
@@ -13,12 +17,16 @@ const NAV: { view: View; label: string }[] = [
   { view: "status", label: "Status" },
   { view: "documents", label: "Documents" },
   { view: "data", label: "Data" },
+  { view: "profile", label: "Profile" },
+  { view: "resumes", label: "Resumes" },
+  { view: "ai", label: "AI" },
 ];
 
 function Shell({ version, root }: { version: string; root: string }) {
   const { view, setView } = useUiStore();
   const nav = useRef<HTMLElement>(null);
   const main = useRef<HTMLElement>(null);
+  const [terminal, setTerminal] = useState(false);
 
   // On a view change, focus moves to the main view heading.
   useEffect(() => main.current?.querySelector("h1")?.focus(), [view]);
@@ -31,16 +39,40 @@ function Shell({ version, root }: { version: string; root: string }) {
         setView(NAV[index].view);
       } else if (e.key === "F6") {
         e.preventDefault();
+        const heading = main.current?.querySelector<HTMLElement>("h1");
         const inNav = nav.current?.contains(document.activeElement);
+        const inPanel = document.activeElement?.closest("[data-terminal-panel]");
+        const shell = document.querySelector<HTMLElement>("[data-terminal-panel]:not([hidden]) textarea");
         const target = inNav
-          ? main.current?.querySelector<HTMLElement>("h1")
-          : nav.current?.querySelector<HTMLElement>("[aria-current]");
+          ? (shell ?? heading)
+          : inPanel
+            ? heading
+            : nav.current?.querySelector<HTMLElement>("[aria-current]");
         target?.focus();
       }
     };
+    // Capture: a focused terminal would otherwise take this as a keystroke.
+    const onToggle = (e: globalThis.KeyboardEvent) => {
+      if (e.ctrlKey && e.code === "Backquote") {
+        e.preventDefault();
+        e.stopPropagation();
+        setTerminal((open) => !open);
+      }
+    };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("keydown", onToggle, true);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("keydown", onToggle, true);
+    };
   }, [setView]);
+
+  // Hiding the panel hands the keyboard back; the panel takes it when it opens.
+  const opened = useRef(false);
+  useEffect(() => {
+    if (opened.current && !terminal) main.current?.querySelector("h1")?.focus();
+    opened.current = terminal;
+  }, [terminal]);
 
   const onNavKey = (e: KeyboardEvent<HTMLElement>) => {
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
@@ -76,10 +108,19 @@ function Shell({ version, root }: { version: string; root: string }) {
           {view === "status" && <StatusView />}
           {view === "documents" && <DocumentsView />}
           {view === "data" && <DataView />}
+          {view === "profile" && <ProfileView />}
+          {view === "resumes" && <ResumesView />}
+          {view === "ai" && <AiView />}
         </main>
       </div>
-      <footer className="flex justify-between border-t px-4 py-2 text-sm text-muted-foreground">
-        <span>Local only. No account. No network.</span>
+      <TerminalPanel open={terminal} onClose={() => setTerminal(false)} />
+      <footer className="flex items-center justify-between border-t px-4 py-2 text-sm text-muted-foreground">
+        <span className="flex items-center gap-3">
+          Local only. No account. No network.
+          <Button size="sm" variant="ghost" onClick={() => setTerminal((open) => !open)}>
+            Terminal
+          </Button>
+        </span>
         <span>
           Data: <span className="select-text">{root}</span>
         </span>
