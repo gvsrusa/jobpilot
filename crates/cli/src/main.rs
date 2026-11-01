@@ -1,5 +1,6 @@
 //! JobPilot CLI: a thin adapter over `jobpilot-core`. Parse, call core, print.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -82,12 +83,23 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli.command).await {
         Ok(output) => {
-            if cli.json {
-                println!("{}", output.json);
-            } else if !output.text.is_empty() {
-                println!("{}", output.text);
+            let line = if cli.json {
+                output.json.to_string()
+            } else {
+                output.text
+            };
+            let written = if line.is_empty() {
+                Ok(())
+            } else {
+                writeln!(std::io::stdout().lock(), "{line}")
+            };
+            match written {
+                Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => {
+                    eprintln!("error[io]: {e}");
+                    ExitCode::from(1)
+                }
+                _ => ExitCode::SUCCESS,
             }
-            ExitCode::SUCCESS
         }
         Err(error) => {
             eprintln!("error[{}]: {error}", error.code());
@@ -125,7 +137,11 @@ async fn restore(paths: &AppPaths, source: &std::path::Path) -> Result<Output> {
     // When the data cannot open, restore is the recovery route, so go offline.
     let db = match Db::open(paths).await {
         Ok(db) => backup::restore(db, source, ACTOR).await?,
-        Err(_) => backup::restore_offline(paths, source, ACTOR).await?,
+        // Only failures of the database itself; `InUse` and `RootNotOwned` are real answers.
+        Err(Error::Db(_) | Error::MigrationFailed(_) | Error::SchemaTooNew { .. }) => {
+            backup::restore_offline(paths, source, ACTOR).await?
+        }
+        Err(error) => return Err(error),
     };
     db.close().await;
     out(

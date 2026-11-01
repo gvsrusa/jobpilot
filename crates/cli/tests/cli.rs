@@ -101,6 +101,7 @@ fn delete_without_confirm_fails_and_keeps_data() {
     assert!(run(&home, &["doc", "add", "Keep"]).status.success());
     let denied = run(&home, &["data", "delete"]);
     assert_eq!(denied.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("error[confirmation_required]"));
     let wrong = run(&home, &["data", "delete", "--confirm", "nope"]);
     assert_eq!(wrong.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&wrong.stderr).contains("error[confirmation_required]"));
@@ -147,4 +148,18 @@ fn restore_works_when_open_fails() {
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn restore_with_another_handle_open_reports_in_use() {
+    let (_dir, home) = fresh_home();
+    assert!(run(&home, &["doc", "add", "Keep"]).status.success());
+    let backup = stdout_json(&run(&home, &["backup", "create", "--json"]));
+    let path = backup["path"].as_str().unwrap().to_string();
+
+    let db = Db::open(&AppPaths::new(&home)).await.unwrap();
+    let output = run(&home, &["backup", "restore", &path]);
+    db.close().await;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).starts_with("error[in_use]"));
 }
