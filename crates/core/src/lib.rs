@@ -7,6 +7,7 @@ pub mod crypto;
 pub mod db;
 pub mod documents;
 pub mod drafts;
+pub mod embed;
 pub mod error;
 pub mod hardware;
 pub mod knowledge;

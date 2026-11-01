@@ -11,6 +11,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::crypto;
 use crate::db::Db;
+use crate::embed::Hit;
 use crate::error::{Error, Result};
 
 const KINDS: [&str; 6] = [
@@ -278,6 +279,56 @@ pub async fn evidence(db: &Db) -> Result<Vec<KnowledgeItem>> {
     .fetch_all(&db.pool)
     .await?;
     Ok(rows.into_iter().map(Row::plain).collect())
+}
+
+/// Case-insensitive substring match over what a draft may cite, newest last, score 0.0.
+/// Knowledge is not in FTS5. The fallback when no embedding model is set up.
+pub async fn search_text(db: &Db, query: &str, limit: usize) -> Result<Vec<Hit>> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(evidence(db)
+        .await?
+        .into_iter()
+        .filter(|item| item.body.to_lowercase().contains(&needle))
+        .take(limit)
+        .map(|item| Hit {
+            item_id: item.id,
+            score: 0.0,
+            body: item.body,
+        })
+        .collect())
+}
+
+/// Cosine similarity, 0.0 when the lengths differ, either is empty, or either has no
+/// length, so a bad vector never ranks high and never yields NaN.
+pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let (mut dot, mut na, mut nb) = (0.0_f32, 0.0_f32, 0.0_f32);
+    for (x, y) in a.iter().zip(b) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    let norm = (na * nb).sqrt();
+    if norm == 0.0 || !norm.is_finite() {
+        return 0.0;
+    }
+    dot / norm
+}
+
+/// Little-endian `f32`, the same bytes on every platform.
+pub fn to_blob(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// Trailing bytes short of a whole `f32` are dropped.
+pub fn from_blob(b: &[u8]) -> Vec<f32> {
+    let (whole, _) = b.as_chunks::<4>();
+    whole.iter().map(|c| f32::from_le_bytes(*c)).collect()
 }
 
 /// Needs no key: it only deletes. Its embedding goes with it.
