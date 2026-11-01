@@ -392,6 +392,7 @@ fn is_program(path: &Path) -> bool {
 
 /// The setting that names the `claude` binary when discovery cannot find it.
 pub const PATH_SETTING: &str = "ai.claude_path";
+#[cfg(unix)]
 const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A relative entry would run whatever sits in the working directory.
