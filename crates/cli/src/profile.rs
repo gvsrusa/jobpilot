@@ -203,7 +203,7 @@ fn basic_text(basic: &ProfileBasic) -> String {
 pub async fn profile(db: &Db, command: ProfileCommand) -> Result<Output> {
     match command {
         ProfileCommand::Show => {
-            let full = profile::get(db).await?;
+            let full = profile::show(db).await?;
             let mut value = shown(&full.basic);
             value["authorization"] = json!(full.authorization);
             value["locked"] = json!(full.locked);

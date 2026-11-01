@@ -248,6 +248,32 @@ pub async fn state(db: &Db) -> Result<KeyState> {
     Ok(publish(db, &found))
 }
 
+/// What `peek` reports when this root holds no key row and no ciphertext.
+pub const NO_KEY_YET: &str = "no_key_yet";
+
+/// Like [`state`], but never makes a key: a root with no key row and no ciphertext reports
+/// `KeyUnavailable { key_id: "", reason: NO_KEY_YET }`. Otherwise it asks the store about
+/// the key that exists. For status, import, discard, and restore reports.
+pub async fn peek(db: &Db) -> Result<KeyState> {
+    let found = match existing_key(db).await? {
+        Some(found) => found,
+        None => Err(no_key_yet(NO_KEY_YET.into())),
+    };
+    Ok(publish(db, &found))
+}
+
+/// The state with no keychain call at all: `NotLoaded` when a key row or ciphertext
+/// exists, else the no-key-yet state. Says nothing about whether the key is readable.
+pub async fn known_state(db: &Db) -> Result<KeyState> {
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM data_keys")
+        .fetch_one(&db.pool)
+        .await?;
+    if rows > 0 || !held_key_ids(db).await?.is_empty() {
+        return Ok(KeyState::NotLoaded);
+    }
+    Ok(no_key_yet(NO_KEY_YET.into()))
+}
+
 /// The key, for one operation: the entry point of every seal and open. The key is read
 /// from the keychain on every call and kept nowhere, so `Db` caches the state and no
 /// secret, and a key removed from the store stops working.

@@ -98,7 +98,17 @@ where
         done = &mut task => done,
         () = interrupt => {
             token.cancel();
-            task.await
+            // A second Ctrl-C gives up waiting. The child is not dropped then, so this
+            // is the user's explicit choice.
+            let again = async {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::select! {
+                done = &mut task => done,
+                () = again => std::process::exit(130),
+            }
         }
     }
 }

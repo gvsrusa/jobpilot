@@ -67,6 +67,9 @@ pub fn describe_key(state: &KeyState) -> String {
     match state {
         KeyState::NotLoaded => "key not loaded".into(),
         KeyState::Unlocked { key_id } => format!("key unlocked ({key_id})"),
+        KeyState::KeyUnavailable { reason, .. } if reason == crypto::NO_KEY_YET => {
+            "no key yet; one is made when you first save something private".into()
+        }
         KeyState::KeyUnavailable { reason, .. } => format!("key store unavailable: {reason}"),
         KeyState::KeyMissing { key_id } => format!(
             "key missing: {key_id}. Import its recovery file with `jobpilot data recovery-key import <path>`."
@@ -77,7 +80,8 @@ pub fn describe_key(state: &KeyState) -> String {
 
 pub async fn status(db: &Db) -> Result<Output> {
     let schema = db.schema_version().await?;
-    let key_state = crypto::state(db).await?;
+    // No keychain call: status must never make a key or prompt.
+    let key_state = crypto::known_state(db).await?;
     let ai = jobpilot_core::ai::status(db).await?;
     let ollama =
         serde_json::to_value(&ai.ollama).map_err(|e| Error::Io(std::io::Error::other(e)))?;
@@ -187,7 +191,7 @@ pub async fn restore(paths: &AppPaths, source: &Path) -> Result<Output> {
         Err(error) => return Err(error),
     };
     // The state on this machine now is the truth; the report's is what the backup's key was.
-    let key_state = crypto::state(&report.db).await;
+    let key_state = crypto::peek(&report.db).await;
     report.db.close().await;
     let key_state = key_state?;
     let text = format!(
@@ -224,8 +228,14 @@ pub async fn data(db: &Db, command: DataCommand) -> Result<Output> {
             )
         }
         DataCommand::RecoveryKey(RecoveryKeyCommand::Export { out: file }) => {
-            // A fresh process is NotLoaded; ask the store first.
-            crypto::state(db).await?;
+            // A fresh process is NotLoaded; ask the store first, without making a key.
+            let state = crypto::peek(db).await?;
+            if matches!(&state, KeyState::KeyUnavailable { reason, .. } if reason == crypto::NO_KEY_YET)
+            {
+                return Err(Error::Refused(
+                    "there is no key yet, so there is nothing to export".into(),
+                ));
+            }
             let receipt = recovery::export(db, &file, ACTOR).await?;
             let text = format!(
                 "recovery key {} written to {}\nKeep it somewhere private and off this computer.",
@@ -235,13 +245,13 @@ pub async fn data(db: &Db, command: DataCommand) -> Result<Output> {
             out(receipt, text)
         }
         DataCommand::RecoveryKey(RecoveryKeyCommand::Import { path }) => {
-            crypto::state(db).await?;
+            crypto::peek(db).await?;
             let state = recovery::import(db, &path, ACTOR).await?;
             let text = describe_key(&state);
             out(json!({ "key_state": state }), text)
         }
         DataCommand::DiscardLocked { confirm } => {
-            crypto::state(db).await?;
+            crypto::peek(db).await?;
             let state = recovery::discard_locked(db, &confirm, ACTOR).await?;
             let text = format!("locked fields discarded\n{}", describe_key(&state));
             out(json!({ "key_state": state }), text)

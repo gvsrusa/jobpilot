@@ -186,7 +186,7 @@ pub async fn no_recovery_key_exported(db: &Db) -> Result<bool> {
 pub async fn import(db: &Db, file: &Path, actor: &str) -> Result<KeyState> {
     refuse_panel()?;
     offered(&db.key_state())?;
-    let named = offered(&crypto::state(db).await?)?;
+    let named = offered(&crypto::peek(db).await?)?;
 
     let text = read_recovery_file(file)?;
     let recovery = parse(&text)?;
@@ -217,6 +217,9 @@ fn offered(state: &KeyState) -> Result<String> {
         KeyState::KeyMissing { key_id } | KeyState::KeyMismatch { key_id } => Ok(key_id.clone()),
         KeyState::NotLoaded => Err(Error::Refused("the key has not been checked yet".into())),
         KeyState::Unlocked { .. } => Err(Error::Refused("the key is already unlocked".into())),
+        KeyState::KeyUnavailable { reason, .. } if reason == crypto::NO_KEY_YET => Err(
+            Error::Refused("there is no key yet, so there is nothing to import or discard".into()),
+        ),
         KeyState::KeyUnavailable { .. } => Err(Error::Refused(
             "the key store could not answer, so try again".into(),
         )),
@@ -302,7 +305,7 @@ pub async fn discard_locked(db: &Db, confirm_key_id: &str, actor: &str) -> Resul
     refuse_panel()?;
     offered(&db.key_state())?;
     let active = crypto::active_key_id(&db.pool).await?;
-    let old = offered(&crypto::state(db).await?)?;
+    let old = offered(&crypto::peek(db).await?)?;
     if confirm_key_id != old {
         return Err(Error::ConfirmationRequired);
     }

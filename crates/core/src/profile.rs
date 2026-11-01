@@ -98,6 +98,23 @@ pub async fn get(db: &Db) -> Result<Profile> {
     })
 }
 
+/// [`get`] for a screen that only looks: with no authorization rows it asks the keychain
+/// nothing, so it can never make a key. `locked` is false then, as there is nothing to lock.
+pub async fn show(db: &Db) -> Result<Profile> {
+    let held: i64 = sqlx::query_scalar("SELECT count(*) FROM work_authorization")
+        .fetch_one(&db.pool)
+        .await?;
+    if held > 0 {
+        return get(db).await;
+    }
+    Ok(Profile {
+        basic: basic(db).await?,
+        authorization: Vec::new(),
+        locked: false,
+        key_state: crypto::known_state(db).await?,
+    })
+}
+
 /// A key error while reading rows (a row sealed under a key this machine lost) leaves the
 /// profile locked instead of failing it. Any other error is real.
 fn degraded(error: Error) -> Result<KeyState> {
