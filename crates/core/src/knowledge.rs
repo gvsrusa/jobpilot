@@ -505,7 +505,7 @@ fn skip_escape(c: &[char], i: usize, cache: &mut Terminator) -> usize {
 /// characters that hide text without a tag: tag characters, bidi overrides, zero-width
 /// space, word joiner, and the byte-order mark. ZWNJ and ZWJ stay because scripts and
 /// emoji use them.
-fn clean_chars(input: &str, findings: &mut Vec<Finding>) -> String {
+pub(crate) fn clean_chars(input: &str, findings: &mut Vec<Finding>) -> String {
     let mut out = String::with_capacity(input.len());
     let mut hidden = 0usize;
     let mut chars = input.chars().peekable();

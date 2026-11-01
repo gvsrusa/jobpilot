@@ -11,5 +11,6 @@ license = "Apache-2.0"
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
+# unwind, so a panic in a file parser is caught (catch_unwind) instead of ending the app
+panic = "unwind"
 strip = true

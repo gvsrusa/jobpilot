@@ -293,3 +293,32 @@ fn constants_match_the_brief() {
     assert_eq!(parse::MAX_TEXT_CHARS, 2_000_000);
     assert_eq!(parse::PARSE_TIMEOUT.as_secs(), 30);
 }
+
+#[tokio::test]
+async fn hidden_characters_are_removed_and_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("h.docx");
+    let mut out = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+    out.start_file(
+        "word/document.xml",
+        zip::write::SimpleFileOptions::default(),
+    )
+    .unwrap();
+    out.write_all(
+        "<w:document><w:body><w:p><w:r><w:t>Ada</w:t></w:r></w:p><w:p><w:r><w:t>Skills</w:t></w:r></w:p>\
+         <w:p><w:r><w:t>Ru\u{200b}st \u{202e}and\u{e0041} Cafe\u{301}</w:t></w:r></w:p>\
+         <w:p><w:r><w:t>\u{200b}</w:t></w:r></w:p></w:body></w:document>"
+            .as_bytes(),
+    )
+    .unwrap();
+    out.finish().unwrap();
+    let (_t, db) = open().await;
+    let done = import_resume(&db, &path, "H").await.unwrap();
+    assert_eq!(done.items, 1);
+    assert!(done.warnings.iter().any(|w| w.contains("invisible")));
+    let body: String = sqlx::query_scalar("SELECT body FROM knowledge_items")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(body, "Rust and Caf\u{e9}");
+}

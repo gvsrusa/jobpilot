@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::db::Db;
 use crate::error::{Error, Result};
@@ -21,6 +22,7 @@ pub const PARSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Largest `word/document.xml` read after inflating (a zip bomb stops here).
 const MAX_XML_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ZIP_ENTRIES: usize = 10_000;
 const MAX_ITEMS: usize = 5_000;
 const ITEM_CHARS: usize = 20_000;
 const TITLE_LIMIT: usize = 300;
@@ -120,6 +122,9 @@ pub fn extract_text(path: &Path) -> Result<String> {
     Ok(text)
 }
 
+// ponytail: accepted residual, `pdf_extract` allocates without a bound while it parses, so
+// a hostile PDF under the 20 MiB file limit can still use a lot of memory before the 30 s
+// limit ends the wait. Ceiling: one file at a time per user action.
 /// Opens once and judges the handle, not the path, so the file cannot change between a
 /// size check and the read.
 fn read_limited(path: &Path) -> Result<Vec<u8>> {
@@ -152,6 +157,9 @@ fn read_limited(path: &Path) -> Result<Vec<u8>> {
 fn docx_text(bytes: &[u8]) -> Result<String> {
     let mut zip =
         zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|_| bad("unreadable_docx"))?;
+    if zip.len() > MAX_ZIP_ENTRIES {
+        return Err(bad("unreadable_docx"));
+    }
     let entry = zip
         .by_name("word/document.xml")
         .map_err(|_| bad("unreadable_docx"))?;
@@ -198,6 +206,9 @@ fn paragraph_text(xml: &str) -> Result<String> {
     let cap = MAX_TEXT_CHARS * 4;
     let mut out = String::new();
     let mut in_text = false;
+    // Start of the current run in `out`, and whether the run is hidden (`w:vanish`).
+    let mut run_start = 0;
+    let mut vanished = false;
     let mut i = 0;
     while i < xml.len() {
         if out.len() > cap {
@@ -238,6 +249,20 @@ fn paragraph_text(xml: &str) -> Result<String> {
                 .next()
                 .unwrap_or("");
             match (closing, name) {
+                (false, "w:r") if !self_closing => {
+                    run_start = out.len();
+                    vanished = false;
+                }
+                (true, "w:r") => {
+                    // Hidden text is not on the page, so it is not in the resume.
+                    if vanished {
+                        out.truncate(run_start);
+                    }
+                    vanished = false;
+                }
+                (false, "w:vanish") => {
+                    vanished = !(inner.contains("\"0\"") || inner.contains("false"));
+                }
                 (false, "w:t") => in_text = !self_closing,
                 (true, "w:t") => in_text = false,
                 (true, "w:p") | (false, "w:br" | "w:cr") => out.push('\n'),
@@ -256,7 +281,7 @@ fn decode_into(text: &str, out: &mut String) {
     while let Some(amp) = rest.find('&') {
         out.push_str(&rest[..amp]);
         rest = &rest[amp + 1..];
-        let Some(semi) = rest.find(';').filter(|&n| n <= 10) else {
+        let Some(semi) = rest.bytes().take(11).position(|b| b == b';') else {
             out.push('&');
             continue;
         };
@@ -461,6 +486,11 @@ pub async fn import_resume(db: &Db, path: &Path, title: &str) -> Result<Imported
     }
     let owned = path.to_path_buf();
     let text = run_limited(PARSE_TIMEOUT, move || extract_text(&owned)).await?;
+    // The same cleaning job text gets: controls, bidi, zero-width and tag characters go,
+    // and the text is NFC. A page break must not glue two words together.
+    let mut findings = Vec::new();
+    let text = crate::knowledge::clean_chars(&text.replace('\u{c}', "\n"), &mut findings);
+    let text: String = text.nfc().collect();
     let doc = sectionize(&text);
     let units = lines(&doc);
     let kinds = kinds(&doc);
@@ -470,7 +500,7 @@ pub async fn import_resume(db: &Db, path: &Path, title: &str) -> Result<Imported
     if units.len() > MAX_ITEMS {
         return Err(bad("too_many_lines"));
     }
-    let mut warnings = Vec::new();
+    let mut warnings: Vec<String> = findings.into_iter().map(|f| f.excerpt).collect();
     if doc.sections.is_empty() {
         warnings.push("no section headings were recognised".to_string());
     }
@@ -531,6 +561,26 @@ mod tests {
     async fn a_panicking_parser_is_an_error() {
         let result: Result<()> = run_limited(Duration::from_secs(5), || panic!("bad input")).await;
         assert!(matches!(result, Err(Error::Validation(_))));
+    }
+
+    #[test]
+    fn many_ampersands_decode_in_linear_time() {
+        let text = "&".repeat(2 * 1024 * 1024);
+        let start = std::time::Instant::now();
+        let mut out = String::new();
+        decode_into(&text, &mut out);
+        assert_eq!(out.len(), text.len());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn vanished_runs_are_skipped() {
+        let xml = "<w:p><w:r><w:t>shown</w:t></w:r><w:r><w:rPr><w:vanish/></w:rPr><w:t>secret</w:t></w:r><w:r><w:rPr><w:vanish w:val=\"0\"/></w:rPr><w:t> ok</w:t></w:r></w:p>";
+        assert_eq!(paragraph_text(xml).unwrap(), "shown ok\n");
     }
 
     #[test]
