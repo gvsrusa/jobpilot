@@ -1,5 +1,13 @@
 //! JobPilot AI core library. All product behaviour lives here.
 
+pub mod db;
+pub mod error;
+pub mod paths;
+
+pub use db::{Db, MIGRATOR, app_schema_version};
+pub use error::{Error, Result};
+pub use paths::AppPaths;
+
 /// Crate version, shown by the CLI.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
