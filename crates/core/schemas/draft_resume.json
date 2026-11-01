@@ -1,0 +1,54 @@
+{
+  "type": "object",
+  "required": ["doc", "claims"],
+  "properties": {
+    "doc": {
+      "type": "object",
+      "required": ["name", "contact", "summary", "sections"],
+      "properties": {
+        "name": { "type": "string" },
+        "contact": { "type": "array", "items": { "type": "string" } },
+        "summary": { "type": "array", "items": { "type": "string" } },
+        "sections": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["heading", "entries"],
+            "properties": {
+              "heading": { "type": "string" },
+              "entries": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["title", "subtitle", "dates", "bullets"],
+                  "properties": {
+                    "title": { "type": "string" },
+                    "subtitle": { "type": "string" },
+                    "dates": { "type": "string" },
+                    "bullets": { "type": "array", "items": { "type": "string" } }
+                  },
+                  "additionalProperties": false
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "claims": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["text", "evidence_ids"],
+        "properties": {
+          "text": { "type": "string", "maxLength": 600 },
+          "evidence_ids": { "type": "array", "items": { "type": "string" } }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

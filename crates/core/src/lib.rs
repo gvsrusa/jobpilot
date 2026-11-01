@@ -1,5 +1,6 @@
 //! JobPilot AI core library. All product behaviour lives here.
 
+pub mod ai;
 pub mod audit;
 pub mod backup;
 pub mod crypto;

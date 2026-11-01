@@ -16,7 +16,8 @@ thiserror = "2"
 unicode-normalization = "=0.1.26"
 docx-rs = "=0.4.22"
 printpdf = { version = "=0.12.8", default-features = false }
-tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time", "process", "io-util"] }
+jsonschema = { version = "=0.60.2", default-features = false } # no resolve-http: nothing but Ollama opens a socket
 pdf-extract = "=0.12.1"
 zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
 zeroize = "1"
