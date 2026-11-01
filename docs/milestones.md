@@ -59,9 +59,9 @@ Exit tests:
 Gates: all five apply. Build means the unsigned installers on macOS and Windows; migrations means the initial core schema on a fresh database; Windows and macOS means CI green on both.
 ## Release 0.2: Candidate and local AI
 
-Scope: profile, field encryption, resume parsing and generation, Ollama, task router, embeddings, xterm.js PTY panel, CLI sidecar bundled in the installer.
+Scope: profile, field encryption, resume parsing and generation, Ollama, task router, embeddings, xterm.js PTY panel, CLI sidecar bundled in the installer, Claude Code terminal launch and headless adapter (moved from 0.4 by ruling of 2026-11-01: the owner named it first, and Ollama is not running on the owner's machine).
 
-Requirements: FR-2.4, FR-2.10, FR-2.13, FR-3.1 to FR-3.8, FR-3.24 to FR-3.29, FR-4.1 to FR-4.10, FR-7.1 to FR-7.12, FR-10.1 to FR-10.4, FR-10.7, FR-10.8, FR-12.1, FR-12.3, FR-12.5, FR-12.6.
+Requirements: FR-2.4, FR-2.10, FR-2.13, FR-3.1 to FR-3.9, FR-3.12 to FR-3.14, FR-3.24 to FR-3.30, FR-4.1 to FR-4.10, FR-7.1 to FR-7.12, FR-10.1 to FR-10.4, FR-10.7, FR-10.8, FR-12.1, FR-12.3, FR-12.5, FR-12.6.
 
 Exit tests:
 - Profile stores multiple countries, regions, cities, currencies, time zones, languages, and work-mode preferences; no code path infers work authorization.
@@ -73,6 +73,9 @@ Exit tests:
 - Injection corpus passes against the local backend for parse and draft tasks, with pasted postings normalized on import.
 - The PTY panel runs the bundled CLI; restricted shell execution rejects disallowed commands.
 - Offline operation passes with a local model installed.
+- Claude Code headless backend: the router calls the user's installed `claude` CLI on its own login, passes job text only with every tool disabled (an adapter test proves the argv, and an ignored smoke test proves it against the real CLI), and the app reads or stores no CLI token. The terminal panel starts `claude` for the user and the router never sends it work. An absent CLI shows as unavailable.
+- A consent record for `claude_code/cli_login` naming the data categories exists before any external call, and revoking it stops the next call.
+- The router works end to end with Claude Code alone, Ollama alone, or No-AI, and a test proves each.
 
 Gates: all five apply. Build includes the bundled CLI sidecar; migrations add profile and encrypted-field tables on top of 0.1 data; Windows and macOS means PTY, keychain, and Ollama paths pass on both.
 ## Release 0.3: Career memory and application tracking
@@ -93,19 +96,18 @@ Exit tests:
 Gates: all five apply. Build includes the workflow runner; migrations add memory, tracking, and execution-log tables and upgrade a 0.2 database; Windows and macOS means pause and cancellation work on both.
 ## Release 0.4: External AI backends
 
-Scope: external AI backends, API providers, consent UI. Per the owner's decisions of 2026-11-01: Claude Code through the official `claude` CLI and its own login, as a headless backend (`claude -p` style) the task router may call and as a user-driven terminal session (D1); optional Gemini CLI and Codex CLI adapters on whatever sign-in the installed CLI supports; direct API providers under standard BYOK (D4). Security controls stay: `no_tools` for job and company text, and consent records.
+Scope: optional CLI adapters, API providers, consent UI extended to them. Claude Code (D1) shipped in 0.2. Per the owner's decisions of 2026-11-01: optional Gemini CLI and Codex CLI adapters on whatever sign-in the installed CLI supports; direct API providers under standard BYOK (D4). Security controls stay: `no_tools` for job and company text, and consent records.
 
-Requirements: FR-3.9 to FR-3.19, FR-3.30.
+Requirements: FR-3.10, FR-3.11, FR-3.15 to FR-3.19.
 
 Exit tests:
 - Each direct API provider in FR-3.15 to FR-3.19 that the register's [owner decisions](policy-register.md#owner-decisions-2026-11-01) make eligible (OpenAI, Anthropic, Google paid key, OpenRouter, loopback endpoints) runs through the task router with capability declarations, schema validation, timeouts, retries, and fallback. A provider the decisions leave out (free Gemini key, non-loopback endpoints, Vertex AI, Ollama cloud models) is refused, and a test proves it.
-- Consent UI blocks any external call until the user gives explicit data-sharing consent, and shows what will be sent.
+- Consent UI extends the 0.2 record (FR-3.30, Claude Code) to API providers and the optional CLI adapters, blocks any external call until consent is given, and shows what will be sent.
 - Prompt-injection tests pass for untrusted text sent to external backends. FR-12.3 lands in 0.2; this test extends it to hosted backends.
-- Claude Code headless backend: the router calls the user's installed `claude` CLI on its own login, passes job text only with tools disabled (an adapter test proves no tool is available), and the app reads or stores no CLI token. The terminal session starts `claude` for the user and the router never sends it work. An absent CLI shows as unavailable.
 - Optional Gemini CLI and Codex CLI adapters: run on the installed CLI's sign-in when present, show unavailable when absent, and are skipped for tasks that need `no_tools` unless a no-tools configuration is proven.
 - No mandatory key: the app still works end to end with no provider configured.
 
-Gates: all five apply. Build includes the provider and consent code; migrations add provider settings and consent records; Windows and macOS means keychain-stored keys, Claude Code headless and terminal, and CLI detection work on both.
+Gates: all five apply. Build includes the provider and consent code; migrations add provider settings and consent records; Windows and macOS means keychain-stored keys and CLI detection work on both.
 ## Release 0.5: International job discovery and intelligence
 
 Scope: connector SDK, read-only discovery, job intelligence (spec section 6).
