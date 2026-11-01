@@ -141,3 +141,88 @@ fn lines_order_is_stable() {
     assert!(letter.sections.is_empty());
     assert_eq!(lines(&letter), vec!["One.", "Two."]);
 }
+
+fn squash(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+fn stress_doc() -> ResumeDoc {
+    let mut d = doc();
+    d.name = "Maximiliana Alexandrovna Wolfeschlegelsteinhausen-Bergerdorff Jr".into();
+    d.contact = vec![
+        "maximiliana.wolfeschlegelsteinhausen@a-very-long-example-domain.example.com".into(),
+        "+44 20 7946 0958".into(),
+    ];
+    d.sections[0].heading =
+        "ПРОФЕССИОНАЛЬНЫЙ ОПЫТ И ДОСТИЖЕНИЯ В ОБЛАСТИ ВЫЧИСЛИТЕЛЬНЫХ МАШИН".into();
+    let e = &mut d.sections[0].entries[0];
+    e.title =
+        "Principal Staff Engineer of Analytical Engines and Difference Machines Division".into();
+    e.dates =
+        "January 1842 to November 1843, then again from March 1845 until further notice".into();
+    e.bullets = vec![
+        "LED THE WHOLE TEAM THROUGH A FULL REWRITE OF THE NOTES ON THE ANALYTICAL ENGINE AND SHIPPED IT ON TIME WITH WWWW MMMM".into(),
+        "Averyveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryverylongwordwithoutspaces".into(),
+    ];
+    d
+}
+
+#[test]
+fn pdf_text_is_present_and_inside_the_margins() {
+    use jobpilot_core::render::{MARGIN, PAGE_W, layout_runs, text_width};
+    let d = stress_doc();
+    for template in templates() {
+        for run in layout_runs(&d, *template) {
+            let right = run.x + text_width(&run.text, run.size);
+            assert!(
+                right <= PAGE_W - MARGIN + 0.01,
+                "{template:?} run overflows by {}: {:?}",
+                right - (PAGE_W - MARGIN),
+                run.text
+            );
+        }
+        let bytes = to_pdf(&d, *template).unwrap();
+        let text = squash(&pdf_extract::extract_text_from_mem(&bytes).unwrap());
+        let mut wanted = lines(&d);
+        wanted.push(d.name.clone());
+        wanted.extend(d.contact.clone());
+        for want in wanted {
+            assert!(text.contains(&squash(&want)), "{template:?} lost {want:?}");
+        }
+    }
+}
+
+#[test]
+fn compact_title_never_meets_the_dates_column() {
+    use jobpilot_core::render::{layout_runs, text_width};
+    let d = stress_doc();
+    let runs = layout_runs(&d, Template::Compact);
+    let dates_x = runs
+        .iter()
+        .find(|r| r.text.starts_with("January"))
+        .unwrap()
+        .x;
+    for r in runs
+        .iter()
+        .filter(|r| r.x < dates_x && r.size > 9.0 && r.size < 10.0)
+    {
+        assert!(r.x + text_width(&r.text, r.size) < dates_x);
+    }
+}
+
+#[test]
+fn docx_drops_xml_invalid_control_characters() {
+    let mut d = doc();
+    d.name = "Ada\u{1}Love\u{0}lace\u{FFFE}".into();
+    d.sections[0].entries[0].bullets = vec!["tab\tkept\u{B}\u{1F}".into()];
+    for template in templates() {
+        let bytes = to_docx(&d, *template).unwrap();
+        let xml = document_xml(&bytes);
+        assert!(
+            !xml.chars()
+                .any(|c| (c < ' ' && !matches!(c, '\t' | '\n' | '\r')) || c == '\u{FFFE}')
+        );
+        assert!(docx_rs::read_docx(&bytes).is_ok());
+        assert!(text_of(&xml).contains("AdaLovelace"));
+    }
+}
