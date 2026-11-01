@@ -144,7 +144,7 @@ async fn connect(paths: &AppPaths) -> Result<SqlitePool> {
     Ok(SqlitePool::connect_with(options).await?)
 }
 
-fn latest_version(migrator: &Migrator) -> i64 {
+pub(crate) fn latest_version(migrator: &Migrator) -> i64 {
     migrator.iter().map(|m| m.version).max().unwrap_or(0)
 }
 

@@ -1,5 +1,6 @@
 use serde::Serialize;
 use sqlx::Row;
+use sqlx::sqlite::SqlitePool;
 
 use crate::db::Db;
 use crate::error::Result;
@@ -22,6 +23,18 @@ pub async fn record(
     target: Option<&str>,
     detail: serde_json::Value,
 ) -> Result<()> {
+    record_to(&db.pool, actor, action, target, detail).await
+}
+
+/// `record` for a database that is not the open one: a restore writes its row into
+/// the temporary copy, so the row exists only if that copy goes live.
+pub(crate) async fn record_to(
+    pool: &SqlitePool,
+    actor: &str,
+    action: &str,
+    target: Option<&str>,
+    detail: serde_json::Value,
+) -> Result<()> {
     sqlx::query(
         "INSERT INTO audit_log (at, actor, action, target, detail) \
          VALUES (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, ?, ?, ?)",
@@ -30,7 +43,7 @@ pub async fn record(
     .bind(action)
     .bind(target)
     .bind(detail.to_string())
-    .execute(&db.pool)
+    .execute(pool)
     .await?;
     Ok(())
 }

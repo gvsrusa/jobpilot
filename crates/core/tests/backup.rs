@@ -3,8 +3,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use jobpilot_core::{AppPaths, Db, Error, app_schema_version, audit, backup, documents};
+use jobpilot_core::{AppPaths, Db, Error, MIGRATOR, app_schema_version, audit, backup, documents};
 use serde_json::{Value, json};
+use sqlx::SqlSafeStr;
+use sqlx::migrate::{Migration, MigrationType, Migrator};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool};
 use tempfile::TempDir;
 
@@ -89,7 +91,7 @@ async fn backup_with_doc(paths: &AppPaths, title: &str) -> PathBuf {
     info.path
 }
 
-fn pre_restore(paths: &AppPaths) -> Vec<PathBuf> {
+fn snapshots(paths: &AppPaths, prefix: &str) -> Vec<PathBuf> {
     fs::read_dir(paths.backups())
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -97,9 +99,35 @@ fn pre_restore(paths: &AppPaths) -> Vec<PathBuf> {
             path.file_name()
                 .unwrap()
                 .to_string_lossy()
-                .starts_with("pre-restore-")
+                .starts_with(prefix)
         })
         .collect()
+}
+
+fn pre_restore(paths: &AppPaths) -> Vec<PathBuf> {
+    snapshots(paths, "pre-restore-")
+}
+
+fn migrator_plus(sql: &'static str) -> Migrator {
+    let mut all: Vec<Migration> = MIGRATOR.iter().cloned().collect();
+    all.push(Migration::new(
+        9000,
+        "test".into(),
+        MigrationType::Simple,
+        sql.into_sql_str(),
+        false,
+    ));
+    Migrator::with_migrations(all)
+}
+
+fn root_is_free_of_temp_names(paths: &AppPaths) -> bool {
+    fs::read_dir(paths.root()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("restore-")
+    })
 }
 
 fn manifest(dir: &Path) -> Value {
@@ -582,6 +610,7 @@ async fn restore_clears_temp_files_left_by_a_crash() {
     let temp = paths.root().join("restore-tmp.db");
     fs::write(&temp, "left by a crash").unwrap();
     fs::write(sidecar(&temp, "-shm"), "left by a crash").unwrap();
+    fs::write(sidecar(&temp, "-journal"), "left by a crash").unwrap();
     let leftovers = paths.root().join("restore-tmp-documents");
     fs::create_dir(&leftovers).unwrap();
     fs::write(leftovers.join("stale.txt"), "stale").unwrap();
@@ -594,6 +623,7 @@ async fn restore_clears_temp_files_left_by_a_crash() {
     assert_eq!(titles(&db).await, ["from wal"]);
     assert!(!paths.documents().join("stale.txt").exists());
     assert!(!moved.exists());
+    assert!(root_is_free_of_temp_names(&paths));
     db.close().await;
 }
 
@@ -884,5 +914,214 @@ async fn offline_restore_reads_secret_index_rows_held_in_the_wal() {
         .unwrap();
 
     assert_eq!(secrets(&db).await, ["only in wal"]);
+    db.close().await;
+}
+
+#[tokio::test]
+async fn restore_migrates_an_older_backup_forward() {
+    let (_tmp, paths) = temp_root();
+    let source = backup_with_doc(&paths, "alpha").await;
+    let newer = migrator_plus("CREATE TABLE added (x);");
+    let db = Db::open_with(&paths, &newer).await.unwrap();
+    add_doc(&db, "bravo").await;
+    let before = snapshots(&paths, "pre-migrate-").len();
+
+    let db = backup::restore_with(db, &source, "cli", &newer)
+        .await
+        .unwrap();
+
+    assert_eq!(titles(&db).await, ["alpha"]);
+    assert_eq!(db.schema_version().await.unwrap(), 9000);
+    sqlx::query("SELECT x FROM added")
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(audit::recent(&db, 1).await.unwrap()[0].action, "restore");
+    assert_eq!(
+        snapshots(&paths, "pre-migrate-").len(),
+        before,
+        "the backup migrates as a temp copy, which needs no snapshot"
+    );
+    db.close().await;
+}
+
+#[tokio::test]
+async fn failing_migration_leaves_live_data_and_no_pre_migrate_copies() {
+    let (_tmp, paths) = temp_root();
+    let source = backup_with_doc(&paths, "alpha").await;
+    let db = Db::open(&paths).await.unwrap();
+    add_doc(&db, "bravo").await;
+    add_secret(&db, "live").await;
+    fs::write(paths.documents().join("kept.txt"), "kept").unwrap();
+    let broken = migrator_plus("CREATE TABLE settings (x);");
+
+    let err = backup::restore_with(db, &source, "cli", &broken)
+        .await
+        .err()
+        .unwrap();
+
+    assert!(matches!(err, Error::MigrationFailed(_)), "{err}");
+    assert!(snapshots(&paths, "pre-migrate-").is_empty());
+    assert!(root_is_free_of_temp_names(&paths));
+    assert!(paths.documents().join("kept.txt").is_file());
+
+    let db = Db::open(&paths).await.unwrap();
+    assert_eq!(titles(&db).await, ["alpha", "bravo"]);
+    assert_eq!(secrets(&db).await, ["live"]);
+    assert!(
+        audit::recent(&db, 10)
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.action != "restore"),
+        "no restore happened"
+    );
+    db.close().await;
+    let newest = &backup::list(&paths).await.unwrap()[0];
+    assert_eq!(newest.path, pre_restore(&paths)[0]);
+}
+
+#[tokio::test]
+async fn backup_missing_a_table_is_refused_with_live_data_intact() {
+    let (_tmp, paths) = temp_root();
+    let source = backup_with_doc(&paths, "alpha").await;
+    let pool =
+        SqlitePool::connect_with(SqliteConnectOptions::new().filename(source.join("jobpilot.db")))
+            .await
+            .unwrap();
+    sqlx::query("DROP TABLE secret_index")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let db = Db::open(&paths).await.unwrap();
+    add_doc(&db, "bravo").await;
+    add_secret(&db, "live").await;
+    let err = backup::restore(db, &source, "cli").await.err().unwrap();
+
+    assert!(matches!(err, Error::InvalidBackup(_)), "{err}");
+    assert!(root_is_free_of_temp_names(&paths));
+    let db = Db::open(&paths).await.unwrap();
+    assert_eq!(titles(&db).await, ["alpha", "bravo"]);
+    assert_eq!(secrets(&db).await, ["live"]);
+    db.close().await;
+}
+
+// A table the backup lacks fails loudly even with no saved rows to insert into it.
+#[tokio::test]
+async fn backup_missing_a_table_is_refused_with_no_live_secrets() {
+    let (_tmp, paths) = temp_root();
+    let source = backup_with_doc(&paths, "alpha").await;
+    let pool =
+        SqlitePool::connect_with(SqliteConnectOptions::new().filename(source.join("jobpilot.db")))
+            .await
+            .unwrap();
+    sqlx::query("DROP TABLE secret_index")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let db = Db::open(&paths).await.unwrap();
+    let err = backup::restore(db, &source, "cli").await.err().unwrap();
+
+    assert!(matches!(err, Error::InvalidBackup(_)), "{err}");
+}
+
+#[tokio::test]
+async fn failed_reopen_after_the_swap_says_the_restore_happened() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    add_doc(&db, "alpha").await;
+    let info = backup::create(&db, "cli").await.unwrap();
+    add_doc(&db, "bravo").await;
+    add_secret(&db, "live").await;
+    // A file where `Db::open` makes a folder fails the reopen, and nothing before it.
+    fs::remove_dir(paths.exports()).unwrap();
+    fs::write(paths.exports(), "in the way").unwrap();
+
+    let err = backup::restore(db, &info.path, "gui").await.err().unwrap();
+
+    assert!(matches!(err, Error::RestoredButNotOpened(_)), "{err}");
+    assert_eq!(err.code(), "restored_not_opened");
+
+    fs::remove_file(paths.exports()).unwrap();
+    let db = Db::open(&paths).await.unwrap();
+    assert_eq!(titles(&db).await, ["alpha"]);
+    assert_eq!(secrets(&db).await, ["live"]);
+    assert_eq!(audit::recent(&db, 1).await.unwrap()[0].action, "restore");
+    db.close().await;
+}
+
+// `Db::open` succeeds here, so the recovery screen never shows: `restore` is the way out.
+#[tokio::test]
+async fn restore_recovers_a_corrupt_database_that_still_opens() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    add_doc(&db, "alpha").await;
+    add_secret(&db, "live").await;
+    let info = backup::create(&db, "cli").await.unwrap();
+    add_doc(&db, "bravo").await;
+    add_secret(&db, "later").await;
+    let root: i64 =
+        sqlx::query_scalar("SELECT rootpage FROM sqlite_master WHERE name = 'documents'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    db.close().await;
+    let mut bytes = fs::read(paths.db()).unwrap();
+    let start = (root as usize - 1) * 4096;
+    bytes[start..start + 4096].fill(0x5a);
+    fs::write(paths.db(), bytes).unwrap();
+
+    let db = Db::open(&paths).await.unwrap();
+    assert!(documents::list(&db).await.is_err(), "really corrupt");
+
+    let db = backup::restore(db, &info.path, "gui").await.unwrap();
+
+    assert_eq!(titles(&db).await, ["alpha"]);
+    assert_eq!(secrets(&db).await, ["later", "live"]);
+    let row = &audit::recent(&db, 1).await.unwrap()[0];
+    assert_eq!(row.action, "restore");
+    assert_eq!(row.detail, json!({}));
+    db.close().await;
+
+    let kept = backup::list(&paths)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|found| found.path != info.path)
+        .unwrap();
+    let copy = fs::read(kept.path.join("jobpilot.db")).unwrap();
+    assert_eq!(copy[(root as usize - 1) * 4096], 0x5a, "kept as it was");
+}
+
+#[tokio::test]
+async fn corrupt_live_database_with_unreadable_secret_index_reports_it() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    add_doc(&db, "alpha").await;
+    let info = backup::create(&db, "cli").await.unwrap();
+    let roots: Vec<i64> = sqlx::query_scalar(
+        "SELECT rootpage FROM sqlite_master WHERE name IN ('documents', 'secret_index')",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    db.close().await;
+    let mut bytes = fs::read(paths.db()).unwrap();
+    for root in roots {
+        let start = (root as usize - 1) * 4096;
+        bytes[start..start + 4096].fill(0x5a);
+    }
+    fs::write(paths.db(), bytes).unwrap();
+
+    let db = Db::open(&paths).await.unwrap();
+    let db = backup::restore(db, &info.path, "gui").await.unwrap();
+
+    assert_eq!(titles(&db).await, ["alpha"]);
+    let row = &audit::recent(&db, 1).await.unwrap()[0];
+    assert_eq!(row.detail, json!({"secret_index_lost": true}));
     db.close().await;
 }

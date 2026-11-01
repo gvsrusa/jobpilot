@@ -12,6 +12,9 @@ pub enum Error {
     MigrationFailed(String),
     #[error("invalid backup: {0}")]
     InvalidBackup(String),
+    /// The restore happened: live data is now the backup. Only reopening failed.
+    #[error("restore finished, but the restored data could not be opened: {0}")]
+    RestoredButNotOpened(String),
     #[error("data folder is in use by another JobPilot process")]
     InUse,
     #[error("not available on this system")]
@@ -35,6 +38,7 @@ impl Error {
             Error::SchemaTooNew { .. } => "schema_too_new",
             Error::MigrationFailed(_) => "migration_failed",
             Error::InvalidBackup(_) => "invalid_backup",
+            Error::RestoredButNotOpened(_) => "restored_not_opened",
             Error::InUse => "in_use",
             Error::Unavailable => "unavailable",
             Error::Secret(_) => "secret",
@@ -65,6 +69,10 @@ mod tests {
             (Error::SchemaTooNew { db: 2, app: 1 }, "schema_too_new"),
             (Error::MigrationFailed("x".into()), "migration_failed"),
             (Error::InvalidBackup("x".into()), "invalid_backup"),
+            (
+                Error::RestoredButNotOpened("x".into()),
+                "restored_not_opened",
+            ),
             (Error::InUse, "in_use"),
             (Error::Unavailable, "unavailable"),
             (Error::Secret("x".into()), "secret"),
