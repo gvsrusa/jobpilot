@@ -26,7 +26,7 @@ cargo test --workspace
 pnpm tauri build --no-bundle
 ```
 
-Thirteen tests touch the real OS keychain and are `#[ignore]`d. Nothing else does: `Db::open` never reaches the keychain, so `cargo test --workspace` writes no entries. Run them against a throwaway service name, never the app's own:
+Thirty-two tests touch the real OS keychain and are `#[ignore]`d. Nothing else does: `Db::open` never reaches the keychain, so `cargo test --workspace` writes no entries. Run them against a throwaway service name, never the app's own:
 
 ```bash
 JOBPILOT_SECRET_SERVICE=jobpilot-test cargo test --workspace -- --ignored

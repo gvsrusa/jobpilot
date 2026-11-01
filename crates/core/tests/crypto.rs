@@ -376,10 +376,11 @@ async fn rows_without_an_active_key_never_create_one() {
     db.close().await;
 }
 
-// A readable key beside ciphertext is never made active: nothing says they belong.
+// The key-check proves the key, so nothing about these fields is locked. Calling this a
+// mismatch would offer an irreversible discard with the right key in the store.
 #[tokio::test]
 #[ignore = "touches the OS keychain"]
-async fn ciphertext_without_an_active_key_is_never_reactivated_over() {
+async fn correct_key_with_no_active_row_is_reactivated_over_its_ciphertext() {
     let (_tmp, paths) = temp_root();
     let db = Db::open(&paths).await.unwrap();
     const HELD: &str = "a000000000000003";
@@ -393,11 +394,159 @@ async fn ciphertext_without_an_active_key_is_never_reactivated_over() {
 
     assert_eq!(
         state,
-        KeyState::KeyMismatch {
+        KeyState::Unlocked {
             key_id: HELD.into()
         }
     );
-    assert_eq!(key_rows(&db).await[0].2, 0);
+    assert_eq!(key_rows(&db).await[0].2, 1);
+    let log = audit::recent(&db, 10).await.unwrap();
+    assert_eq!(reactivated_rows(&log), 1);
+    db.close().await;
+}
+
+/// Ciphertext under `key_id`, under a key made of sevens, that a trial decrypt can open.
+async fn add_sealed_ciphertext(db: &Db, key_id: &str, country: &str) {
+    let sealed = DataKey::from_bytes(key_id, [7; 32])
+        .encrypt("work_authorization", "row", country, b"{}")
+        .unwrap();
+    let mut raw = db.pool.acquire().await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *raw)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO work_authorization (country, ciphertext, key_id, updated_at) \
+         VALUES (?, ?, ?, 't')",
+    )
+    .bind(country)
+    .bind(sealed)
+    .bind(key_id)
+    .execute(&mut *raw)
+    .await
+    .unwrap();
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *raw)
+        .await
+        .unwrap();
+}
+
+// K1 is proven and K2 is not, so the state names K2 and K1 stays out of the name.
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn mixed_ids_name_the_unproven_one() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    // Proven sorts after unproven on the id, and before it on age.
+    const PROVEN: &str = "a000000000000006";
+    const UNPROVEN: &str = "a000000000000005";
+    add_key_row(&db, PROVEN, "2000", &sealed_key_check(PROVEN)).await;
+    add_key_row(&db, UNPROVEN, "1000", &sealed_key_check(UNPROVEN)).await;
+    add_sealed_ciphertext(&db, PROVEN, "PT").await;
+    add_sealed_ciphertext(&db, UNPROVEN, "ES").await;
+    let _guard = EntryGuard(PROVEN.into());
+    entry(PROVEN).set_password(&"07".repeat(32)).unwrap();
+
+    assert_eq!(
+        crypto::state(&db).await.unwrap(),
+        KeyState::KeyMismatch {
+            key_id: UNPROVEN.into()
+        }
+    );
+    assert!(key_rows(&db).await.iter().all(|row| row.2 == 0));
+
+    let _guard = EntryGuard(UNPROVEN.into());
+    entry(UNPROVEN).set_password(&"07".repeat(32)).unwrap();
+
+    assert_eq!(
+        crypto::state(&db).await.unwrap(),
+        KeyState::Unlocked {
+            key_id: PROVEN.into()
+        },
+        "every held id is proven, and the newest becomes active"
+    );
+    db.close().await;
+}
+
+// K2's entry was never asked for before, so the right key beside it read as a mismatch.
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn a_proven_key_beside_active_k1_is_read_and_made_active() {
+    let (_tmp, paths) = temp_root();
+    let (db, key_id, _guard) = unlocked_root(&paths).await;
+    const SECOND: &str = "a000000000000007";
+    add_key_row(&db, SECOND, "1000", &sealed_key_check(SECOND)).await;
+    add_sealed_ciphertext(&db, SECOND, "PT").await;
+    let _second = EntryGuard(SECOND.into());
+    entry(SECOND).set_password(&"07".repeat(32)).unwrap();
+
+    assert_eq!(
+        crypto::state(&db).await.unwrap(),
+        KeyState::Unlocked {
+            key_id: SECOND.into()
+        },
+        "the active key holds nothing, so the one that holds the fields replaces it"
+    );
+    let rows = key_rows(&db).await;
+    assert_eq!(rows.iter().find(|row| row.0 == key_id).unwrap().2, 0);
+    assert_eq!(rows.iter().find(|row| row.0 == SECOND).unwrap().2, 1);
+    assert_eq!(reactivated_rows(&audit::recent(&db, 10).await.unwrap()), 1);
+    db.close().await;
+}
+
+// Both keys are proven and the active one holds fields of its own, so it stays.
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn two_proven_ids_keep_the_active_key() {
+    let (_tmp, paths) = temp_root();
+    let (db, key_id, _guard) = unlocked_root(&paths).await;
+    const SECOND: &str = "a000000000000008";
+    add_key_row(&db, SECOND, "1000", &sealed_key_check(SECOND)).await;
+    add_sealed_ciphertext(&db, SECOND, "ES").await;
+    add_orphan_ciphertext(&db, &key_id).await;
+    let _second = EntryGuard(SECOND.into());
+    entry(SECOND).set_password(&"07".repeat(32)).unwrap();
+
+    assert_eq!(
+        crypto::state(&db).await.unwrap(),
+        KeyState::Unlocked {
+            key_id: key_id.clone()
+        }
+    );
+    assert_eq!(reactivated_rows(&audit::recent(&db, 10).await.unwrap()), 0);
+    db.close().await;
+}
+
+// No row means no key-check, and a trial decrypt of the ciphertext proves the entry.
+// The row it gains makes the key active like any other.
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn a_trial_decrypt_proves_a_key_with_no_row() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    const ORPHAN: &str = "a000000000000009";
+    add_sealed_ciphertext(&db, ORPHAN, "PT").await;
+    let _guard = EntryGuard(ORPHAN.into());
+    entry(ORPHAN).set_password(&"07".repeat(32)).unwrap();
+
+    assert_eq!(
+        crypto::state(&db).await.unwrap(),
+        KeyState::Unlocked {
+            key_id: ORPHAN.into()
+        }
+    );
+    let rows = key_rows(&db).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].0.as_str(), rows[0].2), (ORPHAN, 1));
+    assert_eq!(
+        crypto::key_state_of(ORPHAN, &rows[0].1),
+        KeyState::Unlocked {
+            key_id: ORPHAN.into()
+        },
+        "the new row carries a working key-check"
+    );
+
+    let key = crypto::unlocked(&db).await.unwrap();
+    assert_eq!(key.key_id(), ORPHAN);
     db.close().await;
 }
 
@@ -423,7 +572,7 @@ async fn add_orphan_ciphertext(db: &Db, key_id: &str) {
 }
 
 // Ciphertext blocks a new key whichever table lost its row. The ids it lists are read
-// from the store: with no key-check, an entry there is a mismatch and only a clean
+// from the store: an entry that fails the trial decrypt is a mismatch, and only a clean
 // no-entry is missing. `crypto::tests` pins the store-error case.
 #[tokio::test]
 #[ignore = "touches the OS keychain"]

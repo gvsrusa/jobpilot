@@ -1,3 +1,5 @@
+use sqlx::sqlite::SqliteExecutor;
+
 use crate::db::Db;
 use crate::error::Result;
 
@@ -12,6 +14,15 @@ pub async fn get(db: &Db, key: &str) -> Result<Option<serde_json::Value>> {
 }
 
 pub async fn set(db: &Db, key: &str, value: &serde_json::Value) -> Result<()> {
+    set_to(&db.pool, key, value).await
+}
+
+/// `set` for an open transaction, so the value lands with the change it records.
+pub(crate) async fn set_to(
+    executor: impl SqliteExecutor<'_>,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<()> {
     sqlx::query(
         "INSERT INTO settings (key, value, updated_at) \
          VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
@@ -19,7 +30,7 @@ pub async fn set(db: &Db, key: &str, value: &serde_json::Value) -> Result<()> {
     )
     .bind(key)
     .bind(value.to_string())
-    .execute(&db.pool)
+    .execute(executor)
     .await?;
     Ok(())
 }

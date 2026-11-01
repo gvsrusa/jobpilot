@@ -93,6 +93,25 @@ pub(crate) async fn store_key(name: &str, value: &str) -> Result<()> {
     keychain(move || entry(&name)?.set_password(&value).map_err(secret_error)).await
 }
 
+/// Adds a key the caller has proven, and never replaces an entry. An entry that already
+/// holds this value is fine as it is; one holding anything else is `Refused`, because
+/// nothing here can say which of the two is worth keeping.
+// ponytail: the check and the write are two calls, as keyring has no create-only write.
+// Only another import of this same key can land between them, and it writes this value.
+pub(crate) async fn add_key(name: &str, value: &str) -> Result<()> {
+    let (name, value) = (name.to_owned(), Zeroizing::new(value.to_owned()));
+    keychain(move || match get(&name)?.map(Zeroizing::new) {
+        Some(stored) if stored == value => Ok(()),
+        Some(_) => Err(Error::Refused(
+            "the keychain holds another value for this key, and it is left as it is. \
+             Remove that entry to import this file"
+                .into(),
+        )),
+        None => entry(&name)?.set_password(&value).map_err(secret_error),
+    })
+    .await
+}
+
 pub async fn names(db: &Db) -> Result<Vec<String>> {
     Ok(
         sqlx::query_scalar("SELECT name FROM secret_index ORDER BY name")

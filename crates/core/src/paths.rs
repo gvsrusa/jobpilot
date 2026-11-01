@@ -49,6 +49,20 @@ impl AppPaths {
     pub fn marker(&self) -> PathBuf {
         self.root.join(".jobpilot-root")
     }
+
+    /// True when a file at `path` would land under the root, or that cannot be ruled out.
+    /// Compares resolved directories, so a symlink, a `..`, or another spelling of the
+    /// root's name cannot hide it. A folder that cannot be resolved counts as inside.
+    pub fn is_inside_root(&self, path: &Path) -> bool {
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        match (parent.canonicalize(), self.root.canonicalize()) {
+            (Ok(parent), Ok(root)) => parent.starts_with(root),
+            _ => true,
+        }
+    }
 }
 
 fn root_from(home: Option<OsString>) -> Result<PathBuf> {
@@ -75,6 +89,29 @@ mod tests {
         assert_eq!(paths.exports(), root.join("exports"));
         assert_eq!(paths.lock(), root.join("jobpilot.lock"));
         assert_eq!(paths.marker(), root.join(".jobpilot-root"));
+    }
+
+    #[test]
+    fn inside_root_is_decided_on_resolved_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data");
+        std::fs::create_dir_all(root.join("exports")).unwrap();
+        std::fs::create_dir(tmp.path().join("data2")).unwrap();
+        let paths = AppPaths::new(&root);
+
+        assert!(paths.is_inside_root(&root.join("key.json")));
+        assert!(paths.is_inside_root(&root.join("exports/key.json")));
+        assert!(paths.is_inside_root(&tmp.path().join("data2/../data/key.json")));
+        assert!(!paths.is_inside_root(&tmp.path().join("key.json")));
+        assert!(
+            !paths.is_inside_root(&tmp.path().join("data2/key.json")),
+            "not a prefix"
+        );
+
+        // A bare file name lands in the working directory.
+        assert!(AppPaths::new(".").is_inside_root(Path::new("key.json")));
+        assert!(paths.is_inside_root(&tmp.path().join("missing/key.json")));
+        assert!(AppPaths::new(tmp.path().join("gone")).is_inside_root(&root.join("key.json")));
     }
 
     #[test]

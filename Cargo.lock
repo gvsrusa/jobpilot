@@ -2270,6 +2270,7 @@ dependencies = [
  "aes-gcm",
  "dirs",
  "keyring",
+ "libc",
  "serde",
  "serde_json",
  "sqlx",
