@@ -52,7 +52,7 @@ jobs:
           security default-keychain -s ci.keychain
           security unlock-keychain -p ci ci.keychain
           security set-keychain-settings ci.keychain
-          cargo test --workspace -- --ignored
+          JOBPILOT_ALLOW_KEYCHAIN_SWAP=1 cargo test --workspace -- --ignored
 
       - name: Keychain tests (Windows)
         if: runner.os == 'Windows'

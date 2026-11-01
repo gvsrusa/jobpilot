@@ -177,12 +177,19 @@ fn refuse_data_key(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// `JOBPILOT_SECRET_SERVICE` lets the real keychain tests stay clear of the app's own
-/// entries. Empty means unset, as with `JOBPILOT_HOME`.
+/// `JOBPILOT_SECRET_SERVICE` lets the keychain tests stay clear of the app's own
+/// entries. Only debug and test builds read it: a release build must not let the
+/// environment point the app at another service, so it always uses `SERVICE`.
+// ponytail: one service per build, so no multi-profile secret namespaces.
 fn service() -> String {
-    std::env::var("JOBPILOT_SECRET_SERVICE")
-        .ok()
-        .filter(|service| !service.is_empty())
+    let honour = cfg!(any(test, debug_assertions));
+    resolve_service(std::env::var("JOBPILOT_SECRET_SERVICE").ok(), honour)
+}
+
+/// Empty means unset, as with `JOBPILOT_HOME`.
+fn resolve_service(requested: Option<String>, honour: bool) -> String {
+    requested
+        .filter(|service| honour && !service.is_empty())
         .unwrap_or_else(|| SERVICE.to_owned())
 }
 
@@ -240,6 +247,15 @@ mod tests {
         for name in ["data-key", "openai", "my-data-key-1", "é"] {
             assert!(refuse_data_key(name).is_ok(), "{name}");
         }
+    }
+
+    #[test]
+    fn resolve_service_honours_a_request_only_when_told() {
+        let asked = |value: &str| Some(value.to_owned());
+        assert_eq!(resolve_service(asked("x"), true), "x");
+        assert_eq!(resolve_service(asked("x"), false), SERVICE);
+        assert_eq!(resolve_service(asked(""), true), SERVICE);
+        assert_eq!(resolve_service(None, true), SERVICE);
     }
 
     #[test]
