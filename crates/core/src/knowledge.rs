@@ -603,7 +603,6 @@ fn tag_start(c: &[char], i: usize) -> bool {
 /// Reads the tag at `i` (a `<`). `None` when it does not close within [`TAG_SCAN`].
 fn read_tag(c: &[char], i: usize, budget: &mut Budget) -> Option<(Tag, usize)> {
     let limit = (i + TAG_SCAN).min(c.len());
-    budget.spend(limit - i);
     let mut j = i + 1;
     let closing = c.get(j) == Some(&'/');
     if closing {
@@ -629,9 +628,12 @@ fn read_tag(c: &[char], i: usize, budget: &mut Budget) -> Option<(Tag, usize)> {
         }
         j += 1;
     }
+    // Only what was looked at is charged: a short tag is cheap, a failed one costs its window.
     if j >= limit || c[j] != '>' {
+        budget.spend(limit - i);
         return None;
     }
+    budget.spend(j + 1 - i);
     let attr_text = &c[attrs_start..j];
     let self_closing = attr_text.last() == Some(&'/');
     Some((

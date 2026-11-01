@@ -332,6 +332,20 @@ fn normalize_survives_hostile_markup_quickly() {
     }
 }
 
+// Short tags are charged their own length, so an ordinary tag-heavy posting is read whole.
+#[test]
+fn a_tag_heavy_posting_is_read_whole() {
+    let raw = "<span>x</span>".repeat(5_000) + "<p hidden>SECRET</p><b>tail</b>";
+    let (text, findings) = normalize(&raw);
+    assert_eq!(text.matches('x').count(), 5_000);
+    assert!(text.ends_with("tail\n") || text.ends_with("tail"));
+    assert!(!text.contains("SECRET"));
+    assert!(
+        findings.iter().all(|f| f.kind != "truncated"),
+        "{findings:?}"
+    );
+}
+
 #[test]
 fn normalize_drops_the_rest_when_markup_is_too_tangled_to_read() {
     let raw = "<a ".repeat(600_000) + "<p hidden>SECRET</p>tail";
