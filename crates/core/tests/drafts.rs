@@ -312,6 +312,15 @@ fn every_authorization_pattern_is_flagged_however_it_is_dressed() {
         "vi\u{200b}sa holder",
         "vi\u{00ad}sa holder",
         "vi\u{7}sa holder",
+        "authorized to\nwork",
+        "green\tcard",
+        "green\r\ncard",
+        "vi\u{b}sa holder",
+        "vi\u{c}sa holder",
+        "vi\u{85}sa holder",
+        "vi\u{fffe}sa holder",
+        "vi\u{ffff}sa holder",
+        "vi\u{e0100}sa holder",
         "vi\u{61c}sa holder",
         "vi\u{180e}sa holder",
         "vi\u{fff9}sa holder",
@@ -1286,6 +1295,47 @@ async fn marked_text_reaches_the_check_from_the_database() {
     reused.sections[0].heading = upload.sections[0].heading.clone();
     assert!(matches!(
         generate_doc(&db, reused, &good).await,
+        Err(Error::Validation(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_marked_item_does_not_turn_a_stock_heading_into_a_statement() {
+    let (_tmp, paths, db) = setup().await;
+    let good = user_item(&db, "Rust").await;
+    let references = user_item(&db, "References").await;
+    let skills = user_item(&db, "Skills").await;
+    let mut body = doc(&["Rust"]);
+    body.sections[0].heading = "REFERENCES:".into();
+    body.sections.push(Section {
+        heading: "Technical Skills".into(),
+        entries: Vec::new(),
+    });
+    let v1 = generate_doc(&db, body.clone(), &good).await.unwrap();
+    mark_in_place(&db, &references).await;
+    mark_in_place(&db, &skills).await;
+
+    let v2 = generate_doc(&db, body, &good).await.unwrap();
+    for draft in [&v1, &v2] {
+        assert_eq!(
+            drafts::compare(&db, &draft.id, None).await.unwrap().blocked,
+            0
+        );
+        assert!(export(&db, &paths, &draft.id).await.is_ok());
+    }
+    let claim = &drafts::claims(&db, &v2.id).await.unwrap()[0];
+    drafts::edit_claim(&db, &claim.id, input("Rust and C", &[&good]))
+        .await
+        .unwrap();
+
+    // Only the stock heading: a heading that merely holds the text is still scanned.
+    let mut upload = doc(&["Line."]);
+    upload.sections[0].heading = "Skills of a Spy".into();
+    uploaded(&db, upload).await;
+    let mut other = doc(&["Rust"]);
+    other.sections[0].heading = "Skills of a Spy".into();
+    assert!(matches!(
+        generate_doc(&db, other, &good).await,
         Err(Error::Validation(_))
     ));
 }

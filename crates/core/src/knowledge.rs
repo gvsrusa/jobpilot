@@ -533,8 +533,10 @@ pub(crate) fn clean_chars(input: &str, findings: &mut Vec<Finding>) -> String {
 /// Unicode's format characters (category Cf) and the characters that draw as a blank but
 /// count as letters or symbols, so nothing can hide between two letters. ZWNJ and ZWJ are
 /// left out because scripts and emoji use them; a caller matching words drops them itself.
-/// Combining marks, variation selectors among them, are not here: they carry meaning in
-/// text and [`unicode_normalization::char::is_combining_mark`] finds them.
+/// Combining marks are not here, variation selectors among them: they carry meaning in text
+/// (an emoji's style, the glyph of a Japanese name), which is why plane 14 skips U+E0100 to
+/// U+E01EF. A caller matching words drops them with
+/// [`unicode_normalization::char::is_combining_mark`].
 pub(crate) fn is_invisible(c: char) -> bool {
     matches!(c,
         '\u{ad}' | '\u{600}'..='\u{605}' | '\u{61c}' | '\u{6dd}' | '\u{70f}'
@@ -542,7 +544,7 @@ pub(crate) fn is_invisible(c: char) -> bool {
         | '\u{200b}' | '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
         | '\u{2060}'..='\u{206f}' | '\u{2800}' | '\u{3164}' | '\u{feff}' | '\u{ffa0}'
         | '\u{fff0}'..='\u{fffb}' | '\u{110bd}' | '\u{110cd}' | '\u{13430}'..='\u{1343f}'
-        | '\u{1bca0}'..='\u{1bca3}' | '\u{1d173}'..='\u{1d17a}' | '\u{e0000}'..='\u{e0fff}')
+        | '\u{1bca0}'..='\u{1bca3}' | '\u{1d173}'..='\u{1d17a}' | '\u{e0000}'..='\u{e00ff}' | '\u{e01f0}'..='\u{e0fff}')
 }
 
 fn collapse_blank_lines(text: &str) -> String {

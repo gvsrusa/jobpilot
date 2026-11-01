@@ -65,6 +65,17 @@ fn format_characters_and_blank_fillers_are_removed_from_job_text() {
     // Scripts and emoji need these two.
     let (text, _) = normalize("a\u{200c}b\u{200d}c");
     assert_eq!(text, "a\u{200c}b\u{200d}c");
+    // A variation selector picks a glyph, so a Japanese name keeps its form.
+    for selector in ['\u{e0100}', '\u{e01ef}', '\u{fe00}', '\u{fe0f}'] {
+        let name = format!("\u{8fbb}{selector}");
+        let (text, findings) = normalize(&name);
+        assert_eq!(text, name, "U+{:04X}", selector as u32);
+        assert!(findings.is_empty());
+    }
+    // Either side of them, plane 14 is still stripped.
+    for hidden in ['\u{e00ff}', '\u{e01f0}'] {
+        assert_eq!(normalize(&format!("vi{hidden}sa")).0, "visa");
+    }
 }
 
 #[tokio::test]

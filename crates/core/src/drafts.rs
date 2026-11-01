@@ -203,11 +203,13 @@ fn plain(text: &str) -> String {
 }
 
 /// Takes no room on the page, or is dropped by the renderer, so a model cannot use it to
-/// split a word the patterns look for. ZWNJ and ZWJ are only spared in stored text.
+/// split a word the patterns look for. Only tab and the line breaks separate words: the
+/// renderer's `clean` drops the other controls and U+FFFE, U+FFFF. ZWNJ and ZWJ are only
+/// spared in stored text.
 fn hides(c: char) -> bool {
-    (c.is_control() && !c.is_whitespace())
+    (c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
         || is_invisible(c)
-        || matches!(c, '\u{200c}' | '\u{200d}')
+        || matches!(c, '\u{200c}' | '\u{200d}' | '\u{fffe}' | '\u{ffff}')
 }
 
 /// Lower-case words split at anything that is not a letter or digit, after compatibility
@@ -412,7 +414,8 @@ fn profile_contacts(basic: &profile::ProfileBasic) -> HashSet<String> {
 /// Whether the name, contact, or a heading says what a claim could not: an authorization
 /// pattern or sealed text. These lines have no claim to carry a flag, and a stored draft does
 /// not vouch for them, because an upload makes any capitalised line a heading. Text typed
-/// into the profile, or entered verbatim as the user's evidence, is the user's statement.
+/// into the profile, or entered verbatim as the user's evidence, is the user's statement, and
+/// a stock heading says nothing, even when a marked item happens to hold the same word.
 async fn owned_field_states(db: &Db, doc: &ResumeDoc, when_locked: WhenLocked) -> Result<bool> {
     let basic = profile::basic(db).await?;
     let evidence = knowledge::evidence(db).await?;
@@ -421,7 +424,12 @@ async fn owned_field_states(db: &Db, doc: &ResumeDoc, when_locked: WhenLocked) -
     own.insert(plain(&basic.name));
     let spoken = |text: &str| !own.contains(&plain(text)) && !user_entered(text, &evidence);
     let mut fields: Vec<String> = std::iter::once(&doc.name)
-        .chain(doc.sections.iter().map(|section| &section.heading))
+        .chain(
+            doc.sections
+                .iter()
+                .map(|section| &section.heading)
+                .filter(|heading| !is_stock_heading(heading)),
+        )
         .filter(|field| spoken(field))
         .cloned()
         .collect();
@@ -486,6 +494,14 @@ async fn refuse_owned_statement(db: &Db, doc: &ResumeDoc) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn is_stock_heading(heading: &str) -> bool {
+    let key = heading_key(heading);
+    KNOWN_HEADINGS
+        .iter()
+        .chain(&SUMMARY_HEADINGS)
+        .any(|stock| *stock == key)
 }
 
 fn heading_key(heading: &str) -> String {
