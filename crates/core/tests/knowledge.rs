@@ -38,6 +38,35 @@ async fn unlocked_root(paths: &AppPaths) -> (Db, String, EntryGuard) {
     (db, key_id, guard)
 }
 
+#[test]
+fn format_characters_and_blank_fillers_are_removed_from_job_text() {
+    for hidden in [
+        '\u{ad}',
+        '\u{61c}',
+        '\u{180e}',
+        '\u{200b}',
+        '\u{200e}',
+        '\u{202e}',
+        '\u{2060}',
+        '\u{206a}',
+        '\u{115f}',
+        '\u{1160}',
+        '\u{2800}',
+        '\u{3164}',
+        '\u{feff}',
+        '\u{ffa0}',
+        '\u{fff9}',
+        '\u{e0001}',
+    ] {
+        let (text, findings) = normalize(&format!("vi{hidden}sa"));
+        assert_eq!(text, "visa", "U+{:04X}", hidden as u32);
+        assert!(findings.iter().any(|f| f.kind == "hidden_text"));
+    }
+    // Scripts and emoji need these two.
+    let (text, _) = normalize("a\u{200c}b\u{200d}c");
+    assert_eq!(text, "a\u{200c}b\u{200d}c");
+}
+
 #[tokio::test]
 async fn user_items_are_evidence_parsed_items_are_not_until_approved() {
     let (_tmp, paths) = temp_root();

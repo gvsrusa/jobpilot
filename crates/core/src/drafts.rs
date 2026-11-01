@@ -8,7 +8,8 @@
 //!
 //! What a document shows outside [`lines`] (name, contact, section headings) is not a
 //! claim, so a model must not be able to write it: [`create_version`] refuses any value
-//! that is not the user's. Only [`save_manual`], the user's own hand, skips that check.
+//! that is not the user's, and any value that states what a claim may not. [`save_manual`],
+//! the user's own hand, sets them freely, except for such a statement in a generated lineage.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -22,7 +23,7 @@ use unicode_normalization::char::is_combining_mark;
 use crate::audit;
 use crate::db::Db;
 use crate::error::{Error, Result};
-use crate::knowledge::{self, KnowledgeItem};
+use crate::knowledge::{self, KnowledgeItem, is_invisible};
 use crate::parse::{KNOWN_HEADINGS, SUMMARY_HEADINGS};
 use crate::profile;
 use crate::render::{Entry, ResumeDoc, Template, lines, to_docx, to_pdf};
@@ -95,24 +96,58 @@ impl ExportFormat {
     }
 }
 
-/// Matched as substrings of the folded claim, so `citizenship` counts.
+/// Matched at the start of a word of the folded text, so `citizenship` counts and
+/// `noncitizen` needs its own entry; [`WHOLE_WORD_PATTERNS`] must match a word exactly.
 // ponytail: this matches words, not meaning. A paraphrase passes ("my papers are in order"),
-// a look-alike letter from another script passes, and an honest "advisable" or "Visa Inc."
-// is flagged until it is reworded or entered by the user. The compare screen is the next gate.
+// a look-alike letter from another script passes, and an honest "Visa Inc." or "opt in" is
+// flagged until it is reworded or entered by the user. The compare screen is the next gate.
 pub const AUTHORIZATION_PATTERNS: &[&str] = &[
     "authorized to work",
     "authorised to work",
+    "unauthorized to work",
+    "unauthorised to work",
+    "authorization to work",
+    "authorisation to work",
     "work authorization",
     "work authorisation",
+    "work authorized",
+    "work authorised",
     "work permit",
+    "residence permit",
     "visa",
-    "sponsorship",
+    "visas",
+    "sponsor",
     "citizen",
+    "noncitizen",
     "permanent resident",
+    "permanent residence",
+    "permanent residency",
     "green card",
+    "blue card",
+    "passport",
     "right to work",
     "eligible to work",
+    "allowed to work",
+    "permitted to work",
+    "entitled to work",
+    "legally authorized",
+    "legally authorised",
+    "legally allowed",
+    "legally eligible",
+    "legally entitled",
+    "legally permitted",
+    "legally able to work",
+    "legally work",
+    "h1b",
+    "h 1b",
+    "h1 b",
+    "h 1 b",
+    "ead",
+    "opt",
 ];
+
+/// In [`AUTHORIZATION_PATTERNS`]: short enough to begin other words (`visage`, `option`).
+const WHOLE_WORD_PATTERNS: [&str; 4] = ["visa", "visas", "ead", "opt"];
 
 fn bad(message: &str) -> Error {
     Error::Validation(message.into())
@@ -168,12 +203,11 @@ fn plain(text: &str) -> String {
 }
 
 /// Takes no room on the page, or is dropped by the renderer, so a model cannot use it to
-/// split a word the patterns look for.
+/// split a word the patterns look for. ZWNJ and ZWJ are only spared in stored text.
 fn hides(c: char) -> bool {
     (c.is_control() && !c.is_whitespace())
-        || matches!(c,
-            '\u{ad}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}'
-            | '\u{feff}' | '\u{e0000}'..='\u{e007f}')
+        || is_invisible(c)
+        || matches!(c, '\u{200c}' | '\u{200d}')
 }
 
 /// Lower-case words split at anything that is not a letter or digit, after compatibility
@@ -186,6 +220,32 @@ fn fold(text: &str) -> String {
         .map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect();
     words.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn states_authorization(text: &str) -> bool {
+    let folded = format!(" {} ", fold(text));
+    AUTHORIZATION_PATTERNS.iter().any(|pattern| {
+        if WHOLE_WORD_PATTERNS.contains(pattern) {
+            folded.contains(&format!(" {pattern} "))
+        } else {
+            folded.contains(&format!(" {pattern}"))
+        }
+    })
+}
+
+/// For each line, whether `hit` holds for it, or for it and its neighbour read as one line,
+/// which is how they sit on the page. Only a statement neither half makes alone marks both:
+/// a line that makes one itself does not taint the line beside it.
+fn hits_by_line(texts: &[&str], hit: impl Fn(&str) -> bool) -> Vec<bool> {
+    let alone: Vec<bool> = texts.iter().map(|text| hit(text)).collect();
+    let mut found = alone.clone();
+    for i in 1..texts.len() {
+        if !alone[i - 1] && !alone[i] && hit(&format!("{} {}", texts[i - 1], texts[i])) {
+            found[i - 1] = true;
+            found[i] = true;
+        }
+    }
+    found
 }
 
 fn usable(item: &KnowledgeItem) -> bool {
@@ -204,8 +264,9 @@ fn user_entered(text: &str, evidence: &[KnowledgeItem]) -> bool {
 /// `evidence` (approved, unmarked, user or approved-parsed). Any claim text matching the
 /// authorization patterns gets status `authorization_statement` unless the same sentence
 /// (case-folded, whitespace-collapsed) is the body of an evidence item the user entered
-/// (`source = 'user'`). That status comes first, so an uncited statement is reported as what
-/// it is. Items in `evidence` that are not usable count for nothing. Each `id` is empty.
+/// (`source = 'user'`). A statement split across two neighbouring claims flags both. That
+/// status comes first, so an uncited statement is reported as what it is. Items in `evidence`
+/// that are not usable count for nothing. Each `id` is empty.
 // ponytail: proves only that cited ids are real evidence, not that the evidence supports the
 // wording (threat path 11); the compare screen is the second gate.
 pub fn check_claims(claims: &[ClaimInput], evidence: &[KnowledgeItem]) -> Vec<Claim> {
@@ -214,9 +275,9 @@ pub fn check_claims(claims: &[ClaimInput], evidence: &[KnowledgeItem]) -> Vec<Cl
         .filter(|e| usable(e))
         .map(|e| e.id.as_str())
         .collect();
-    let status = |claim: &ClaimInput| {
-        let folded = fold(&claim.text);
-        let stated = AUTHORIZATION_PATTERNS.iter().any(|p| folded.contains(p));
+    let texts: Vec<&str> = claims.iter().map(|claim| claim.text.as_str()).collect();
+    let stated = hits_by_line(&texts, states_authorization);
+    let status = |claim: &ClaimInput, stated: bool| {
         if stated && !user_entered(&claim.text, evidence) {
             "authorization_statement"
         } else if claim.evidence_ids.is_empty()
@@ -232,13 +293,14 @@ pub fn check_claims(claims: &[ClaimInput], evidence: &[KnowledgeItem]) -> Vec<Cl
     };
     claims
         .iter()
+        .zip(stated)
         .enumerate()
-        .map(|(position, claim)| Claim {
+        .map(|(position, (claim, stated))| Claim {
             id: String::new(),
             position: position as i64,
             text: claim.text.clone(),
             evidence_ids: claim.evidence_ids.clone(),
-            status: status(claim).into(),
+            status: status(claim, stated).into(),
         })
         .collect()
 }
@@ -287,13 +349,17 @@ fn holds(text: &str, sealed: &[String]) -> bool {
 /// A note is a statement about authorization; a marked text is at least not evidence. The
 /// exemption is the one [`check_claims`] gives: the user typed this very sentence as evidence.
 fn flag_sealed(claims: &mut [Claim], evidence: &[KnowledgeItem], sealed: &Sealed) {
-    for claim in claims.iter_mut() {
+    let texts: Vec<String> = claims.iter().map(|claim| claim.text.clone()).collect();
+    let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let notes = hits_by_line(&texts, |text| holds(text, &sealed.notes));
+    let marked = hits_by_line(&texts, |text| holds(text, &sealed.marked));
+    for ((claim, note), mark) in claims.iter_mut().zip(notes).zip(marked) {
         if user_entered(&claim.text, evidence) {
             continue;
         }
-        if holds(&claim.text, &sealed.notes) {
+        if note {
             claim.status = "authorization_statement".into();
-        } else if claim.status == "ok" && holds(&claim.text, &sealed.marked) {
+        } else if claim.status == "ok" && mark {
             claim.status = "no_evidence".into();
         }
     }
@@ -316,31 +382,71 @@ fn is_key_error(error: &Error) -> bool {
     )
 }
 
-async fn review(db: &Db, inputs: &[ClaimInput], when_locked: WhenLocked) -> Result<Vec<Claim>> {
+async fn readable_sealed_text(db: &Db, when_locked: WhenLocked) -> Result<Sealed> {
+    match sealed_text(db).await {
+        Err(error) if matches!(when_locked, WhenLocked::Proceed) && is_key_error(&error) => {
+            Ok(Sealed::default())
+        }
+        other => other,
+    }
+}
+
+async fn review(db: &Db, inputs: &[ClaimInput]) -> Result<Vec<Claim>> {
     let evidence = knowledge::evidence(db).await?;
     let mut claims = check_claims(inputs, &evidence);
-    match sealed_text(db).await {
-        Ok(sealed) => flag_sealed(&mut claims, &evidence, &sealed),
-        Err(error) if matches!(when_locked, WhenLocked::Proceed) && is_key_error(&error) => {}
-        Err(error) => return Err(error),
-    }
+    let sealed = readable_sealed_text(db, WhenLocked::Proceed).await?;
+    flag_sealed(&mut claims, &evidence, &sealed);
     Ok(claims)
 }
 
+/// What the profile says the user's contact details are.
+fn profile_contacts(basic: &profile::ProfileBasic) -> HashSet<String> {
+    std::iter::once(&basic.email)
+        .chain(&basic.countries)
+        .chain(&basic.regions)
+        .chain(&basic.cities)
+        .map(|value| plain(value))
+        .collect()
+}
+
+/// Whether the name, contact, or a heading says what a claim could not: an authorization
+/// pattern or sealed text. These lines have no claim to carry a flag, and a stored draft does
+/// not vouch for them, because an upload makes any capitalised line a heading. Text typed
+/// into the profile, or entered verbatim as the user's evidence, is the user's statement.
+async fn owned_field_states(db: &Db, doc: &ResumeDoc, when_locked: WhenLocked) -> Result<bool> {
+    let basic = profile::basic(db).await?;
+    let evidence = knowledge::evidence(db).await?;
+    let sealed = readable_sealed_text(db, when_locked).await?;
+    let mut own = profile_contacts(&basic);
+    own.insert(plain(&basic.name));
+    let spoken = |text: &str| !own.contains(&plain(text)) && !user_entered(text, &evidence);
+    let mut fields: Vec<String> = std::iter::once(&doc.name)
+        .chain(doc.sections.iter().map(|section| &section.heading))
+        .filter(|field| spoken(field))
+        .cloned()
+        .collect();
+    // Contact entries print on one line, so they are read as one.
+    let contact: Vec<&str> = doc
+        .contact
+        .iter()
+        .map(String::as_str)
+        .filter(|entry| spoken(entry))
+        .collect();
+    fields.push(contact.join(" "));
+    Ok(fields.iter().any(|field| {
+        states_authorization(field) || holds(field, &sealed.notes) || holds(field, &sealed.marked)
+    }))
+}
+
 /// The name, contact, and headings must be the user's: from the profile, a stock heading, or
-/// any stored version. Those were the user's own, or passed this check, so a draft stays
-/// editable after the profile changes.
+/// any stored version, so a draft stays editable after the profile changes. Being the user's
+/// says only who wrote the value; [`owned_field_states`] judges what it says.
 // ponytail: a heading outside these fails the whole draft with `Err(Validation)`, like a claim
 // mismatch; the Task 15 prompt has to name the stock headings.
 async fn check_user_owned(db: &Db, doc: &ResumeDoc) -> Result<()> {
     let basic = profile::basic(db).await?;
     let mut names = HashSet::from([plain(&basic.name)]);
-    let mut contacts: HashSet<String> = std::iter::once(&basic.email)
-        .chain(&basic.countries)
-        .chain(&basic.regions)
-        .chain(&basic.cities)
-        .map(|value| plain(value))
-        .collect();
+    let mut contacts = profile_contacts(&basic);
     let mut headings: HashSet<String> = KNOWN_HEADINGS
         .iter()
         .chain(&SUMMARY_HEADINGS)
@@ -368,6 +474,16 @@ async fn check_user_owned(db: &Db, doc: &ResumeDoc) -> Result<()> {
         .all(|s| theirs(&headings, heading_key(&s.heading)))
     {
         return Err(bad("a generated draft cannot invent a section heading"));
+    }
+    refuse_owned_statement(db, doc).await
+}
+
+async fn refuse_owned_statement(db: &Db, doc: &ResumeDoc) -> Result<()> {
+    if owned_field_states(db, doc, WhenLocked::Proceed).await? {
+        return Err(bad(
+            "the name, contact, or a heading states work authorization or sealed text; \
+             enter the sentence as your own knowledge item to keep it",
+        ));
     }
     Ok(())
 }
@@ -480,8 +596,14 @@ pub async fn create_version(
     };
     let checked = match origin {
         "uploaded" => {
-            if lineage_id.is_some() || !claims.is_empty() {
-                return Err(bad("an upload starts a new lineage and has no claims"));
+            if lineage_id.is_some()
+                || !claims.is_empty()
+                || provider.is_some()
+                || job_text_id.is_some()
+            {
+                return Err(bad(
+                    "an upload starts a new lineage with no claims, provider, or job text",
+                ));
             }
             Vec::new()
         }
@@ -494,7 +616,7 @@ pub async fn create_version(
                 return Err(bad("the claims must be the lines of the document"));
             }
             check_user_owned(db, &doc).await?;
-            review(db, &claims, WhenLocked::Proceed).await?
+            review(db, &claims).await?
         }
         _ => return Err(bad("an origin is uploaded, generated, or edited")),
     };
@@ -577,24 +699,20 @@ fn inputs_of(claims: &[Claim]) -> Vec<ClaimInput> {
         .collect()
 }
 
-/// Stored claims with a stored `ok` re-judged against the evidence as it is now.
-async fn current(db: &Db, draft_id: &str, when_locked: WhenLocked) -> Result<Vec<Claim>> {
+/// The claims as an export would judge them now: a stored `ok` is judged again, a stored
+/// flag stands. See the module notes.
+pub async fn claims(db: &Db, draft_id: &str) -> Result<Vec<Claim>> {
     let mut claims = stored_claims(db, draft_id).await?;
     if claims.is_empty() {
         return Ok(claims);
     }
-    let live = review(db, &inputs_of(&claims), when_locked).await?;
+    let live = review(db, &inputs_of(&claims)).await?;
     for (claim, live) in claims.iter_mut().zip(live) {
         if claim.status == "ok" {
             claim.status = live.status;
         }
     }
     Ok(claims)
-}
-
-/// The claims as an export would judge them now; see the module notes.
-pub async fn claims(db: &Db, draft_id: &str) -> Result<Vec<Claim>> {
-    current(db, draft_id, WhenLocked::Proceed).await
 }
 
 /// The fields of [`lines`], in its order. Clearing one takes it out of the document.
@@ -616,8 +734,8 @@ fn line_slots(doc: &mut ResumeDoc) -> Vec<&mut String> {
         .collect()
 }
 
-/// A new `edited` version of the claim's own version, with that line changed or gone. Later
-/// versions stay in the lineage, but their changes are not in this one.
+/// A new `edited` version with that line changed or gone. The claim must be from the
+/// lineage's latest version: forking an older one would bring back what was removed since.
 async fn revise(db: &Db, claim_id: &str, replacement: Option<ClaimInput>) -> Result<Draft> {
     let (draft_id, position): (String, i64) =
         sqlx::query_as("SELECT draft_id, position FROM claims WHERE id = ?")
@@ -626,6 +744,13 @@ async fn revise(db: &Db, claim_id: &str, replacement: Option<ClaimInput>) -> Res
             .await?
             .ok_or(Error::NotFound)?;
     let draft = get(db, &draft_id).await?;
+    let latest: i64 = sqlx::query_scalar("SELECT max(version) FROM drafts WHERE lineage_id = ?")
+        .bind(&draft.lineage_id)
+        .fetch_one(&db.pool)
+        .await?;
+    if draft.version != latest {
+        return Err(Error::Refused("not_latest_version".into()));
+    }
     let stored = stored_claims(db, &draft_id).await?;
     let mut doc = draft.doc;
     let slot = usize::try_from(position)
@@ -677,7 +802,8 @@ pub async fn remove_claim(db: &Db, claim_id: &str) -> Result<Draft> {
 /// The user's own edit (FR-3.23), `edited`. The title comes from the lineage's latest
 /// version, else `doc.name`. In a lineage with a generated version each line keeps the
 /// evidence of the claim with the same text and other lines get none, so they block export.
-/// Any other lineage stores no claims. The name, contact, and headings are the user's to set.
+/// Any other lineage stores no claims. The name, contact, and headings are the user's to set,
+/// but in a lineage with a generated version they may not state authorization or sealed text.
 pub async fn save_manual(
     db: &Db,
     kind: &str,
@@ -702,6 +828,7 @@ pub async fn save_manual(
     };
     let claims = match (&latest, generated) {
         (Some(latest), true) => {
+            refuse_owned_statement(db, &doc).await?;
             let prior = stored_claims(db, &latest.id).await?;
             let inputs: Vec<ClaimInput> = lines(&doc)
                 .into_iter()
@@ -714,7 +841,7 @@ pub async fn save_manual(
                     text: line,
                 })
                 .collect();
-            review(db, &inputs, WhenLocked::Proceed).await?
+            review(db, &inputs).await?
         }
         _ => Vec::new(),
     };
@@ -762,7 +889,11 @@ pub async fn compare(db: &Db, generated_id: &str, original_id: Option<&str>) -> 
         .into_iter()
         .filter(|item| cited.contains(&item.id))
         .collect();
-    let blocked = generated.iter().filter(|c| c.status != "ok").count();
+    let flagged = generated.iter().filter(|c| c.status != "ok").count();
+    // Export refuses for this too, for instance sealed text marked since the draft was stored.
+    let stated = holds_generated_text(db, &draft).await?
+        && owned_field_states(db, &draft.doc, WhenLocked::Proceed).await?;
+    let blocked = flagged + usize::from(stated);
     Ok(Compare {
         original,
         generated,
@@ -817,8 +948,8 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(written?)
 }
 
-/// `Err(Refused("claims_blocked"))` when a claim is not `ok` now, or the claims are not the
-/// document's lines. `Err(Locked)` or a key error while a sealed text cannot be read, since
+/// `Err(Refused("claims_blocked"))` when a claim is not `ok` now, the claims are not the
+/// document's lines, or the name, contact, or a heading now states what a claim may not. `Err(Locked)` or a key error while a sealed text cannot be read, since
 /// the draft cannot then be shown free of it. Neither writes a file. The file is
 /// `<title-slug>-v<version>.<docx|pdf>` under `out_dir`, replacing one of that name.
 // ponytail: two lineages with one title share a file name, and the later export wins.
@@ -832,9 +963,12 @@ pub async fn export(
 ) -> Result<PathBuf> {
     let draft = get(db, draft_id).await?;
     if holds_generated_text(db, &draft).await? {
-        let claims = current(db, draft_id, WhenLocked::Refuse).await?;
+        // First, so sealed text that cannot be read refuses before `claims` looks past it.
+        let stated = owned_field_states(db, &draft.doc, WhenLocked::Refuse).await?;
+        let claims = claims(db, draft_id).await?;
         let aligned = claims.iter().map(|c| &c.text).eq(lines(&draft.doc).iter());
-        if !aligned || claims.iter().any(|claim| claim.status != "ok") {
+        let flagged = claims.iter().any(|claim| claim.status != "ok");
+        if !aligned || flagged || stated {
             return Err(Error::Refused("claims_blocked".into()));
         }
     }
@@ -946,6 +1080,33 @@ mod tests {
         let s = sealed(&["no", "Yes", "N/A", "none", "  "], &[]);
         assert!(s.notes.is_empty());
         assert_eq!(flagged("No downtime, none lost", "ok", &[], &s), "ok");
+    }
+
+    #[test]
+    fn a_sealed_text_split_across_two_claims_flags_both() {
+        let s = sealed(&["Residence card D7"], &["Treated for a rare condition"]);
+        let flag = |texts: [&str; 3]| {
+            let mut claims = texts.map(|text| claim(text, "ok"));
+            flag_sealed(&mut claims, &[], &s);
+            claims.map(|c| c.status)
+        };
+        assert_eq!(
+            flag(["Rust", "Residence", "card D7"]),
+            ["ok", "authorization_statement", "authorization_statement"]
+        );
+        assert_eq!(
+            flag(["Treated for", "a rare condition", "Rust"]),
+            ["no_evidence", "no_evidence", "ok"]
+        );
+    }
+
+    #[test]
+    fn one_line_stating_something_does_not_taint_its_neighbour() {
+        let hit = |text: &str| text.contains("visa");
+        assert_eq!(hits_by_line(&["a visa", "b"], hit), [true, false]);
+        assert_eq!(hits_by_line(&["vi", "sa"], |t| t == "vi sa"), [true, true]);
+        assert_eq!(hits_by_line(&["a"], hit), [false]);
+        assert!(hits_by_line(&[], hit).is_empty());
     }
 
     #[test]

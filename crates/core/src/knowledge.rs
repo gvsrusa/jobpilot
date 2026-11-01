@@ -502,9 +502,7 @@ fn skip_escape(c: &[char], i: usize, cache: &mut Terminator) -> usize {
 }
 
 /// Controls other than `\n` and `\t` go; `\r\n` and a lone `\r` become `\n`. So do the
-/// characters that hide text without a tag: tag characters, bidi overrides, zero-width
-/// space, word joiner, and the byte-order mark. ZWNJ and ZWJ stay because scripts and
-/// emoji use them.
+/// characters that hide text without a tag ([`is_invisible`]).
 pub(crate) fn clean_chars(input: &str, findings: &mut Vec<Finding>) -> String {
     let mut out = String::with_capacity(input.len());
     let mut hidden = 0usize;
@@ -532,12 +530,19 @@ pub(crate) fn clean_chars(input: &str, findings: &mut Vec<Finding>) -> String {
     out
 }
 
-/// Characters that take no room on screen: tag characters, bidi overrides, zero-width
-/// space, word joiner, and the byte-order mark.
-fn is_invisible(c: char) -> bool {
+/// Unicode's format characters (category Cf) and the characters that draw as a blank but
+/// count as letters or symbols, so nothing can hide between two letters. ZWNJ and ZWJ are
+/// left out because scripts and emoji use them; a caller matching words drops them itself.
+/// Combining marks, variation selectors among them, are not here: they carry meaning in
+/// text and [`unicode_normalization::char::is_combining_mark`] finds them.
+pub(crate) fn is_invisible(c: char) -> bool {
     matches!(c,
-        '\u{200b}' | '\u{2060}' | '\u{feff}' | '\u{202a}'..='\u{202e}'
-        | '\u{2066}'..='\u{2069}' | '\u{e0000}'..='\u{e007f}')
+        '\u{ad}' | '\u{600}'..='\u{605}' | '\u{61c}' | '\u{6dd}' | '\u{70f}'
+        | '\u{890}'..='\u{891}' | '\u{8e2}' | '\u{115f}'..='\u{1160}' | '\u{180e}'
+        | '\u{200b}' | '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+        | '\u{2060}'..='\u{206f}' | '\u{2800}' | '\u{3164}' | '\u{feff}' | '\u{ffa0}'
+        | '\u{fff0}'..='\u{fffb}' | '\u{110bd}' | '\u{110cd}' | '\u{13430}'..='\u{1343f}'
+        | '\u{1bca0}'..='\u{1bca3}' | '\u{1d173}'..='\u{1d17a}' | '\u{e0000}'..='\u{e0fff}')
 }
 
 fn collapse_blank_lines(text: &str) -> String {

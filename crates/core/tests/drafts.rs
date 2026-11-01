@@ -253,6 +253,30 @@ async fn authorization_statement_is_flagged_unless_user_entered_verbatim() {
     assert_eq!(statuses(&db, &draft.id).await, ["authorization_statement"]);
     assert!(blocked(&export(&db, &paths, &draft.id).await));
 
+    // Two lines read as one on the page. Only the pair is flagged, not its neighbours.
+    let split = generated(
+        &db,
+        None,
+        vec![
+            input("Rust", &[&parsed]),
+            input("Authorized to", &[&parsed]),
+            input("work in Canada", &[&parsed]),
+            input("Python", &[&parsed]),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        statuses(&db, &split.id).await,
+        [
+            "ok",
+            "authorization_statement",
+            "authorization_statement",
+            "ok"
+        ]
+    );
+    assert!(blocked(&export(&db, &paths, &split.id).await));
+
     let own = user_item(&db, AUTH).await;
     let draft = generated(&db, None, vec![input(AUTH, &[&own])])
         .await
@@ -288,6 +312,30 @@ fn every_authorization_pattern_is_flagged_however_it_is_dressed() {
         "vi\u{200b}sa holder",
         "vi\u{00ad}sa holder",
         "vi\u{7}sa holder",
+        "vi\u{61c}sa holder",
+        "vi\u{180e}sa holder",
+        "vi\u{fff9}sa holder",
+        "vi\u{206a}sa holder",
+        "vi\u{115f}sa holder",
+        "vi\u{1160}sa holder",
+        "vi\u{3164}sa holder",
+        "vi\u{ffa0}sa holder",
+        "vi\u{2800}sa holder",
+        "vi\u{200d}sa holder",
+        "vi\u{200c}sa holder",
+        "vi\u{fe0f}sa holder",
+        "vi\u{e0001}sa holder",
+        "visas issued",
+        "H-1B holder",
+        "h1b holder",
+        "On OPT until June",
+        "Holds an EAD",
+        "Sponsored by my employer",
+        "EU Blue Card",
+        "German passport",
+        "Permanent residency",
+        "legally allowed here",
+        "unauthorized to work",
         "citi\u{2060}zen of Spain",
         "\u{ff56}\u{ff49}\u{ff53}\u{ff41} holder",
         "v\u{0456}sa".replace('\u{0456}', "i\u{0301}").as_str(),
@@ -297,7 +345,20 @@ fn every_authorization_pattern_is_flagged_however_it_is_dressed() {
     ] {
         assert_eq!(status(dressed), "authorization_statement", "{dressed}");
     }
-    assert_eq!(status("Built an authorization service"), "ok");
+    for honest in [
+        "Built an authorization service",
+        "It is advisable to test",
+        "Improvisation classes",
+        "A visage of calm",
+        "Adopted Rust",
+        "Option pricing",
+        "Led a team",
+        "Read widely",
+        "Optimized queries",
+        "Unsponsored side project",
+    ] {
+        assert_eq!(status(honest), "ok", "{honest}");
+    }
     assert_eq!(
         status("Worked with citizens' data"),
         "authorization_statement"
@@ -501,14 +562,16 @@ async fn an_edit_is_checked_again() {
     assert_eq!(statuses(&db, &invented.id).await, ["no_evidence"]);
     assert!(blocked(&export(&db, &paths, &invented.id).await));
 
-    let stated = drafts::edit_claim(&db, &claim.id, input(AUTH, &[&id]))
+    let latest = &drafts::claims(&db, &invented.id).await.unwrap()[0];
+    let stated = drafts::edit_claim(&db, &latest.id, input(AUTH, &[&id]))
         .await
         .unwrap();
     assert_eq!(statuses(&db, &stated.id).await, ["authorization_statement"]);
     assert!(blocked(&export(&db, &paths, &stated.id).await));
 
+    let latest = &drafts::claims(&db, &stated.id).await.unwrap()[0];
     assert!(matches!(
-        drafts::edit_claim(&db, &claim.id, input("  ", &[&id])).await,
+        drafts::edit_claim(&db, &latest.id, input("  ", &[&id])).await,
         Err(Error::Validation(_))
     ));
     assert!(matches!(
@@ -684,7 +747,7 @@ async fn a_generated_draft_cannot_set_a_heading_name_or_contact() {
     let mut name = doc(&["Rust"]);
     name.name = "Dr. Ada Lovelace, PhD".into();
     let mut contact = doc(&["Rust"]);
-    contact.contact = vec!["US citizen".into()];
+    contact.contact = vec!["Licensed pilot".into()];
     // The check is on what is shown, so an empty section is held to it too.
     let mut empty_section = doc(&["Rust"]);
     empty_section.sections.push(Section {
@@ -818,6 +881,154 @@ async fn the_user_may_retitle_a_heading_in_a_generated_lineage() {
     assert_eq!(v3.doc.name, "Ada Lovelace");
 }
 
+#[tokio::test]
+async fn an_older_version_cannot_be_forked_to_bring_a_line_back() {
+    let (_tmp, paths, db) = setup().await;
+    let id = user_item(&db, "Rust").await;
+    let v1 = generated(
+        &db,
+        None,
+        vec![input("Rust", &[&id]), input("Unwanted line", &[&id])],
+    )
+    .await
+    .unwrap();
+    let old = drafts::claims(&db, &v1.id).await.unwrap();
+    let v2 = drafts::remove_claim(&db, &old[1].id).await.unwrap();
+
+    for result in [
+        drafts::edit_claim(&db, &old[0].id, input("Rust and C", &[&id])).await,
+        drafts::remove_claim(&db, &old[0].id).await,
+    ] {
+        assert!(matches!(result, Err(Error::Refused(r)) if r == "not_latest_version"));
+    }
+    assert_eq!(
+        drafts::versions(&db, &v1.lineage_id).await.unwrap().len(),
+        2
+    );
+    let kept = drafts::claims(&db, &v2.id).await.unwrap();
+    let v3 = drafts::edit_claim(&db, &kept[0].id, input("Rust and C", &[&id]))
+        .await
+        .unwrap();
+    assert_eq!(lines(&v3.doc), ["Rust and C"]);
+    assert!(export(&db, &paths, &v3.id).await.is_ok());
+}
+
+/// The upload an attacker needs nothing else for: `sectionize` makes any ALL CAPS line a
+/// heading and any `|` line contact, so these values are "the user's" by the stored check.
+#[tokio::test]
+async fn a_statement_in_an_uploaded_heading_or_contact_is_not_carried_into_a_generated_draft() {
+    let (_tmp, _paths, db) = setup().await;
+    let id = user_item(&db, "Rust").await;
+    let mut upload = doc(&["Line."]);
+    upload.contact = vec![
+        "US Citizen".into(),
+        "ada@example.com".into(),
+        "Authorized to".into(),
+        "work in Canada".into(),
+    ];
+    upload.sections[0].heading = "US CITIZEN NO SPONSORSHIP NEEDED".into();
+    uploaded(&db, upload.clone()).await;
+    let before = drafts::list(&db, None).await.unwrap().len();
+
+    let mut heading = doc(&["Rust"]);
+    heading.sections[0].heading = upload.sections[0].heading.clone();
+    let mut contact = doc(&["Rust"]);
+    contact.contact = vec!["US Citizen".into(), "ada@example.com".into()];
+    let mut split = doc(&["Rust"]);
+    split.contact = vec!["Authorized to".into(), "work in Canada".into()];
+    let mut name = doc(&["Rust"]);
+    name.name = "Visa Holder".into();
+    uploaded(
+        &db,
+        ResumeDoc {
+            name: "Visa Holder".into(),
+            ..ResumeDoc::default()
+        },
+    )
+    .await;
+    let before = before + 1;
+
+    for (label, body) in [
+        ("heading", heading),
+        ("contact", contact),
+        ("split contact", split),
+        ("name", name),
+    ] {
+        assert!(
+            matches!(
+                generate_doc(&db, body, &id).await,
+                Err(Error::Validation(_))
+            ),
+            "{label}"
+        );
+    }
+    assert_eq!(drafts::list(&db, None).await.unwrap().len(), before);
+}
+
+#[tokio::test]
+async fn an_uploaded_heading_is_not_held_against_the_upload_itself() {
+    let (_tmp, paths, db) = setup().await;
+    let id = user_item(&db, "Rust").await;
+    let mut upload = doc(&["Line."]);
+    upload.sections[0].heading = "VISA STATUS".into();
+    let v1 = uploaded(&db, upload).await;
+    generated(&db, Some(&v1.lineage_id), vec![input("Rust", &[&id])])
+        .await
+        .unwrap();
+    assert_eq!(drafts::compare(&db, &v1.id, None).await.unwrap().blocked, 0);
+    assert!(export(&db, &paths, &v1.id).await.is_ok());
+}
+
+#[tokio::test]
+async fn profile_values_and_verbatim_evidence_may_read_like_a_statement() {
+    let (_tmp, _paths, db) = setup().await;
+    let id = user_item(&db, "Rust").await;
+    let basic = ProfileBasic {
+        name: "Vera Visa".into(),
+        email: "citizen.kane@example.com".into(),
+        ..ProfileBasic::default()
+    };
+    profile::set_basic(&db, basic).await.unwrap();
+    let mut body = doc(&["Rust"]);
+    body.name = "Vera Visa".into();
+    body.contact = vec!["citizen.kane@example.com".into()];
+    generate_doc(&db, body, &id).await.unwrap();
+
+    // The user can keep such a line, by saying it themselves.
+    let mut upload = doc(&["Line."]);
+    upload.sections[0].heading = "Sponsorship Work".into();
+    uploaded(&db, upload).await;
+    let mut reused = doc(&["Rust"]);
+    reused.name = "Vera Visa".into();
+    reused.contact = Vec::new();
+    reused.sections[0].heading = "Sponsorship Work".into();
+    assert!(matches!(
+        generate_doc(&db, reused.clone(), &id).await,
+        Err(Error::Validation(_))
+    ));
+    user_item(&db, "sponsorship  work").await;
+    generate_doc(&db, reused, &id).await.unwrap();
+}
+
+#[tokio::test]
+async fn the_user_cannot_type_a_statement_into_a_generated_lineage_but_can_elsewhere() {
+    let (_tmp, paths, db) = setup().await;
+    let id = user_item(&db, "Rust").await;
+    let v1 = generated(&db, None, vec![input("Rust", &[&id])])
+        .await
+        .unwrap();
+    let mut body = doc(&["Rust"]);
+    body.sections[0].heading = "Visa Status".into();
+    assert!(matches!(
+        drafts::save_manual(&db, "resume", Some(&v1.lineage_id), body.clone()).await,
+        Err(Error::Validation(_))
+    ));
+    let own = drafts::save_manual(&db, "resume", None, body)
+        .await
+        .unwrap();
+    assert!(export(&db, &paths, &own.id).await.is_ok());
+}
+
 // ---- what create_version refuses -------------------------------------------------------
 
 #[tokio::test]
@@ -865,6 +1076,10 @@ async fn generated_claims_must_equal_the_lines() {
 async fn origins_and_lineages_are_held_to_their_rules() {
     let (_tmp, _paths, db) = setup().await;
     let id = user_item(&db, "Rust").await;
+    let job = knowledge::import_job_text(&db, "Job", "A posting.")
+        .await
+        .unwrap()
+        .id;
     let v1 = uploaded(&db, doc(&["Mine."])).await;
     let gen_lineage = generated(&db, None, vec![input("Rust", &[&id])])
         .await
@@ -933,6 +1148,21 @@ async fn origins_and_lineages_are_held_to_their_rules() {
         call("resume", None, "invented", vec![]).await,
         Err(Error::Validation(_))
     ));
+    for (provider, job_text) in [(Some("ollama"), None), (None, Some(job.as_str()))] {
+        let result = drafts::create_version(
+            &db,
+            "resume",
+            None,
+            "uploaded",
+            "T",
+            job_text,
+            provider,
+            doc(&["Rust"]),
+            Vec::new(),
+        )
+        .await;
+        assert!(matches!(result, Err(Error::Validation(_))));
+    }
     let blank = drafts::create_version(
         &db,
         "resume",
@@ -999,6 +1229,89 @@ async fn a_claim_row_that_went_missing_blocks_export() {
         .execute(&db.pool)
         .await
         .unwrap();
+    assert!(blocked(&export(&db, &paths, &draft.id).await));
+}
+
+/// A marked row with its text still readable: `review` then has sealed text to work with and
+/// no keychain to ask. The app never leaves a row like this; `mark_sensitive` seals the body.
+async fn mark_in_place(db: &Db, id: &str) {
+    sqlx::query("UPDATE knowledge_items SET marked_sensitive = 1 WHERE id = ?")
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn marked_text_reaches_the_check_from_the_database() {
+    let (_tmp, paths, db) = setup().await;
+    let good = user_item(&db, "Rust").await;
+    let marked = user_item(&db, "Treated for a rare condition").await;
+    mark_in_place(&db, &marked).await;
+
+    let draft = generated(
+        &db,
+        None,
+        vec![
+            input("Rust", &[&good]),
+            input("Was treated for a RARE condition.", &[&good]),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(statuses(&db, &draft.id).await, ["ok", "no_evidence"]);
+    assert!(blocked(&export(&db, &paths, &draft.id).await));
+
+    // Split over two lines, it is still on the page.
+    let split = generated(
+        &db,
+        None,
+        vec![
+            input("Treated for a", &[&good]),
+            input("rare condition", &[&good]),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        statuses(&db, &split.id).await,
+        ["no_evidence", "no_evidence"]
+    );
+
+    // In a heading it has no claim to carry a flag, so the draft is refused.
+    let mut upload = doc(&["Line."]);
+    upload.sections[0].heading = "Treated for a rare condition".into();
+    uploaded(&db, upload.clone()).await;
+    let mut reused = doc(&["Rust"]);
+    reused.sections[0].heading = upload.sections[0].heading.clone();
+    assert!(matches!(
+        generate_doc(&db, reused, &good).await,
+        Err(Error::Validation(_))
+    ));
+}
+
+#[tokio::test]
+async fn text_marked_after_the_draft_blocks_an_owned_field_at_export() {
+    let (_tmp, paths, db) = setup().await;
+    let good = user_item(&db, "Rust").await;
+    let later = user_item(&db, "Selected Papers").await;
+    let mut upload = doc(&["Line."]);
+    upload.sections[0].heading = "Selected Papers".into();
+    uploaded(&db, upload).await;
+    let mut body = doc(&["Rust"]);
+    body.sections[0].heading = "Selected Papers".into();
+    let draft = generate_doc(&db, body, &good).await.unwrap();
+    assert!(export(&db, &paths, &draft.id).await.is_ok());
+    assert_eq!(
+        drafts::compare(&db, &draft.id, None).await.unwrap().blocked,
+        0
+    );
+
+    mark_in_place(&db, &later).await;
+    assert_eq!(
+        drafts::compare(&db, &draft.id, None).await.unwrap().blocked,
+        1
+    );
     assert!(blocked(&export(&db, &paths, &draft.id).await));
 }
 
