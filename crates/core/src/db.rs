@@ -19,6 +19,10 @@ pub fn app_schema_version() -> i64 {
 /// An open, migrated database. Holds a shared lock on `jobpilot.lock` for its
 /// whole life: any number of handles may coexist, and backup restore or delete
 /// takes the exclusive lock, so it fails with `InUse` while one is open.
+///
+/// Anything that needs the exclusive lock after this handle must call [`Db::close`],
+/// not drop it: dropping unlocks at once while the SQLite workers exit asynchronously,
+/// so the lock could be won with database files still open.
 #[derive(Debug)]
 pub struct Db {
     pub pool: SqlitePool,
@@ -359,14 +363,11 @@ mod tests {
         }
     }
 
-    // FTS5 external content points at documents.rowid, and `documents` has no
-    // INTEGER PRIMARY KEY, so SQLite does not promise VACUUM keeps those rowids.
-    // This pins the behaviour backups depend on across SQLite upgrades.
+    // Every backup is a `VACUUM INTO`, and FTS5 external content finds rows by key
+    // alone, so a key that moved would silently return the wrong document.
     #[tokio::test]
-    async fn snapshot_search_index_still_matches_documents() {
-        let (_tmp, paths) = temp_root();
-        let db = Db::open(&paths).await.unwrap();
-        for (id, title) in [("a", "alpha"), ("b", "bravo"), ("c", "charlie")] {
+    async fn snapshot_search_index_matches_documents_after_gaps() {
+        async fn insert(db: &Db, id: &str, title: &str) {
             sqlx::query(
                 "INSERT INTO documents (id, title, body, created_at, updated_at) \
                  VALUES (?, ?, 'body', 't', 't')",
@@ -377,10 +378,35 @@ mod tests {
             .await
             .unwrap();
         }
-        sqlx::query("DELETE FROM documents WHERE id = 'a'")
-            .execute(&db.pool)
+        async fn delete(db: &Db, id: &str) {
+            sqlx::query("DELETE FROM documents WHERE id = ?")
+                .bind(id)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        async fn hit(pool: &SqlitePool, term: &str) -> Vec<String> {
+            sqlx::query_scalar(
+                "SELECT d.id FROM documents_fts f JOIN documents d ON d.seq = f.rowid \
+                 WHERE documents_fts MATCH ?",
+            )
+            .bind(term)
+            .fetch_all(pool)
             .await
-            .unwrap();
+            .unwrap()
+        }
+
+        let (_tmp, paths) = temp_root();
+        let db = Db::open(&paths).await.unwrap();
+        for (id, title) in [("a", "alpha"), ("b", "bravo"), ("c", "charlie")] {
+            insert(&db, id, title).await;
+        }
+        // Leaves a gap at the low keys, then reuses the highest key, which is freed.
+        delete(&db, "a").await;
+        delete(&db, "c").await;
+        insert(&db, "a", "delta").await;
+        insert(&db, "e", "echo").await;
+        delete(&db, "b").await;
 
         let dir = snapshot(&paths, &db.pool, "pre-test").await.unwrap();
         db.close().await;
@@ -389,14 +415,18 @@ mod tests {
             SqlitePool::connect_with(SqliteConnectOptions::new().filename(dir.join("jobpilot.db")))
                 .await
                 .unwrap();
-        let id: String = sqlx::query_scalar(
-            "SELECT d.id FROM documents_fts f JOIN documents d ON d.rowid = f.rowid \
-             WHERE documents_fts MATCH 'charlie'",
+        assert_eq!(hit(&pool, "delta").await, ["a"]);
+        assert_eq!(hit(&pool, "echo").await, ["e"]);
+        for gone in ["alpha", "bravo", "charlie"] {
+            assert!(hit(&pool, gone).await.is_empty(), "{gone}");
+        }
+        // With rank 1, FTS5 also compares the index against the content table.
+        sqlx::query(
+            "INSERT INTO documents_fts (documents_fts, rank) VALUES ('integrity-check', 1)",
         )
-        .fetch_one(&pool)
+        .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(id, "c");
         pool.close().await;
     }
 }

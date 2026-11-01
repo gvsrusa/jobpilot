@@ -28,7 +28,8 @@ erDiagram
         text created_at
     }
     documents {
-        text id PK
+        integer seq PK "FTS5 key"
+        text id UK
         text title
         text body
         text created_at
@@ -38,7 +39,7 @@ erDiagram
         text title
         text body
     }
-    documents ||--|| documents_fts : "external content, joined by rowid"
+    documents ||--|| documents_fts : "external content, joined by seq"
 ```
 
 `settings`, `audit_log`, and `secret_index` have no foreign keys and stand alone.
@@ -50,7 +51,7 @@ erDiagram
 | `settings` | Key/value application settings. `value` is JSON text. | Supporting storage |
 | `audit_log` | Append-only record of consequential actions (backup, restore, export, delete, secret change). `actor` is `gui`, `cli`, or `system`. `detail` is JSON text and never holds a secret value. Delete-all removes this table's rows by design. | FR-12.7 |
 | `secret_index` | Names of secrets held in the OS credential store, with creation time. It never stores values. Restore keeps the live rows, because the secrets stay in the credential store. | FR-2.9, FR-12.2 |
-| `documents` | User documents. `id` is a text identifier. Timestamps are text. | FR-2.3, FR-2.11, FR-3.23 |
+| `documents` | User documents. `id` is the text identifier the app uses. `seq` is the internal key the search index joins on. Timestamps are text. | FR-2.3, FR-2.11, FR-3.23 |
 | `documents_fts` | FTS5 virtual table over `documents.title` and `documents.body`. | FR-2.2, FR-3.21 |
 
 ### DDL
@@ -60,11 +61,11 @@ CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEX
 CREATE TABLE audit_log (id INTEGER PRIMARY KEY, at TEXT NOT NULL, actor TEXT NOT NULL,
   action TEXT NOT NULL, target TEXT, detail TEXT NOT NULL DEFAULT '{}');
 CREATE TABLE secret_index (name TEXT PRIMARY KEY, created_at TEXT NOT NULL);
-CREATE TABLE documents (id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL,
-  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE documents (seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
+  body TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 ```
 
-`documents_fts` is an external-content FTS5 table over `title` and `body`, with `tokenize='unicode61 remove_diacritics 2'`. Insert, update, and delete triggers on `documents` keep the index in step. It reads content from `documents` and is matched to rows by `rowid`, which `documents` has implicitly.
+`documents_fts` is an external-content FTS5 table over `title` and `body`, with `tokenize='unicode61 remove_diacritics 2'`. Insert, update, and delete triggers on `documents` keep the index in step. It reads content from `documents` and is matched to rows by `seq` (`content_rowid='seq'`). The key is declared because SQLite does not promise that `VACUUM` keeps implicit rowids, and every backup uses `VACUUM INTO`.
 
 Known limit: `unicode61` does not segment Chinese, Japanese, or Korean text. When those users appear, move to the `trigram` tokenizer or a segmenter. The migration file carries a `ponytail:` comment naming this ceiling.
 
