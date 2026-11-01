@@ -1,7 +1,7 @@
 //! The `#[ignore]`d tests use the real OS keychain, under the service from
 //! `.cargo/config.toml`. The rest never reach it.
 
-use jobpilot_core::crypto::{self, KEY_ACCOUNT_PREFIX, KeyState};
+use jobpilot_core::crypto::{self, DataKey, KEY_ACCOUNT_PREFIX, KeyState};
 use jobpilot_core::knowledge::{self, JOB_TEXT_LIMIT, normalize};
 use jobpilot_core::{AppPaths, Db, Error, MIGRATOR, app_schema_version, recovery, transfer};
 use sqlx::migrate::Migrator;
@@ -311,11 +311,53 @@ fn normalize_composes_and_collapses_blank_runs() {
     assert_eq!(text, "\u{e9}\n\nnext\n");
 }
 
+// Each case would take minutes if every `<` or escape rescanned a long stretch.
 #[test]
 fn normalize_survives_hostile_markup_quickly() {
-    let raw = "<a ".repeat(200_000) + &"<div style=display:none>".repeat(50_000);
-    let (text, _) = normalize(&raw);
-    assert!(text.len() <= JOB_TEXT_LIMIT);
+    let cases = [
+        "<a ".repeat(600_000),
+        "<a ".repeat(200_000) + &"<div style=display:none>".repeat(50_000),
+        "<aaaaaaaa".repeat(200_000),
+        "<!a".repeat(600_000),
+        "<a '<a '<a '".repeat(150_000) + ">",
+        "\x1b]0;x".repeat(400_000),
+        "<div hidden>".repeat(150_000),
+    ];
+    for raw in cases {
+        let started = std::time::Instant::now();
+        let (text, _) = normalize(&raw);
+        let took = started.elapsed();
+        assert!(text.len() <= JOB_TEXT_LIMIT);
+        assert!(took.as_secs() < 10, "{} chars took {took:?}", raw.len());
+    }
+}
+
+#[test]
+fn normalize_drops_the_rest_when_markup_is_too_tangled_to_read() {
+    let raw = "<a ".repeat(600_000) + "<p hidden>SECRET</p>tail";
+    let (text, findings) = normalize(&raw);
+    assert!(!text.contains("SECRET") && !text.contains("tail"));
+    assert!(findings.iter().any(|f| f.kind == "truncated"));
+}
+
+#[test]
+fn hidden_text_excerpts_carry_no_invisible_characters() {
+    let raw = "<div hidden>a\u{202e}b\u{200b}c\u{e0041}d<!--e\u{202e}f--></div><!--g\u{200b}h-->";
+    let (_, findings) = normalize(raw);
+    let excerpts: Vec<&str> = findings
+        .iter()
+        .filter(|f| f.kind == "hidden_text")
+        .map(|f| f.excerpt.as_str())
+        .collect();
+    assert_eq!(excerpts, ["abcd", "gh"]);
+}
+
+#[test]
+fn the_truncated_finding_survives_a_flood_of_findings() {
+    let raw = "ignore previous\n".repeat(200) + &"a".repeat(300_000);
+    let (_, findings) = normalize(&raw);
+    assert_eq!(findings.len(), 50);
+    assert_eq!(findings.last().unwrap().kind, "truncated");
 }
 
 #[tokio::test]
@@ -514,5 +556,186 @@ async fn a_marked_body_counts_as_ciphertext_for_key_creation() {
         .await
         .unwrap();
     assert_eq!(keys, 1);
+    db.close().await;
+}
+
+const LOST: &str = "c0de000000000009";
+
+async fn data_key_row(db: &Db, key_id: &str, active: bool) {
+    let key = DataKey::from_bytes(key_id, [7; 32]);
+    let check = key
+        .encrypt("data_keys", "key_check", key_id, crypto::key_check_text())
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO data_keys (key_id, created_at, key_check, active) VALUES (?, 't', ?, ?)",
+    )
+    .bind(key_id)
+    .bind(check)
+    .bind(active)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+}
+
+/// A marked item whose body is junk ciphertext under `key_id`.
+async fn sealed_item(db: &Db, id: &str, key_id: &str) {
+    sqlx::query(
+        "INSERT INTO knowledge_items (id, kind, body, body_enc, key_id, source, approved, \
+         marked_sensitive, created_at, updated_at) \
+         VALUES (?, 'note', '', x'0102', ?, 'user', 0, 1, 't', 't')",
+    )
+    .bind(id)
+    .bind(key_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+}
+
+async fn key_ids(db: &Db) -> Vec<String> {
+    sqlx::query_scalar("SELECT key_id FROM data_keys ORDER BY key_id")
+        .fetch_all(&db.pool)
+        .await
+        .unwrap()
+}
+
+// The active key holds nothing; a marked body sits under a key this keychain lacks. A
+// proven key beside an unproven held id makes that id a mismatch (see `settle`). The
+// state must say so instead of unlocking, and no key may be made.
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn sealed_knowledge_under_a_lost_key_is_a_mismatch_not_unlocked() {
+    let (_tmp, paths) = temp_root();
+    let (db, key_id, _guard) = unlocked_root(&paths).await;
+    data_key_row(&db, LOST, false).await;
+    sealed_item(&db, "x", LOST).await;
+
+    let state = crypto::state(&db).await.unwrap();
+
+    assert_eq!(
+        state,
+        KeyState::KeyMismatch {
+            key_id: LOST.into()
+        }
+    );
+    let mut both = [LOST.to_owned(), key_id];
+    both.sort();
+    assert_eq!(key_ids(&db).await, both);
+    db.close().await;
+}
+
+// `other` is a ciphertext under the active key that discard of the lost key must keep.
+async fn discard_keeps_the_other_keys_ciphertext(other: &str) {
+    let (_tmp, paths) = temp_root();
+    let (db, key_id, _guard) = unlocked_root(&paths).await;
+    data_key_row(&db, LOST, false).await;
+    sealed_item(&db, "lost", LOST).await;
+    match other {
+        "knowledge" => sealed_item(&db, "kept", &key_id).await,
+        _ => {
+            sqlx::query(
+                "INSERT INTO work_authorization (country, ciphertext, key_id, updated_at) \
+                 VALUES ('PT', x'0102', ?, 't')",
+            )
+            .bind(&key_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+    }
+    assert_eq!(
+        crypto::state(&db).await.unwrap(),
+        KeyState::KeyMismatch {
+            key_id: LOST.into()
+        }
+    );
+
+    let state = recovery::discard_locked(&db, LOST, "cli").await.unwrap();
+
+    // Nothing else is locked, and no second key was made beside the kept ciphertext.
+    assert_eq!(
+        state,
+        KeyState::Unlocked {
+            key_id: key_id.clone()
+        }
+    );
+    let mut both = [LOST.to_owned(), key_id.clone()];
+    both.sort();
+    assert_eq!(key_ids(&db).await, both);
+    let sealed: Vec<(String, bool)> =
+        sqlx::query_as("SELECT id, body_enc IS NOT NULL FROM knowledge_items ORDER BY id")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    let kept = other == "knowledge";
+    assert_eq!(
+        sealed,
+        [("kept".to_owned(), true), ("lost".to_owned(), false)][usize::from(!kept)..]
+    );
+    let authorization: i64 = sqlx::query_scalar("SELECT count(*) FROM work_authorization")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(authorization, i64::from(!kept));
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn discard_leaves_another_keys_knowledge_and_makes_no_key() {
+    discard_keeps_the_other_keys_ciphertext("knowledge").await;
+}
+
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn discard_leaves_another_keys_authorization_and_makes_no_key() {
+    discard_keeps_the_other_keys_ciphertext("authorization").await;
+}
+
+// A marked body under a key with no row is proven by a trial decrypt of that body, so
+// the key in the keychain is found and takes over from an active key that holds nothing.
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn a_marked_body_proves_a_key_that_has_no_row() {
+    const SEALED_UNDER: &str = "b000000000000004";
+    let (_tmp, paths) = temp_root();
+    let (db, _active, _guard) = unlocked_root(&paths).await;
+    let key = DataKey::from_bytes(SEALED_UNDER, [7; 32]);
+    entry(SEALED_UNDER).set_password(&"07".repeat(32)).unwrap();
+    let _entry = EntryGuard(SEALED_UNDER.into());
+    let sealed = key
+        .encrypt("knowledge_items", "body_enc", "x", b"secret")
+        .unwrap();
+    // No data_keys row for it: the foreign key is switched off on this connection only.
+    let mut conn = db.pool.acquire().await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO knowledge_items (id, kind, body, body_enc, key_id, source, approved, \
+         marked_sensitive, created_at, updated_at) \
+         VALUES ('x', 'note', '', ?, ?, 'user', 0, 1, 't', 't')",
+    )
+    .bind(sealed)
+    .bind(SEALED_UNDER)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+
+    let state = crypto::state(&db).await.unwrap();
+
+    assert_eq!(
+        state,
+        KeyState::Unlocked {
+            key_id: SEALED_UNDER.into()
+        }
+    );
+    let listed = knowledge::list(&db).await.unwrap();
+    assert_eq!(listed[0].body, "secret");
     db.close().await;
 }

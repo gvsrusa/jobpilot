@@ -361,9 +361,10 @@ pub fn normalize(raw: &str) -> (String, Vec<Finding>) {
     let mut text = collapse_blank_lines(&text);
 
     let length = text.chars().count();
+    let mut cut = None;
     if length > JOB_TEXT_LIMIT {
         text = text.chars().take(JOB_TEXT_LIMIT).collect();
-        findings.push(finding(
+        cut = Some(finding(
             "truncated",
             format!("kept {JOB_TEXT_LIMIT} of {length} characters"),
         ));
@@ -371,7 +372,12 @@ pub fn normalize(raw: &str) -> (String, Vec<Finding>) {
     for line in text.lines().filter(|line| instruction_like(line)) {
         findings.push(finding("instruction_like", excerpt(line, EXCERPT_CHARS)));
     }
-    findings.truncate(FINDINGS_LIMIT);
+    // Cut text is the finding the reader needs most, so it keeps its slots.
+    findings.extend(cut);
+    let (cuts, mut findings): (Vec<_>, Vec<_>) =
+        findings.into_iter().partition(|f| f.kind == "truncated");
+    findings.truncate(FINDINGS_LIMIT.saturating_sub(cuts.len()));
+    findings.extend(cuts);
     (text, findings)
 }
 
@@ -400,6 +406,7 @@ fn instruction_like(line: &str) -> bool {
 fn excerpt(text: &str, max: usize) -> String {
     let flat: String = text
         .chars()
+        .filter(|c| !is_invisible(*c))
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -416,9 +423,10 @@ fn strip_terminal_escapes(input: &str) -> String {
     let c: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
+    let mut cache = None;
     while i < c.len() {
         match c[i] {
-            '\u{1b}' | '\u{9b}' | '\u{9d}' => i = skip_escape(&c, i),
+            '\u{1b}' | '\u{9b}' | '\u{9d}' => i = skip_escape(&c, i, &mut cache),
             ch => {
                 out.push(ch);
                 i += 1;
@@ -428,8 +436,30 @@ fn strip_terminal_escapes(input: &str) -> String {
     out
 }
 
+/// What was last found by looking for a string's end: scanning from `.0` found the first
+/// terminator at `.1` (`None`: there is none). It answers every later start up to that
+/// terminator without another scan, so a run of unterminated strings costs one pass.
+type Terminator = Option<(usize, Option<(usize, usize)>)>;
+
+/// The first BEL, U+009C, or ESC `\` at or after `from`, and the index after it.
+fn terminator_after(c: &[char], from: usize, cache: &mut Terminator) -> Option<(usize, usize)> {
+    if let Some((scanned, found)) = *cache
+        && from >= scanned
+        && found.is_none_or(|(at, _)| from <= at)
+    {
+        return found;
+    }
+    let found = (from..c.len()).find_map(|j| match c[j] {
+        '\u{7}' | '\u{9c}' => Some((j, j + 1)),
+        '\u{1b}' if c.get(j + 1) == Some(&'\\') => Some((j, j + 2)),
+        _ => None,
+    });
+    *cache = Some((from, found));
+    found
+}
+
 /// The index after the escape sequence that starts at `i`.
-fn skip_escape(c: &[char], i: usize) -> usize {
+fn skip_escape(c: &[char], i: usize, cache: &mut Terminator) -> usize {
     let (csi, string) = match c[i] {
         '\u{9b}' => (true, false),
         '\u{9d}' => (false, true),
@@ -452,16 +482,10 @@ fn skip_escape(c: &[char], i: usize) -> usize {
         };
     }
     if string {
-        let end = (body + TAG_SCAN).min(c.len());
-        let mut j = body;
-        while j < end {
-            match c[j] {
-                '\u{7}' | '\u{9c}' => return j + 1,
-                '\u{1b}' if c.get(j + 1) == Some(&'\\') => return j + 2,
-                _ => j += 1,
-            }
-        }
-        return body;
+        return match terminator_after(c, body, cache) {
+            Some((at, after)) if at - body <= TAG_SCAN => after,
+            _ => body,
+        };
     }
     if c[i] != '\u{1b}' {
         return i + 1;
@@ -495,12 +519,7 @@ fn clean_chars(input: &str, findings: &mut Vec<Finding>) -> String {
             }
             '\n' | '\t' => out.push(c),
             c if c.is_control() => {}
-            '\u{200b}'
-            | '\u{2060}'
-            | '\u{feff}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{e0000}'..='\u{e007f}' => hidden += 1,
+            c if is_invisible(c) => hidden += 1,
             c => out.push(c),
         }
     }
@@ -511,6 +530,14 @@ fn clean_chars(input: &str, findings: &mut Vec<Finding>) -> String {
         ));
     }
     out
+}
+
+/// Characters that take no room on screen: tag characters, bidi overrides, zero-width
+/// space, word joiner, and the byte-order mark.
+fn is_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{200b}' | '\u{2060}' | '\u{feff}' | '\u{202a}'..='\u{202e}'
+        | '\u{2066}'..='\u{2069}' | '\u{e0000}'..='\u{e007f}')
 }
 
 fn collapse_blank_lines(text: &str) -> String {
@@ -527,6 +554,25 @@ fn collapse_blank_lines(text: &str) -> String {
 
 // ---- HTML ---------------------------------------------------------------------------
 
+/// Characters the HTML pass may look at, beyond reading each once. Hostile markup that
+/// makes every `<` rescan a long stretch spends it, and then the rest of the text is
+/// dropped, not shown, because what was left unread may be hidden.
+struct Budget(usize);
+
+impl Budget {
+    fn for_input(len: usize) -> Budget {
+        Budget(32 * len + 2_000_000)
+    }
+
+    fn spend(&mut self, n: usize) {
+        self.0 = self.0.saturating_sub(n);
+    }
+
+    fn spent(&self) -> bool {
+        self.0 == 0
+    }
+}
+
 struct Tag {
     name: String,
     closing: bool,
@@ -541,8 +587,10 @@ fn starts_with_at(c: &[char], i: usize, pattern: &str) -> bool {
         .all(|(k, p)| c.get(i + k).is_some_and(|ch| ch.eq_ignore_ascii_case(&p)))
 }
 
-fn find_from(c: &[char], from: usize, pattern: &str) -> Option<usize> {
-    (from..c.len()).find(|&i| starts_with_at(c, i, pattern))
+fn find_from(c: &[char], from: usize, pattern: &str, budget: &mut Budget) -> Option<usize> {
+    let found = (from..c.len()).find(|&i| starts_with_at(c, i, pattern));
+    budget.spend(found.unwrap_or(c.len()).saturating_sub(from));
+    found
 }
 
 /// A `<` starts markup only before a letter, `/`, or `!`, so "a < b" stays text.
@@ -553,14 +601,16 @@ fn tag_start(c: &[char], i: usize) -> bool {
 }
 
 /// Reads the tag at `i` (a `<`). `None` when it does not close within [`TAG_SCAN`].
-fn read_tag(c: &[char], i: usize) -> Option<(Tag, usize)> {
+fn read_tag(c: &[char], i: usize, budget: &mut Budget) -> Option<(Tag, usize)> {
+    let limit = (i + TAG_SCAN).min(c.len());
+    budget.spend(limit - i);
     let mut j = i + 1;
     let closing = c.get(j) == Some(&'/');
     if closing {
         j += 1;
     }
     let name_start = j;
-    while j < c.len() && !c[j].is_whitespace() && !matches!(c[j], '/' | '>') {
+    while j < limit && !c[j].is_whitespace() && !matches!(c[j], '/' | '>') {
         j += 1;
     }
     let name: String = c[name_start..j]
@@ -568,7 +618,6 @@ fn read_tag(c: &[char], i: usize) -> Option<(Tag, usize)> {
         .collect::<String>()
         .to_ascii_lowercase();
 
-    let limit = (i + TAG_SCAN).min(c.len());
     let attrs_start = j;
     let mut quote: Option<char> = None;
     while j < limit {
@@ -722,10 +771,10 @@ fn drops_always(name: &str) -> bool {
 /// Where the hidden element that opened just before `from` ends: the end of its content
 /// and the index after its close tag. Same-name nesting is counted. An element that never
 /// closes runs to the end of the input, as a browser would hide it.
-fn hidden_end(c: &[char], from: usize, name: &str) -> (usize, usize) {
+fn hidden_end(c: &[char], from: usize, name: &str, budget: &mut Budget) -> (usize, usize) {
     if is_raw_text(name) {
         let close = format!("</{name}");
-        return match find_from(c, from, &close) {
+        return match find_from(c, from, &close, budget) {
             Some(at) => (
                 at,
                 c[at..]
@@ -739,15 +788,19 @@ fn hidden_end(c: &[char], from: usize, name: &str) -> (usize, usize) {
     let mut depth = 1;
     let mut i = from;
     while i < c.len() {
+        budget.spend(1);
+        if budget.spent() {
+            return (c.len(), c.len());
+        }
         if !tag_start(c, i) {
             i += 1;
             continue;
         }
         if starts_with_at(c, i, "<!--") {
-            i = find_from(c, i + 4, "-->").map_or(c.len(), |end| end + 3);
+            i = find_from(c, i + 4, "-->", budget).map_or(c.len(), |end| end + 3);
             continue;
         }
-        let Some((tag, next)) = read_tag(c, i) else {
+        let Some((tag, next)) = read_tag(c, i, budget) else {
             i += 1;
             continue;
         };
@@ -766,12 +819,13 @@ fn hidden_end(c: &[char], from: usize, name: &str) -> (usize, usize) {
     (c.len(), c.len())
 }
 
-/// Text with every tag cut out, for an excerpt of what was hidden. It does not recurse.
-fn flat_text(c: &[char]) -> String {
+/// Text with every tag cut out, for an excerpt of what was hidden. It does not recurse and
+/// stops once it has more than an excerpt can use.
+fn flat_text(c: &[char], budget: &mut Budget) -> String {
     let mut out = String::new();
     let mut i = 0;
-    while i < c.len() {
-        match read_if_tag(c, i) {
+    while i < c.len() && out.len() < 2000 && !budget.spent() {
+        match read_if_tag(c, i, budget) {
             Some(next) => i = next,
             None => {
                 out.push(c[i]);
@@ -782,11 +836,11 @@ fn flat_text(c: &[char]) -> String {
     out
 }
 
-fn read_if_tag(c: &[char], i: usize) -> Option<usize> {
+fn read_if_tag(c: &[char], i: usize, budget: &mut Budget) -> Option<usize> {
     if !tag_start(c, i) {
         return None;
     }
-    read_tag(c, i).map(|(_, next)| next)
+    read_tag(c, i, budget).map(|(_, next)| next)
 }
 
 /// Returns the text and whether any tag was seen.
@@ -794,8 +848,9 @@ fn html_to_text(input: &str, findings: &mut Vec<Finding>) -> (String, bool) {
     let c: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
     let mut saw_tag = false;
+    let mut budget = Budget::for_input(c.len());
     let mut i = 0;
-    while i < c.len() {
+    while i < c.len() && !budget.spent() {
         if !tag_start(&c, i) {
             out.push(c[i]);
             i += 1;
@@ -803,8 +858,9 @@ fn html_to_text(input: &str, findings: &mut Vec<Finding>) -> (String, bool) {
         }
         if starts_with_at(&c, i, "<!--") {
             saw_tag = true;
-            let end = find_from(&c, i + 4, "-->");
-            let said = excerpt(&flat_text(&c[i + 4..end.unwrap_or(c.len())]), EXCERPT_CHARS);
+            let end = find_from(&c, i + 4, "-->", &mut budget);
+            let inside = &c[i + 4..end.unwrap_or(c.len())];
+            let said = excerpt(&flat_text(inside, &mut budget), EXCERPT_CHARS);
             if !said.is_empty() {
                 findings.push(finding("hidden_text", said));
             }
@@ -812,15 +868,18 @@ fn html_to_text(input: &str, findings: &mut Vec<Finding>) -> (String, bool) {
             continue;
         }
         if c[i + 1] == '!' {
-            // A doctype or the like.
-            saw_tag = true;
-            i = c[i..]
-                .iter()
-                .position(|&ch| ch == '>')
-                .map_or(i + 1, |p| i + p + 1);
+            // A doctype or the like; with no `>` near, the `<` is text.
+            let reach = &c[i..(i + TAG_SCAN).min(c.len())];
+            budget.spend(reach.len());
+            let end = reach.iter().position(|&ch| ch == '>');
+            saw_tag |= end.is_some();
+            if end.is_none() {
+                out.push('<');
+            }
+            i += end.map_or(1, |p| p + 1);
             continue;
         }
-        let Some((tag, next)) = read_tag(&c, i) else {
+        let Some((tag, next)) = read_tag(&c, i, &mut budget) else {
             out.push(c[i]);
             i += 1;
             continue;
@@ -841,13 +900,19 @@ fn html_to_text(input: &str, findings: &mut Vec<Finding>) -> (String, bool) {
             continue;
         }
         if drops_always(&tag.name) || is_hidden(&tag.attrs) {
-            let (content_end, after) = hidden_end(&c, i, &tag.name);
-            let said = excerpt(&flat_text(&c[i..content_end]), EXCERPT_CHARS);
+            let (content_end, after) = hidden_end(&c, i, &tag.name, &mut budget);
+            let said = excerpt(&flat_text(&c[i..content_end], &mut budget), EXCERPT_CHARS);
             if !said.is_empty() {
                 findings.push(finding("hidden_text", said));
             }
             i = after;
         }
+    }
+    if budget.spent() {
+        findings.push(finding(
+            "truncated",
+            "the markup was too tangled to read; the rest was dropped".into(),
+        ));
     }
     (out, saw_tag)
 }
