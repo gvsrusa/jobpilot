@@ -82,17 +82,35 @@ pub struct Profile {
 /// `locked` is true and `authorization` is empty.
 pub async fn get(db: &Db) -> Result<Profile> {
     let basic = basic(db).await?;
-    let key_state = crypto::state(db).await?;
-    let authorization = match key_state {
-        KeyState::Unlocked { .. } => read_authorization(db).await?,
-        _ => Vec::new(),
-    };
+    let mut key_state = crypto::state(db).await?;
+    let mut authorization = Vec::new();
+    if matches!(key_state, KeyState::Unlocked { .. }) {
+        match read_authorization(db).await {
+            Ok(rows) => authorization = rows,
+            Err(error) => key_state = degraded(error)?,
+        }
+    }
     Ok(Profile {
         basic,
         authorization,
         locked: !matches!(key_state, KeyState::Unlocked { .. }),
         key_state,
     })
+}
+
+/// A key error while reading rows (a row sealed under a key this machine lost) leaves the
+/// profile locked instead of failing it. Any other error is real.
+fn degraded(error: Error) -> Result<KeyState> {
+    match error {
+        Error::KeyMissing { key_id } => Ok(KeyState::KeyMissing { key_id }),
+        Error::KeyMismatch { key_id } => Ok(KeyState::KeyMismatch { key_id }),
+        Error::KeyUnavailable(reason) => Ok(KeyState::KeyUnavailable {
+            key_id: String::new(),
+            reason,
+        }),
+        Error::Locked => Ok(KeyState::NotLoaded),
+        other => Err(other),
+    }
 }
 
 /// Never touches `work_authorization` or the keychain.
@@ -203,7 +221,13 @@ pub(crate) async fn export_authorization(db: &Db) -> Result<(String, bool)> {
         let locked = json!({ "locked": key_state });
         return Ok((locked.to_string(), false));
     }
-    let rows = read_authorization(db).await?;
+    let rows = match read_authorization(db).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            let locked = json!({ "locked": degraded(error)? });
+            return Ok((locked.to_string(), false));
+        }
+    };
     let text = serde_json::to_string(&rows).map_err(|e| Error::Validation(e.to_string()))?;
     Ok((text, true))
 }

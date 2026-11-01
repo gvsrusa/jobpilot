@@ -124,6 +124,19 @@ fn write_export(
     Ok(finished?)
 }
 
+/// Owner-only on Unix: this file may hold plaintext work authorization.
+fn write_private(path: &Path, text: &str) -> io::Result<()> {
+    use io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(text.as_bytes())
+}
+
 fn fill_and_publish(
     temp: &Path,
     exports: &Path,
@@ -133,7 +146,7 @@ fn fill_and_publish(
     authorization: &str,
 ) -> io::Result<PathBuf> {
     fs::write(temp.join("data.json"), text)?;
-    fs::write(temp.join("work_authorization.json"), authorization)?;
+    write_private(&temp.join("work_authorization.json"), authorization)?;
     copy_dir(documents, &temp.join("documents"))?;
 
     let mut dir = exports.join(name);

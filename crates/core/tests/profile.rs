@@ -131,13 +131,29 @@ async fn lower_case_codes_are_stored_upper_case() {
     db.close().await;
 }
 
+/// Every byte of the database file and its WAL, as SQLite leaves them on disk.
+fn db_bytes(paths: &AppPaths) -> Vec<u8> {
+    let mut all = Vec::new();
+    for name in ["jobpilot.db", "jobpilot.db-wal"] {
+        if let Ok(bytes) = std::fs::read(paths.root().join(name)) {
+            all.extend(bytes);
+        }
+    }
+    all
+}
+
 #[tokio::test]
 #[ignore]
 async fn authorization_is_ciphertext_at_rest() {
+    const CONTROL: &str = "ZXQ-PLAIN-CONTROL";
     let (_tmp, paths) = temp_root();
     let db = Db::open(&paths).await.unwrap();
     let _guard = unlock(&db).await;
     profile::set_authorization(&db, auth("PT")).await.unwrap();
+    // A plain value written the same way, so the scan is proven able to find one.
+    jobpilot_core::documents::create(&db, "control", CONTROL)
+        .await
+        .unwrap();
 
     let (blob, _) = raw_row(&db, "PT").await;
     assert!(blob.starts_with(b"JPK1"));
@@ -145,14 +161,115 @@ async fn authorization_is_ciphertext_at_rest() {
     let got = profile::get(&db).await.unwrap();
     assert_eq!(got.authorization, vec![auth("PT")]);
     assert!(!got.locked);
-    db.close().await;
 
-    for name in ["jobpilot.db", "jobpilot.db-wal"] {
-        let path = paths.root().join(name);
-        if let Ok(bytes) = std::fs::read(&path) {
-            assert!(!contains(&bytes, NOTE.as_bytes()), "{name}");
-        }
+    // Open: the WAL is present and holds the writes.
+    let open = db_bytes(&paths);
+    assert!(contains(&open, CONTROL.as_bytes()), "scan cannot see plain");
+    assert!(!contains(&open, NOTE.as_bytes()));
+    db.close().await;
+    let closed = db_bytes(&paths);
+    assert!(contains(&closed, CONTROL.as_bytes()));
+    assert!(!contains(&closed, NOTE.as_bytes()));
+}
+
+fn store_second_key(key_id: &str) -> [u8; 32] {
+    let bytes = [7u8; 32];
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    entry(key_id).set_password(&hex).unwrap();
+    bytes
+}
+
+const KEY_B: &str = "0123456789abcdef";
+
+async fn seal_under_b(db: &Db, bytes: [u8; 32], row: &WorkAuthorization) {
+    let key = jobpilot_core::crypto::DataKey::from_bytes(KEY_B, bytes);
+    let plain = serde_json::to_vec(row).unwrap();
+    let check = key
+        .encrypt("data_keys", "key_check", KEY_B, crypto::key_check_text())
+        .unwrap();
+    sqlx::query(
+        "INSERT OR IGNORE INTO data_keys (key_id, created_at, key_check, active) \
+         VALUES (?, '2000-01-01T00:00:00Z', ?, 0)",
+    )
+    .bind(KEY_B)
+    .bind(check)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let sealed = key
+        .encrypt("work_authorization", "row", &row.country, &plain)
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO work_authorization (country, ciphertext, key_id, updated_at) \
+         VALUES (?, ?, ?, 't')",
+    )
+    .bind(&row.country)
+    .bind(sealed)
+    .bind(KEY_B)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn rows_under_two_keys_are_both_read() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let _a = unlock(&db).await;
+    let _b = EntryGuard(KEY_B.into());
+    profile::set_authorization(&db, auth("PT")).await.unwrap();
+    seal_under_b(&db, store_second_key(KEY_B), &auth("CA")).await;
+
+    let got = profile::get(&db).await.unwrap();
+    assert!(!got.locked, "{:?}", got.key_state);
+    assert_eq!(got.authorization, vec![auth("CA"), auth("PT")]);
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn a_row_under_a_lost_key_locks_instead_of_failing() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let _a = unlock(&db).await;
+    let _b = EntryGuard(KEY_B.into());
+    profile::set_basic(&db, sample()).await.unwrap();
+    profile::set_authorization(&db, auth("PT")).await.unwrap();
+    seal_under_b(&db, store_second_key(KEY_B), &auth("CA")).await;
+    entry(KEY_B).delete_credential().unwrap();
+
+    let got = profile::get(&db).await.unwrap();
+    assert!(got.locked);
+    assert!(got.authorization.is_empty());
+    assert_eq!(got.basic, sample());
+    assert!(
+        matches!(
+            got.key_state,
+            KeyState::KeyMissing { .. } | KeyState::KeyMismatch { .. }
+        ),
+        "{:?}",
+        got.key_state
+    );
+
+    let dir = transfer::export_all(&db, "cli").await.unwrap();
+    assert!(dir.join("data.json").is_file());
+    let text = std::fs::read_to_string(dir.join("work_authorization.json")).unwrap();
+    assert!(text.contains("\"locked\""), "{text}");
+    assert!(!text.contains(NOTE));
+    let entries = audit::recent(&db, 10).await.unwrap();
+    let export = entries.iter().find(|e| e.action == "export").unwrap();
+    assert_eq!(export.detail["sensitive_plain"], false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir.join("work_authorization.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
+    db.close().await;
 }
 
 #[tokio::test]
