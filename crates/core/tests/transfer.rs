@@ -187,7 +187,7 @@ async fn delete_all_removes_data_and_can_keep_backups() {
     let db = Db::open(&paths).await.unwrap();
     assert!(documents::list(&db).await.unwrap().is_empty());
     assert!(
-        audit::recent(&db, 10).await.unwrap().is_empty(),
+        no_audit_rows(&db).await,
         "delete-all removes the log and writes no row of its own"
     );
     assert_eq!(backup::list(&paths).await.unwrap().len(), 1);
@@ -268,7 +268,7 @@ async fn empty_name_is_refused_before_any_write() {
     };
     assert!(!error.to_string().contains("hunter2-value"), "{error}");
     assert!(secrets::names(&db).await.unwrap().is_empty());
-    assert!(audit::recent(&db, 10).await.unwrap().is_empty());
+    assert!(no_audit_rows(&db).await);
     db.close().await;
 }
 
@@ -281,8 +281,14 @@ async fn delete_of_an_unlisted_name_is_not_found() {
     let result = secrets::delete(&db, "not-in-this-root", "cli").await;
 
     assert!(matches!(result, Err(Error::NotFound)), "{result:?}");
-    assert!(audit::recent(&db, 10).await.unwrap().is_empty());
+    assert!(no_audit_rows(&db).await);
     db.close().await;
+}
+
+/// Leaves out the row a first open writes when the keychain takes the key.
+async fn no_audit_rows(db: &Db) -> bool {
+    let rows = audit::recent(db, 10).await.unwrap();
+    rows.iter().all(|row| row.action == "data_key_created")
 }
 
 fn root_with_a_user_file() -> (TempDir, AppPaths, PathBuf) {
@@ -484,7 +490,8 @@ async fn keychain_round_trip() {
     assert_eq!(secrets::get(name).unwrap(), None);
     assert!(secrets::names(&db).await.unwrap().is_empty());
 
-    let log = audit::recent(&db, 10).await.unwrap();
+    let mut log = audit::recent(&db, 10).await.unwrap();
+    log.retain(|entry| entry.action != "data_key_created");
     let actions: Vec<_> = log.iter().map(|entry| entry.action.as_str()).collect();
     assert_eq!(
         actions,

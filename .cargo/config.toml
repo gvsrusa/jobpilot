@@ -1,0 +1,4 @@
+# Every Db::open reaches the keychain, so every test binary needs a throwaway service.
+# Cargo leaves a value already in the environment alone, so CI's own name wins.
+[env]
+JOBPILOT_SECRET_SERVICE = "jobpilot-test"

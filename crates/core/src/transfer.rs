@@ -48,9 +48,11 @@ pub async fn export_all(db: &Db, actor: &str) -> Result<PathBuf> {
 /// `pragma_table_list` is `sqlite_master` plus each table's kind, and that kind is what
 /// leaves out FTS virtual and shadow tables, whatever a later migration names them.
 /// Their content is derived from the tables that are exported.
-// ponytail: all rows sit in memory at once, and `json_object` refuses BLOB columns and
-// tables wider than SQLite's function argument limit, so such a table fails the export
-// loudly. No table is either today; stream rows and encode BLOBs when one is.
+/// BLOB columns are left out: `json_object` refuses them, and a declared BLOB is
+/// ciphertext, a key-check, or a vector, none of which means anything in an export.
+// ponytail: all rows sit in memory at once, and `json_object` refuses tables wider than
+// SQLite's function argument limit, so such a table fails the export loudly. No table is
+// that wide today; stream rows when one is.
 async fn read_tables(pool: &SqlitePool) -> Result<Map<String, Value>> {
     let mut read = pool.begin().await?;
     let names: Vec<String> = sqlx::query_scalar(
@@ -62,11 +64,12 @@ async fn read_tables(pool: &SqlitePool) -> Result<Map<String, Value>> {
 
     let mut tables = Map::new();
     for name in names {
-        let columns: Vec<String> =
-            sqlx::query_scalar("SELECT name FROM pragma_table_info(?) ORDER BY cid")
-                .bind(&name)
-                .fetch_all(&mut *read)
-                .await?;
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info(?) WHERE upper(type) <> 'BLOB' ORDER BY cid",
+        )
+        .bind(&name)
+        .fetch_all(&mut *read)
+        .await?;
         let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(rows_sql(&name, &columns)))
             .fetch_all(&mut *read)
             .await?;

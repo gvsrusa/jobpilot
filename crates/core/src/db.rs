@@ -1,12 +1,14 @@
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool};
 
+use crate::crypto::{self, KeyState};
 use crate::error::{Error, Result};
 use crate::paths::{APP_ID, AppPaths};
 
@@ -29,6 +31,7 @@ pub struct Db {
     pub pool: SqlitePool,
     lock: File,
     paths: AppPaths,
+    key_state: Mutex<KeyState>,
 }
 
 impl Db {
@@ -55,11 +58,24 @@ impl Db {
             let pool = connect(paths).await?;
             match pending_migration(&pool, migrator).await {
                 Ok(None) => {
-                    return Ok(Db {
+                    let db = Db {
                         pool,
                         lock,
                         paths: paths.clone(),
-                    });
+                        key_state: Mutex::new(KeyState::KeyUnavailable {
+                            key_id: String::new(),
+                            reason: "the key store has not been asked yet".into(),
+                        }),
+                    };
+                    // A key state short of Unlocked is a normal open. Only a database
+                    // failure comes back as an error here.
+                    return match crypto::load(&db).await {
+                        Ok(_) => Ok(db),
+                        Err(error) => {
+                            db.close().await;
+                            Err(error)
+                        }
+                    };
                 }
                 Ok(Some(_)) => {
                     pool.close().await;
@@ -94,6 +110,21 @@ impl Db {
 
     pub fn paths(&self) -> &AppPaths {
         &self.paths
+    }
+
+    /// The state read at open or at the latest `crypto::state`. Never touches the store.
+    pub fn key_state(&self) -> KeyState {
+        self.key_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn set_key_state(&self, state: KeyState) {
+        *self
+            .key_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = state;
     }
 }
 

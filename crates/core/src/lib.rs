@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod backup;
+pub mod crypto;
 pub mod db;
 pub mod documents;
 pub mod error;

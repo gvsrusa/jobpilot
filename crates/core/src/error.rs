@@ -30,6 +30,34 @@ pub enum Error {
     NotFound,
     #[error("confirmation required")]
     ConfirmationRequired,
+    /// The key store could not answer. Temporary: nothing about the key is known.
+    #[error("the key store could not answer: {0}")]
+    KeyUnavailable(String),
+    #[error("the key store has no data key {key_id}")]
+    KeyMissing { key_id: String },
+    #[error("the data key does not match {key_id}")]
+    KeyMismatch { key_id: String },
+    /// A sensitive field was asked for while the key is not unlocked.
+    #[error("sensitive fields are locked")]
+    Locked,
+    #[error("refused in the terminal panel")]
+    PanelRefused,
+    #[error("invalid input: {0}")]
+    Validation(String),
+    #[error("this needs manual work: {0}")]
+    ManualRequired(String),
+    /// A policy, consent, or capability refusal.
+    #[error("refused: {0}")]
+    Refused(String),
+    #[error("timed out")]
+    Timeout,
+    #[error("cancelled")]
+    Cancelled,
+    #[error("too large: the limit is {limit} bytes")]
+    TooLarge { limit: u64 },
+    /// The router tried every provider and ended `Outcome::Failed`.
+    #[error("failed: {0}")]
+    Failed(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -50,6 +78,18 @@ impl Error {
             Error::Secret(_) => "secret",
             Error::NotFound => "not_found",
             Error::ConfirmationRequired => "confirmation_required",
+            Error::KeyUnavailable(_) => "key_unavailable",
+            Error::KeyMissing { .. } => "key_missing",
+            Error::KeyMismatch { .. } => "key_mismatch",
+            Error::Locked => "locked",
+            Error::PanelRefused => "panel_refused",
+            Error::Validation(_) => "validation",
+            Error::ManualRequired(_) => "manual_required",
+            Error::Refused(_) => "refused",
+            Error::Timeout => "timeout",
+            Error::Cancelled => "cancelled",
+            Error::TooLarge { .. } => "too_large",
+            Error::Failed(_) => "failed",
         }
     }
 }
@@ -85,6 +125,18 @@ mod tests {
             (Error::Secret("x".into()), "secret"),
             (Error::NotFound, "not_found"),
             (Error::ConfirmationRequired, "confirmation_required"),
+            (Error::KeyUnavailable("x".into()), "key_unavailable"),
+            (Error::KeyMissing { key_id: "x".into() }, "key_missing"),
+            (Error::KeyMismatch { key_id: "x".into() }, "key_mismatch"),
+            (Error::Locked, "locked"),
+            (Error::PanelRefused, "panel_refused"),
+            (Error::Validation("x".into()), "validation"),
+            (Error::ManualRequired("x".into()), "manual_required"),
+            (Error::Refused("x".into()), "refused"),
+            (Error::Timeout, "timeout"),
+            (Error::Cancelled, "cancelled"),
+            (Error::TooLarge { limit: 1 }, "too_large"),
+            (Error::Failed("x".into()), "failed"),
         ];
         for (error, code) in cases {
             assert_eq!(error.code(), code);

@@ -105,6 +105,14 @@ async fn search_ignores_a_nul_byte() {
     assert_eq!(hits[0].id, doc.id);
 }
 
+/// Audit rows, leaving out the one a first open writes when the keychain takes the key.
+async fn audit_rows(db: &Db, limit: i64) -> usize {
+    let rows = audit::recent(db, limit).await.unwrap();
+    rows.iter()
+        .filter(|row| row.action != "data_key_created")
+        .count()
+}
+
 #[tokio::test]
 async fn audit_limit_is_clamped() {
     let (_tmp, db) = open().await;
@@ -115,7 +123,7 @@ async fn audit_limit_is_clamped() {
     }
     assert_eq!(audit::recent(&db, -1).await.unwrap().len(), 1);
     assert_eq!(audit::recent(&db, 0).await.unwrap().len(), 1);
-    assert_eq!(audit::recent(&db, i64::MAX).await.unwrap().len(), 3);
+    assert_eq!(audit_rows(&db, i64::MAX).await, 3);
 }
 
 #[test]
@@ -157,5 +165,5 @@ async fn audit_records_in_reverse_order() {
     assert_eq!(latest[0].actor, "cli");
     assert_eq!(latest[0].target.as_deref(), Some("t"));
     assert_eq!(latest[0].detail, json!({"n": 1}));
-    assert_eq!(audit::recent(&db, 10).await.unwrap().len(), 2);
+    assert_eq!(audit_rows(&db, 10).await, 2);
 }

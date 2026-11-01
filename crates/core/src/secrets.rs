@@ -12,6 +12,7 @@
 // writers from two processes; hold the row in a transaction if that ever happens.
 
 use serde_json::json;
+use zeroize::Zeroizing;
 
 use crate::audit;
 use crate::db::Db;
@@ -81,6 +82,14 @@ pub async fn delete(db: &Db, name: &str, actor: &str) -> Result<()> {
     audit::record(db, actor, "secret_delete", Some(name), json!({})).await
 }
 
+/// Keychain only: a data key has no `secret_index` row and no `secret_set` audit, so it
+/// stays out of `names` and `delete`. Replaces any value at `name`, so callers pass a
+/// new name: a stored key must never be overwritten (threat model section 8).
+pub(crate) async fn store_key(name: &str, value: &str) -> Result<()> {
+    let (name, value) = (name.to_owned(), Zeroizing::new(value.to_owned()));
+    keychain(move || entry(&name)?.set_password(&value).map_err(secret_error)).await
+}
+
 pub async fn names(db: &Db) -> Result<Vec<String>> {
     Ok(
         sqlx::query_scalar("SELECT name FROM secret_index ORDER BY name")
@@ -136,7 +145,7 @@ fn service() -> String {
 }
 
 /// Keychain calls can block on a system prompt for as long as the user takes.
-async fn keychain<T, F>(work: F) -> Result<T>
+pub(crate) async fn keychain<T, F>(work: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
