@@ -268,16 +268,16 @@ pub(crate) async fn snapshot(paths: &AppPaths, pool: &SqlitePool, label: &str) -
 }
 
 /// `create_dir` fails on an existing folder, so a snapshot never lands in another.
-pub(crate) fn new_snapshot_dir(backups: &Path, name: &str) -> Result<PathBuf> {
-    fs::create_dir_all(backups)?;
-    let mut dir = backups.join(name);
+pub(crate) fn new_snapshot_dir(parent: &Path, name: &str) -> Result<PathBuf> {
+    fs::create_dir_all(parent)?;
+    let mut dir = parent.join(name);
     let mut attempt = 0;
     loop {
         match fs::create_dir(&dir) {
             Ok(()) => return Ok(dir),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 attempt += 1;
-                dir = backups.join(format!("{name}-{attempt}"));
+                dir = parent.join(format!("{name}-{attempt}"));
             }
             Err(error) => return Err(error.into()),
         }

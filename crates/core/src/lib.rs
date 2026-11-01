@@ -6,7 +6,9 @@ pub mod db;
 pub mod documents;
 pub mod error;
 pub mod paths;
+pub mod secrets;
 pub mod settings;
+pub mod transfer;
 
 pub use db::{Db, MIGRATOR, app_schema_version};
 pub use error::{Error, Result};

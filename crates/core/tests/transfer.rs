@@ -1,0 +1,442 @@
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::Path;
+
+use jobpilot_core::{AppPaths, Db, Error, audit, backup, documents, secrets, transfer};
+use serde_json::Value;
+use tempfile::TempDir;
+
+fn temp_root() -> (TempDir, AppPaths) {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = AppPaths::new(tmp.path().join("data"));
+    (tmp, paths)
+}
+
+fn read_export(dir: &Path) -> (String, Value) {
+    let text = fs::read_to_string(dir.join("data.json")).unwrap();
+    let data = serde_json::from_str(&text).unwrap();
+    (text, data)
+}
+
+fn table_names(data: &Value) -> BTreeSet<String> {
+    data["tables"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect()
+}
+
+fn entries(dir: &Path) -> BTreeSet<String> {
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+async fn add_secret_row(db: &Db, name: &str) {
+    sqlx::query("INSERT INTO secret_index (name, created_at) VALUES (?, 't')")
+        .bind(name)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+}
+
+async fn document_count(paths: &AppPaths) -> usize {
+    let db = Db::open(paths).await.unwrap();
+    let count = documents::list(&db).await.unwrap().len();
+    db.close().await;
+    count
+}
+
+#[tokio::test]
+async fn export_covers_every_user_table() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+
+    let dir = transfer::export_all(&db, "cli").await.unwrap();
+
+    let expected: BTreeSet<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' \
+         AND name NOT GLOB '_sqlx_*' AND name NOT GLOB 'documents_fts*'",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .collect();
+    db.close().await;
+
+    let (_, data) = read_export(&dir);
+    assert!(expected.contains("audit_log"), "{expected:?}");
+    assert_eq!(table_names(&data), expected);
+    assert_eq!(data["format"], 1);
+    assert_eq!(data["schema_version"], jobpilot_core::app_schema_version());
+    assert!(data["exported_at"].as_str().unwrap().ends_with('Z'));
+}
+
+#[tokio::test]
+async fn export_finds_a_future_table_with_awkward_names() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    sqlx::query(r#"CREATE TABLE "odd ""table'" ("a ""b'" TEXT, n INTEGER)"#)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(r#"INSERT INTO "odd ""table'" VALUES ('{"not":"parsed"}', NULL)"#)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let dir = transfer::export_all(&db, "cli").await.unwrap();
+    db.close().await;
+
+    let (_, data) = read_export(&dir);
+    assert_eq!(
+        data["tables"][r#"odd "table'"#],
+        serde_json::json!([{r#"a "b'"#: r#"{"not":"parsed"}"#, "n": null}])
+    );
+}
+
+#[tokio::test]
+async fn export_has_documents_and_secret_names() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let doc = documents::create(&db, "resume", "body").await.unwrap();
+    add_secret_row(&db, "openai").await;
+    fs::write(paths.documents().join("resume.pdf"), "pdf").unwrap();
+
+    let dir = transfer::export_all(&db, "cli").await.unwrap();
+
+    let (_, data) = read_export(&dir);
+    let rows = data["tables"]["documents"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], doc.id.as_str());
+    assert_eq!(rows[0]["title"], "resume");
+    assert_eq!(data["tables"]["secret_index"][0]["name"], "openai");
+    assert_eq!(
+        fs::read_to_string(dir.join("documents").join("resume.pdf")).unwrap(),
+        "pdf"
+    );
+
+    let log = audit::recent(&db, 1).await.unwrap();
+    assert_eq!(log[0].action, "export");
+    assert_eq!(log[0].actor, "cli");
+    assert_eq!(log[0].target.as_deref(), Some(&*dir.to_string_lossy()));
+    db.close().await;
+}
+
+#[tokio::test]
+async fn exports_never_overwrite_and_leave_no_temporary_folder() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+
+    let first = transfer::export_all(&db, "cli").await.unwrap();
+    let second = transfer::export_all(&db, "cli").await.unwrap();
+    let third = transfer::export_all(&db, "cli").await.unwrap();
+    db.close().await;
+
+    assert_ne!(first, second);
+    assert_ne!(second, third);
+    assert_eq!(first.parent().unwrap(), paths.exports());
+    let found = entries(&paths.exports());
+    assert_eq!(found.len(), 3, "{found:?}");
+    assert!(
+        found
+            .iter()
+            .all(|name| name.starts_with("jobpilot-export-"))
+    );
+}
+
+#[tokio::test]
+async fn delete_requires_exact_confirmation() {
+    let (_tmp, paths) = temp_root();
+    for wrong in ["delete", "", "DELETE ", "yes"] {
+        let db = Db::open(&paths).await.unwrap();
+        documents::create(&db, "keep", "body").await.unwrap();
+
+        let result = transfer::delete_all(db, wrong, true).await;
+
+        assert!(
+            matches!(result, Err(Error::ConfirmationRequired)),
+            "{result:?}"
+        );
+    }
+    assert_eq!(document_count(&paths).await, 4);
+}
+
+#[tokio::test]
+async fn delete_all_removes_data_and_can_keep_backups() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    documents::create(&db, "gone", "body").await.unwrap();
+    fs::write(paths.documents().join("resume.pdf"), "pdf").unwrap();
+    let snapshot = backup::create(&db, "cli").await.unwrap();
+    transfer::export_all(&db, "cli").await.unwrap();
+
+    transfer::delete_all(db, "DELETE", false).await.unwrap();
+
+    assert_eq!(
+        entries(paths.root()),
+        ["backups", "jobpilot.lock"].map(String::from).into()
+    );
+    assert!(snapshot.path.join("jobpilot.db").is_file());
+
+    let db = Db::open(&paths).await.unwrap();
+    assert!(documents::list(&db).await.unwrap().is_empty());
+    assert!(
+        audit::recent(&db, 10).await.unwrap().is_empty(),
+        "delete-all removes the log and writes no row of its own"
+    );
+    assert_eq!(backup::list(&paths).await.unwrap().len(), 1);
+
+    transfer::delete_all(db, "DELETE", true).await.unwrap();
+
+    assert_eq!(
+        entries(paths.root()),
+        ["jobpilot.lock"].map(String::from).into()
+    );
+}
+
+#[tokio::test]
+async fn delete_all_removes_what_a_crashed_restore_left_and_nothing_foreign() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let root = paths.root();
+    for leftover in ["restore-tmp.db", "restore-tmp.db-wal", "restore-old.db-wal"] {
+        fs::write(root.join(leftover), "user data").unwrap();
+    }
+    for leftover in ["restore-tmp-documents", "restore-old-documents"] {
+        fs::create_dir(root.join(leftover)).unwrap();
+        fs::write(root.join(leftover).join("resume.pdf"), "user data").unwrap();
+    }
+    // `JOBPILOT_HOME` can point anywhere, so only JobPilot's own names may go.
+    fs::write(root.join("not-ours.txt"), "keep").unwrap();
+
+    transfer::delete_all(db, "DELETE", true).await.unwrap();
+
+    assert_eq!(
+        entries(root),
+        ["jobpilot.lock", "not-ours.txt"].map(String::from).into()
+    );
+}
+
+#[tokio::test]
+async fn delete_refused_while_another_handle_open() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    documents::create(&db, "keep", "body").await.unwrap();
+    fs::write(paths.documents().join("resume.pdf"), "pdf").unwrap();
+    let other = Db::open(&paths).await.unwrap();
+
+    let result = transfer::delete_all(db, "DELETE", true).await;
+
+    assert!(matches!(result, Err(Error::InUse)), "{result:?}");
+    assert_eq!(documents::list(&other).await.unwrap().len(), 1);
+    assert!(paths.documents().join("resume.pdf").is_file());
+    other.close().await;
+}
+
+// An empty name fails before any keychain call, so this needs no real keychain.
+#[tokio::test]
+async fn keychain_failure_leaves_files_for_a_retry() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    documents::create(&db, "keep", "body").await.unwrap();
+    fs::write(paths.documents().join("resume.pdf"), "pdf").unwrap();
+    add_secret_row(&db, "").await;
+
+    let result = transfer::delete_all(db, "DELETE", true).await;
+
+    assert!(matches!(result, Err(Error::Secret(_))), "{result:?}");
+    assert!(paths.documents().join("resume.pdf").is_file());
+
+    let db = Db::open(&paths).await.unwrap();
+    assert_eq!(documents::list(&db).await.unwrap().len(), 1);
+    assert_eq!(secrets::names(&db).await.unwrap(), [""]);
+    sqlx::query("DELETE FROM secret_index")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    transfer::delete_all(db, "DELETE", true).await.unwrap();
+    assert!(!paths.db().exists());
+}
+
+#[tokio::test]
+async fn failed_set_leaves_no_name_no_audit_row_and_no_value_in_the_error() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+
+    let result = secrets::set(&db, "", "hunter2-value", "cli").await;
+
+    let Err(error @ Error::Secret(_)) = result else {
+        panic!("{result:?}");
+    };
+    assert!(!error.to_string().contains("hunter2-value"), "{error}");
+    assert!(secrets::names(&db).await.unwrap().is_empty());
+    assert!(audit::recent(&db, 10).await.unwrap().is_empty());
+    db.close().await;
+}
+
+// Another data root may have stored this name, so the keychain must not be touched.
+#[tokio::test]
+async fn delete_of_an_unlisted_name_is_not_found() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+
+    let result = secrets::delete(&db, "not-in-this-root", "cli").await;
+
+    assert!(matches!(result, Err(Error::NotFound)), "{result:?}");
+    assert!(audit::recent(&db, 10).await.unwrap().is_empty());
+    db.close().await;
+}
+
+#[tokio::test]
+async fn names_are_sorted() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    add_secret_row(&db, "b").await;
+    add_secret_row(&db, "a").await;
+
+    assert_eq!(secrets::names(&db).await.unwrap(), ["a", "b"]);
+    db.close().await;
+}
+
+/// The real tests refuse to run against the app's own keychain service. Entries go
+/// even when an assertion fails first.
+struct KeychainEntries {
+    service: String,
+    names: Vec<String>,
+}
+
+impl KeychainEntries {
+    fn new(test: &str, count: usize) -> Self {
+        let service = std::env::var("JOBPILOT_SECRET_SERVICE")
+            .expect("set JOBPILOT_SECRET_SERVICE=jobpilot-test");
+        assert_ne!(service, "io.github.gvsrusa.jobpilot");
+        let pid = std::process::id();
+        let names = (0..count).map(|i| format!("{test}-{pid}-{i}")).collect();
+        Self { service, names }
+    }
+
+    fn present(&self, name: &str) -> bool {
+        match keyring::Entry::new(&self.service, name)
+            .unwrap()
+            .get_password()
+        {
+            Ok(_) => true,
+            Err(keyring::Error::NoEntry) => false,
+            Err(error) => panic!("{error}"),
+        }
+    }
+}
+
+impl Drop for KeychainEntries {
+    fn drop(&mut self) {
+        for name in &self.names {
+            if let Ok(entry) = keyring::Entry::new(&self.service, name) {
+                let _ = entry.delete_credential();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn keychain_round_trip() {
+    const VALUE: &str = "round-trip-secret-value";
+    let entries = KeychainEntries::new("round-trip", 1);
+    let name = entries.names[0].as_str();
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+
+    assert_eq!(secrets::get(name).unwrap(), None);
+    secrets::set(&db, name, "first-value", "cli").await.unwrap();
+    secrets::set(&db, name, VALUE, "cli").await.unwrap();
+
+    assert_eq!(secrets::get(name).unwrap().as_deref(), Some(VALUE));
+    assert_eq!(secrets::names(&db).await.unwrap(), [name]);
+
+    let dir = transfer::export_all(&db, "cli").await.unwrap();
+    let (text, data) = read_export(&dir);
+    assert!(!text.contains(VALUE));
+    assert!(!text.contains("first-value"));
+    assert_eq!(data["tables"]["secret_index"][0]["name"], name);
+
+    secrets::delete(&db, name, "cli").await.unwrap();
+
+    assert_eq!(secrets::get(name).unwrap(), None);
+    assert!(secrets::names(&db).await.unwrap().is_empty());
+
+    let log = audit::recent(&db, 10).await.unwrap();
+    let actions: Vec<_> = log.iter().map(|entry| entry.action.as_str()).collect();
+    assert_eq!(
+        actions,
+        ["secret_delete", "export", "secret_set", "secret_set"]
+    );
+    assert_eq!(log[0].target.as_deref(), Some(name));
+    for entry in &log {
+        assert_eq!(entry.detail, serde_json::json!({}));
+    }
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn delete_all_clears_keychain() {
+    let entries = KeychainEntries::new("delete-all", 2);
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    for name in &entries.names {
+        secrets::set(&db, name, "delete-all-value", "cli")
+            .await
+            .unwrap();
+    }
+    // A retry after a partial failure meets entries that are already gone.
+    keyring::Entry::new(&entries.service, &entries.names[0])
+        .unwrap()
+        .delete_credential()
+        .unwrap();
+
+    transfer::delete_all(db, "DELETE", true).await.unwrap();
+
+    for name in &entries.names {
+        assert_eq!(secrets::get(name).unwrap(), None);
+    }
+}
+
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn refused_delete_all_leaves_the_keychain_alone() {
+    let entries = KeychainEntries::new("refused", 1);
+    let name = entries.names[0].as_str();
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    secrets::set(&db, name, "kept-value", "cli").await.unwrap();
+    let other = Db::open(&paths).await.unwrap();
+
+    let result = transfer::delete_all(db, "DELETE", true).await;
+
+    assert!(matches!(result, Err(Error::InUse)), "{result:?}");
+    assert_eq!(secrets::get(name).unwrap().as_deref(), Some("kept-value"));
+    other.close().await;
+}
+
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn another_roots_entry_survives_delete() {
+    let entries = KeychainEntries::new("other-root", 1);
+    let name = entries.names[0].as_str();
+    keyring::Entry::new(&entries.service, name)
+        .unwrap()
+        .set_password("other-root-value")
+        .unwrap();
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+
+    let result = secrets::delete(&db, name, "cli").await;
+
+    assert!(matches!(result, Err(Error::NotFound)), "{result:?}");
+    assert!(entries.present(name));
+    db.close().await;
+}

@@ -311,13 +311,7 @@ async fn read_live(paths: &AppPaths) -> (Option<i64>, Option<Vec<SecretRow>>) {
 /// the database rename did not happen, so live data is unchanged.
 async fn install(paths: &AppPaths, plan: &Plan<'_>) -> Result<()> {
     let root = paths.clone();
-    blocking(move || {
-        clear_temp(&root)?;
-        // Left by a crash in `swap_in`; that restore's snapshot holds these files.
-        remove_if_present(&root.root().join(OLD_WAL))?;
-        remove_dir_if_present(&root.root().join(OLD_DOCUMENTS))
-    })
-    .await?;
+    blocking(move || remove_restore_leftovers(&root)).await?;
 
     let installed = stage_and_swap(paths, plan).await;
     if installed.is_err() {
@@ -500,6 +494,14 @@ async fn reopen(paths: &AppPaths, migrator: &Migrator) -> Result<Db> {
         .map_err(|error| Error::RestoredButNotOpened(error.to_string()))
 }
 
+/// Everything a restore that crashed can leave in the root. `swap_in` leaves the old
+/// files, and that restore's `pre-restore` snapshot holds them.
+pub(crate) fn remove_restore_leftovers(paths: &AppPaths) -> io::Result<()> {
+    clear_temp(paths)?;
+    remove_if_present(&paths.root().join(OLD_WAL))?;
+    remove_dir_if_present(&paths.root().join(OLD_DOCUMENTS))
+}
+
 fn clear_temp(paths: &AppPaths) -> io::Result<()> {
     let temp = paths.root().join(TEMP_DB);
     remove_if_present(&sidecar(&temp, "-wal"))?;
@@ -517,14 +519,14 @@ fn rename_if_present(from: &Path, to: &Path) -> io::Result<bool> {
     }
 }
 
-fn remove_if_present(file: &Path) -> io::Result<()> {
+pub(crate) fn remove_if_present(file: &Path) -> io::Result<()> {
     match fs::remove_file(file) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
         _ => Ok(()),
     }
 }
 
-fn remove_dir_if_present(dir: &Path) -> io::Result<()> {
+pub(crate) fn remove_dir_if_present(dir: &Path) -> io::Result<()> {
     match fs::remove_dir_all(dir) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
         _ => Ok(()),
@@ -532,13 +534,13 @@ fn remove_dir_if_present(dir: &Path) -> io::Result<()> {
 }
 
 /// `jobpilot.db` plus `-wal` or `-shm`.
-fn sidecar(file: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn sidecar(file: &Path, suffix: &str) -> PathBuf {
     let mut name = OsString::from(file);
     name.push(suffix);
     name.into()
 }
 
-async fn blocking<T, F>(work: F) -> Result<T>
+pub(crate) async fn blocking<T, F>(work: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> io::Result<T> + Send + 'static,
