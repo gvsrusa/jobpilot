@@ -33,10 +33,11 @@ pub struct AppState {
     restored_key_state: Mutex<Option<KeyState>>,
 }
 
-/// A handle that stays open without the `db` lock, for as long as this is held.
+/// A handle that stays open without the `db` lock, for as long as this is held. `db` is
+/// declared first so it drops first: whoever wins the gate next must find the only reference.
 pub struct Work<'a> {
-    _gate: RwLockReadGuard<'a, ()>,
     db: Arc<Db>,
+    _gate: RwLockReadGuard<'a, ()>,
 }
 
 impl std::ops::Deref for Work<'_> {
@@ -185,7 +186,7 @@ impl AppState {
     pub async fn work(&self) -> Result<Work<'_>> {
         let gate = self.gate.read().await;
         let db = self.db.read().await.clone().ok_or(Error::Unavailable)?;
-        Ok(Work { _gate: gate, db })
+        Ok(Work { db, _gate: gate })
     }
 
     /// For what replaces the handle: ends running tasks, as they would write to the data

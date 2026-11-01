@@ -92,6 +92,7 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         ai_set_order,
         ai_enable,
         ai_set_claude_path,
+        ai_clear_claude_path,
         ai_set_ollama_url,
         ai_consent_give,
         ai_consent_revoke,
@@ -623,8 +624,27 @@ pub async fn ai_set_claude_path<R: Runtime>(
     if !(path.is_absolute() && claude_code::has_claude_name(&path)) {
         return Err(Error::Validation("choose a program named claude".into()));
     }
+    let path = path
+        .to_str()
+        .ok_or_else(|| Error::Validation("this path cannot be stored".into()))?;
     let db = state.work().await?;
     settings::set(&db, claude_code::PATH_SETTING, &json!(path)).await
+}
+
+/// Back to finding `claude` by itself, which changes what runs, so it is confirmed too.
+#[tauri::command]
+pub async fn ai_clear_claude_path<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+) -> Result<()> {
+    let stored = settings::get(&*state.work().await?, claude_code::PATH_SETTING).await?;
+    let stored = stored.as_ref().and_then(Value::as_str).unwrap_or_default();
+    let message = format!(
+        "Stop using this program as Claude Code, and find claude automatically?\n\n{stored}"
+    );
+    native::confirmed(&app, "Claude Code program", message, "Clear").await?;
+    let db = state.work().await?;
+    settings::set(&db, claude_code::PATH_SETTING, &json!("")).await
 }
 
 /// Where Ollama listens. Core refuses anything off this machine (M-21) before anyone is
@@ -653,7 +673,8 @@ fn consent_provider(provider: &str) -> Result<String> {
 }
 
 /// The record that lets data leave this machine (FR-3.30), so it is confirmed outside the
-/// webview, or injected script could write one.
+/// webview. The dialog alone would not stop injected script: it can type into the terminal
+/// panel too, which is why the CLI's `ai consent give` is refused there (M-14).
 #[tauri::command]
 pub async fn ai_consent_give<R: Runtime>(
     app: AppHandle<R>,
@@ -739,12 +760,23 @@ pub async fn recovery_key_export<R: Runtime>(
 }
 
 /// `peek` first: core imports only from a state a handle has seen, and a new one has seen none.
+/// From a state with no key to import, core's own refusal comes before it reads any file, so
+/// that answers and no picker opens.
 #[tauri::command]
 pub async fn recovery_key_import<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, AppState>,
 ) -> Result<KeyState> {
-    drop(state.work().await?);
+    {
+        let db = state.work().await?;
+        let held = crypto::peek(&db).await?;
+        if !matches!(
+            held,
+            KeyState::KeyMissing { .. } | KeyState::KeyMismatch { .. }
+        ) {
+            return recovery::import(&db, Path::new(""), ACTOR).await;
+        }
+    }
     let dialog = FileDialog {
         title: "Import recovery key",
         filter: "Recovery key",
@@ -754,7 +786,9 @@ pub async fn recovery_key_import<R: Runtime>(
     let path = native::open_file(&app, dialog).await?;
     let db = state.work().await?;
     crypto::peek(&db).await?;
-    recovery::import(&db, &path, ACTOR).await
+    let imported = recovery::import(&db, &path, ACTOR).await?;
+    state.set_restored_key_state(None);
+    Ok(imported)
 }
 
 /// Core re-checks the id against the store after the dialog, so what the user read is what
@@ -774,7 +808,9 @@ pub async fn discard_locked_fields<R: Runtime>(
          data is kept in the backups folder."
     );
     native::confirmed(&app, "Discard locked fields", message, "Discard").await?;
-    recovery::discard_locked(&*state.work().await?, &key_id, ACTOR).await
+    let discarded = recovery::discard_locked(&*state.work().await?, &key_id, ACTOR).await?;
+    state.set_restored_key_state(None);
+    Ok(discarded)
 }
 
 #[cfg(test)]
@@ -1913,6 +1949,7 @@ mod tests {
         "ai_set_order",
         "ai_enable",
         "ai_set_claude_path",
+        "ai_clear_claude_path",
         "ai_set_ollama_url",
         "ai_consent_give",
         "ai_consent_revoke",
@@ -2228,6 +2265,62 @@ mod tests {
     }
 
     #[test]
+    fn clearing_the_claude_path_is_natively_confirmed() {
+        let h = ready();
+        let key = json!({ "key": "ai.claude_path" });
+        let claude = h._tmp.path().join("claude");
+        h.pick(&claude);
+        h.ok("ai_set_claude_path", json!({}));
+
+        h.answer(false);
+        let code = h.code("ai_clear_claude_path", json!({}));
+        assert_eq!(code, "confirmation_required");
+        assert!(h.asked().last().unwrap().contains(claude.to_str().unwrap()));
+        assert_eq!(h.ok("settings_get", key.clone()), json!(claude));
+
+        h.answer(true);
+        h.ok("ai_clear_claude_path", json!({}));
+        assert_eq!(h.ok("settings_get", key), "");
+    }
+
+    /// What the macOS panel returns for the installer's `claude` link.
+    #[test]
+    fn a_picked_release_of_claude_is_stored() {
+        let h = ready();
+        let release = h._tmp.path().join("claude/versions/2.1.316");
+        h.pick(&release);
+
+        h.ok("ai_set_claude_path", json!({}));
+
+        let key = json!({ "key": "ai.claude_path" });
+        assert_eq!(h.ok("settings_get", key), json!(release));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_picked_path_that_is_not_text_is_refused_without_a_panic() {
+        use std::os::unix::ffi::OsStrExt;
+        let h = ready();
+        let dir = std::ffi::OsStr::from_bytes(b"/tmp/\xff");
+
+        h.pick(&Path::new(dir).join("claude"));
+
+        assert_eq!(h.code("ai_set_claude_path", json!({})), "validation");
+    }
+
+    #[test]
+    fn recovery_import_with_nothing_to_import_opens_no_picker() {
+        let h = ready();
+        let junk = h._tmp.path().join("junk.json");
+        fs::write(&junk, "{}").unwrap();
+        h.pick(&junk);
+
+        assert_eq!(h.code("recovery_key_import", json!({})), "refused");
+
+        assert!(h.asked().is_empty());
+    }
+
+    #[test]
     fn the_ollama_address_is_loopback_and_natively_confirmed() {
         let h = ready();
         let key = json!({ "key": "ai.ollama_url" });
@@ -2407,12 +2500,17 @@ mod tests {
     fn discard_after_confirmation_replaces_the_lost_key() {
         let h = ready();
         lose_a_key(&h);
+        let info = h.ok("backup_create", json!({}));
+        let source = PathBuf::from(info["path"].as_str().unwrap());
+        let restored = h.ok("backup_restore", restore(&source));
+        assert_eq!(restored["restored_key_state"]["state"], "key_missing");
 
         let state = h.ok("discard_locked_fields", json!({}));
 
         assert_eq!(state["state"], "unlocked");
         assert_ne!(state["key_id"], LOST_KEY);
         assert_eq!(h.status()["key_state"], state);
+        assert_eq!(h.status()["restored_key_state"], Value::Null);
         h.ok("data_delete", delete("DELETE", true));
     }
 

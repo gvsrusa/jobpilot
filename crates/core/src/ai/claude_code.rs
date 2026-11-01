@@ -428,11 +428,27 @@ pub fn has_claude_name(path: &Path) -> bool {
         return false;
     };
     #[cfg(unix)]
-    return name == "claude";
+    let named = name == "claude";
     #[cfg(windows)]
-    return ["claude", "claude.exe", "claude.cmd"]
+    let named = ["claude", "claude.exe", "claude.cmd"]
         .iter()
         .any(|allowed| name.eq_ignore_ascii_case(allowed));
+    named || is_release(path, name)
+}
+
+/// The native installer's `.../claude/versions/<version>`, where its `claude` link points.
+/// The macOS open panel resolves links and rfd has no switch for that, so a picked link
+/// comes back as this file.
+// ponytail: a path stored this way ends with that release, and `find_binary` then reports it
+// as wrong. Choosing the new release fixes it; the link cannot be stored from the picker.
+fn is_release(path: &Path, name: &str) -> bool {
+    let folder_is = |level: usize, wanted: &str| {
+        let folder = path.ancestors().nth(level).and_then(Path::file_name);
+        folder.is_some_and(|folder| folder == wanted)
+    };
+    name.starts_with(|first: char| first.is_ascii_digit())
+        && folder_is(1, "versions")
+        && folder_is(2, "claude")
 }
 
 /// Order: `JOBPILOT_CLAUDE_BIN`, the `ai.claude_path` setting, `PATH`, the usual install

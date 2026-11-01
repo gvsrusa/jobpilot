@@ -975,3 +975,29 @@ async fn real_claude_has_no_tools_smoke() {
         "{named:?}"
     );
 }
+
+/// The macOS open panel resolves a link, so picking the installer's `claude` link can only
+/// ever return the release file it points at.
+#[test]
+fn a_release_of_the_native_installer_counts_as_claude() {
+    use jobpilot_core::ai::claude_code::has_claude_name;
+
+    for path in [
+        "/Users/me/.local/share/claude/versions/2.1.316",
+        "/opt/claude/versions/2.1.316",
+    ] {
+        assert!(has_claude_name(Path::new(path)), "{path}");
+    }
+    for path in [
+        "/tmp/versions/2.1.316",
+        "/tmp/claude/2.1.316",
+        "/tmp/claude/versions/evil",
+        "/tmp/claude/versions/.2",
+        "/tmp/claude/old/versions/2.1.316",
+        "/tmp/notclaude/versions/2.1.316",
+        "2.1.316",
+        "/",
+    ] {
+        assert!(!has_claude_name(Path::new(path)), "{path}");
+    }
+}

@@ -65,14 +65,25 @@ pub enum Command {
 }
 
 impl Command {
-    /// The terminal panel's input has no shell to clear its marker with, so what could
-    /// leak a key or destroy data is refused there.
+    /// The terminal panel's input has no shell to clear its marker with, and script in the
+    /// webview can write to it. So it refuses what could leak a key or destroy data, what
+    /// the app confirms in a native dialog, and what changes what runs or starts a download
+    /// (M-14). Revoking consent stays: it only ever takes something away.
     pub fn refused_in_panel(&self) -> bool {
+        use ai::{AiCommand, ConsentCommand};
         use data::{BackupCommand, DataCommand};
         matches!(
             self,
             Command::Backup(BackupCommand::Restore { .. })
-                | Command::Ai(ai::AiCommand::ClaudePath { .. })
+                | Command::Ai(
+                    AiCommand::ClaudePath { .. }
+                        | AiCommand::Consent(ConsentCommand::Give { .. })
+                        | AiCommand::Enable { .. }
+                        | AiCommand::Disable { .. }
+                        | AiCommand::Order { .. }
+                        | AiCommand::SetModel { .. }
+                        | AiCommand::Pull { .. }
+                )
                 | Command::Data(
                     DataCommand::Delete { .. }
                         | DataCommand::RecoveryKey(_)
@@ -199,5 +210,111 @@ async fn with_db(db: &Db, command: Command) -> Result<Output> {
         Command::Ai(command) => ai::ai(db, command).await,
         // `main` and the shell handle this before any command runs.
         Command::Shell => Err(Error::PanelRefused),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::{CommandFactory, Parser};
+
+    use super::{Cli, Command};
+
+    /// Every leaf command, with whether the panel refuses it. Script in the webview can type
+    /// into the panel, so a command whose GUI twin needs a native dialog, or that changes
+    /// what runs, is refused there. A new command fails `every_command_is_classified` until
+    /// it is given a row here, which is the moment to ask which kind it is.
+    const PANEL: &[(&str, bool)] = &[
+        ("status", false),
+        ("doc list", false),
+        ("doc add t", false),
+        ("doc search q", false),
+        ("backup create", false),
+        ("backup list", false),
+        ("backup restore /b", true),
+        ("data export", false),
+        ("data delete --confirm DELETE", true),
+        ("data recovery-key export --out /k", true),
+        ("data recovery-key import /k", true),
+        ("data discard-locked --confirm id", true),
+        ("profile show", false),
+        ("profile set --name n", false),
+        ("profile add countries PT", false),
+        ("profile remove countries PT", false),
+        ("profile auth set PT", false),
+        ("profile auth remove PT", false),
+        ("prefs work-mode remote", false),
+        ("prefs employment add PT full-time", false),
+        ("prefs employment remove PT full-time", false),
+        ("kb list", false),
+        ("kb add note b", false),
+        ("kb remove i", false),
+        ("kb approve i", false),
+        ("kb unapprove i", false),
+        ("kb mark-sensitive i", false),
+        ("kb unmark i", false),
+        ("kb search q", false),
+        ("job paste t", false),
+        ("job list", false),
+        ("job show i", false),
+        ("resume import /r", false),
+        ("resume list", false),
+        ("resume versions l", false),
+        ("resume generate j", false),
+        ("resume compare d", false),
+        ("resume export d --format pdf", false),
+        ("resume edit-claim c --text t", false),
+        ("resume remove-claim c", false),
+        ("letter generate j", false),
+        ("letter export d --format pdf", false),
+        ("ai status", false),
+        ("ai models", false),
+        ("ai pull m", true),
+        ("ai set-model --drafting m", true),
+        ("ai order ollama", true),
+        ("ai enable claude_code", true),
+        ("ai disable claude_code", true),
+        ("ai claude-path /c", true),
+        ("ai consent give claude_code --categories job_text", true),
+        ("ai consent revoke claude_code", false),
+        ("ai index", false),
+    ];
+
+    fn parsed(line: &str) -> Command {
+        let argv = std::iter::once("jobpilot").chain(line.split(' '));
+        match Cli::try_parse_from(argv) {
+            Ok(cli) => cli.command,
+            Err(error) => panic!("{line}: {error}"),
+        }
+    }
+
+    fn leaves(command: &clap::Command, path: &str, found: &mut Vec<String>) {
+        if command.get_subcommands().next().is_none() {
+            found.push(path.trim_start().to_string());
+        }
+        for sub in command.get_subcommands() {
+            leaves(sub, &format!("{path} {}", sub.get_name()), found);
+        }
+    }
+
+    #[test]
+    fn every_command_is_classified() {
+        let mut found = Vec::new();
+        leaves(&Cli::command(), "", &mut found);
+        // The shell refuses a nested shell itself, by name.
+        found.retain(|path| path != "shell");
+        for path in found {
+            let named = |(line, _): &&(&str, bool)| {
+                line.strip_prefix(path.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+            };
+            assert!(PANEL.iter().find(named).is_some(), "not classified: {path}");
+        }
+    }
+
+    #[test]
+    fn the_panel_refuses_what_needs_a_user_gesture() {
+        for (line, refused) in PANEL {
+            assert_eq!(parsed(line).refused_in_panel(), *refused, "{line}");
+        }
     }
 }

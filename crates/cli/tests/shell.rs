@@ -232,6 +232,57 @@ fn claude_path_setter_is_refused_in_the_panel_and_stores_nothing() {
     assert_eq!(stored_path(&home), None);
 }
 
+/// Script in the webview writes to the panel, so nothing here may stand in for a native
+/// dialog or a user's click (M-14). Consent and what runs stay as they were.
+#[test]
+fn the_panel_cannot_give_consent_or_change_what_runs() {
+    let (_tmp, home) = fresh_home();
+    let lines = "ai consent give claude_code --categories job_text,resume_text,profile_basic\n\
+                 jobpilot ai enable claude_code\n\
+                 ai disable ollama\n\
+                 ai order claude_code\n\
+                 ai set-model --drafting evil\n\
+                 ai pull evil\n\
+                 exit\n";
+
+    let out = text(&session(&home, lines.as_bytes(), &[]));
+
+    let refused = format!("error[panel_refused]: {REFUSAL}");
+    assert_eq!(out.matches(&refused).count(), 6, "{out}");
+    let status = ordinary(&home, &["--json", "ai", "status"]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["claude_code"]["consent"], serde_json::Value::Null);
+    assert_eq!(status["enabled"]["claude_code"], false);
+    assert_eq!(status["enabled"]["ollama"], true);
+    assert_eq!(status["order"], serde_json::json!(["ollama"]));
+    assert_eq!(status["drafting_model"], serde_json::Value::Null);
+}
+
+#[test]
+fn the_panel_can_still_revoke_consent() {
+    let (_tmp, home) = fresh_home();
+    let give = [
+        "ai",
+        "consent",
+        "give",
+        "claude_code",
+        "--categories",
+        "job_text",
+    ];
+    assert!(ordinary(&home, &give).status.success());
+
+    let out = text(&session(
+        &home,
+        b"ai consent revoke claude_code\nexit\n",
+        &[],
+    ));
+
+    assert!(!out.contains("error["), "{out}");
+    let status = ordinary(&home, &["--json", "ai", "status"]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["claude_code"]["consent"], serde_json::Value::Null);
+}
+
 fn stored_path(home: &Path) -> Option<serde_json::Value> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
