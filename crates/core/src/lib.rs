@@ -9,6 +9,7 @@ pub mod documents;
 pub mod drafts;
 pub mod embed;
 pub mod error;
+pub mod generate;
 pub mod hardware;
 pub mod knowledge;
 pub mod parse;

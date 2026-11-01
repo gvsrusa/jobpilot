@@ -250,7 +250,7 @@ fn hits_by_line(texts: &[&str], hit: impl Fn(&str) -> bool) -> Vec<bool> {
     found
 }
 
-fn usable(item: &KnowledgeItem) -> bool {
+pub(crate) fn usable(item: &KnowledgeItem) -> bool {
     item.approved && !item.marked_sensitive && !item.locked
 }
 
