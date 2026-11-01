@@ -17,11 +17,12 @@ From the [milestones](milestones.md). Each agent lands with its feature.
 
 | Release | Agents | Also lands |
 |---|---|---|
+| 0.2 | None (external backends start with Claude Code) | Task router, Claude Code headless adapter, consent record |
 | 0.3 | Resume, cover letter, career memory, tracking, analytics | Workflow runner, execution logs, emergency pause |
 | 0.5 | Discovery, matching, research | Connector SDK |
 | 0.6 | Browser application | Playwright runtime, permissions engine |
 
-Until 0.5, the resume and cover letter agents take posting text the user pastes. External backends arrive in 0.4, so 0.3 agents use Ollama or No-AI. After that, the router's checks decide.
+Until 0.5, the resume and cover letter agents take posting text the user pastes. External backends start with Claude Code in 0.2 and widen in 0.4, so 0.3 agents use Claude Code, Ollama, or No-AI. After that, the router's checks decide.
 
 ## 3. Permission vocabulary
 

@@ -23,7 +23,7 @@ Only the first five screens (shell, recovery, status, documents, data) belong to
 | 10 | Resume compare with evidence | 0.2 | FR-7.9 to FR-7.12 |
 | 11 | Application review and pause state | 0.6 | FR-9.2 to FR-9.6, FR-9.16 to FR-9.21 |
 | 12 | Terminal panel | 0.2 | FR-10.1, FR-10.2, FR-12.5 |
-| 13 | AI provider consent | 0.4 | FR-3.12, FR-3.30 |
+| 13 | AI provider consent | 0.2 (Claude Code row), 0.4 (other providers) | FR-3.12, FR-3.30 |
 | 14 | AI: Ollama and models | 0.2 | FR-2.13, FR-3.2 to FR-3.8 |
 
 ### Rules every screen follows
@@ -83,7 +83,7 @@ Later releases extend the navigation. Each entry appears only in the release tha
  Data               0.1       6
  Profile            0.2       7
  Resumes            0.2       10 (resume compare)
- AI                 0.2       14 (Ollama, models); 13 (consent) joins 0.4
+ AI                 0.2       14 (Ollama, models, Claude Code consent); 13 grows in 0.4
  Applications       0.3       history; review screen 11 joins in 0.6
  Jobs               0.5       8, 9
 
@@ -556,7 +556,7 @@ A bottom panel running xterm.js over a Rust PTY. It is a restricted terminal, no
 - **Empty state:** an empty panel shows the prompt and "Type `jobpilot --help`."
 - **Error state:** a failed PTY start shows an alert in the panel header with its code and a [Restart] button. A refused command prints the refusal line above and keeps the session. A rejected command never reaches a shell.
 
-## 13. AI provider consent (release 0.4)
+## 13. AI provider consent (release 0.2 for Claude Code, 0.4 for the rest)
 
 Providers are listed with the register verdict, the reason, and the owner-decision status. An ineligible provider (free Gemini key, non-loopback endpoints, Vertex AI, Ollama cloud models, Antigravity) shows the reason and has **no enable control at all**: no switch, no key field, no sign-in button. No setting overrides that. Providers the owner decisions make eligible show [Review...] and the vendor's terms on the consent dialog. Verdicts and quoted reasons come from the [policy register](policy-register.md) at the date shown, and the screen shows that date.
 
@@ -627,7 +627,7 @@ Consent dialog (opened by Review on an eligible, non-local provider). Nothing is
 
 ## 14. AI: Ollama and models (release 0.2)
 
-This is the first AI screen. It sets up Ollama on this computer (FR-3.2 to FR-3.8). Provider consent stays in 0.4 (screen 13), and that list then joins this view. A local model under loopback Ollama needs no consent, because data stays on the machine. Ollama cloud models are not offered: they are hidden, and refused by routing check 2 in docs/ai-providers.md.
+This is the first AI screen. It sets up Ollama on this computer (FR-3.2 to FR-3.8). The Claude Code consent row (screen 13) joins this view in 0.2; the other providers join in 0.4. A local model under loopback Ollama needs no consent, because data stays on the machine. Ollama cloud models are not offered: they are hidden, and refused by routing check 2 in docs/ai-providers.md.
 
 ```text
 +-------------+----------------------------------------------------------------+

@@ -79,7 +79,7 @@ flowchart LR
 | Boundary | First exists in | Notes |
 |---|---|---|
 | B1 webview to Rust | 0.1 | Tauri IPC. The webview is the less trusted side and never holds a secret value. |
-| B2 Rust to subprocess | 0.2 | PTY panel in 0.2, vendor CLIs in 0.4 if opened, Playwright in 0.6. |
+| B2 Rust to subprocess | 0.2 | PTY panel and vendor CLIs in 0.2 (Claude Code) and 0.4, Playwright in 0.6. |
 | B3 app to model | 0.2 | Ollama in 0.2, external backends in 0.4. |
 | B4 job page to agent | 0.2 | Pasted postings in 0.2, connectors in 0.5, live pages in 0.6. |
 | B5 app to filesystem | 0.1 | Data root, backups, exports, credential store. |
@@ -296,7 +296,7 @@ Delete-all removes the entries for this root's key ids from the credential store
 | M-12 | Recovery-key export and import (accepted under Decision D5), key ids per root, and the distinct key states, as in [section 9](#9-keychain-loss-and-the-recovery-key). | Planned 0.2 | FR-12.1, FR-12.2 | None |
 | M-13 | Delete-all, restore, and discard of locked fields confirm through a Rust-owned native dialog before job text can reach the webview. | Planned 0.2 | FR-12.10 | None |
 | M-14 | Restricted terminal: the PTY runs an allow-list, not a general shell. In 0.2 that is the bundled `jobpilot` CLI. User-started `claude` joins it under D1, and `codex` and `gemini` if installed; there is no launcher for `agy`. No CLI command prints a secret value. Recovery-key commands and the commands M-13 confirms are refused in the panel, through a marker only the Rust PTY layer sets. Scrollback is neither stored nor read into a workflow. Agents have no terminal access. | Planned 0.2, extended 0.4 | FR-12.5 | Yes |
-| M-15 | Spawn rules: resolved absolute path, shown to the user for vendor CLIs; argument arrays, never a shell string; untrusted text through standard input, never argv; empty temporary working directory; killed on timeout, cancel, pause, or app exit. Child environment allow-list. | Planned 0.2 for PTY, 0.4 for CLIs, 0.6 for Playwright | FR-12.5 | Part |
+| M-15 | Spawn rules: resolved absolute path, shown to the user for vendor CLIs; argument arrays, never a shell string; untrusted text through standard input, never argv; empty temporary working directory; killed on timeout, cancel, pause, or app exit. Child environment allow-list. | Planned 0.2 for PTY and Claude Code, 0.4 for other CLIs, 0.6 for Playwright | FR-12.5 | Part |
 | M-16 | Output validation on every backend, as in [AI providers](../ai-providers.md#output-validation): size, JSON, schema, task checks. URLs, paths, and commands in output are data only. | Planned 0.2 | FR-12.6, FR-3.25 | Yes |
 | M-17 | Every generated claim maps to evidence or the output is rejected. Templates render plain fields, so no hidden text reaches a document. The user sees the comparison with the original. | Planned 0.2 | FR-7.10, FR-7.11, FR-7.12 | Yes |
 | M-18 | Work-authorization guard: output may not state or imply authorization beyond what the user recorded. Matching compares stated values per country, and a missing value stays "not stated". | Planned 0.2, extended 0.5 | FR-4.9, FR-4.10 | Yes |

@@ -77,7 +77,7 @@ Exit tests:
 - A consent record for `claude_code/cli_login` naming the data categories exists before any external call, and revoking it stops the next call.
 - The router works end to end with Claude Code alone, Ollama alone, or No-AI, and a test proves each.
 
-Gates: all five apply. Build includes the bundled CLI sidecar; migrations add profile and encrypted-field tables on top of 0.1 data; Windows and macOS means PTY, keychain, and Ollama paths pass on both.
+Gates: all five apply. Build includes the bundled CLI sidecar and the consent code; migrations add profile, encrypted-field, and consent-record tables on top of 0.1 data; Windows and macOS means PTY, keychain, and Ollama paths pass on both.
 ## Release 0.3: Career memory and application tracking
 
 Scope: career memory, application tracking, deterministic workflow runner, execution logs, emergency pause.
@@ -107,7 +107,7 @@ Exit tests:
 - Optional Gemini CLI and Codex CLI adapters: run on the installed CLI's sign-in when present, show unavailable when absent, and are skipped for tasks that need `no_tools` unless a no-tools configuration is proven.
 - No mandatory key: the app still works end to end with no provider configured.
 
-Gates: all five apply. Build includes the provider and consent code; migrations add provider settings and consent records; Windows and macOS means keychain-stored keys and CLI detection work on both.
+Gates: all five apply. Build includes the provider code; migrations add provider settings; Windows and macOS means keychain-stored keys and CLI detection work on both.
 ## Release 0.5: International job discovery and intelligence
 
 Scope: connector SDK, read-only discovery, job intelligence (spec section 6).
