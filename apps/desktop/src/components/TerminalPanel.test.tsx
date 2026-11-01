@@ -1,15 +1,16 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { emit } from "@tauri-apps/api/event";
-import { mockIPC } from "@tauri-apps/api/mocks";
+import { emit, listen } from "@tauri-apps/api/event";
+import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import { describe, expect, it, vi } from "vitest";
 import { ptyWrite } from "@/lib/ipc";
-import { TerminalPanel } from "./TerminalPanel";
+import { TERMINAL_OPTIONS, TerminalPanel } from "./TerminalPanel";
 
 type Call = { cmd: string; args: Record<string, unknown> };
 
 function backend(overrides: Record<string, () => unknown> = {}) {
   const calls: Call[] = [];
+  mockWindows("main");
   mockIPC(
     (cmd, args) => {
       calls.push({ cmd, args: args as Call["args"] });
@@ -107,6 +108,44 @@ describe("TerminalPanel", () => {
     await waitFor(() =>
       expect(document.querySelector(".xterm-rows")?.textContent).not.toContain("hello"),
     );
+  });
+
+  it("acks_output_only_once_the_terminal_has_taken_it", async () => {
+    const { of } = backend();
+    const acks: unknown[] = [];
+    panel();
+    await waitFor(() => expect(of("pty_open")).toHaveLength(1));
+    await listen("pty:ack", (event) => void acks.push(event.payload));
+    await emit("pty:data", [...new TextEncoder().encode("twelve bytes")]);
+    await waitFor(() => expect(acks).toEqual([12]));
+  });
+
+  it("replies_from_the_terminal_are_not_typing", async () => {
+    const { of } = backend();
+    panel();
+    await waitFor(() => expect(of("pty_open")).toHaveLength(1));
+    // A cursor position query: ConPTY sends this on start, and xterm.js answers it itself.
+    await emit("pty:data", [...new TextEncoder().encode("\x1b[6n")]);
+    await waitFor(() => expect(of("pty_write")).toHaveLength(1));
+    expect(screen.getByText("Type `jobpilot --help`.")).toBeInTheDocument();
+  });
+
+  it("the_empty_hint_goes_with_the_first_key", async () => {
+    const { of } = backend();
+    const { user } = panel();
+    await waitFor(() => expect(of("pty_open")).toHaveLength(1));
+    terminalInput().focus();
+    await user.keyboard("a");
+    await waitFor(() =>
+      expect(screen.queryByText("Type `jobpilot --help`.")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("links_in_output_open_nothing", () => {
+    const open = vi.spyOn(window, "open");
+    TERMINAL_OPTIONS.linkHandler.activate();
+    expect(open).not.toHaveBeenCalled();
+    open.mockRestore();
   });
 
   it("failed_open_shows_code_and_restart", async () => {

@@ -1,6 +1,6 @@
 // ponytail: hand-kept in sync with commands.rs; add tauri-specta when the command count makes drift a real problem.
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { open } from "@tauri-apps/plugin-dialog";
 
 /** What every failed command rejects with (jobpilot-core `Error`). */
@@ -307,11 +307,18 @@ export function ptyClose(): Promise<void> {
 }
 
 export function onPtyData(cb: (bytes: Uint8Array) => void): Promise<() => void> {
-  return listen<number[]>("pty:data", (event) => cb(Uint8Array.from(event.payload)));
+  return getCurrentWebviewWindow().listen<number[]>("pty:data", (event) =>
+    cb(Uint8Array.from(event.payload)),
+  );
 }
 
 export function onPtyExit(cb: (code: number | null) => void): Promise<() => void> {
-  return listen<number | null>("pty:exit", (event) => cb(event.payload));
+  return getCurrentWebviewWindow().listen<number | null>("pty:exit", (event) => cb(event.payload));
+}
+
+/** Frees output credit once xterm.js has parsed `bytes`, so the PTY paces the child. */
+export function ptyAck(bytes: number): Promise<void> {
+  return getCurrentWebviewWindow().emit("pty:ack", bytes);
 }
 
 /** The folder picker for a backup. Returns null when the user cancels. */

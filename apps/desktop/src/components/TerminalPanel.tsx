@@ -4,8 +4,15 @@ import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { ErrorAlert } from "@/components/ErrorAlert";
 import { Button } from "@/components/ui/button";
-import { onPtyData, onPtyExit, ptyClose, ptyOpen, ptyResize, ptyWrite } from "@/lib/ipc";
+import { onPtyData, onPtyExit, ptyAck, ptyClose, ptyOpen, ptyResize, ptyWrite } from "@/lib/ipc";
 import { cn } from "@/lib/utils";
+
+/** Output is untrusted, so a link in it (OSC 8) must never open anything. */
+export const TERMINAL_OPTIONS = {
+  convertEol: true,
+  scrollback: 2000,
+  linkHandler: { activate: () => undefined },
+};
 
 /**
  * The bottom panel. A session starts when the panel first opens and lives until Close panel,
@@ -35,7 +42,7 @@ export function TerminalPanel({ open, onClose }: { open: boolean; onClose(): voi
 
   useEffect(() => {
     if (!wanted || !host.current) return;
-    const term = new Terminal({ convertEol: true, scrollback: 2000 });
+    const term = new Terminal(TERMINAL_OPTIONS);
     const addon = new FitAddon();
     term.loadAddon(addon);
     term.open(host.current);
@@ -50,7 +57,7 @@ export function TerminalPanel({ open, onClose }: { open: boolean; onClose(): voi
     const opened = turn.current.then(async () => {
       if (stopped) return;
       unlisten.push(
-        await onPtyData((bytes) => term.write(bytes)),
+        await onPtyData((bytes) => term.write(bytes, () => void ptyAck(bytes.length))),
         await onPtyExit(() => {
           finished = true;
           setEnded(true);
@@ -64,9 +71,10 @@ export function TerminalPanel({ open, onClose }: { open: boolean; onClose(): voi
       if (!stopped) setFailure(error);
     });
 
+    // Not `onData`: that also carries the terminal's own replies to the shell.
+    const key = term.onKey(() => setTyped(true));
     const input = term.onData((data) => {
       if (finished) return;
-      setTyped(true);
       ptyWrite(new TextEncoder().encode(data)).then(() => setWriteError(null), setWriteError);
     });
     const resized = term.onResize(({ cols, rows }) => {
@@ -81,6 +89,7 @@ export function TerminalPanel({ open, onClose }: { open: boolean; onClose(): voi
     return () => {
       stopped = true;
       window.removeEventListener("resize", refit);
+      key.dispose();
       input.dispose();
       resized.dispose();
       term.dispose();

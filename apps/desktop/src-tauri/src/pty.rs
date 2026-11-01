@@ -2,21 +2,26 @@
 //! shell. `pty_open` takes a size and nothing else, so the webview cannot choose what runs.
 //! Keystrokes are bytes on a queue, because a write can block for as long as the child
 //! ignores its input and commands run on the main thread. Output and the exit code go out
-//! as events to the window that opened the session.
+//! as events to the window that opened the session, and output is paced by acks from the
+//! panel: Claude Code repaints continuously, so a child that outruns xterm.js must block.
 
 use std::collections::BTreeMap;
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::thread;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use jobpilot_core::ai::claude_code::ClaudeCode;
 use jobpilot_core::{Error, Result};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use tauri::{Emitter, EventTarget, Manager, Runtime, State, WebviewWindow, Window, WindowEvent};
+use tauri::{
+    Emitter, EventTarget, Listener, Manager, Runtime, State, WebviewWindow, Window, WindowEvent,
+};
 
 use crate::state::AppState;
 
@@ -24,6 +29,14 @@ pub const MAX_WRITE_BYTES: usize = 64 * 1024;
 /// Writes waiting on a child that is not reading. More than this is refused.
 const INPUT_QUEUE: usize = 64;
 const READ_CHUNK: usize = 8 * 1024;
+/// Output bytes sent and not yet acked. Past this the reader stops, the terminal driver's
+/// buffer fills, and the child blocks in its own write.
+const OUTPUT_WINDOW: usize = 128 * 1024;
+/// A sane ceiling on the size the webview may ask for.
+const MAX_DIMENSION: u16 = 1000;
+/// How long a hung-up child gets before its process groups are killed.
+#[cfg(unix)]
+const HANGUP_GRACE: Duration = Duration::from_millis(250);
 /// How long an ended session's last output gets. A daemon the child left behind can hold
 /// the terminal open for ever, and the exit must still be reported.
 const DRAIN: Duration = Duration::from_millis(500);
@@ -41,6 +54,8 @@ const TOOL_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin"];
 pub struct PtyState {
     slot: Mutex<Option<Session>>,
     next_id: AtomicU64,
+    /// Closes running in the background, which `close` waits for on the way out.
+    ending: Mutex<Vec<JoinHandle<()>>>,
 }
 
 pub struct Session {
@@ -48,11 +63,92 @@ pub struct Session {
     master: Box<dyn MasterPty + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     input: SyncSender<Vec<u8>>,
-    /// Set by `close`: from then on this session emits nothing, or its late output and
-    /// exit would land in the session that follows it.
-    silent: Arc<AtomicBool>,
-    #[cfg(test)]
+    output: Arc<Output>,
+    #[cfg(any(unix, test))]
     pid: Option<u32>,
+}
+
+impl Session {
+    /// Ends the child and whatever it runs. Blocks for up to the grace period, and on Windows
+    /// until the pseudoconsole has closed: that close is what ends the attached processes,
+    /// and the reader keeps draining meanwhile. A failed kill means the child has gone.
+    fn end(mut self) {
+        self.output.silence();
+        #[cfg(unix)]
+        let groups = [
+            self.master.process_group_leader(),
+            self.pid.and_then(|pid| libc::pid_t::try_from(pid).ok()),
+        ];
+        let _ = self.killer.kill();
+        #[cfg(unix)]
+        kill_groups_after_grace(groups);
+    }
+}
+
+/// A hangup is only a request: `claude` may ignore it. The foreground group is the running
+/// program, and the shell's own group holds whatever it started. Read before the hangup,
+/// which takes the terminal away.
+#[cfg(unix)]
+fn kill_groups_after_grace(groups: [Option<libc::pid_t>; 2]) {
+    // `kill` reads 0 and 1 as "my group" and "everything": never pass those on.
+    let groups = || groups.iter().flatten().copied().filter(|group| *group > 1);
+    // SAFETY: `kill` takes plain integers and touches no memory.
+    let exists = |group: libc::pid_t| unsafe { libc::kill(-group, 0) } == 0;
+    let until = Instant::now() + HANGUP_GRACE;
+    while groups().any(exists) && Instant::now() < until {
+        thread::sleep(Duration::from_millis(10));
+    }
+    for group in groups() {
+        // SAFETY: as above. A group that has gone answers ESRCH.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+    }
+}
+
+/// The credit between the reader and the panel.
+#[derive(Default)]
+struct Output {
+    credit: Mutex<Credit>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct Credit {
+    unacked: usize,
+    /// From here on this session emits nothing, or its late output and exit would land in
+    /// the session that follows it.
+    silent: bool,
+}
+
+impl Output {
+    fn credit(&self) -> MutexGuard<'_, Credit> {
+        self.credit.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Blocks while the window is full. `false` means drop the chunk: nobody is listening.
+    fn admit(&self, bytes: usize) -> bool {
+        let mut credit = self.credit();
+        while !credit.silent && credit.unacked >= OUTPUT_WINDOW {
+            credit = self
+                .changed
+                .wait(credit)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        if !credit.silent {
+            credit.unacked += bytes;
+        }
+        !credit.silent
+    }
+
+    fn ack(&self, bytes: usize) {
+        let mut credit = self.credit();
+        credit.unacked = credit.unacked.saturating_sub(bytes);
+        self.changed.notify_all();
+    }
+
+    fn silence(&self) {
+        self.credit().silent = true;
+        self.changed.notify_all();
+    }
 }
 
 impl PtyState {
@@ -72,15 +168,31 @@ impl PtyState {
         }
     }
 
-    /// Hangs up on the child; the waiter thread reaps it. A failed kill means it is gone.
-    /// Dropped elsewhere: closing a pseudoconsole on Windows waits for its output to drain.
+    /// Ends the session and returns once it has ended, closes already under way included:
+    /// the process may be about to exit, and a thread would die with it. The waiter thread
+    /// reaps the child.
     pub fn close(&self) {
         let session = self.slot().take();
-        if let Some(mut session) = session {
-            session.silent.store(true, Ordering::SeqCst);
-            let _ = session.killer.kill();
-            thread::spawn(move || drop(session));
+        if let Some(session) = session {
+            session.end();
         }
+        let ending = std::mem::take(&mut *self.ending());
+        for close in ending {
+            let _ = close.join();
+        }
+    }
+
+    /// For the main thread: stops the output now and leaves the grace period to a thread.
+    fn close_soon(&self) {
+        let session = self.slot().take();
+        if let Some(session) = session {
+            session.output.silence();
+            self.ending().push(thread::spawn(move || session.end()));
+        }
+    }
+
+    fn ending(&self) -> MutexGuard<'_, Vec<JoinHandle<()>>> {
+        self.ending.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     #[cfg(test)]
@@ -145,8 +257,11 @@ fn with_tool_dirs(path: Option<&String>, home: Option<&String>) -> Option<String
 }
 
 fn checked_size(cols: u16, rows: u16) -> Result<PtySize> {
-    if cols == 0 || rows == 0 {
-        return Err(Error::Validation("terminal size must not be zero".into()));
+    let allowed = 1..=MAX_DIMENSION;
+    if !allowed.contains(&cols) || !allowed.contains(&rows) {
+        return Err(Error::Validation(format!(
+            "terminal size must be 1 to {MAX_DIMENSION} in each direction"
+        )));
     }
     Ok(PtySize {
         rows,
@@ -206,26 +321,31 @@ pub async fn pty_open<R: Runtime>(
     let reader = pair.master.try_clone_reader().map_err(pty_error)?;
     let writer = pair.master.take_writer().map_err(pty_error)?;
     let (input, queue) = mpsc::sync_channel(INPUT_QUEUE);
-    let silent = Arc::new(AtomicBool::new(false));
+    let output = Arc::new(Output::default());
     let id = state.next_id.fetch_add(1, Ordering::Relaxed);
     let killer = child.clone_killer();
-    #[cfg(test)]
+    #[cfg(any(unix, test))]
     let pid = child.process_id();
 
     thread::spawn(move || write_input(queue, writer));
-    let drained = read_output(reader, window.clone(), silent.clone());
-    let quiet = silent.clone();
+    let drained = read_output(reader, window.clone(), output.clone());
+    let credit = output.clone();
+    // Scoped to this window; a late ack from an earlier session frees a little credit, no more.
+    let acks = window.listen("pty:ack", move |event| {
+        credit.ack(serde_json::from_str(event.payload()).unwrap_or(0));
+    });
+    let ended = output.clone();
     thread::spawn(move || {
         let code = child.wait().ok().map(|status| status.exit_code());
         // `None`: `close` took it, so nobody is waiting for an exit.
-        let Some(session) = window.state::<PtyState>().take(id) else {
-            return;
-        };
-        // Windows only ends the reader when the pseudoconsole closes.
-        drop(session);
-        let _ = drained.recv_timeout(DRAIN);
-        quiet.store(true, Ordering::SeqCst);
-        let _ = window.emit_to(target(&window), "pty:exit", code);
+        if let Some(session) = window.state::<PtyState>().take(id) {
+            // Windows only ends the reader when the pseudoconsole closes.
+            drop(session);
+            let _ = drained.recv_timeout(DRAIN);
+            ended.silence();
+            let _ = window.emit_to(target(&window), "pty:exit", code);
+        }
+        window.unlisten(acks);
     });
 
     *slot = Some(Session {
@@ -233,8 +353,8 @@ pub async fn pty_open<R: Runtime>(
         master: pair.master,
         killer,
         input,
-        silent,
-        #[cfg(test)]
+        output,
+        #[cfg(any(unix, test))]
         pid,
     });
     Ok(())
@@ -262,7 +382,7 @@ fn write_input(queue: mpsc::Receiver<Vec<u8>>, mut writer: Box<dyn Write + Send>
 fn read_output<R: Runtime>(
     mut reader: Box<dyn Read + Send>,
     window: WebviewWindow<R>,
-    silent: Arc<AtomicBool>,
+    output: Arc<Output>,
 ) -> mpsc::Receiver<()> {
     let (done, drained) = mpsc::channel();
     thread::spawn(move || {
@@ -270,11 +390,11 @@ fn read_output<R: Runtime>(
         loop {
             match reader.read(&mut chunk) {
                 Ok(0) => break,
-                Ok(read) if !silent.load(Ordering::SeqCst) => {
-                    // ponytail: no backpressure on a flood; the child's output is short.
-                    let _ = window.emit_to(target(&window), "pty:data", chunk[..read].to_vec());
+                Ok(read) => {
+                    if output.admit(read) {
+                        let _ = window.emit_to(target(&window), "pty:data", chunk[..read].to_vec());
+                    }
                 }
-                Ok(_) => {}
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
                 Err(_) => break,
             }
@@ -312,13 +432,16 @@ pub fn pty_resize(state: State<'_, PtyState>, cols: u16, rows: u16) -> Result<()
 /// reload left behind with nobody listening.
 #[tauri::command]
 pub fn pty_close(state: State<'_, PtyState>) -> Result<()> {
-    state.close();
+    state.close_soon();
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use tauri::Listener;
+    #[cfg(unix)]
+    use jobpilot_core::AppPaths;
+    use tauri::test::MockRuntime;
+    use tauri::{App, WebviewWindowBuilder};
 
     use super::*;
 
@@ -368,29 +491,242 @@ mod tests {
         assert_eq!(path, "/opt/homebrew/bin:/usr/local/bin");
     }
 
-    /// Late output of a closed session must not land in the session after it, and the
-    /// reader still runs to the end: a pseudoconsole cannot close until it is drained.
-    #[test]
-    fn a_silent_session_drains_and_emits_nothing() {
+    fn mock_window() -> (App<MockRuntime>, WebviewWindow<MockRuntime>) {
         let app = tauri::test::mock_app();
-        let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        let window = WebviewWindowBuilder::new(&app, "main", Default::default())
             .build()
             .unwrap();
+        (app, window)
+    }
+
+    fn output_events(window: &WebviewWindow<MockRuntime>) -> Arc<AtomicU64> {
         let seen = Arc::new(AtomicU64::new(0));
         let count = seen.clone();
         window.listen("pty:data", move |_| {
             count.fetch_add(1, Ordering::SeqCst);
         });
+        seen
+    }
+
+    /// Late output of a closed session must not land in the session after it, and the
+    /// reader still runs to the end: a pseudoconsole cannot close until it is drained.
+    #[test]
+    fn a_silent_session_drains_and_emits_nothing() {
+        let (_app, window) = mock_window();
+        let seen = output_events(&window);
         let read = |silent: bool| {
             let bytes = Box::new(io::Cursor::new(b"late".to_vec()));
-            let silent = Arc::new(AtomicBool::new(silent));
-            let drained = read_output(bytes, window.clone(), silent);
+            let output = Arc::new(Output::default());
+            if silent {
+                output.silence();
+            }
+            let drained = read_output(bytes, window.clone(), output);
             drained.recv_timeout(Duration::from_secs(10)).unwrap();
         };
         read(true);
         assert_eq!(seen.load(Ordering::SeqCst), 0);
         read(false);
         assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
+    /// A child that never stops printing, counting what the reader has taken from it.
+    struct Flood(Arc<AtomicU64>);
+
+    impl Read for Flood {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.0.fetch_add(buffer.len() as u64, Ordering::SeqCst);
+            buffer.fill(b'x');
+            Ok(buffer.len())
+        }
+    }
+
+    fn settled(count: &AtomicU64) -> u64 {
+        // Bounded, so a reader that never stops fails the test instead of hanging it.
+        let mut last = u64::MAX;
+        for _ in 0..50 {
+            let now = count.load(Ordering::SeqCst);
+            if now == last {
+                break;
+            }
+            last = now;
+            thread::sleep(Duration::from_millis(100));
+        }
+        last
+    }
+
+    #[test]
+    fn the_reader_stops_without_acks_and_resumes_with_them() {
+        let (_app, window) = mock_window();
+        let taken = Arc::new(AtomicU64::new(0));
+        let output = Arc::new(Output::default());
+        let flood = Box::new(Flood(taken.clone()));
+        let _drained = read_output(flood, window.clone(), output.clone());
+
+        let stalled = settled(&taken);
+        // One chunk past the window: the one in hand when it filled, plus the one it blocks on.
+        let ceiling = (OUTPUT_WINDOW + 2 * READ_CHUNK) as u64;
+        assert!(stalled <= ceiling, "read {stalled} bytes with no ack");
+
+        output.ack(OUTPUT_WINDOW);
+        let resumed = settled(&taken);
+        assert!(resumed > stalled, "an ack must let it read on");
+        assert!(resumed <= stalled + ceiling);
+
+        // Closing frees a stalled reader, so nothing waits on a panel that has gone.
+        output.silence();
+        wait_until(|| taken.load(Ordering::SeqCst) > resumed + ceiling);
+    }
+
+    #[test]
+    fn an_ack_cannot_buy_more_than_the_window() {
+        let output = Output::default();
+        output.ack(usize::MAX);
+        assert_eq!(output.credit().unacked, 0);
+        assert!(output.admit(OUTPUT_WINDOW));
+        assert_eq!(output.credit().unacked, OUTPUT_WINDOW);
+    }
+
+    #[test]
+    fn size_is_one_to_a_thousand_each_way() {
+        assert!(checked_size(1, 1).is_ok());
+        assert!(checked_size(1000, 1000).is_ok());
+        for (cols, rows) in [
+            (0, 24),
+            (80, 0),
+            (1001, 24),
+            (80, 1001),
+            (u16::MAX, u16::MAX),
+        ] {
+            let refused = checked_size(cols, rows).unwrap_err();
+            assert_eq!(refused.code(), "validation", "{cols}x{rows}");
+        }
+    }
+
+    fn wait_until(done: impl Fn() -> bool) {
+        let until = std::time::Instant::now() + Duration::from_secs(20);
+        while !done() {
+            assert!(std::time::Instant::now() < until, "timed out");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The real CLI under a real terminal, with a stand-in `claude` that ignores hangups.
+    #[cfg(unix)]
+    struct Stubborn {
+        _tmp: tempfile::TempDir,
+        app: App<MockRuntime>,
+        pid: i32,
+    }
+
+    #[cfg(unix)]
+    impl Stubborn {
+        fn start() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let tmp = tempfile::tempdir().unwrap();
+            let bin = tmp.path().join("fake");
+            std::fs::create_dir(&bin).unwrap();
+            let claude = bin.join("claude");
+            let pid_file = tmp.path().join("claude.pid");
+            let body = format!(
+                "#!/bin/sh\ntrap '' HUP\necho $$ > {}\necho claude-ready\nwhile :; do sleep 1; done\n",
+                pid_file.display()
+            );
+            std::fs::write(&claude, body).unwrap();
+            std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let paths = AppPaths::new(tmp.path().join("data"));
+            let state = tauri::async_runtime::block_on(async {
+                let state = AppState::open(paths).await;
+                let path = serde_json::json!(claude);
+                let slot = state.db.read().await;
+                let db = slot.as_ref().unwrap();
+                jobpilot_core::settings::set(db, "ai.claude_path", &path)
+                    .await
+                    .unwrap();
+                drop(slot);
+                state
+            });
+            let app = tauri::test::mock_builder()
+                .manage(state)
+                .manage(PtyState::default())
+                .build(tauri::test::mock_context(tauri::test::noop_assets()))
+                .unwrap();
+            let window = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .unwrap();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let sink = seen.clone();
+            window.listen("pty:data", move |event| {
+                let bytes: Vec<u8> = serde_json::from_str(event.payload()).unwrap();
+                sink.lock().unwrap().extend(bytes);
+            });
+            let wait_for = |needle: &str| {
+                wait_until(|| String::from_utf8_lossy(&seen.lock().unwrap()).contains(needle));
+            };
+            tauri::async_runtime::block_on(pty_open(
+                window.clone(),
+                app.state(),
+                app.state(),
+                200,
+                40,
+            ))
+            .expect("build the CLI first: cargo build -p jobpilot-cli");
+            wait_for("jobpilot> ");
+            pty_write(app.state(), b"claude\r".to_vec()).unwrap();
+            wait_for("claude-ready");
+            let pid = std::fs::read_to_string(pid_file).unwrap();
+            let pid = pid.trim().parse().unwrap();
+            Stubborn {
+                _tmp: tmp,
+                app,
+                pid,
+            }
+        }
+
+        /// Soon after the kill, not eventually: this runs after the close has returned.
+        fn assert_gone(&self) {
+            // SAFETY: `kill` takes plain integers; signal 0 only asks if the process exists.
+            let alive = || unsafe { libc::kill(self.pid, 0) } == 0;
+            let until = Instant::now() + Duration::from_secs(2);
+            while alive() {
+                assert!(Instant::now() < until, "process {} survived", self.pid);
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn close_kills_a_claude_that_ignores_the_hangup() {
+        let session = Stubborn::start();
+        session.app.state::<PtyState>().close();
+        session.assert_gone();
+    }
+
+    /// The panel's `emit` arrives as an app-wide event, which the session must hear.
+    #[cfg(unix)]
+    #[test]
+    fn an_ack_event_frees_the_sessions_credit() {
+        let session = Stubborn::start();
+        let state = session.app.state::<PtyState>();
+        let unacked = || state.slot().as_ref().unwrap().output.credit().unacked;
+        assert!(unacked() > 0);
+        session.app.emit("pty:ack", OUTPUT_WINDOW).unwrap();
+        wait_until(|| unacked() == 0);
+    }
+
+    /// `RunEvent::Exit` calls `close`: the process ends right after, so it must also wait
+    /// for a close that `pty_close` left running in the background.
+    #[cfg(unix)]
+    #[test]
+    fn close_waits_for_a_pty_close_still_under_way() {
+        let session = Stubborn::start();
+        let started = std::time::Instant::now();
+        pty_close(session.app.state()).unwrap();
+        session.app.state::<PtyState>().close();
+        assert!(started.elapsed() >= HANGUP_GRACE, "close did not wait");
+        session.assert_gone();
     }
 
     #[test]

@@ -191,7 +191,8 @@ async fn jobpilot(args: Vec<String>) -> String {
     }
 }
 
-/// Starts the owner's own session with the full environment and the terminal, then waits.
+/// Starts the owner's own session with this process's environment and the terminal, then
+/// waits. In the panel that environment is the PTY layer's allow-list, so API keys stay out.
 /// The adapter's no-tools flags and scrubbed environment are for headless drafting only.
 async fn claude(output: &mut (impl AsyncWrite + Unpin), args: &[String]) -> Result<String> {
     let bin = match locate().await {
@@ -238,10 +239,12 @@ async fn locate() -> std::result::Result<std::path::PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jobpilot_core::ai::claude_code::{
-        PATH_SETTING, checked, fallback_dirs, login_shell_lookup, search,
-    };
-    use std::path::{Path, PathBuf};
+    use jobpilot_core::ai::claude_code::{PATH_SETTING, checked};
+    #[cfg(unix)]
+    use jobpilot_core::ai::claude_code::{fallback_dirs, login_shell_lookup, search};
+    #[cfg(unix)]
+    use std::path::Path;
+    use std::path::PathBuf;
 
     fn words(text: &str) -> Vec<String> {
         text.split_whitespace().map(str::to_string).collect()
