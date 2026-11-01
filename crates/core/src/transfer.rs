@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 use sqlx::sqlite::SqlitePool;
 
-use crate::audit;
 use crate::backup::{
     blocking, remove_dir_if_present, remove_if_present, remove_restore_leftovers, sidecar,
 };
@@ -19,6 +18,7 @@ use crate::error::{Error, Result};
 use crate::paths::AppPaths;
 use crate::profile;
 use crate::secrets;
+use crate::{audit, crypto};
 
 /// Writes `exports/jobpilot-export-<stamp>/`, holding `data.json`, `work_authorization.json`
 /// (plain when the key is unlocked, else a locked marker; callers warn first) and a copy of
@@ -159,8 +159,9 @@ fn fill_and_publish(
     Ok(dir)
 }
 
-/// Removes JobPilot's data under the root and its keychain entries. This cannot be
-/// undone, and it writes no audit row because it removes the log.
+/// Removes JobPilot's data under the root and its keychain entries: this root's data keys,
+/// active or not, then the API keys. This cannot be undone, and it writes no audit row
+/// because it removes the log.
 ///
 /// Consumes `db`. On any error the handle is closed, so callers run `Db::open` again.
 /// `confirm` must be exactly `"DELETE"`, and the root must still hold its marker. An
@@ -192,7 +193,14 @@ async fn names_to_erase(db: &Db, confirm: &str) -> Result<Vec<String>> {
     if !db.paths().marker().is_file() {
         return Err(Error::RootNotOwned(db.paths().root().to_path_buf()));
     }
-    secrets::names(db).await
+    // A key can have ciphertext and no row, and no other root's id is in either list.
+    let mut key_ids: Vec<String> = sqlx::query_scalar("SELECT key_id FROM data_keys")
+        .fetch_all(&db.pool)
+        .await?;
+    key_ids.extend(crypto::held_key_ids(db).await?);
+    let mut names: Vec<String> = key_ids.iter().map(|id| crypto::account(id)).collect();
+    names.extend(secrets::names(db).await?);
+    Ok(names)
 }
 
 /// The keychain goes first: a failure there must leave `secret_index` to retry from.
@@ -220,6 +228,7 @@ fn remove_files(paths: &AppPaths, include_backups: bool) -> io::Result<()> {
         remove_dir_if_present(&paths.backups())?;
     }
     remove_restore_leftovers(paths)?;
+    remove_if_present(&paths.swap_marker())?;
 
     let db = paths.db();
     for suffix in ["-wal", "-shm", "-journal"] {

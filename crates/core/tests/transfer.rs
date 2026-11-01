@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use jobpilot_core::crypto::{self, KEY_ACCOUNT_PREFIX, KeyState};
 use jobpilot_core::{AppPaths, Db, Error, audit, backup, documents, secrets, transfer};
 use serde_json::Value;
 use tempfile::TempDir;
@@ -206,7 +207,12 @@ async fn delete_all_removes_what_a_crashed_restore_left_and_nothing_foreign() {
     let (_tmp, paths) = temp_root();
     let db = Db::open(&paths).await.unwrap();
     let root = paths.root();
-    for leftover in ["restore-tmp.db", "restore-tmp.db-wal", "restore-old.db-wal"] {
+    for leftover in [
+        "restore-tmp.db",
+        "restore-tmp.db-wal",
+        "restore-old.db-wal",
+        ".jobpilot-swap",
+    ] {
         fs::write(root.join(leftover), "user data").unwrap();
     }
     for leftover in ["restore-tmp-documents", "restore-old-documents"] {
@@ -559,4 +565,139 @@ async fn another_roots_entry_survives_delete() {
     assert!(matches!(result, Err(Error::NotFound)), "{result:?}");
     assert!(entries.present(name));
     db.close().await;
+}
+
+/// A data key's entry, removed even when an assertion fails first.
+struct KeyEntry(keyring::Entry);
+
+impl KeyEntry {
+    fn new(key_id: &str) -> Self {
+        let service = std::env::var("JOBPILOT_SECRET_SERVICE")
+            .expect("set JOBPILOT_SECRET_SERVICE=jobpilot-test");
+        assert_ne!(service, "io.github.gvsrusa.jobpilot");
+        let name = format!("{KEY_ACCOUNT_PREFIX}{key_id}");
+        Self(keyring::Entry::new(&service, &name).unwrap())
+    }
+
+    fn stored(key_id: &str) -> Self {
+        let entry = Self::new(key_id);
+        entry.0.set_password("not a real key").unwrap();
+        entry
+    }
+
+    fn present(&self) -> bool {
+        match self.0.get_password() {
+            Ok(_) => true,
+            Err(keyring::Error::NoEntry) => false,
+            Err(error) => panic!("{error}"),
+        }
+    }
+}
+
+impl Drop for KeyEntry {
+    fn drop(&mut self) {
+        let _ = self.0.delete_credential();
+    }
+}
+
+async fn unlocked(paths: &AppPaths) -> (Db, KeyEntry) {
+    let db = Db::open(paths).await.unwrap();
+    let state = crypto::state(&db).await.unwrap();
+    let KeyState::Unlocked { key_id } = state else {
+        panic!("{state:?}");
+    };
+    (db, KeyEntry::new(&key_id))
+}
+
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn delete_all_removes_this_roots_data_keys_only() {
+    let (_tmp_a, a) = temp_root();
+    let (_tmp_b, b) = temp_root();
+    let (db_a, entry_a) = unlocked(&a).await;
+    let (db_b, entry_b) = unlocked(&b).await;
+    let before = audit::recent(&db_b, 10).await.unwrap().len();
+    assert_eq!(before, 1);
+
+    transfer::delete_all(db_a, "DELETE", true).await.unwrap();
+
+    assert!(!entry_a.present());
+    assert!(entry_b.present());
+    assert_eq!(audit::recent(&db_b, 10).await.unwrap().len(), before);
+    assert!(matches!(
+        crypto::state(&db_b).await.unwrap(),
+        KeyState::Unlocked { .. }
+    ));
+    db_b.close().await;
+}
+
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn delete_all_removes_inactive_data_keys_too() {
+    const INACTIVE: &str = "a0a1a2a3a4a5a6a7";
+    let (_tmp, paths) = temp_root();
+    let (db, active) = unlocked(&paths).await;
+    let inactive = KeyEntry::stored(INACTIVE);
+    sqlx::query(
+        "INSERT INTO data_keys (key_id, created_at, key_check, active) VALUES (?, 't', x'00', 0)",
+    )
+    .bind(INACTIVE)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    transfer::delete_all(db, "DELETE", true).await.unwrap();
+
+    assert!(!active.present());
+    assert!(!inactive.present());
+}
+
+// With no key row, the ciphertext is all that says this root ever used the key.
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn delete_all_removes_a_key_only_its_ciphertext_names() {
+    const ROWLESS: &str = "b0b1b2b3b4b5b6b7";
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let entry = KeyEntry::stored(ROWLESS);
+    let mut connection = db.pool.acquire().await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO work_authorization (country, ciphertext, key_id, updated_at) \
+         VALUES ('PT', x'00', ?, 't')",
+    )
+    .bind(ROWLESS)
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    drop(connection);
+
+    transfer::delete_all(db, "DELETE", true).await.unwrap();
+
+    assert!(!entry.present());
+}
+
+// M-08: the restored database no longer uses this key, and its row is all that finds it.
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn delete_all_after_a_restore_removes_the_outgoing_key() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let info = backup::create(&db, "cli").await.unwrap();
+    db.close().await;
+    let (db, outgoing) = unlocked(&paths).await;
+
+    let report = backup::restore(db, &info.path, "cli").await.unwrap();
+    transfer::delete_all(report.db, "DELETE", true)
+        .await
+        .unwrap();
+
+    assert!(!outgoing.present());
 }

@@ -136,10 +136,10 @@ async fn run(command: Command) -> Result<Output> {
 async fn restore(paths: &AppPaths, source: &std::path::Path) -> Result<Output> {
     // When the data cannot open, restore is the recovery route, so go offline.
     let db = match Db::open(paths).await {
-        Ok(db) => backup::restore(db, source, ACTOR).await?,
+        Ok(db) => backup::restore(db, source, ACTOR).await?.db,
         // Only failures of the database itself; `InUse` and `RootNotOwned` are real answers.
         Err(Error::Db(_) | Error::MigrationFailed(_) | Error::SchemaTooNew { .. }) => {
-            backup::restore_offline(paths, source, ACTOR).await?
+            backup::restore_offline(paths, source, ACTOR).await?.db
         }
         Err(error) => return Err(error),
     };

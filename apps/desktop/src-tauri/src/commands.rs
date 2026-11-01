@@ -184,8 +184,8 @@ pub async fn backup_restore(state: State<'_, AppState>, source: String) -> Resul
         }
     };
     match restored {
-        Ok(db) => {
-            *slot = Some(db);
+        Ok(report) => {
+            *slot = Some(report.db);
             state.set_failure(None);
         }
         // Live data is now the backup. This must not read as "nothing changed".

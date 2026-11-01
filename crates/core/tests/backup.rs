@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use jobpilot_core::crypto::{self, KEY_ACCOUNT_PREFIX, KeyState};
 use jobpilot_core::{AppPaths, Db, Error, MIGRATOR, app_schema_version, audit, backup, documents};
 use serde_json::{Value, json};
 use sqlx::SqlSafeStr;
@@ -194,7 +195,7 @@ async fn backup_then_restore_round_trip() {
 
     add_doc(&db, "bravo").await;
     fs::write(paths.documents().join("extra.txt"), "extra").unwrap();
-    let db = backup::restore(db, &info.path, "gui").await.unwrap();
+    let db = backup::restore(db, &info.path, "gui").await.unwrap().db;
 
     assert_eq!(titles(&db).await, ["alpha"]);
     assert!(paths.documents().join("kept.txt").is_file());
@@ -227,7 +228,7 @@ async fn backup_and_restore_write_audit_rows() {
     assert_eq!(rows[0].actor, "cli");
     assert_eq!(rows[0].target.as_deref(), Some(source.as_str()));
 
-    let db = backup::restore(db, &info.path, "gui").await.unwrap();
+    let db = backup::restore(db, &info.path, "gui").await.unwrap().db;
     let rows = audit::recent(&db, 1).await.unwrap();
     assert_eq!(rows[0].action, "restore");
     assert_eq!(rows[0].actor, "gui");
@@ -251,7 +252,7 @@ async fn restore_works_under_unicode_path_with_spaces() {
     let info = backup::create(&db, "cli").await.unwrap();
     add_doc(&db, "bravo").await;
 
-    let db = backup::restore(db, &info.path, "gui").await.unwrap();
+    let db = backup::restore(db, &info.path, "gui").await.unwrap().db;
     assert_eq!(titles(&db).await, ["alpha"]);
     db.close().await;
 }
@@ -267,6 +268,7 @@ async fn restore_keeps_safety_snapshot() {
     backup::restore(db, &source, "cli")
         .await
         .unwrap()
+        .db
         .close()
         .await;
 
@@ -460,7 +462,7 @@ async fn restore_removes_stale_wal() {
     fs::write(&wal, "junk").unwrap();
     let db = Db::open(&paths).await.unwrap();
     add_doc(&db, "bravo").await;
-    let db = backup::restore(db, &source, "cli").await.unwrap();
+    let db = backup::restore(db, &source, "cli").await.unwrap().db;
     assert_eq!(titles(&db).await, ["alpha"]);
     db.close().await;
 
@@ -469,7 +471,8 @@ async fn restore_removes_stale_wal() {
     fs::write(&shm, "junk").unwrap();
     let db = backup::restore_offline(&paths, &source, "cli")
         .await
-        .unwrap();
+        .unwrap()
+        .db;
     assert_eq!(titles(&db).await, ["alpha"]);
     assert!(
         fs::read(&wal).unwrap_or_default() != b"junk",
@@ -488,7 +491,8 @@ async fn restore_offline_does_not_replay_old_wal_over_new_database() {
 
     let db = backup::restore_offline(&paths, &source, "cli")
         .await
-        .unwrap();
+        .unwrap()
+        .db;
 
     // VACUUM moved the pages, so a replay does not show as a row: it corrupts others.
     let report: Vec<String> = sqlx::query_scalar("PRAGMA integrity_check")
@@ -514,12 +518,13 @@ async fn restore_offline_snapshot_holds_live_wal_and_can_be_restored() {
 
     let db = backup::restore_offline(&paths, &source, "cli")
         .await
-        .unwrap();
+        .unwrap()
+        .db;
     let found = pre_restore(&paths);
     assert_eq!(found.len(), 1);
     assert_eq!(manifest(&found[0])["wal"], true);
 
-    let db = backup::restore(db, &found[0], "cli").await.unwrap();
+    let db = backup::restore(db, &found[0], "cli").await.unwrap().db;
     assert_eq!(titles(&db).await, ["alpha", "from wal"]);
     db.close().await;
 }
@@ -580,7 +585,7 @@ async fn failed_temp_copy_leaves_live_data_and_releases_the_lock() {
 
     fs::remove_dir(blocker).unwrap();
     let db = Db::open(&paths).await.unwrap();
-    let db = backup::restore(db, &source, "cli").await.unwrap();
+    let db = backup::restore(db, &source, "cli").await.unwrap().db;
     assert_eq!(titles(&db).await, ["alpha"]);
     db.close().await;
 }
@@ -624,7 +629,7 @@ async fn restore_clears_temp_files_left_by_a_crash() {
     fs::create_dir(&moved).unwrap();
 
     let db = Db::open(&paths).await.unwrap();
-    let db = backup::restore(db, &source, "cli").await.unwrap();
+    let db = backup::restore(db, &source, "cli").await.unwrap().db;
 
     assert_eq!(titles(&db).await, ["from wal"]);
     assert!(!paths.documents().join("stale.txt").exists());
@@ -709,7 +714,8 @@ async fn restore_offline_recovers_when_db_cannot_open() {
 
     let db = backup::restore_offline(&paths, &source, "gui")
         .await
-        .unwrap();
+        .unwrap()
+        .db;
 
     assert_eq!(titles(&db).await, ["alpha"]);
     assert_eq!(db.schema_version().await.unwrap(), app_schema_version());
@@ -742,12 +748,16 @@ async fn unreadable_live_database_gives_null_snapshot_and_reports_lost_secrets()
 
     let db = backup::restore_offline(&paths, &source, "gui")
         .await
-        .unwrap();
+        .unwrap()
+        .db;
 
     assert_eq!(titles(&db).await, ["alpha"]);
     let row = &audit::recent(&db, 1).await.unwrap()[0];
     assert_eq!(row.action, "restore");
-    assert_eq!(row.detail, json!({"secret_index_lost": true}));
+    assert_eq!(
+        row.detail,
+        json!({"secret_index_lost": true, "data_keys_lost": true})
+    );
 
     let found = pre_restore(&paths);
     assert_eq!(found.len(), 1);
@@ -761,6 +771,7 @@ async fn unreadable_live_database_gives_null_snapshot_and_reports_lost_secrets()
     let listed = backup::list(&paths).await.unwrap();
     let kept = listed.iter().find(|info| info.path == found[0]).unwrap();
     assert_eq!(kept.schema_version, None);
+    assert!(kept.key_ids.is_empty(), "still listed");
 
     let err = backup::restore(db, &found[0], "gui").await.err().unwrap();
     assert!(matches!(err, Error::InvalidBackup(_)), "{err}");
@@ -775,7 +786,7 @@ async fn null_snapshot_that_opens_is_restored() {
 
     let db = Db::open(&paths).await.unwrap();
     add_doc(&db, "bravo").await;
-    let db = backup::restore(db, &source, "cli").await.unwrap();
+    let db = backup::restore(db, &source, "cli").await.unwrap().db;
 
     assert_eq!(titles(&db).await, ["alpha"]);
     db.close().await;
@@ -812,7 +823,7 @@ async fn restore_of_offline_snapshot_keeps_wal_writes() {
 
     let db = Db::open(&paths).await.unwrap();
     add_doc(&db, "bravo").await;
-    let db = backup::restore(db, &source, "cli").await.unwrap();
+    let db = backup::restore(db, &source, "cli").await.unwrap().db;
 
     assert_eq!(titles(&db).await, ["from wal"]);
     db.close().await;
@@ -857,7 +868,7 @@ async fn restore_ignores_stray_wal_beside_backup() {
 
     let db = Db::open(&paths).await.unwrap();
     add_doc(&db, "bravo").await;
-    let db = backup::restore(db, &source, "cli").await.unwrap();
+    let db = backup::restore(db, &source, "cli").await.unwrap().db;
 
     assert_eq!(titles(&db).await, ["alpha"]);
     db.close().await;
@@ -887,7 +898,7 @@ async fn restore_keeps_secret_index_of_live_secrets() {
     let info = backup::create(&db, "cli").await.unwrap();
     add_secret(&db, "b").await;
 
-    let db = backup::restore(db, &info.path, "cli").await.unwrap();
+    let db = backup::restore(db, &info.path, "cli").await.unwrap().db;
 
     assert_eq!(secrets(&db).await, ["a", "b"]);
     db.close().await;
@@ -909,7 +920,8 @@ async fn offline_restore_unions_secret_index_of_too_new_database() {
 
     let db = backup::restore_offline(&paths, &info.path, "gui")
         .await
-        .unwrap();
+        .unwrap()
+        .db;
 
     assert_eq!(secrets(&db).await, ["a", "b"]);
     assert_eq!(audit::recent(&db, 1).await.unwrap()[0].detail, json!({}));
@@ -934,7 +946,8 @@ async fn offline_restore_reads_secret_index_rows_held_in_the_wal() {
 
     let db = backup::restore_offline(&paths, &source, "gui")
         .await
-        .unwrap();
+        .unwrap()
+        .db;
 
     assert_eq!(secrets(&db).await, ["only in wal"]);
     db.close().await;
@@ -951,7 +964,8 @@ async fn restore_migrates_an_older_backup_forward() {
 
     let db = backup::restore_with(db, &source, "cli", &newer)
         .await
-        .unwrap();
+        .unwrap()
+        .db;
 
     assert_eq!(titles(&db).await, ["alpha"]);
     assert_eq!(db.schema_version().await.unwrap(), 9000);
@@ -1049,7 +1063,7 @@ async fn backup_with_different_library_ddl_still_restores() {
 
     let db = Db::open(&paths).await.unwrap();
     add_doc(&db, "bravo").await;
-    let db = backup::restore(db, &source, "cli").await.unwrap();
+    let db = backup::restore(db, &source, "cli").await.unwrap().db;
     assert_eq!(titles(&db).await, ["alpha"]);
     db.close().await;
 }
@@ -1124,7 +1138,7 @@ async fn restore_recovers_a_corrupt_database_that_still_opens() {
     let db = Db::open(&paths).await.unwrap();
     assert!(documents::list(&db).await.is_err(), "really corrupt");
 
-    let db = backup::restore(db, &info.path, "gui").await.unwrap();
+    let db = backup::restore(db, &info.path, "gui").await.unwrap().db;
 
     assert_eq!(titles(&db).await, ["alpha"]);
     assert_eq!(secrets(&db).await, ["later", "live"]);
@@ -1164,10 +1178,503 @@ async fn corrupt_live_database_with_unreadable_secret_index_reports_it() {
     fs::write(paths.db(), bytes).unwrap();
 
     let db = Db::open(&paths).await.unwrap();
-    let db = backup::restore(db, &info.path, "gui").await.unwrap();
+    let db = backup::restore(db, &info.path, "gui").await.unwrap().db;
 
     assert_eq!(titles(&db).await, ["alpha"]);
     let row = &audit::recent(&db, 1).await.unwrap()[0];
     assert_eq!(row.detail, json!({"secret_index_lost": true}));
     db.close().await;
+}
+
+const KEY_ID: &str = "00112233aabbccdd";
+const OTHER_KEY_ID: &str = "99887766ffeeddcc";
+
+/// A key row whose key-check opens under nothing. Only a keychain read looks at it.
+async fn add_key_row(db: &Db, key_id: &str, active: bool) {
+    sqlx::query(
+        "INSERT INTO data_keys (key_id, created_at, key_check, active) \
+         VALUES (?, 'then', x'0102', ?)",
+    )
+    .bind(key_id)
+    .bind(active)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+}
+
+async fn key_rows(db: &Db) -> Vec<(String, i64)> {
+    sqlx::query_as("SELECT key_id, active FROM data_keys ORDER BY key_id")
+        .fetch_all(&db.pool)
+        .await
+        .unwrap()
+}
+
+async fn audit_count(db: &Db, action: &str) -> usize {
+    let rows = audit::recent(db, 100).await.unwrap();
+    rows.iter().filter(|row| row.action == action).count()
+}
+
+fn missing(key_id: &str) -> KeyState {
+    KeyState::KeyMissing {
+        key_id: key_id.into(),
+    }
+}
+
+fn entry(key_id: &str) -> keyring::Entry {
+    let service = std::env::var("JOBPILOT_SECRET_SERVICE")
+        .expect("set JOBPILOT_SECRET_SERVICE=jobpilot-test");
+    assert_ne!(service, "io.github.gvsrusa.jobpilot");
+    keyring::Entry::new(&service, &format!("{KEY_ACCOUNT_PREFIX}{key_id}")).unwrap()
+}
+
+/// Removes a key's keychain entry even when an assertion fails first.
+struct EntryGuard(String);
+
+impl Drop for EntryGuard {
+    fn drop(&mut self) {
+        let _ = entry(&self.0).delete_credential();
+    }
+}
+
+/// A root with its first key, which the keychain must have accepted.
+async fn unlocked_root(paths: &AppPaths) -> (Db, String, EntryGuard) {
+    let db = Db::open(paths).await.unwrap();
+    let state = crypto::state(&db).await.unwrap();
+    let KeyState::Unlocked { key_id } = state else {
+        panic!("{state:?}");
+    };
+    let guard = EntryGuard(key_id.clone());
+    (db, key_id, guard)
+}
+
+fn first_migration_only() -> Migrator {
+    let first: Vec<Migration> = MIGRATOR
+        .iter()
+        .filter(|migration| migration.version == 1)
+        .cloned()
+        .collect();
+    Migrator::with_migrations(first)
+}
+
+/// A snapshot from before `data_keys` existed. The next `Db::open` migrates the root.
+async fn backup_from_before_data_keys(paths: &AppPaths) -> backup::BackupInfo {
+    let old = first_migration_only();
+    let db = Db::open_with(paths, &old).await.unwrap();
+    add_doc(&db, "alpha").await;
+    let info = backup::create(&db, "cli").await.unwrap();
+    db.close().await;
+    info
+}
+
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn restore_reports_backup_key_state_first() {
+    let (_tmp, paths) = temp_root();
+    let (db, key_id, _guard) = unlocked_root(&paths).await;
+    let info = backup::create(&db, "cli").await.unwrap();
+    entry(&key_id).delete_credential().unwrap();
+
+    let report = backup::restore(db, &info.path, "cli").await.unwrap();
+
+    assert_eq!(report.backup_key_state, Some(missing(&key_id)));
+    assert_eq!(key_rows(&report.db).await, [(key_id.clone(), 1)]);
+    assert_eq!(
+        crypto::state(&report.db).await.unwrap(),
+        missing(&key_id),
+        "no second key"
+    );
+    assert_eq!(key_rows(&report.db).await, [(key_id.clone(), 1)]);
+    assert_eq!(audit_count(&report.db, "data_key_created").await, 1);
+    report.db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn restore_reports_a_key_this_machine_holds_as_unlocked() {
+    let (_tmp, paths) = temp_root();
+    let (db, key_id, _guard) = unlocked_root(&paths).await;
+    let info = backup::create(&db, "cli").await.unwrap();
+
+    let report = backup::restore(db, &info.path, "cli").await.unwrap();
+
+    let expected = KeyState::Unlocked { key_id };
+    assert_eq!(report.backup_key_state, Some(expected));
+    report.db.close().await;
+}
+
+// Key rows with none active are a key this root once used, so `None` would read as 0.1.
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn a_backup_with_no_active_row_reports_its_newest_key() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    add_key_row(&db, KEY_ID, false).await;
+    let info = backup::create(&db, "cli").await.unwrap();
+
+    let report = backup::restore(db, &info.path, "cli").await.unwrap();
+
+    assert_eq!(report.backup_key_state, Some(missing(KEY_ID)));
+    report.db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn restore_keeps_the_backups_key_active_beside_the_outgoing_one() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    add_key_row(&db, KEY_ID, true).await;
+    let info = backup::create(&db, "cli").await.unwrap();
+    sqlx::query("DELETE FROM data_keys")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    add_key_row(&db, OTHER_KEY_ID, true).await;
+
+    let report = backup::restore(db, &info.path, "cli").await.unwrap();
+
+    assert_eq!(report.backup_key_state, Some(missing(KEY_ID)));
+    assert_eq!(
+        key_rows(&report.db).await,
+        [(KEY_ID.to_owned(), 1), (OTHER_KEY_ID.to_owned(), 0)]
+    );
+    report.db.close().await;
+}
+
+// The rename is done, so the caller gets no report: the state travels in the text.
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn failed_reopen_still_names_the_backups_key_state() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    add_key_row(&db, KEY_ID, true).await;
+    let info = backup::create(&db, "cli").await.unwrap();
+    fs::remove_dir(paths.exports()).unwrap();
+    fs::write(paths.exports(), "in the way").unwrap();
+
+    let err = backup::restore(db, &info.path, "gui").await.err().unwrap();
+
+    let Error::RestoredButNotOpened(text) = &err else {
+        panic!("{err}");
+    };
+    assert!(text.contains(KEY_ID), "{text}");
+    assert!(text.contains("no entry"), "{text}");
+}
+
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn a_readable_outgoing_key_reactivates_after_an_older_backup() {
+    let (_tmp, paths) = temp_root();
+    let info = backup_from_before_data_keys(&paths).await;
+    let (db, key_id, _guard) = unlocked_root(&paths).await;
+
+    let report = backup::restore(db, &info.path, "cli").await.unwrap();
+
+    assert_eq!(report.backup_key_state, None);
+    assert_eq!(key_rows(&report.db).await, [(key_id.clone(), 0)]);
+    let expected = KeyState::Unlocked {
+        key_id: key_id.clone(),
+    };
+    assert_eq!(crypto::state(&report.db).await.unwrap(), expected);
+    assert_eq!(key_rows(&report.db).await, [(key_id, 1)]);
+    report.db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn backup_lists_key_ids_from_its_database() {
+    let (_tmp, paths) = temp_root();
+    let (db, key_id, _guard) = unlocked_root(&paths).await;
+
+    let info = backup::create(&db, "cli").await.unwrap();
+
+    assert_eq!(info.key_ids, [key_id.as_str()]);
+    assert_eq!(backup::list(&paths).await.unwrap()[0].key_ids, [key_id]);
+    db.close().await;
+}
+
+#[tokio::test]
+async fn restore_of_a_backup_without_data_keys_reports_none() {
+    let (_tmp, paths) = temp_root();
+    let info = backup_from_before_data_keys(&paths).await;
+    assert!(info.key_ids.is_empty());
+    let db = Db::open(&paths).await.unwrap();
+    add_doc(&db, "bravo").await;
+    let listed = backup::list(&paths).await.unwrap();
+    assert!(listed.iter().all(|found| found.key_ids.is_empty()));
+
+    let report = backup::restore(db, &info.path, "cli").await.unwrap();
+
+    assert_eq!(report.backup_key_state, None);
+    assert_eq!(titles(&report.db).await, ["alpha"]);
+    assert!(key_rows(&report.db).await.is_empty());
+    report.db.close().await;
+}
+
+#[tokio::test]
+async fn key_ids_come_from_each_backups_own_database_active_first() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    add_key_row(&db, KEY_ID, false).await;
+    add_key_row(&db, OTHER_KEY_ID, true).await;
+    let created = backup::create(&db, "cli").await.unwrap();
+    sqlx::query("DELETE FROM data_keys")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    db.close().await;
+
+    let expected = [OTHER_KEY_ID, KEY_ID];
+    assert_eq!(created.key_ids, expected);
+    assert_eq!(backup::list(&paths).await.unwrap()[0].key_ids, expected);
+}
+
+/// The live row must survive a restore for `delete_all` to find its entry.
+#[tokio::test]
+async fn restore_puts_live_key_rows_back_inactive() {
+    let (_tmp, paths) = temp_root();
+    let source = backup_with_doc(&paths, "alpha").await;
+    let db = Db::open(&paths).await.unwrap();
+    add_key_row(&db, KEY_ID, true).await;
+
+    let report = backup::restore(db, &source, "cli").await.unwrap();
+
+    assert_eq!(report.backup_key_state, None);
+    assert_eq!(key_rows(&report.db).await, [(KEY_ID.to_owned(), 0)]);
+    let (created_at, key_check): (String, Vec<u8>) =
+        sqlx::query_as("SELECT created_at, key_check FROM data_keys")
+            .fetch_one(&report.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(created_at, "then");
+    assert_eq!(key_check, [1, 2]);
+    report.db.close().await;
+}
+
+#[tokio::test]
+async fn offline_restore_puts_key_rows_of_a_too_new_database_back_inactive() {
+    let (_tmp, paths) = temp_root();
+    let source = backup_with_doc(&paths, "alpha").await;
+    let db = Db::open(&paths).await.unwrap();
+    add_key_row(&db, KEY_ID, true).await;
+    plant_future_version(&db.pool).await;
+    db.close().await;
+
+    let report = backup::restore_offline(&paths, &source, "gui")
+        .await
+        .unwrap();
+
+    assert_eq!(key_rows(&report.db).await, [(KEY_ID.to_owned(), 0)]);
+    let row = &audit::recent(&report.db, 1).await.unwrap()[0];
+    assert_eq!(row.detail, json!({}));
+    report.db.close().await;
+}
+
+// A live database from before `data_keys` has no rows to lose, so this is not "lost".
+#[tokio::test]
+async fn offline_restore_over_a_database_with_no_data_keys_table_loses_nothing() {
+    let (_tmp, paths) = temp_root();
+    let source = backup_with_doc(&paths, "alpha").await;
+    let db = Db::open(&paths).await.unwrap();
+    for statement in ["DROP TABLE work_authorization", "DROP TABLE data_keys"] {
+        sqlx::query(statement).execute(&db.pool).await.unwrap();
+    }
+    plant_future_version(&db.pool).await;
+    db.close().await;
+
+    let report = backup::restore_offline(&paths, &source, "gui")
+        .await
+        .unwrap();
+
+    let row = &audit::recent(&report.db, 1).await.unwrap()[0];
+    assert_eq!(row.detail, json!({}));
+    report.db.close().await;
+}
+
+#[cfg(unix)]
+fn mkfifo(path: &Path) {
+    let made = std::process::Command::new("mkfifo").arg(path).status();
+    assert!(made.unwrap().success());
+}
+
+/// Runs on its own thread, so a copy stuck opening a FIFO fails the test instead of
+/// holding the runtime open for ever.
+#[cfg(unix)]
+fn within_five_seconds<T: Send + 'static>(work: impl Future<Output = T> + Send + 'static) -> T {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _ = done.send(runtime.block_on(work));
+    });
+    finished
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the copy hung")
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_dir_skips_symlinks_and_fifos_without_hanging() {
+    let (tmp, paths) = temp_root();
+    let outside = tmp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("taxes.pdf"), "user data").unwrap();
+
+    let dir = within_five_seconds(async move {
+        let db = Db::open(&paths).await.unwrap();
+        let documents = paths.documents();
+        fs::write(documents.join("kept.txt"), "kept").unwrap();
+        fs::create_dir(documents.join("nested")).unwrap();
+        fs::write(documents.join("nested").join("inner.txt"), "inner").unwrap();
+        mkfifo(&documents.join("nested").join("pipe"));
+        mkfifo(&documents.join("pipe"));
+        std::os::unix::fs::symlink("/etc/hosts", documents.join("hosts")).unwrap();
+        std::os::unix::fs::symlink("/etc/nowhere", documents.join("dangling")).unwrap();
+        std::os::unix::fs::symlink(&outside, documents.join("folder")).unwrap();
+        let info = backup::create(&db, "cli").await.unwrap();
+        db.close().await;
+        info.path.join("documents")
+    });
+
+    let mut found: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    found.sort();
+    assert_eq!(found, ["kept.txt", "nested"]);
+    assert_eq!(fs::read_to_string(dir.join("kept.txt")).unwrap(), "kept");
+    let nested: Vec<_> = fs::read_dir(dir.join("nested")).unwrap().collect();
+    assert_eq!(nested.len(), 1, "the FIFO one level down is skipped too");
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_dir_leaves_a_unix_socket_behind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (from, to) = (tmp.path().join("from"), tmp.path().join("to"));
+    fs::create_dir(&from).unwrap();
+    let _socket = std::os::unix::net::UnixListener::bind(from.join("socket")).unwrap();
+
+    jobpilot_core::db::copy_dir(&from, &to).unwrap();
+
+    assert_eq!(fs::read_dir(&to).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_from_a_backup_holding_a_fifo_does_not_hang() {
+    let (_tmp, paths) = temp_root();
+    within_five_seconds(async move {
+        let source = backup_with_doc(&paths, "alpha").await;
+        mkfifo(&source.join("documents").join("pipe"));
+        let db = Db::open(&paths).await.unwrap();
+
+        let report = backup::restore(db, &source, "cli").await.unwrap();
+
+        assert!(!paths.documents().join("pipe").exists());
+        report.db.close().await;
+    });
+}
+
+// A backup is untrusted input, and this link would pull the target folder into the root.
+#[cfg(unix)]
+#[tokio::test]
+async fn restore_refuses_a_documents_folder_that_is_a_link() {
+    let (tmp, paths) = temp_root();
+    let outside = tmp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("taxes.pdf"), "user data").unwrap();
+    let source = backup_with_doc(&paths, "alpha").await;
+    fs::remove_dir_all(source.join("documents")).unwrap();
+    std::os::unix::fs::symlink(&outside, source.join("documents")).unwrap();
+
+    let db = Db::open(&paths).await.unwrap();
+    let err = backup::restore(db, &source, "cli").await.err().unwrap();
+
+    assert!(matches!(err, Error::InvalidBackup(_)), "{err}");
+    assert!(!paths.documents().join("taxes.pdf").exists());
+}
+
+#[tokio::test]
+async fn swap_marker_left_by_a_crash_is_reported_and_clears() {
+    let (_tmp, paths) = temp_root();
+    Db::open(&paths).await.unwrap().close().await;
+    fs::write(paths.swap_marker(), "").unwrap();
+
+    let db = Db::open(&paths).await.unwrap();
+    assert!(db.swap_interrupted());
+    db.close().await;
+    assert!(paths.swap_marker().is_file(), "open leaves it for the user");
+
+    let db = Db::open(&paths).await.unwrap();
+    db.clear_swap_warning().await.unwrap();
+    assert!(!db.swap_interrupted());
+    assert!(!paths.swap_marker().exists());
+    db.clear_swap_warning().await.unwrap();
+    db.close().await;
+}
+
+#[tokio::test]
+async fn good_restore_leaves_no_swap_marker() {
+    let (_tmp, paths) = temp_root();
+    let source = backup_with_doc(&paths, "alpha").await;
+    let db = Db::open(&paths).await.unwrap();
+
+    let report = backup::restore(db, &source, "cli").await.unwrap();
+
+    assert!(!paths.swap_marker().exists());
+    assert!(!report.db.swap_interrupted());
+    report.db.close().await;
+
+    let report = backup::restore_offline(&paths, &source, "cli")
+        .await
+        .unwrap();
+    assert!(!report.db.swap_interrupted());
+    report.db.close().await;
+}
+
+// The swap replaced everything, so what the crash damaged is gone.
+#[tokio::test]
+async fn good_restore_clears_the_warning_of_an_earlier_crash() {
+    let (_tmp, paths) = temp_root();
+    let source = backup_with_doc(&paths, "alpha").await;
+    fs::write(paths.swap_marker(), "").unwrap();
+    let db = Db::open(&paths).await.unwrap();
+
+    let report = backup::restore(db, &source, "cli").await.unwrap();
+
+    assert!(!report.db.swap_interrupted());
+    report.db.close().await;
+}
+
+// It never reached the swap, so the damage it warns of is still there.
+#[tokio::test]
+async fn failed_restore_keeps_the_warning_of_an_earlier_crash() {
+    let (_tmp, paths) = temp_root();
+    let source = backup_with_doc(&paths, "alpha").await;
+    fs::write(source.join("jobpilot.db"), "").unwrap();
+    fs::write(paths.swap_marker(), "").unwrap();
+    let db = Db::open(&paths).await.unwrap();
+
+    backup::restore(db, &source, "cli").await.err().unwrap();
+
+    let db = Db::open(&paths).await.unwrap();
+    assert!(db.swap_interrupted());
+    db.close().await;
+}
+
+// Past the commit point the data is the backup, so nothing is left to warn about.
+#[tokio::test]
+async fn failed_reopen_after_the_swap_leaves_no_swap_marker() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let info = backup::create(&db, "cli").await.unwrap();
+    fs::remove_dir(paths.exports()).unwrap();
+    fs::write(paths.exports(), "in the way").unwrap();
+
+    let err = backup::restore(db, &info.path, "gui").await.err().unwrap();
+
+    assert!(matches!(err, Error::RestoredButNotOpened(_)), "{err}");
+    assert!(!paths.swap_marker().exists());
 }

@@ -1,23 +1,28 @@
 //! Backup and restore. A bug here destroys the user's data, so the restore order
 //! below is fixed:
 //!
-//! 1. Validate the source. Live data is not touched.
-//! 2. Write a `pre-restore` snapshot and read the live `secret_index`.
+//! 1. Validate the source and ask the store about its key. Live data is not touched.
+//! 2. Write a `pre-restore` snapshot and read the live `secret_index` and `data_keys`.
 //! 3. Close every handle and take the exclusive lock.
 //! 4. Build the new database as a temporary copy inside the root: copy, merge a WAL
 //!    the manifest claims, migrate, check the schema, put back the saved
-//!    `secret_index` rows, write the audit row, check it again. Copy the documents.
-//! 5. Rename the documents, then the database, over the live paths. Clearing the live
-//!    `-wal` and `-shm` comes right before the database rename, the commit point.
+//!    `secret_index` and `data_keys` rows, write the audit row, check it again. Copy
+//!    the documents.
+//! 5. Under `.jobpilot-swap`, rename the documents, then the database, over the live
+//!    paths. Clearing the live `-wal` and `-shm` comes right before the database rename,
+//!    the commit point.
 //! 6. Release the lock and reopen.
 //!
 //! All database work happens in step 4 because a backup that cannot migrate must not
 //! replace anything. Any failure before the database rename leaves live data unchanged.
 //! Once that rename succeeds the restore has happened, and a failed reopen is
 //! `Error::RestoredButNotOpened`, never an error that reads as "nothing changed".
+//!
+//! A restore removes no keychain entry, so the `pre-restore` snapshot stays readable,
+//! and the outgoing key rows stay in the new database, so `delete_all` can find them.
 
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -26,13 +31,14 @@ use serde_json::json;
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 
-use crate::audit;
+use crate::crypto::{self, KeyState};
 use crate::db::{
     Db, MIGRATOR, Manifest, claim_root, copy_dir, current_version, latest_version, lock_exclusive,
     new_snapshot_dir, release, snapshot, utc_stamps,
 };
 use crate::error::{Error, Result};
 use crate::paths::AppPaths;
+use crate::{audit, secrets};
 
 const DB_FILE: &str = "jobpilot.db";
 const DOCUMENTS: &str = "documents";
@@ -46,10 +52,38 @@ pub struct BackupInfo {
     pub path: PathBuf,
     pub created_at: String,
     pub schema_version: Option<i64>,
+    /// From the backup's own `data_keys`, the key it is under first. Empty for a backup
+    /// with no such table, or a database that cannot be read.
+    pub key_ids: Vec<String>,
+}
+
+/// A finished restore. `backup_key_state` is the state the backup's key had on this
+/// machine before live data was touched, and `None` for a backup with no key row, as
+/// from 0.1. With rows, it is the active key's, else the newest key's.
+#[derive(Debug)]
+pub struct RestoreReport {
+    pub db: Db,
+    pub backup_key_state: Option<KeyState>,
 }
 
 /// A `secret_index` row: name and `created_at`. Never a secret value.
 type SecretRow = (String, String);
+
+/// A `data_keys` row: id, `created_at`, key-check. Never a key. Its active flag stays
+/// behind, because a live row that goes back is no longer the key in use.
+type KeyRow = (String, String, Vec<u8>);
+
+/// What the live database knows that a backup may not. `None` means it could not be read.
+struct LiveRows {
+    secrets: Option<Vec<SecretRow>>,
+    keys: Option<Vec<KeyRow>>,
+}
+
+/// What step 1 found in the source.
+struct Validated {
+    wal: bool,
+    backup_key_state: Option<KeyState>,
+}
 
 /// What step 4 needs to know to build the new database.
 struct Plan<'a> {
@@ -57,8 +91,7 @@ struct Plan<'a> {
     actor: &'a str,
     migrator: &'a Migrator,
     wal: bool,
-    secrets: Vec<SecretRow>,
-    secret_index_lost: bool,
+    live: LiveRows,
 }
 
 pub async fn create(db: &Db, actor: &str) -> Result<BackupInfo> {
@@ -69,6 +102,7 @@ pub async fn create(db: &Db, actor: &str) -> Result<BackupInfo> {
     Ok(BackupInfo {
         created_at: manifest.created_at,
         schema_version: manifest.schema_version,
+        key_ids: key_ids_in(&path, manifest.wal).await,
         path,
     })
 }
@@ -89,6 +123,7 @@ pub async fn list(paths: &AppPaths) -> Result<Vec<BackupInfo>> {
         }
         if let Ok(manifest) = read_manifest(&path) {
             found.push(BackupInfo {
+                key_ids: key_ids_in(&path, manifest.wal).await,
                 path,
                 created_at: manifest.created_at,
                 schema_version: manifest.schema_version,
@@ -102,15 +137,21 @@ pub async fn list(paths: &AppPaths) -> Result<Vec<BackupInfo>> {
 /// Replaces live data with `source`. On any error the handle is closed, so callers
 /// run `Db::open` again. Live data is unchanged after every error except
 /// `Error::RestoredButNotOpened`, which means live data is now the backup and only
-/// the reopen failed.
-pub async fn restore(db: Db, source: &Path, actor: &str) -> Result<Db> {
+/// the reopen failed. That error's text carries what the report would have said about
+/// the backup's key.
+pub async fn restore(db: Db, source: &Path, actor: &str) -> Result<RestoreReport> {
     restore_with(db, source, actor, &MIGRATOR).await
 }
 
 /// `restore` with a chosen migrator. Tests use this to restore an older backup or
 /// fail its migration; `restore` is the only production caller.
 #[doc(hidden)]
-pub async fn restore_with(db: Db, source: &Path, actor: &str, migrator: &Migrator) -> Result<Db> {
+pub async fn restore_with(
+    db: Db,
+    source: &Path,
+    actor: &str,
+    migrator: &Migrator,
+) -> Result<RestoreReport> {
     let paths = db.paths().clone();
     // ponytail: a refused attempt (`InUse`, from the lock below) has already written a
     // `pre-restore` snapshot. An early `lock_exclusive` probe cannot work: this
@@ -118,7 +159,7 @@ pub async fn restore_with(db: Db, source: &Path, actor: &str, migrator: &Migrato
     // and dropping that lock first opens the gap `Db::open_with` describes.
     let prepared = prepare(&db, source, migrator).await;
     db.close().await;
-    let (wal, secrets) = match prepared {
+    let (validated, live) = match prepared {
         Ok(prepared) => prepared,
         // `validate` raises no `Db` errors, so this is the live database failing. One
         // can open and still be corrupt, and then no recovery screen ever shows, so
@@ -132,20 +173,23 @@ pub async fn restore_with(db: Db, source: &Path, actor: &str, migrator: &Migrato
         source,
         actor,
         migrator,
-        wal,
-        secrets,
-        secret_index_lost: false,
+        wal: validated.wal,
+        live,
     };
     let installed = install(&paths, &plan).await;
     release(lock);
     installed?;
-    reopen(&paths, migrator).await
+    reopen(&paths, migrator, validated.backup_key_state).await
 }
 
 /// `restore` for the recovery screen, where no `Db` could open. The lock comes before
 /// step 2, so no writer can tear the database and its WAL apart while they are copied.
 /// The same error contract as `restore`.
-pub async fn restore_offline(paths: &AppPaths, source: &Path, actor: &str) -> Result<Db> {
+pub async fn restore_offline(
+    paths: &AppPaths,
+    source: &Path,
+    actor: &str,
+) -> Result<RestoreReport> {
     offline_with(paths, source, actor, &MIGRATOR).await
 }
 
@@ -154,20 +198,19 @@ async fn offline_with(
     source: &Path,
     actor: &str,
     migrator: &Migrator,
-) -> Result<Db> {
-    let manifest = validate(source, migrator).await?;
+) -> Result<RestoreReport> {
+    let validated = validate(source, migrator).await?;
 
     claim_root(paths)?;
     let lock = lock_exclusive(paths)?;
     let installed = match snapshot_offline(paths).await {
-        Ok(secrets) => {
+        Ok(live) => {
             let plan = Plan {
                 source,
                 actor,
                 migrator,
-                wal: manifest.wal,
-                secret_index_lost: secrets.is_none(),
-                secrets: secrets.unwrap_or_default(),
+                wal: validated.wal,
+                live,
             };
             install(paths, &plan).await
         }
@@ -175,15 +218,21 @@ async fn offline_with(
     };
     release(lock);
     installed?;
-    reopen(paths, migrator).await
+    reopen(paths, migrator, validated.backup_key_state).await
 }
 
-/// Steps 1 and 2, while the pool is still open. Returns the manifest's `wal` flag
-/// and the live `secret_index`.
-async fn prepare(db: &Db, source: &Path, migrator: &Migrator) -> Result<(bool, Vec<SecretRow>)> {
-    let manifest = validate(source, migrator).await?;
+/// Steps 1 and 2, while the pool is still open.
+// ponytail: live rows are read before the lock is won, because no pool is open after it.
+// A key or secret another process adds and closes inside that gap loses its row, and
+// with it the way `delete_all` finds its entry.
+async fn prepare(db: &Db, source: &Path, migrator: &Migrator) -> Result<(Validated, LiveRows)> {
+    let validated = validate(source, migrator).await?;
     snapshot(db.paths(), &db.pool, "pre-restore").await?;
-    Ok((manifest.wal, read_secrets(&db.pool).await?))
+    let live = LiveRows {
+        secrets: Some(read_secrets(&db.pool).await?),
+        keys: Some(read_keys(&db.pool).await?),
+    };
+    Ok((validated, live))
 }
 
 fn read_manifest(dir: &Path) -> Result<Manifest> {
@@ -196,14 +245,16 @@ fn read_manifest(dir: &Path) -> Result<Manifest> {
     Ok(manifest)
 }
 
-async fn validate(source: &Path, migrator: &Migrator) -> Result<Manifest> {
+async fn validate(source: &Path, migrator: &Migrator) -> Result<Validated> {
     let manifest = read_manifest(source)?;
     let app = latest_version(migrator);
     if let Some(db) = manifest.schema_version.filter(|version| *version > app) {
         return Err(Error::SchemaTooNew { db, app });
     }
-    // A restore replaces `documents/`, so a missing copy would silently empty it.
-    if !source.join(DOCUMENTS).is_dir() {
+    // A restore replaces `documents/`, so a missing copy would silently empty it. A link
+    // is no copy, and `copy_dir` would pull in whatever it points at.
+    let documents = fs::symlink_metadata(source.join(DOCUMENTS));
+    if !documents.is_ok_and(|found| found.is_dir()) {
         return Err(Error::InvalidBackup("no documents folder".into()));
     }
     let database = source.join(DB_FILE);
@@ -211,26 +262,49 @@ async fn validate(source: &Path, migrator: &Migrator) -> Result<Manifest> {
         return Err(Error::InvalidBackup("its WAL is missing".into()));
     }
     // The manifest is only a claim, so the database's own version decides.
-    let db = check_database(&database, manifest.wal).await?;
+    let (db, keys) = check_database(&database, manifest.wal).await?;
     if db > app {
         return Err(Error::SchemaTooNew { db, app });
     }
-    Ok(manifest)
+    // Last, so a backup that is refused anyway raises no keychain prompt.
+    let backup_key_state = match keys.into_iter().next() {
+        Some((key_id, _, key_check)) => Some(key_state_here(key_id, key_check).await),
+        None => None,
+    };
+    Ok(Validated {
+        wal: manifest.wal,
+        backup_key_state,
+    })
 }
 
-/// Returns the schema version of a healthy database, else `InvalidBackup`.
-///
+/// Only a report, so a keychain call that dies is an answer, never a failed restore.
+async fn key_state_here(key_id: String, key_check: Vec<u8>) -> KeyState {
+    let lookup = key_id.clone();
+    let asked = secrets::keychain(move || Ok(crypto::key_state_of(&lookup, &key_check))).await;
+    asked.unwrap_or_else(|error| KeyState::KeyUnavailable {
+        key_id,
+        reason: error.to_string(),
+    })
+}
+
 /// `immutable` reads the main file alone. Plain read-only would replay any `-wal`
 /// beside it, so a stray one would decide what passes validation.
-async fn check_database(file: &Path, with_wal: bool) -> Result<i64> {
-    let options = SqliteConnectOptions::new()
+fn read_only(file: &Path, with_wal: bool) -> SqliteConnectOptions {
+    SqliteConnectOptions::new()
         .filename(file)
         .read_only(true)
-        .immutable(!with_wal);
-    let pool = SqlitePool::connect_with(options)
+        .immutable(!with_wal)
+}
+
+/// Returns the schema version and key rows of a healthy database, else `InvalidBackup`.
+async fn check_database(file: &Path, with_wal: bool) -> Result<(i64, Vec<KeyRow>)> {
+    let pool = SqlitePool::connect_with(read_only(file, with_wal))
         .await
         .map_err(|error| Error::InvalidBackup(format!("database: {error}")))?;
-    let checked = integrity_and_version(&pool).await;
+    let checked = match integrity_and_version(&pool).await {
+        Ok(version) => read_keys(&pool).await.map(|keys| (version, keys)),
+        Err(error) => Err(error),
+    };
     pool.close().await;
     checked.map_err(|error| match error {
         Error::Db(error) => Error::InvalidBackup(format!("database: {error}")),
@@ -258,9 +332,40 @@ async fn read_secrets(pool: &SqlitePool) -> Result<Vec<SecretRow>> {
         .await?)
 }
 
+/// The key in use comes first: the active row, else the newest. A database from before
+/// `data_keys` holds none, which is valid.
+async fn read_keys(pool: &SqlitePool) -> Result<Vec<KeyRow>> {
+    let table: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'data_keys'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if table.is_none() {
+        return Ok(Vec::new());
+    }
+    Ok(sqlx::query_as(
+        "SELECT key_id, created_at, key_check FROM data_keys \
+         ORDER BY active = 1 DESC, created_at DESC, key_id",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+/// A folder stays listed whatever its database holds: a snapshot of a broken database is
+/// what the recovery screen must still offer. So one that cannot be read has no ids.
+async fn key_ids_in(dir: &Path, with_wal: bool) -> Vec<String> {
+    let options = read_only(&dir.join(DB_FILE), with_wal);
+    let Ok(pool) = SqlitePool::connect_with(options).await else {
+        return Vec::new();
+    };
+    let keys = read_keys(&pool).await.unwrap_or_default();
+    pool.close().await;
+    keys.into_iter().map(|(key_id, ..)| key_id).collect()
+}
+
 /// Step 2 with no pool: copies the live files as they are, WAL included, because
-/// the database may be unopenable. Returns the live `secret_index`, `None` if unread.
-async fn snapshot_offline(paths: &AppPaths) -> Result<Option<Vec<SecretRow>>> {
+/// the database may be unopenable.
+async fn snapshot_offline(paths: &AppPaths) -> Result<LiveRows> {
     // Only for the clock: no live database can be trusted to answer.
     let memory = SqlitePool::connect_with(SqliteConnectOptions::new().in_memory(true)).await?;
     let stamps = utc_stamps(&memory).await;
@@ -272,9 +377,9 @@ async fn snapshot_offline(paths: &AppPaths) -> Result<Option<Vec<SecretRow>>> {
     let wal = blocking(move || copy_live_files(&live, &target)).await?;
 
     // After the copy: a read-only connection can leave an empty `-wal` behind.
-    let (schema_version, secrets) = read_live(paths).await;
+    let (schema_version, live) = read_live(paths).await;
     Manifest::new(schema_version, created_at, wal).write(&dir)?;
-    Ok(secrets)
+    Ok(live)
 }
 
 /// Returns whether a WAL was copied.
@@ -296,19 +401,26 @@ fn copy_if_present(from: &Path, to: &Path) -> io::Result<bool> {
     }
 }
 
-/// The schema version and `secret_index` of a database that may be unreadable.
+/// The schema version and rows of a database that may be unreadable.
 /// Not immutable: rows committed to the live WAL count.
-async fn read_live(paths: &AppPaths) -> (Option<i64>, Option<Vec<SecretRow>>) {
+async fn read_live(paths: &AppPaths) -> (Option<i64>, LiveRows) {
     let options = SqliteConnectOptions::new()
         .filename(paths.db())
         .read_only(true);
     let Ok(pool) = SqlitePool::connect_with(options).await else {
-        return (None, None);
+        let live = LiveRows {
+            secrets: None,
+            keys: None,
+        };
+        return (None, live);
     };
     let version = current_version(&pool).await.ok();
-    let secrets = read_secrets(&pool).await.ok();
+    let live = LiveRows {
+        secrets: read_secrets(&pool).await.ok(),
+        keys: read_keys(&pool).await.ok(),
+    };
     pool.close().await;
-    (version, secrets)
+    (version, live)
 }
 
 /// Steps 4 and 5. The exclusive lock is held and no handle is open. An error means
@@ -346,7 +458,7 @@ async fn stage_and_swap(paths: &AppPaths, plan: &Plan<'_>) -> Result<()> {
             .open(root.root().join(TEMP_DB))?
             .sync_all()?;
         copy_dir(&from, &root.root().join(TEMP_DOCUMENTS))?;
-        swap_in(&root)
+        swap_marked(&root)
     })
     .await
 }
@@ -391,7 +503,7 @@ async fn migrate_and_fill(pool: &SqlitePool, plan: &Plan<'_>) -> Result<()> {
 
     // Secret values are never in a backup and their keychain entries are untouched,
     // so the live names go back or `delete_all` could not find those entries.
-    for (name, created_at) in &plan.secrets {
+    for (name, created_at) in plan.live.secrets.iter().flatten() {
         sqlx::query("INSERT OR IGNORE INTO secret_index (name, created_at) VALUES (?, ?)")
             .bind(name)
             .bind(created_at)
@@ -399,12 +511,27 @@ async fn migrate_and_fill(pool: &SqlitePool, plan: &Plan<'_>) -> Result<()> {
             .await?;
     }
 
+    // The same goes for data keys, and a row the backup has keeps its own active flag.
+    for (key_id, created_at, key_check) in plan.live.keys.iter().flatten() {
+        sqlx::query(
+            "INSERT OR IGNORE INTO data_keys (key_id, created_at, key_check, active) \
+             VALUES (?, ?, ?, 0)",
+        )
+        .bind(key_id)
+        .bind(created_at)
+        .bind(key_check)
+        .execute(pool)
+        .await?;
+    }
+
     let target = plan.source.to_string_lossy();
-    let detail = if plan.secret_index_lost {
-        json!({"secret_index_lost": true})
-    } else {
-        json!({})
-    };
+    let mut detail = json!({});
+    if plan.live.secrets.is_none() {
+        detail["secret_index_lost"] = json!(true);
+    }
+    if plan.live.keys.is_none() {
+        detail["data_keys_lost"] = json!(true);
+    }
     audit::record_to(pool, plan.actor, "restore", Some(&target), detail).await
 }
 
@@ -448,13 +575,41 @@ async fn schema_of(pool: &SqlitePool) -> Result<Vec<(String, Option<String>)>> {
     .await?)
 }
 
+/// Step 5 inside its marker, so a crash anywhere in it leaves `Db::swap_interrupted` true.
+/// The marker is written first and goes at once, ahead of the reopen, unless a failed swap
+/// must keep it: the undo itself failed, or it is an earlier crash's warning, which only a
+/// finished swap answers. Once the swap is done its removal can fail only as a stale
+/// warning, so that must not read as a failed restore.
+fn swap_marked(paths: &AppPaths) -> io::Result<()> {
+    let marker = paths.swap_marker();
+    let earlier = marker.exists();
+    File::create(&marker)?.sync_all()?;
+
+    let swapped = swap_in(paths);
+    let settled = match swapped {
+        Ok(()) => true,
+        Err(_) => !earlier && !set_aside_files_remain(paths),
+    };
+    if settled {
+        let _ = remove_if_present(&marker);
+    }
+    swapped
+}
+
+/// `swap_in` puts these back or removes them, so after a failure they mean an undo failed.
+fn set_aside_files_remain(paths: &AppPaths) -> bool {
+    let root = paths.root();
+    root.join(OLD_DOCUMENTS).exists() || root.join(OLD_WAL).exists()
+}
+
 /// Step 5. A folder cannot be renamed over a folder, so the live one moves aside.
 /// That comes first because it is the rename most likely to fail: Windows refuses
 /// while any file inside is open. The database goes last because its rename is the
 /// commit point: every failure before it is undone here, so an error means live data
 /// is as it was.
 // ponytail: not crash-safe across the renames. A crash here can leave new documents
-// beside the old database, or none in place; the `pre-restore` snapshot holds them.
+// beside the old database, or none in place. `.jobpilot-swap` says so at the next open,
+// and the `pre-restore` snapshot holds them.
 fn swap_in(paths: &AppPaths) -> io::Result<()> {
     let root = paths.root();
     let (live, old, new) = (
@@ -500,10 +655,37 @@ fn swap_database(paths: &AppPaths) -> io::Result<()> {
 }
 
 /// Step 6. The rename is done, so a failure here must not read as "nothing changed".
-async fn reopen(paths: &AppPaths, migrator: &Migrator) -> Result<Db> {
-    Db::open_with(paths, migrator)
-        .await
-        .map_err(|error| Error::RestoredButNotOpened(error.to_string()))
+async fn reopen(
+    paths: &AppPaths,
+    migrator: &Migrator,
+    backup_key_state: Option<KeyState>,
+) -> Result<RestoreReport> {
+    match Db::open_with(paths, migrator).await {
+        Ok(db) => Ok(RestoreReport {
+            db,
+            backup_key_state,
+        }),
+        Err(error) => Err(Error::RestoredButNotOpened(match &backup_key_state {
+            Some(state) => format!("{error}. {}", key_note(state)),
+            None => error.to_string(),
+        })),
+    }
+}
+
+fn key_note(state: &KeyState) -> String {
+    match state {
+        KeyState::NotLoaded => "The backup's key was not checked".into(),
+        KeyState::Unlocked { key_id } => format!("The backup's key {key_id} is on this machine"),
+        KeyState::KeyUnavailable { key_id, reason } => {
+            format!("The backup's key {key_id} could not be read: {reason}")
+        }
+        KeyState::KeyMissing { key_id } => {
+            format!("The backup's key {key_id} has no entry on this machine")
+        }
+        KeyState::KeyMismatch { key_id } => {
+            format!("The backup's key {key_id} does not match the entry on this machine")
+        }
+    }
 }
 
 /// Everything a restore that crashed can leave in the root. `swap_in` leaves the old
@@ -647,6 +829,59 @@ mod tests {
             fs::read_to_string(sidecar(&paths.db(), "-wal")).unwrap(),
             "committed rows"
         );
+    }
+
+    #[test]
+    fn the_marker_is_gone_after_a_swap_and_after_an_undone_one() {
+        let (_tmp, paths) = staged_root();
+        swap_marked(&paths).unwrap();
+        assert!(!paths.swap_marker().exists());
+
+        let (_tmp, paths) = staged_root();
+        fs::remove_dir_all(paths.root().join(TEMP_DOCUMENTS)).unwrap();
+        swap_marked(&paths).unwrap_err();
+        assert_live_unchanged(&paths);
+        assert!(!paths.swap_marker().exists());
+    }
+
+    // A folder cannot be written as a file on any OS, so this stops the swap at its start.
+    #[test]
+    fn nothing_is_renamed_until_the_marker_is_written() {
+        let (_tmp, paths) = staged_root();
+        fs::create_dir(paths.swap_marker()).unwrap();
+
+        swap_marked(&paths).unwrap_err();
+
+        assert_live_unchanged(&paths);
+        assert_eq!(fs::read_to_string(paths.db()).unwrap(), "live");
+    }
+
+    #[test]
+    fn a_failed_swap_keeps_an_earlier_warning_and_a_finished_one_clears_it() {
+        let (_tmp, paths) = staged_root();
+        fs::write(paths.swap_marker(), "").unwrap();
+        let temp_documents = paths.root().join(TEMP_DOCUMENTS);
+        let held = paths.root().join("held");
+        fs::rename(&temp_documents, &held).unwrap();
+
+        swap_marked(&paths).unwrap_err();
+        assert!(paths.swap_marker().exists());
+
+        fs::rename(&held, &temp_documents).unwrap();
+        swap_marked(&paths).unwrap();
+        assert!(!paths.swap_marker().exists());
+    }
+
+    // An undo cannot be made to fail on demand, so this plants what one leaves behind.
+    #[test]
+    fn a_failed_undo_keeps_the_marker() {
+        let (_tmp, paths) = staged_root();
+        fs::remove_dir_all(paths.root().join(TEMP_DOCUMENTS)).unwrap();
+        fs::write(paths.root().join(OLD_WAL), "left by a failed undo").unwrap();
+
+        swap_marked(&paths).unwrap_err();
+
+        assert!(paths.swap_marker().exists());
     }
 
     #[test]

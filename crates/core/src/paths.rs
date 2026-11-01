@@ -51,6 +51,12 @@ impl AppPaths {
         self.root.join(".jobpilot-root")
     }
 
+    /// Exists while a restore renames files over the live ones, so one that outlives the
+    /// rename means the restore stopped partway.
+    pub fn swap_marker(&self) -> PathBuf {
+        self.root.join(".jobpilot-swap")
+    }
+
     /// True when a file at `path` would land under the root, or that cannot be ruled out.
     /// Resolves the parent folder, so a symlink or a `..` cannot hide the root, then looks
     /// for the root among that folder's ancestors: by device and inode on Unix, as a
@@ -112,6 +118,7 @@ mod tests {
         assert_eq!(paths.exports(), root.join("exports"));
         assert_eq!(paths.lock(), root.join("jobpilot.lock"));
         assert_eq!(paths.marker(), root.join(".jobpilot-root"));
+        assert_eq!(paths.swap_marker(), root.join(".jobpilot-swap"));
     }
 
     #[test]
