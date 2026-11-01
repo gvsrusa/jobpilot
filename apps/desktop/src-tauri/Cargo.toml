@@ -1,0 +1,17 @@
+[package]
+name = "jobpilot-desktop"
+description = "JobPilot AI desktop shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "jobpilot_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+jobpilot-core = { path = "../../../crates/core" }

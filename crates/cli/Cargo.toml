@@ -1,0 +1,13 @@
+[package]
+name = "jobpilot-cli"
+description = "JobPilot AI command line"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "jobpilot"
+path = "src/main.rs"
+
+[dependencies]
+jobpilot-core = { path = "../core" }

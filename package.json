@@ -1,0 +1,11 @@
+{
+  "name": "jobpilot",
+  "private": true,
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@12.16.1",
+  "scripts": {
+    "test": "pnpm --filter desktop test",
+    "typecheck": "pnpm --filter desktop typecheck",
+    "tauri": "pnpm --filter desktop tauri"
+  }
+}
