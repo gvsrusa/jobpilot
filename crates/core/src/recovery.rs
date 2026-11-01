@@ -98,10 +98,20 @@ fn create_new_regular(out: &Path) -> Result<File> {
 }
 
 fn require_regular(file: &File) -> Result<()> {
-    if !file.metadata()?.file_type().is_file() || !is_disk_file(file) {
-        return Err(Error::Refused("this is not a regular file".into()));
+    let refused = || Error::Refused("this is not a regular file".into());
+    // The handle type goes first: on Windows a device such as `NUL` cannot answer a
+    // metadata query at all, and that failure is a refusal, not an I/O error.
+    if !is_disk_file(file) {
+        return Err(refused());
     }
-    Ok(())
+    match file.metadata() {
+        Ok(meta) if meta.file_type().is_file() => Ok(()),
+        Ok(_) => Err(refused()),
+        #[cfg(windows)]
+        Err(_) => Err(refused()),
+        #[cfg(not(windows))]
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg(unix)]

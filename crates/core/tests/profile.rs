@@ -179,19 +179,28 @@ fn store_second_key(key_id: &str) -> [u8; 32] {
     bytes
 }
 
-const KEY_B: &str = "0123456789abcdef";
+/// A fresh id per test. The keychain tests run in parallel against one service, and a
+/// fixed id let one test's cleanup or deletion remove the entry another was reading,
+/// which showed up as `KeyMismatch` for that id.
+fn fresh_key_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    format!("{:016x}", hasher.finish())
+}
 
-async fn seal_under_b(db: &Db, bytes: [u8; 32], row: &WorkAuthorization) {
-    let key = jobpilot_core::crypto::DataKey::from_bytes(KEY_B, bytes);
+async fn seal_under_b(db: &Db, key_id: &str, bytes: [u8; 32], row: &WorkAuthorization) {
+    let key_b = key_id;
+    let key = jobpilot_core::crypto::DataKey::from_bytes(key_b, bytes);
     let plain = serde_json::to_vec(row).unwrap();
     let check = key
-        .encrypt("data_keys", "key_check", KEY_B, crypto::key_check_text())
+        .encrypt("data_keys", "key_check", key_b, crypto::key_check_text())
         .unwrap();
     sqlx::query(
         "INSERT OR IGNORE INTO data_keys (key_id, created_at, key_check, active) \
          VALUES (?, '2000-01-01T00:00:00Z', ?, 0)",
     )
-    .bind(KEY_B)
+    .bind(key_b)
     .bind(check)
     .execute(&db.pool)
     .await
@@ -205,7 +214,7 @@ async fn seal_under_b(db: &Db, bytes: [u8; 32], row: &WorkAuthorization) {
     )
     .bind(&row.country)
     .bind(sealed)
-    .bind(KEY_B)
+    .bind(key_b)
     .execute(&db.pool)
     .await
     .unwrap();
@@ -217,9 +226,10 @@ async fn rows_under_two_keys_are_both_read() {
     let (_tmp, paths) = temp_root();
     let db = Db::open(&paths).await.unwrap();
     let _a = unlock(&db).await;
-    let _b = EntryGuard(KEY_B.into());
+    let key_b = fresh_key_id();
+    let _b = EntryGuard(key_b.clone());
     profile::set_authorization(&db, auth("PT")).await.unwrap();
-    seal_under_b(&db, store_second_key(KEY_B), &auth("CA")).await;
+    seal_under_b(&db, &key_b, store_second_key(&key_b), &auth("CA")).await;
 
     let got = profile::get(&db).await.unwrap();
     assert!(!got.locked, "{:?}", got.key_state);
@@ -233,11 +243,12 @@ async fn a_row_under_a_lost_key_locks_instead_of_failing() {
     let (_tmp, paths) = temp_root();
     let db = Db::open(&paths).await.unwrap();
     let _a = unlock(&db).await;
-    let _b = EntryGuard(KEY_B.into());
+    let key_b = fresh_key_id();
+    let _b = EntryGuard(key_b.clone());
     profile::set_basic(&db, sample()).await.unwrap();
     profile::set_authorization(&db, auth("PT")).await.unwrap();
-    seal_under_b(&db, store_second_key(KEY_B), &auth("CA")).await;
-    entry(KEY_B).delete_credential().unwrap();
+    seal_under_b(&db, &key_b, store_second_key(&key_b), &auth("CA")).await;
+    entry(&key_b).delete_credential().unwrap();
 
     let got = profile::get(&db).await.unwrap();
     assert!(got.locked);
