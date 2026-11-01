@@ -125,7 +125,8 @@ Text block by error code. The code is always shown, so the user can report it.
 | `in_use` | "Another JobPilot window or the `jobpilot` command is using this data. Close it, then try again. Nothing was changed." | Try again is the default action. Restore is disabled, because restore is refused while another process holds the data (ADR 4). |
 | `migration_failed` | "Updating your data to this version failed. Your data from before the update is kept as a snapshot named `pre-migrate-{from}-{stamp}` in {data root}/backups. Nothing was deleted." | Try again enabled. Restore opens with the `pre-migrate` snapshot listed first. |
 | `restored_not_opened` | "The restore finished and your data now comes from the backup, but it could not be opened: {cause}. Your data from before the restore is kept as a snapshot named `pre-restore-{stamp}` in {data root}/backups." | Try again is the default action. Restore enabled with the `pre-restore` snapshot listed first. |
-| Any other code | The core message, the code, and "Nothing was changed by this screen." | Try again and Restore enabled. |
+| `db` | The core message, the code, and "Nothing was changed by this screen." | Try again and Restore enabled. |
+| `root_not_owned`, `io`, `unavailable`, or any code this build does not know | The core message, the code, and "Nothing was changed by this screen." | Try again enabled. Restore is disabled: the backend refuses an offline restore unless the database itself failed (`db`, `migration_failed`, `schema_too_new`, `restored_not_opened`), and the screen mirrors that. |
 
 Restore opens the backup picker, then the restore warning from the Data screen (screen 6), including the `pre-restore` snapshot notice. Restore here is the same command as on the Data screen.
 
