@@ -619,7 +619,7 @@ Consent dialog (opened by Review on an eligible, non-local provider). Nothing is
 - Consent is per provider, per sign-in method, and per category. [Allow selected] stays disabled until at least one category is ticked. No category is ticked by default.
 - A verdict change in a release suspends the affected consent until the user confirms again, and the list row says "Suspended: terms changed".
 - Consent records, timestamps, and revocations are listed under the provider and shown in audit entries (FR-12.7).
-- **Release:** 0.4. Subscription rows follow decision D1 and hosted API rows decision D4, both decided 2026-11-01.
+- **Release:** 0.2 for the Claude Code row, 0.4 for the other providers. Subscription rows follow decision D1 and hosted API rows decision D4, both decided 2026-11-01.
 - **Keyboard:** the provider list is one tab stop with arrows. Enter on a row opens its detail. Ineligible rows are focusable so their reason is read. In the dialog, the checkboxes take Space, the focus stays inside, and Esc cancels.
 - **Focus order:** Ollama toggle, Add endpoint, Review, then the Not available list (read-only rows, in order). Dialog: Cancel, category checkboxes, Show exactly what will be sent, Allow selected.
 - **Empty state:** no provider enabled other than No-AI: "JobPilot works without one. Tasks that need AI end with a manual path." This is a normal state, not an error.

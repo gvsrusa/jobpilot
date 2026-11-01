@@ -26,7 +26,7 @@ flowchart LR
     user -->|GUI and terminal| jp
     jp -->|read and write| data
     jp -->|store and read secrets| keychain
-    jp -.->|0.4 and later, only with consent| later
+    jp -.->|0.2 and later, only with consent| later
 ```
 
 The dotted edge does not exist in 0.1. Its rules are owned by the [AI providers](ai-providers.md) and [policy register](policy-register.md) documents.
