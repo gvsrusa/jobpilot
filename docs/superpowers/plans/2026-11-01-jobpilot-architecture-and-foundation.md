@@ -303,7 +303,8 @@ git commit -m "feat: scaffold Tauri workspace with core and CLI crates"
 ```rust
 pub enum Error {
     Io(std::io::Error), Db(sqlx::Error), SchemaTooNew { db: i64, app: i64 },
-    InvalidBackup(String), InUse, Unavailable, Secret(String), NotFound, ConfirmationRequired,
+    MigrationFailed(String), InvalidBackup(String), InUse, Unavailable, Secret(String), NotFound,
+    ConfirmationRequired,
 }
 pub type Result<T> = std::result::Result<T, Error>;
 impl Error { pub fn code(&self) -> &'static str } // e.g. "in_use"
@@ -361,7 +362,7 @@ Each test uses a fresh temp root (`tempfile` dev-dependency).
     // a backups/pre-migrate-* folder exists and its database holds the row
 }
 #[tokio::test] async fn failed_migration_keeps_snapshot_and_data() {
-    // same, but version 9000 is invalid SQL: Err returned, snapshot exists,
+    // same, but version 9000 is invalid SQL: Error::MigrationFailed, snapshot exists,
     // and the row is still readable through a raw SqlitePool on the live file
 }
 ```
@@ -493,6 +494,8 @@ pub struct BackupInfo { pub path: PathBuf, pub created_at: String, pub schema_ve
 pub async fn backup::create(db: &Db, actor: &str) -> Result<BackupInfo>;
 pub async fn backup::list(paths: &AppPaths) -> Result<Vec<BackupInfo>>; // newest first, skips invalid
 pub async fn backup::restore(db: Db, source: &Path, actor: &str) -> Result<Db>;
+// For the recovery screen, where no Db could open:
+pub async fn backup::restore_offline(paths: &AppPaths, source: &Path, actor: &str) -> Result<Db>;
 ```
 
 `restore` takes `Db` by value because live handles must close first. On any error the handle is closed and live data is unchanged, so callers run `Db::open` again.
@@ -521,6 +524,10 @@ pub async fn backup::restore(db: Db, source: &Path, actor: &str) -> Result<Db>;
     // second Db::open on same root; restore -> InUse; second handle still reads
 }
 #[tokio::test] async fn list_skips_invalid_folders() { /* junk folder ignored, newest first */ }
+#[tokio::test] async fn restore_offline_recovers_when_db_cannot_open() {
+    // plant _sqlx_migrations version 9999 so Db::open fails; restore_offline succeeds;
+    // the unopenable files are kept in a backups/pre-restore-* folder
+}
 ```
 
 - [ ] **Step 2: Run tests and confirm they fail**
@@ -540,12 +547,12 @@ Expected: compile errors for missing `backup` module.
 6. Release the lock and `Db::open`, which migrates older backups forward.
 7. Write the audit row in the newly opened database.
 
-A failure in steps 1 to 3 leaves live data unchanged. Take the temp copy before any rename so disk-full fails safely.
+`restore_offline` follows the same order with no pool: step 2 copies the live files as they are into `pre-restore`, because the database cannot open. A failure in steps 1 to 3 leaves live data unchanged. Take the temp copy before any rename so disk-full fails safely.
 
 - [ ] **Step 4: Run tests and confirm they pass**
 
 Run: `cargo test -p jobpilot-core --test backup`
-Expected: 8 passed.
+Expected: 9 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -737,6 +744,9 @@ Enable tauri's `test` feature as a dev dependency. Keep helpers thin and test th
 #[test] fn restore_swaps_the_live_handle() {
     // document made after backup is gone after backup_restore; Db slot is Some
 }
+#[test] fn restore_works_from_recovery_state() {
+    // db=None and a valid backup: backup_restore returns state "ready"
+}
 ```
 
 - [ ] **Step 2: Run tests and confirm they fail**
@@ -746,12 +756,12 @@ Expected: compile errors for missing commands.
 
 - [ ] **Step 3: Implement state, commands, and startup**
 
-In `setup`, resolve `AppPaths::from_env`, attempt `Db::open`, and on failure store a `StartupError` instead of panicking. A missing `Db` returns `Error::Unavailable`. `backup_restore` and `data_delete` take the write lock, `.take()` the `Db`, run core, and always reopen before returning. Add `tauri-plugin-single-instance` so a second launch focuses the window. Add `tauri-plugin-dialog` with only `dialog:allow-open` in capabilities, for picking a backup folder.
+In `setup`, resolve `AppPaths::from_env`, attempt `Db::open`, and on failure store a `StartupError` instead of panicking. A missing `Db` returns `Error::Unavailable`. `backup_restore` and `data_delete` take the write lock, `.take()` the `Db`, run core, and always reopen before returning. With no `Db` in the slot, `backup_restore` calls `restore_offline`, which is what makes the recovery screen's Restore work. Add `tauri-plugin-single-instance` so a second launch focuses the window. Add `tauri-plugin-dialog` with only `dialog:allow-open` in capabilities, for picking a backup folder.
 
 - [ ] **Step 4: Run tests and confirm they pass**
 
 Run: `cargo test -p jobpilot-desktop`
-Expected: 4 passed.
+Expected: 5 passed.
 
 - [ ] **Step 5: Commit**
 
