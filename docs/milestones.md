@@ -97,7 +97,7 @@ Scope: external AI backends, API providers, consent UI. The design of the subscr
 Requirements: FR-3.9 to FR-3.19 (subscription items conditional on D1), FR-3.30, FR-12.3.
 
 Exit tests:
-- API providers (OpenAI, Anthropic, Google, OpenRouter, compatible endpoints) run through the task router with capability declarations, schema validation, timeouts, retries, and fallback.
+- Each API provider in FR-3.15 to FR-3.19 whose [policy register](policy-register.md) verdict permits the operation runs through the task router with capability declarations, schema validation, timeouts, retries, and fallback. A provider or model whose verdict is `unknown` or `blocked` is refused, and a test proves it.
 - Consent UI blocks any external call until the user gives explicit data-sharing consent, and shows what will be sent.
 - Prompt-injection tests pass for untrusted text sent to external backends.
 - Subscription backends: scope and tests defined after D1; the terms review for each CLI is recorded before any of them ships.
@@ -112,7 +112,7 @@ Requirements: FR-3.20, FR-5.1 to FR-5.18, FR-6.1 to FR-6.12, FR-10.5, FR-10.6, F
 
 Exit tests:
 - The connector SDK defines operations, automation capabilities, rate limits, and policy-review status; connectors cannot register without them.
-- Read-only connectors for the sources in FR-5.2 to FR-5.9 respect rate limits and permitted access only; LinkedIn is user-assisted or authorized access only.
+- A read-only connector exists for each source in FR-5.2 to FR-5.9 whose register read verdict is `allowed`, and respects rate limits and permitted access. A source at `unknown` or `blocked` has no read connector, a test proves it is refused, and its postings enter through user-assisted import. LinkedIn is user-assisted or authorized access only.
 - Tests confirm no CAPTCHA bypass, MFA bypass, or access-control circumvention.
 - Job description parsing, duplicate detection, weighted match scores, missing skills, seniority, compensation, and location matching work, with explainable output.
 - CLI job search and job analysis commands (FR-10.5, 10.6) call the same services as the GUI.
@@ -122,12 +122,13 @@ Exit tests:
 Gates: all five apply. Build includes the connector SDK; migrations add jobs, companies, and match tables; Windows and macOS means connector tests and the job CLI commands pass on both.
 ## Release 0.6: Browser automation
 
-Scope: Playwright runtime, permissions engine, Manual and Copilot modes. Autonomous mode ships only for connectors that pass policy review.
+Scope: Playwright runtime, permissions engine, Manual and Copilot modes. Copilot runs only on sites with an `allowed` register row. Autonomous mode ships only for connectors that pass policy review.
 
 Requirements: FR-3.22, FR-9.1 to FR-9.21, FR-11.6, FR-12.4.
 
 Exit tests:
-- Manual and Copilot modes detect forms, extract questions, retrieve answers, fill forms, upload resume and cover letter, and capture confirmations.
+- Manual mode supplies documents and retrieved answers for the user to apply in their own browser, and records the outcome.
+- Copilot mode detects forms, extracts questions, retrieves answers, fills forms, uploads resume and cover letter, and captures confirmations on sites whose register verdict for Copilot fill is `allowed`. All other sites are refused, and a test proves it. Where no site is eligible, these behaviours are tested against local fixture forms only.
 - The permissions engine allows Autonomous submission only for connectors with verified permission and explicit user authorization; all other connectors are refused.
 - The runtime pauses for legal declarations, unverified sensitive information, identity verification, CAPTCHA, MFA, and other human-only steps.
 - Browser processes are isolated; emergency pause halts them.
