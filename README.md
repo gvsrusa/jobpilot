@@ -1,23 +1,46 @@
 # JobPilot AI
 
-JobPilot AI is an open-source, local-first desktop application for international job seekers. It covers the job-search lifecycle: discover, analyze, match, personalize, apply, track, improve.
+JobPilot AI is a personal, non-commercial, open-source, local-first desktop application for international job seekers. The long-term goal covers the job-search lifecycle: discover, analyze, match, personalize, apply, track, improve. This is one person's project, not a product with support or a roadmap guarantee.
 
-Your data stays on your machine. There are no mandatory API keys, no API credits, no hosted backend, and no proprietary cloud account. You choose which AI provider runs, if any, and what automation is allowed.
+Your data stays on your machine. There are no mandatory API keys, no API credits, no hosted backend, and no proprietary cloud account. No network call exists in the 0.1 code.
 
-## Status
+## What works today (0.1)
 
-Pre-code. The repository currently holds the governing spec and the architecture and foundation plan. No application code exists yet. Nothing here is implemented or tested.
+Only the foundation exists. Nothing job-specific is built yet.
 
-## Planned stack
+- Desktop app with status, documents, data, and recovery views. Tests pass in CI on macOS and Windows. The macOS arm64 installer launches; other installers are not yet tested.
+- Local SQLite database with versioned migrations, document storage, and full-text search.
+- Backup, restore, export, and delete-all of your data, with an audit log.
+- The `jobpilot` command line: `status`, `doc`, `backup`, and `data` commands.
+- OS keychain access for secrets. Secret values never reach the webview, logs, or exports.
 
-Tauri 2, Rust, SQLite with SQLx and FTS5, React, TypeScript, Vite, Tailwind CSS, shadcn/ui, Zustand, TanStack Query, Playwright, xterm.js. Targets: macOS (arm64, x86_64) and Windows x64.
+Not built yet: job discovery, matching, resume tools, AI providers, application automation. See [milestones](docs/milestones.md).
+
+## Installing (unsigned)
+
+0.x installers are not code-signed with a paid certificate (Decision D3). Expect OS warnings.
+
+- macOS: the app is ad-hoc signed. Gatekeeper will refuse the first launch. Right-click the app, choose Open, then confirm. Each 0.x build has a different code identity, so keychain prompts or denials can appear after an upgrade.
+- Windows: SmartScreen shows "Windows protected your PC". Choose More info, then Run anyway.
+
+Installers come from the draft GitHub Releases of this repository. Paid signing is planned for 1.0.
+
+## Building
+
+See [docs/development.md](docs/development.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Documents
 
 - [Master spec](docs/superpowers/specs/2026-11-01-jobpilot-master-spec.md)
 - [Architecture and foundation plan](docs/superpowers/plans/2026-11-01-jobpilot-architecture-and-foundation.md)
-- [PRD](docs/prd.md) (added on the `docs/architecture` branch)
-- [Milestones](docs/milestones.md) (added on the `docs/architecture` branch)
+- [PRD](docs/prd.md)
+- [Milestones](docs/milestones.md)
+- [Connector SDK (stub)](docs/connector-sdk.md)
+- [Changelog](CHANGELOG.md)
+
+## Stack
+
+Tauri 2, Rust, SQLite with SQLx and FTS5, React, TypeScript, Vite, Tailwind CSS, shadcn/ui, Zustand.
 
 ## License
 

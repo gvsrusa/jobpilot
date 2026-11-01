@@ -1,0 +1,8 @@
+import { create } from "zustand";
+
+export type View = "status" | "documents" | "data";
+
+export const useUiStore = create<{ view: View; setView(v: View): void }>((set) => ({
+  view: "status",
+  setView: (view) => set({ view }),
+}));

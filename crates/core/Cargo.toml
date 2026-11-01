@@ -1,0 +1,18 @@
+[package]
+name = "jobpilot-core"
+description = "JobPilot AI core library"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dirs = "7"
+keyring = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "sqlite-bundled", "macros", "migrate"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[dev-dependencies]
+tempfile = "3"
