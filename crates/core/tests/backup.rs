@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use jobpilot_core::ai::{DataCategory, consent};
 use jobpilot_core::crypto::{self, KEY_ACCOUNT_PREFIX, KeyState};
 use jobpilot_core::{AppPaths, Db, Error, MIGRATOR, app_schema_version, audit, backup, documents};
 use serde_json::{Value, json};
@@ -10,6 +11,8 @@ use sqlx::SqlSafeStr;
 use sqlx::migrate::{Migration, MigrationType, Migrator};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool};
 use tempfile::TempDir;
+
+const CLAUDE: &str = "claude_code/cli_login";
 
 fn temp_root() -> (TempDir, AppPaths) {
     let tmp = tempfile::tempdir().unwrap();
@@ -234,6 +237,79 @@ async fn backup_and_restore_write_audit_rows() {
     assert_eq!(rows[0].actor, "gui");
     assert_eq!(rows[0].target.as_deref(), Some(source.as_str()));
     assert_eq!(rows[0].detail, json!({}));
+    db.close().await;
+}
+
+/// Consent is a decision made now, so a backup cannot bring one back: not one that was active
+/// when it was taken, and not one that was revoked since.
+#[tokio::test]
+async fn restore_revokes_external_consent_and_says_so_in_the_audit_log() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let job_text = [DataCategory::JobText];
+    consent::give(&db, CLAUDE, &job_text, "2026-11-01", "gui")
+        .await
+        .unwrap();
+    let info = backup::create(&db, "test").await.unwrap();
+    consent::revoke(&db, CLAUDE, "gui").await.unwrap();
+
+    let db = backup::restore(db, &info.path, "test").await.unwrap().db;
+
+    assert_eq!(consent::active(&db, CLAUDE).await.unwrap(), None);
+    let actions = audit::recent(&db, 10).await.unwrap();
+    let revoked: Vec<_> = actions
+        .iter()
+        .filter(|entry| entry.action == "consent_revoked_by_restore")
+        .collect();
+    assert_eq!(revoked.len(), 1, "{actions:?}");
+    assert_eq!(revoked[0].actor, "test");
+    assert_eq!(revoked[0].target.as_deref(), Some(CLAUDE));
+    // The record of the old decision stays: only its end is written.
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM consent")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+    db.close().await;
+}
+
+/// The recovery screen's restore goes through the same temporary copy.
+#[tokio::test]
+async fn offline_restore_revokes_external_consent_too() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let job_text = [DataCategory::JobText];
+    consent::give(&db, CLAUDE, &job_text, "2026-11-01", "gui")
+        .await
+        .unwrap();
+    let info = backup::create(&db, "test").await.unwrap();
+    db.close().await;
+
+    let db = backup::restore_offline(&paths, &info.path, "test")
+        .await
+        .unwrap()
+        .db;
+
+    assert_eq!(consent::active(&db, CLAUDE).await.unwrap(), None);
+    db.close().await;
+}
+
+/// A restore that revokes nothing writes nothing about consent.
+#[tokio::test]
+async fn restore_with_no_consent_writes_no_consent_row() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let info = backup::create(&db, "test").await.unwrap();
+
+    let db = backup::restore(db, &info.path, "test").await.unwrap().db;
+
+    let actions = audit::recent(&db, 10).await.unwrap();
+    assert!(
+        actions
+            .iter()
+            .all(|entry| entry.action != "consent_revoked_by_restore"),
+        "{actions:?}"
+    );
     db.close().await;
 }
 

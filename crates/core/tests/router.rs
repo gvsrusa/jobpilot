@@ -260,7 +260,10 @@ async fn falls_back_in_order_and_ends_no_ai_manual_required() {
     let second_counters = second.counters();
     let router = Router::with_providers(vec![first.boxed(), second.boxed()]);
 
-    assert_eq!(parse_job(&router, &db).await, manual("no_ai"));
+    assert_eq!(
+        parse_job(&router, &db).await,
+        manual("provider_unavailable")
+    );
 
     assert_eq!(calls(&second_counters), 0);
     assert_eq!(
@@ -278,7 +281,7 @@ async fn falls_back_in_order_and_ends_no_ai_manual_required() {
                 "no_ai".into(),
                 1,
                 "manual_required".into(),
-                Some("no_ai".into())
+                Some("provider_unavailable".into())
             ),
         ]
     );
@@ -483,7 +486,7 @@ async fn external_provider_without_consent_is_skipped_and_consent_unlocks_it() {
     let (_tmp, db) = setup().await;
     let build = || Router::with_providers(vec![Mock::claude(vec![text(JOB)]).boxed()]);
 
-    assert_eq!(parse_job(&build(), &db).await, manual("no_ai"));
+    assert_eq!(parse_job(&build(), &db).await, manual("consent_needed"));
     assert_eq!(skip_reasons(&db, CLAUDE).await, ["consent"]);
 
     let job_text = [DataCategory::JobText];
@@ -494,7 +497,7 @@ async fn external_provider_without_consent_is_skipped_and_consent_unlocks_it() {
     assert!(is_ok(&outcome, ProviderId::ClaudeCode, 1), "{outcome:?}");
 
     consent::revoke(&db, CLAUDE, "gui").await.unwrap();
-    assert_eq!(parse_job(&build(), &db).await, manual("no_ai"));
+    assert_eq!(parse_job(&build(), &db).await, manual("consent_needed"));
     assert_eq!(skip_reasons(&db, CLAUDE).await, ["consent", "consent"]);
 }
 
@@ -519,7 +522,7 @@ async fn fallback_never_widens_consent() {
         )
         .await
         .unwrap();
-    assert_eq!(outcome, manual("no_ai"));
+    assert_eq!(outcome, manual("consent_needed"));
     assert_eq!(calls(&counters), 0);
 
     consent::revoke(&db, CLAUDE, "gui").await.unwrap();
@@ -527,7 +530,7 @@ async fn fallback_never_widens_consent() {
     let claude = Mock::claude(vec![text(JOB)]);
     let counters = claude.counters();
     let router = Router::with_providers(vec![ollama.boxed(), claude.boxed()]);
-    assert_eq!(parse_job(&router, &db).await, manual("no_ai"));
+    assert_eq!(parse_job(&router, &db).await, manual("consent_needed"));
     assert_eq!(calls(&counters), 0);
     assert_eq!(skip_reasons(&db, CLAUDE).await, ["consent", "consent"]);
 }
@@ -543,7 +546,7 @@ async fn consent_is_keyed_by_provider_and_sign_in_method() {
         .await
         .unwrap();
     let router = Router::with_providers(vec![Mock::claude(vec![text(JOB)]).boxed()]);
-    assert_eq!(parse_job(&router, &db).await, manual("no_ai"));
+    assert_eq!(parse_job(&router, &db).await, manual("consent_needed"));
     assert_eq!(skip_reasons(&db, CLAUDE).await, ["consent"]);
 }
 
@@ -559,10 +562,58 @@ async fn revoking_between_attempts_stops_the_retry() {
     let counters = claude.counters();
     let router = Router::with_providers(vec![claude.boxed()]);
 
-    assert_eq!(parse_job(&router, &db).await, manual("no_ai"));
+    assert_eq!(parse_job(&router, &db).await, manual("consent_needed"));
 
     assert_eq!(calls(&counters), 1);
     assert_eq!(skip_reasons(&db, CLAUDE).await, ["consent"]);
+}
+
+/// The end of a task says what would change it: consent, whichever way round the providers
+/// are, and not "no provider is on" while one is waiting for it.
+#[tokio::test]
+async fn consent_needed_outranks_an_unavailable_provider_in_either_order() {
+    let (_tmp, db) = setup().await;
+    let down = || Mock::ollama(vec![]).unavailable().boxed();
+    let waiting = || Mock::claude(vec![text(JOB)]).boxed();
+
+    let router = Router::with_providers(vec![down(), waiting()]);
+    assert_eq!(parse_job(&router, &db).await, manual("consent_needed"));
+    let router = Router::with_providers(vec![waiting(), down()]);
+    assert_eq!(parse_job(&router, &db).await, manual("consent_needed"));
+}
+
+/// A reason from a real attempt is the most specific there is, so a later skip keeps it.
+#[tokio::test]
+async fn a_failed_attempt_keeps_its_reason_past_a_later_skip() {
+    let (_tmp, db) = setup().await;
+    let too_big = {
+        let mut mock = Mock::ollama(vec![text(JOB)]);
+        mock.declaration.context_limit = 1;
+        mock
+    };
+    let waiting = Mock::claude(vec![text(JOB)]);
+    let router = Router::with_providers(vec![too_big.boxed(), waiting.boxed()]);
+    assert_eq!(parse_job(&router, &db).await, manual("prompt_too_large"));
+}
+
+/// Consent would not let this one run, so asking for it would send the user the wrong way.
+#[tokio::test]
+async fn a_provider_short_of_more_than_consent_does_not_ask_for_consent() {
+    let (_tmp, db) = setup().await;
+    let mut mock = Mock::claude(vec![text(JOB)]);
+    mock.declaration.capabilities.clear();
+    let router = Router::with_providers(vec![mock.boxed()]);
+
+    assert_eq!(parse_job(&router, &db).await, manual("no_ai"));
+    assert_eq!(skip_reasons(&db, CLAUDE).await, ["consent"]);
+}
+
+/// With no provider listed at all, `no_ai` stays the honest reason.
+#[tokio::test]
+async fn no_provider_at_all_is_still_no_ai() {
+    let (_tmp, db) = setup().await;
+    let router = Router::with_providers(vec![]);
+    assert_eq!(parse_job(&router, &db).await, manual("no_ai"));
 }
 
 /// Consent cannot rescue a model that is not local: it is ineligible outright.
@@ -593,7 +644,7 @@ async fn claude_code_declaring_local_still_needs_consent() {
     let counters = mock.counters();
     let router = Router::with_providers(vec![mock.boxed()]);
 
-    assert_eq!(parse_job(&router, &db).await, manual("no_ai"));
+    assert_eq!(parse_job(&router, &db).await, manual("consent_needed"));
 
     assert_eq!(calls(&counters), 0);
     assert_eq!(skip_reasons(&db, CLAUDE).await, ["consent"]);
@@ -770,7 +821,10 @@ async fn hanging_availability_probe_cannot_outlive_the_timeout() {
         Router::with_providers(vec![slow.boxed()]).with_timeout(Duration::from_millis(100));
 
     let started = Instant::now();
-    assert_eq!(parse_job(&router, &db).await, manual("no_ai"));
+    assert_eq!(
+        parse_job(&router, &db).await,
+        manual("provider_unavailable")
+    );
 
     assert!(started.elapsed() < Duration::from_millis(500));
     assert_eq!(calls(&counters), 0);
@@ -1255,7 +1309,7 @@ async fn router_keeps_user_order_and_always_ends_with_the_real_no_ai() {
         router.provider_ids(),
         [ProviderId::ClaudeCode, ProviderId::Ollama, ProviderId::NoAi]
     );
-    assert_eq!(parse_job(&router, &db).await, manual("no_ai"));
+    assert_eq!(parse_job(&router, &db).await, manual("consent_needed"));
     assert_eq!(calls(&counters), 0);
 
     let from_settings = Router::from_settings(&db).await.unwrap();

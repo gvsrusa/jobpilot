@@ -558,8 +558,13 @@ mod locate_tests {
 
     #[test]
     fn relative_path_entries_are_dropped() {
-        let joined = std::env::join_paths(["rel/bin", "/abs/bin", "."]).unwrap();
-        assert_eq!(absolute_dirs(&joined), vec![PathBuf::from("/abs/bin")]);
+        let absolute = if cfg!(windows) {
+            r"C:\abs\bin"
+        } else {
+            "/abs/bin"
+        };
+        let joined = std::env::join_paths(["rel/bin", absolute, "."]).unwrap();
+        assert_eq!(absolute_dirs(&joined), vec![PathBuf::from(absolute)]);
     }
 
     #[test]

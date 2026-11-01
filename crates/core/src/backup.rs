@@ -6,8 +6,8 @@
 //! 3. Close every handle and take the exclusive lock.
 //! 4. Build the new database as a temporary copy inside the root: copy, merge a WAL
 //!    the manifest claims, migrate, check the schema, put back the saved
-//!    `secret_index` and `data_keys` rows, write the audit row, check it again. Copy
-//!    the documents.
+//!    `secret_index` and `data_keys` rows, revoke external consent, write the audit rows,
+//!    check it again. Copy the documents.
 //! 5. Under `.jobpilot-swap`, rename the documents, then the database, over the live
 //!    paths. Clearing the live `-wal` and `-shm` comes right before the database rename,
 //!    the commit point.
@@ -557,6 +557,8 @@ async fn migrate_and_fill(pool: &SqlitePool, plan: &Plan<'_>) -> Result<()> {
         .await?;
     }
 
+    revoke_external_consent(pool, plan.actor).await?;
+
     let target = plan.source.to_string_lossy();
     let mut detail = json!({});
     if plan.live.secrets.is_none() {
@@ -566,6 +568,23 @@ async fn migrate_and_fill(pool: &SqlitePool, plan: &Plan<'_>) -> Result<()> {
         detail["data_keys_lost"] = json!(true);
     }
     audit::record_to(pool, plan.actor, "restore", Some(&target), detail).await
+}
+
+/// Consent is a decision made now, and a backup is an old one, or someone else's copy, so a
+/// restore never brings one back (FR-3.30). Fails closed as the router does: anything but
+/// Ollama is external. The row stays as the record, closed by the restore.
+async fn revoke_external_consent(pool: &SqlitePool, actor: &str) -> Result<()> {
+    let revoked: Vec<String> = sqlx::query_scalar(
+        "UPDATE consent SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE revoked_at IS NULL AND provider <> 'ollama' RETURNING provider",
+    )
+    .fetch_all(pool)
+    .await?;
+    for provider in revoked {
+        let action = "consent_revoked_by_restore";
+        audit::record_to(pool, actor, action, Some(&provider), json!({})).await?;
+    }
+    Ok(())
 }
 
 async fn run_migrations(pool: &SqlitePool, migrator: &Migrator) -> Result<()> {

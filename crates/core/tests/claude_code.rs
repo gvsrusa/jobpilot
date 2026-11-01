@@ -10,10 +10,10 @@ use jobpilot_core::ai::claude_code::{ClaudeCode, PROVIDER, TERMS_DATE};
 use jobpilot_core::ai::router::Router;
 use jobpilot_core::ai::validate::MAX_OUTPUT_BYTES;
 use jobpilot_core::ai::{
-    Availability, CancellationToken, Capability, DataCategory, Outcome, Prompt, Provider,
+    self, Availability, CancellationToken, Capability, DataCategory, Outcome, Prompt, Provider,
     ProviderId, TaskType, consent, spec,
 };
-use jobpilot_core::{AppPaths, Db, Error, settings};
+use jobpilot_core::{AppPaths, Db, Error, generate, knowledge, parse, settings};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -98,7 +98,8 @@ fn write_wrapper(dir: &Path, mock: &Path, vars: &[(String, String)]) -> PathBuf 
         script.push_str(&format!("export {name}='{value}'\n"));
     }
     script.push_str(&format!("'{}' \"$@\"\n", mock.join("claude").display()));
-    let path = dir.join("claude-wrapper");
+    // This name, because a stored `ai.claude_path` must be a program named claude.
+    let path = dir.join("claude");
     fs::write(&path, script).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     path
@@ -115,7 +116,7 @@ fn write_wrapper(dir: &Path, mock: &Path, vars: &[(String, String)]) -> PathBuf 
         "call \"{}\" %*\r\nexit /b %ERRORLEVEL%\r\n",
         target.display()
     ));
-    let path = dir.join("claude-wrapper.cmd");
+    let path = dir.join("claude.cmd");
     fs::write(&path, script).unwrap();
     path
 }
@@ -759,11 +760,128 @@ async fn from_settings_honours_order_and_enabled() {
     settings::set(&db, "ai.enabled", &neither).await.unwrap();
     assert_eq!(ids(&db).await, [ProviderId::NoAi]);
 
-    // Names outside the allow-list and repeats do not add a provider or a second turn.
+    // Names outside the allow-list and repeats do not add a provider or a second turn, and an
+    // enabled provider the stored order leaves out still gets its turn, after that order.
     settings::set(&db, "ai.enabled", &both).await.unwrap();
     let odd = json!(["openai", "claude_code", "claude_code", "no_ai"]);
     settings::set(&db, "ai.order", &odd).await.unwrap();
-    assert_eq!(ids(&db).await, [ProviderId::ClaudeCode, ProviderId::NoAi]);
+    assert_eq!(
+        ids(&db).await,
+        [ProviderId::ClaudeCode, ProviderId::Ollama, ProviderId::NoAi]
+    );
+}
+
+/// `set_enabled` is all the consent screen does to routing, and `ai.order` defaults to Ollama
+/// alone, so the provider has to come from `ai.enabled`. The screen reads the same order.
+#[tokio::test]
+async fn enabled_claude_with_the_default_order_is_routed_and_shown() {
+    let (_tmp, db) = setup().await;
+    assert_eq!(ai::status(&db).await.unwrap().order, ["ollama"]);
+
+    ai::set_enabled(&db, "claude_code", true).await.unwrap();
+
+    assert_eq!(
+        ids(&db).await,
+        [ProviderId::Ollama, ProviderId::ClaudeCode, ProviderId::NoAi]
+    );
+    assert_eq!(
+        ai::status(&db).await.unwrap().order,
+        ["ollama", "claude_code"]
+    );
+}
+
+/// The stored order decides what it names, and turning a provider off leaves it there for the
+/// screen to show as off, while the router passes it by.
+#[tokio::test]
+async fn stored_order_stays_first_and_a_provider_turned_off_is_not_routed() {
+    let (_tmp, db) = setup().await;
+    ai::set_order(&db, &["claude_code".into()]).await.unwrap();
+    ai::set_enabled(&db, "claude_code", true).await.unwrap();
+    assert_eq!(
+        ai::status(&db).await.unwrap().order,
+        ["claude_code", "ollama"]
+    );
+
+    ai::set_enabled(&db, "claude_code", false).await.unwrap();
+    assert_eq!(ids(&db).await, [ProviderId::Ollama, ProviderId::NoAi]);
+    assert_eq!(
+        ai::status(&db).await.unwrap().order,
+        ["claude_code", "ollama"]
+    );
+}
+
+/// A resume reply a stored draft can be made from, citing `evidence`.
+fn resume_reply(evidence: &str) -> Value {
+    let line = "Built billing systems";
+    let doc = json!({"name": "", "contact": [], "summary": [line], "sections": []});
+    let claims = json!([{"text": line, "evidence_ids": [evidence]}]);
+    json!({"type": "result", "subtype": "success", "is_error": false, "permission_denials": [],
+        "structured_output": {"doc": doc, "claims": claims}})
+}
+
+/// The whole first run, through what the desktop commands call: `Router::from_settings` and
+/// `generate::resume`, on settings that `ai_enable` and `ai_consent_give` leave. Nothing listens
+/// on the Ollama address, and `ai.order` was never written.
+#[tokio::test]
+async fn enabling_claude_with_consent_and_no_ollama_reaches_the_provider() {
+    let (_tmp, db) = setup().await;
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/resume.docx");
+    parse::import_resume(&db, &fixture, "My CV").await.unwrap();
+    let job = knowledge::import_job_text(&db, "Role", SENTINEL)
+        .await
+        .unwrap();
+    let run = async || {
+        let router = Router::from_settings(&db).await.unwrap();
+        generate::resume(&db, &router, "gui", &job.id, CancellationToken::new()).await
+    };
+
+    let unapproved = run().await.unwrap_err();
+    assert!(
+        matches!(&unapproved, Error::ManualRequired(why) if why == "no_evidence"),
+        "{unapproved}"
+    );
+    let items = knowledge::list(&db).await.unwrap();
+    for item in &items {
+        knowledge::approve(&db, &item.id, true).await.unwrap();
+    }
+
+    let reply = resume_reply(&items[0].id).to_string();
+    let cli = MockCli::with_reply(&reply, &[]);
+    let path = json!(cli.bin.display().to_string());
+    settings::set(&db, "ai.claude_path", &path).await.unwrap();
+    settings::set(&db, "ai.ollama_url", &json!("http://127.0.0.1:1"))
+        .await
+        .unwrap();
+    ai::set_enabled(&db, "claude_code", true).await.unwrap();
+
+    let waiting = run().await.unwrap_err();
+    assert!(
+        matches!(&waiting, Error::ManualRequired(why) if why == "consent_needed"),
+        "{waiting}"
+    );
+    assert!(cli.read("stdin").is_empty(), "nothing goes before consent");
+
+    let needed = spec(TaskType::DraftResume).categories;
+    consent::give(&db, PROVIDER, &needed[..1], TERMS_DATE, "gui")
+        .await
+        .unwrap();
+    let partial = run().await.unwrap_err();
+    assert!(
+        matches!(&partial, Error::ManualRequired(why) if why == "consent_needed"),
+        "{partial}"
+    );
+    assert!(
+        cli.read("stdin").is_empty(),
+        "partial consent sends nothing"
+    );
+
+    consent::give(&db, PROVIDER, needed, TERMS_DATE, "gui")
+        .await
+        .unwrap();
+    let made = run().await.unwrap();
+    assert_eq!(made.provider, ProviderId::ClaudeCode);
+    assert_eq!(made.blocked, 0);
+    assert!(cli.read("stdin").contains(SENTINEL));
 }
 
 /// No-AI must survive a bad setting: a remote URL drops Ollama, not the router.

@@ -14,7 +14,7 @@ use super::ollama::{DEFAULT_URL, Ollama};
 use super::validate::validate;
 use super::{
     Availability, CancellationToken, Capability, DataCategory, Declaration, Outcome, Prompt,
-    Provider, ProviderId, RUN_REASONS, TaskSpec, TaskType, consent, spec,
+    Provider, ProviderId, RUN_REASONS, TaskSpec, TaskType, consent, provider_settings, spec,
 };
 use crate::audit;
 use crate::db::Db;
@@ -24,6 +24,9 @@ use crate::settings;
 const CANCEL_POLL: Duration = Duration::from_millis(100);
 const NOT_LOGGED_IN: &str = "not_logged_in";
 const PROMPT_TOO_LARGE: &str = "prompt_too_large";
+const CONSENT: &str = "consent";
+const CONSENT_NEEDED: &str = "consent_needed";
+const PROVIDER_UNAVAILABLE: &str = "provider_unavailable";
 const OLLAMA: &str = "ollama";
 const CLAUDE_CODE: &str = "claude_code";
 
@@ -67,34 +70,23 @@ enum Step<T> {
 }
 
 impl Router {
-    /// Settings: `ai.order` (`["ollama","claude_code"]`, default `["ollama"]`), `ai.enabled`
-    /// (`{ollama: bool, claude_code: bool}`; Ollama defaults on, Claude off, because data
-    /// leaves the machine), `ai.ollama_url`, `ai.drafting_model`, `ai.embedding_model`.
+    /// Settings: `ai.order` (`["ollama","claude_code"]`, default `["ollama"]`) and `ai.enabled`
+    /// (`{ollama: bool, claude_code: bool}`), as [`provider_settings`] reads them, then
+    /// `ai.ollama_url`, `ai.drafting_model`, `ai.embedding_model`.
     /// Spawns nothing and opens no socket: availability is checked when a task runs.
     pub async fn from_settings(db: &Db) -> Result<Router> {
-        let order: Option<Vec<String>> = settings::get(db, "ai.order")
-            .await?
-            .and_then(|value| serde_json::from_value(value).ok());
-        let order = order.unwrap_or_else(|| vec![OLLAMA.to_string()]);
-        let enabled = settings::get(db, "ai.enabled").await?.unwrap_or_default();
-        let on = |name: &str, default: bool| enabled[name].as_bool().unwrap_or(default);
-
+        let (order, enabled) = provider_settings(db).await?;
         let mut providers: Vec<Box<dyn Provider>> = Vec::new();
-        let mut seen: Vec<&str> = Vec::new();
-        for name in &order {
-            if seen.contains(&name.as_str()) {
-                continue;
-            }
-            seen.push(name);
+        for name in order.iter().filter(|name| enabled[*name] == true) {
             match name.as_str() {
-                OLLAMA if on(OLLAMA, true) => {
+                OLLAMA => {
                     // A bad setting costs Ollama, not every task: No-AI must still run.
                     match ollama_from_settings(db).await? {
                         Some(ollama) => providers.push(Box::new(ollama)),
                         None => eprintln!("ollama: ai.ollama_url refused, provider left out"),
                     }
                 }
-                CLAUDE_CODE if on(CLAUDE_CODE, false) => {
+                CLAUDE_CODE => {
                     // No binary stays listed, so the run log shows it as unavailable.
                     let claude = ClaudeCode::locate_in(db, None)
                         .await
@@ -187,7 +179,11 @@ impl Router {
                     });
                 }
                 Step::Next => {}
-                Step::Manual(reason) => manual = Some(reason),
+                Step::Manual(reason) => {
+                    if manual.is_none_or(|held| weight(reason) >= weight(held)) {
+                        manual = Some(reason);
+                    }
+                }
                 Step::Cancelled => return Ok(Outcome::Cancelled),
             }
         }
@@ -284,11 +280,7 @@ impl Router {
                 row(&name, 0, "skipped", Some(&reason), task.db).await?,
             )
             .await?;
-            return Ok(if reason == PROMPT_TOO_LARGE {
-                Step::Manual(PROMPT_TOO_LARGE)
-            } else {
-                Step::Next
-            });
+            return Ok(after_skip(task, &declaration, &reason));
         }
 
         // Check 5, last on purpose: an ineligible provider is not even probed.
@@ -299,7 +291,7 @@ impl Router {
             Ok(Availability::Unavailable(_)) | Err(Error::Timeout) => {
                 let skipped = row(&name, 0, "skipped", Some("unavailable"), task.db).await?;
                 log(task, skipped).await?;
-                return Ok(Step::Next);
+                return Ok(Step::Manual(PROVIDER_UNAVAILABLE));
             }
             Err(_) => {
                 log(task, row(&name, 0, "cancelled", None, task.db).await?).await?;
@@ -316,7 +308,7 @@ impl Router {
                     row(&name, 0, "skipped", Some(&reason), task.db).await?,
                 )
                 .await?;
-                return Ok(Step::Next);
+                return Ok(after_skip(task, &declaration, &reason));
             }
             if task.cancel.is_cancelled() {
                 log(task, row(&name, attempt, "cancelled", None, task.db).await?).await?;
@@ -384,6 +376,26 @@ pub async fn ollama_from_settings(db: &Db) -> Result<Option<Ollama>> {
     Ok(Ollama::new(url, drafting, embedding).ok())
 }
 
+/// What a skip tells the user at the end of the task. Consent is named only when nothing else
+/// holds this provider back: a provider it would not unlock must not send them to that screen.
+fn after_skip<T>(task: &Task<'_>, declaration: &Declaration, reason: &str) -> Step<T> {
+    match reason {
+        PROMPT_TOO_LARGE => Step::Manual(PROMPT_TOO_LARGE),
+        CONSENT if unfit(task, declaration).is_none() => Step::Manual(CONSENT_NEEDED),
+        _ => Step::Next,
+    }
+}
+
+/// Which reason ends the task when providers gave several: what a real attempt found, then
+/// what the user can grant here, then a provider that is simply not there right now.
+fn weight(reason: &str) -> u8 {
+    match reason {
+        PROVIDER_UNAVAILABLE => 0,
+        CONSENT_NEEDED => 1,
+        _ => 2,
+    }
+}
+
 /// A task no provider may run, whatever it declares. Sensitive values never travel beside
 /// untrusted text, because that text can steer the model that reads them.
 fn refusal(spec: &TaskSpec) -> Option<&'static str> {
@@ -431,15 +443,19 @@ async fn ineligible(task: &Task<'_>, declaration: &Declaration) -> Result<Option
         let covered =
             granted.is_some_and(|granted| task.spec.categories.iter().all(|c| granted.contains(c)));
         if !covered {
-            return Ok(Some("consent".into()));
+            return Ok(Some(CONSENT.into()));
         }
     } else if !declaration.local {
         return Ok(Some("model_not_local".into()));
     }
+    Ok(unfit(task, declaration))
+}
 
+/// Check 4: what the provider cannot do for this task, whatever the user allows.
+fn unfit(task: &Task<'_>, declaration: &Declaration) -> Option<String> {
     let declares = |capability| declaration.capabilities.contains(&capability);
     if carries_untrusted_text(task.spec) && !declares(Capability::NoTools) {
-        return Ok(Some(code(&Capability::NoTools)));
+        return Some(code(&Capability::NoTools));
     }
     let missing = task
         .spec
@@ -448,9 +464,9 @@ async fn ineligible(task: &Task<'_>, declaration: &Declaration) -> Result<Option
         .find(|capability| !declares(**capability))
         .map(code);
     if missing.is_none() && task.tokens > declaration.context_limit {
-        return Ok(Some(PROMPT_TOO_LARGE.into()));
+        return Some(PROMPT_TOO_LARGE.into());
     }
-    Ok(missing)
+    missing
 }
 
 /// Ends `work` at the timeout or within one poll of the cancel, whichever is first.

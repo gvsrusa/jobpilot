@@ -575,6 +575,7 @@ pub async fn ai_cancel_pull(state: State<'_, AppState>) -> Result<()> {
     Ok(())
 }
 
+/// No confirmation here: the consent record is the gate, and the router checks it on every call.
 #[tauri::command]
 pub async fn ai_set_models(
     state: State<'_, AppState>,
@@ -596,11 +597,13 @@ pub async fn ai_set_models(
     Ok(())
 }
 
+/// No confirmation here: the consent record is the gate, and the router checks it on every call.
 #[tauri::command]
 pub async fn ai_set_order(state: State<'_, AppState>, order: Vec<String>) -> Result<()> {
     ai::set_order(&*state.work().await?, &order).await
 }
 
+/// No confirmation here: the consent record is the gate, and the router checks it on every call.
 #[tauri::command]
 pub async fn ai_enable(state: State<'_, AppState>, provider: String, enabled: bool) -> Result<()> {
     ai::set_enabled(&*state.work().await?, &provider, enabled).await
@@ -2591,7 +2594,6 @@ mod tests {
             "ai_enable",
             json!({ "provider": "claude_code", "enabled": true }),
         );
-        h.ok("ai_set_order", json!({ "order": ["claude_code"] }));
         let categories = ["job_text", "profile_basic", "resume_text"];
         h.ok(
             "ai_consent_give",
@@ -2599,6 +2601,47 @@ mod tests {
         );
         h.ok("kb_add", json!({ "kind": "skill", "body": "Rust" }));
         h.ok("job_paste", json!({ "title": "Role", "raw": "Build" }))["id"].clone()
+    }
+
+    /// What the consent dialog calls, and nothing else: `ai.order` is never written, so this is
+    /// a default install. A reply with no citation is still stored, flagged.
+    #[cfg(unix)]
+    #[test]
+    fn enable_and_consent_alone_reach_claude() {
+        let h = ready();
+        let doc = json!({ "name": "", "contact": [], "summary": ["Builds"], "sections": [] });
+        let claims = json!([{ "text": "Builds", "evidence_ids": [] }]);
+        let reply = json!({ "type": "result", "subtype": "success", "is_error": false,
+            "permission_denials": [], "structured_output": { "doc": doc, "claims": claims } });
+        let job = claude_is_set_up(&h, &format!("cat > /dev/null\nprintf '%s' '{reply}'"));
+
+        assert_eq!(
+            h.ok("ai_status", json!({}))["order"],
+            json!(["ollama", "claude_code"])
+        );
+        let made = h.ok("resume_generate", json!({ "jobTextId": job }));
+        assert_eq!(made["provider"], "claude_code");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_consent_reaches_the_ui_as_a_reason() {
+        let h = ready();
+        let ran = h._tmp.path().join("ran");
+        let job = claude_is_set_up(&h, &format!("touch {}", ran.display()));
+        h.ok(
+            "ai_consent_give",
+            json!({ "provider": "claude_code", "categories": ["job_text"] }),
+        );
+
+        let error = h
+            .call("resume_generate", json!({ "jobTextId": job }))
+            .unwrap_err();
+
+        assert_eq!(error["code"], "manual_required");
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains("consent_needed"), "{message}");
+        assert!(!ran.exists());
     }
 
     /// A paid run in progress: its pid, and the thread waiting on `resume_generate`.

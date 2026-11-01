@@ -35,6 +35,8 @@ pub const RUN_REASONS: &[&str] = &[
     "error_max_turns",
     "error_during_execution",
     "error_max_structured_output_retries",
+    "consent_needed",
+    "provider_unavailable",
 ];
 
 /// Absent capabilities are false: a declaration lists only what the provider proves.
@@ -266,6 +268,33 @@ async fn text_setting(db: &Db, key: &str) -> Result<Option<String>> {
     Ok(value.and_then(|v| v.as_str().map(str::to_string)))
 }
 
+/// `ai.order` and `ai.enabled` as they take effect, read by the router and the screen alike so
+/// the two cannot differ. Each name is known and appears once: the stored order first, then
+/// every enabled provider it leaves out, because `ai.order` is only written when the user
+/// reorders and enabling a provider must be enough to route it. The consent check still
+/// decides whether an external provider runs. A provider that is off stays listed if the
+/// order names it; the router passes over it. Ollama defaults on, Claude off, because data
+/// leaves the machine.
+pub(crate) async fn provider_settings(db: &Db) -> Result<(Vec<String>, serde_json::Value)> {
+    let stored = settings::get(db, "ai.enabled").await?.unwrap_or_default();
+    let enabled = serde_json::json!({
+        "ollama": stored["ollama"].as_bool().unwrap_or(true),
+        "claude_code": stored["claude_code"].as_bool().unwrap_or(false),
+    });
+    let stored: Option<Vec<String>> = settings::get(db, "ai.order")
+        .await?
+        .and_then(|value| serde_json::from_value(value).ok());
+    let stored = stored.unwrap_or_else(|| vec!["ollama".into()]);
+    let on = PROVIDER_NAMES.iter().filter(|name| enabled[**name] == true);
+    let mut order: Vec<String> = Vec::new();
+    for name in stored.iter().map(String::as_str).chain(on.copied()) {
+        if PROVIDER_NAMES.contains(&name) && !order.iter().any(|seen| seen == name) {
+            order.push(name.to_string());
+        }
+    }
+    Ok((order, enabled))
+}
+
 /// What the screen and the CLI show: availability of both providers, hardware, and the
 /// settings the router reads. Probes loopback Ollama and runs `claude --version`; sends no
 /// text and needs no consent.
@@ -289,19 +318,12 @@ pub async fn status(db: &Db) -> Result<AiStatus> {
             consent,
         },
     };
-    let order: Option<Vec<String>> = settings::get(db, "ai.order")
-        .await?
-        .and_then(|value| serde_json::from_value(value).ok());
-    let stored = settings::get(db, "ai.enabled").await?.unwrap_or_default();
-    let enabled = serde_json::json!({
-        "ollama": stored["ollama"].as_bool().unwrap_or(true),
-        "claude_code": stored["claude_code"].as_bool().unwrap_or(false),
-    });
+    let (order, enabled) = provider_settings(db).await?;
     Ok(AiStatus {
         ollama,
         claude_code,
         hardware: hardware::detect(),
-        order: order.unwrap_or_else(|| vec!["ollama".into()]),
+        order,
         enabled,
         drafting_model: text_setting(db, "ai.drafting_model").await?,
         embedding_model: text_setting(db, "ai.embedding_model").await?,

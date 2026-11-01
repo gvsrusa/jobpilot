@@ -177,6 +177,16 @@ fn message(error: &Error) -> String {
         Error::ManualRequired(reason) if reason == "not_logged_in" => {
             "Claude Code is not signed in. Run `claude` once to log in, then try again.".into()
         }
+        Error::ManualRequired(reason) if reason == "consent_needed" => {
+            "Claude Code is on, but your consent does not cover this task. Give consent with \
+             `jobpilot ai consent give` in an ordinary terminal, or on the AI screen."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "provider_unavailable" => {
+            "An AI provider is on but cannot be reached. Check `jobpilot ai status`, or write \
+             this one yourself."
+                .into()
+        }
         other => other.to_string(),
     }
 }
