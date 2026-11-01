@@ -1,4 +1,5 @@
 mod commands;
+mod native;
 mod pty;
 mod state;
 
@@ -41,6 +42,9 @@ pub fn run() {
         .run(|app, event| {
             if matches!(event, RunEvent::Exit) {
                 app.state::<PtyState>().close();
+                if let Some(state) = app.try_state::<AppState>() {
+                    tauri::async_runtime::block_on(state.shutdown());
+                }
             }
         });
 }

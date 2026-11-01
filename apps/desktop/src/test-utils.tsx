@@ -13,10 +13,20 @@ export const READY: Status = {
   app_version: "0.1.0",
   data_root: "/home/me/jobpilot",
   error: null,
+  key_state: { state: "key_not_loaded" },
+  swap_interrupted: false,
+  recovery_key_exported: true,
+  restored_key_state: null,
 };
 
 export function recovery(code: string, message = `message for ${code}`): Status {
-  return { ...READY, state: "recovery", schema_version: null, error: { code, message } };
+  return {
+    ...READY,
+    state: "recovery",
+    schema_version: null,
+    error: { code, message },
+    key_state: null,
+  };
 }
 
 type Handler = (args: Record<string, unknown>) => unknown;

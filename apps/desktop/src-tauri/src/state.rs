@@ -1,17 +1,91 @@
 //! What the app holds between commands. The `db` lock guards the handle and the
 //! failure together: a slot is `None` exactly when `startup_error` says why.
+//!
+//! The `db` lock is for short work. A task that can wait on a model or a keychain prompt
+//! holds a [`Work`] instead, so `status` answers throughout and a queued restore does not
+//! stall every reader behind it. Restore and delete take the gate first: every `Work` is
+//! gone once they have it, so theirs is the only reference to the handle.
 
 use std::io;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
-use jobpilot_core::{AppPaths, Db, Error, Result, VERSION};
+use jobpilot_core::ai::CancellationToken;
+use jobpilot_core::crypto::{self, KeyState};
+use jobpilot_core::{AppPaths, Db, Error, Result, VERSION, recovery};
 use serde::Serialize;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+/// How long app exit waits for a cancelled task. The router drops a cancelled attempt within
+/// 100 ms, which kills the child, so only a task that ignores the token reaches this.
+const EXIT_WAIT: Duration = Duration::from_secs(5);
 
 pub struct AppState {
     pub paths: AppPaths,
-    pub db: RwLock<Option<Db>>,
+    pub db: RwLock<Option<Arc<Db>>>,
     pub startup_error: Mutex<Option<StartupError>>,
+    /// Always taken before `db`. Readers are the open [`Work`]s.
+    gate: RwLock<()>,
+    /// The router task: drafting and indexing.
+    pub ai: InFlight,
+    /// A model download, which can outlast many tasks and is cancelled on its own.
+    pub pull: InFlight,
+    restored_key_state: Mutex<Option<KeyState>>,
+}
+
+/// A handle that stays open without the `db` lock, for as long as this is held.
+pub struct Work<'a> {
+    _gate: RwLockReadGuard<'a, ()>,
+    db: Arc<Db>,
+}
+
+impl std::ops::Deref for Work<'_> {
+    type Target = Db;
+
+    fn deref(&self) -> &Db {
+        &self.db
+    }
+}
+
+/// The token of the one running task. One slot means one task: a second token here would
+/// leave the first run beyond the reach of Cancel, consent revoke, and app exit.
+#[derive(Default)]
+pub struct InFlight(Mutex<Option<CancellationToken>>);
+
+/// Frees the slot when the task ends, however it ends.
+pub struct Running<'a> {
+    slot: &'a InFlight,
+    pub token: CancellationToken,
+}
+
+impl InFlight {
+    fn token(&self) -> MutexGuard<'_, Option<CancellationToken>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Before [`AppState::work`], so a cancel that comes while the task waits for its handle
+    /// is not lost.
+    pub fn begin(&self) -> Result<Running<'_>> {
+        let mut slot = self.token();
+        if slot.is_some() {
+            return Err(Error::Refused("another_task_is_running".into()));
+        }
+        let token = CancellationToken::new();
+        *slot = Some(token.clone());
+        Ok(Running { slot: self, token })
+    }
+
+    pub fn cancel(&self) {
+        if let Some(token) = self.token().as_ref() {
+            token.cancel();
+        }
+    }
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        *self.slot.token() = None;
+    }
 }
 
 /// Why no handle is open. Not only from startup: a failed reopen lands here too.
@@ -38,26 +112,38 @@ pub struct Status {
     pub app_version: String,
     pub data_root: String,
     pub error: Option<StartupError>,
+    /// `None` with no handle. Never asks the keychain, so it says `key_not_loaded` until
+    /// something else has: that means neither locked nor unlocked.
+    pub key_state: Option<KeyState>,
+    pub swap_interrupted: bool,
+    /// False only while the active key has no recovery file, so also true with no key yet.
+    pub recovery_key_exported: bool,
+    /// What the last restore found about its backup's key. `None` for any other data.
+    pub restored_key_state: Option<KeyState>,
 }
 
 impl AppState {
+    fn with_slot(paths: AppPaths, db: Option<Db>, error: Option<StartupError>) -> Self {
+        Self {
+            paths,
+            db: RwLock::new(db.map(Arc::new)),
+            startup_error: Mutex::new(error),
+            gate: RwLock::new(()),
+            ai: InFlight::default(),
+            pull: InFlight::default(),
+            restored_key_state: Mutex::new(None),
+        }
+    }
+
     pub async fn open(paths: AppPaths) -> Self {
         match Db::open(&paths).await {
-            Ok(db) => Self {
-                paths,
-                db: RwLock::new(Some(db)),
-                startup_error: Mutex::new(None),
-            },
+            Ok(db) => Self::with_slot(paths, Some(db), None),
             Err(error) => Self::failed(paths, (&error).into()),
         }
     }
 
     pub fn failed(paths: AppPaths, error: StartupError) -> Self {
-        Self {
-            paths,
-            db: RwLock::new(None),
-            startup_error: Mutex::new(Some(error)),
-        }
+        Self::with_slot(paths, None, Some(error))
     }
 
     /// `AppPaths::from_env` found no data folder. The empty root is never used: every
@@ -87,17 +173,75 @@ impl AppState {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    pub fn set_restored_key_state(&self, state: Option<KeyState>) {
+        *self
+            .restored_key_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = state;
+    }
+
+    /// The handle for one command, with no state lock held while it runs. Waits while a
+    /// restore or delete has the gate.
+    pub async fn work(&self) -> Result<Work<'_>> {
+        let gate = self.gate.read().await;
+        let db = self.db.read().await.clone().ok_or(Error::Unavailable)?;
+        Ok(Work { _gate: gate, db })
+    }
+
+    /// For what replaces the handle: ends running tasks, as they would write to the data
+    /// being replaced and a download can last hours, then waits for them to let go.
+    pub async fn exclusive(
+        &self,
+    ) -> (
+        RwLockWriteGuard<'_, ()>,
+        RwLockWriteGuard<'_, Option<Arc<Db>>>,
+    ) {
+        self.ai.cancel();
+        self.pull.cancel();
+        let gate = self.gate.write().await;
+        (gate, self.db.write().await)
+    }
+
+    /// On the way out. Tasks live on the async runtime, which dies with the process, and
+    /// a dropped task is what kills its `claude` child, so this waits for that.
+    // ponytail: past `EXIT_WAIT` the app leaves anyway. `kb_search` has no token, so a hung
+    // Ollama can hold the gate this long, and it starts no paid child.
+    pub async fn shutdown(&self) {
+        self.ai.cancel();
+        self.pull.cancel();
+        let _ = tokio::time::timeout(EXIT_WAIT, self.gate.write()).await;
+    }
+
     pub async fn status(&self, db: Option<&Db>) -> Status {
         let (state, schema_version) = match db {
             Some(db) => ("ready", db.schema_version().await.ok()),
             None => ("recovery", None),
         };
+        let key_state = match db {
+            Some(db) => last_known_key_state(db).await,
+            None => None,
+        };
+        let no_recovery_file = match db {
+            Some(db) => recovery::no_recovery_key_exported(db)
+                .await
+                .unwrap_or(false),
+            None => false,
+        };
+        let restored_key_state = self
+            .restored_key_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         Status {
             state: state.to_owned(),
             schema_version,
             app_version: VERSION.to_owned(),
             data_root: self.paths.root().to_string_lossy().into_owned(),
             error: self.failure().clone(),
+            key_state,
+            swap_interrupted: db.is_some_and(Db::swap_interrupted),
+            recovery_key_exported: !no_recovery_file,
+            restored_key_state,
         }
     }
 
@@ -121,5 +265,13 @@ impl AppState {
             }
             _ => Err(Error::Unavailable),
         }
+    }
+}
+
+/// What this handle last learned, with no keychain call, so `status` cannot prompt.
+async fn last_known_key_state(db: &Db) -> Option<KeyState> {
+    match db.key_state() {
+        KeyState::NotLoaded => crypto::known_state(db).await.ok(),
+        known => Some(known),
     }
 }
