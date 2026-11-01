@@ -35,7 +35,7 @@ Every release must clear all five gates before it is declared done:
 | 9 | Application automation | 0.6 |
 | 10 | Terminal and command interface | 0.1, 0.2, 0.3, 0.5 |
 | 11 | Agent orchestration | 0.3, 0.5, 0.6 |
-| 12 | Security | 0.1, 0.2, 0.3, 0.4, 0.6 (reviewed in 1.0) |
+| 12 | Security | 0.1, 0.2, 0.3, 0.6 (reviewed in 1.0) |
 | 13 | Open-source engineering | 0.1, 0.5, 1.0 |
 
 ## Release 0.1: Desktop foundation
@@ -61,7 +61,7 @@ Gates: all five apply. Build means the unsigned installers on macOS and Windows;
 
 Scope: profile, field encryption, resume parsing and generation, Ollama, task router, embeddings, xterm.js PTY panel, CLI sidecar bundled in the installer.
 
-Requirements: FR-2.4, FR-2.10, FR-2.13, FR-3.1 to FR-3.8, FR-3.24 to FR-3.29, FR-4.1 to FR-4.10, FR-7.1 to FR-7.12, FR-10.1 to FR-10.4, FR-10.7, FR-10.8, FR-12.1, FR-12.5, FR-12.6.
+Requirements: FR-2.4, FR-2.10, FR-2.13, FR-3.1 to FR-3.8, FR-3.24 to FR-3.29, FR-4.1 to FR-4.10, FR-7.1 to FR-7.12, FR-10.1 to FR-10.4, FR-10.7, FR-10.8, FR-12.1, FR-12.3, FR-12.5, FR-12.6.
 
 Exit tests:
 - Profile stores multiple countries, regions, cities, currencies, time zones, languages, and work-mode preferences; no code path infers work authorization.
@@ -70,6 +70,7 @@ Exit tests:
 - Generated resumes and cover letters export to DOCX and PDF, are versioned, compare against the original, and carry claim-level provenance; no claim lacks evidence.
 - Ollama discovery, hardware detection, user-initiated download, structured output, and embeddings work against a local model.
 - The task router validates outputs against JSON schemas, enforces timeouts and retries, and handles fallback when a backend fails.
+- Injection corpus passes against the local backend for parse and draft tasks, with pasted postings normalized on import.
 - The PTY panel runs the bundled CLI; restricted shell execution rejects disallowed commands.
 - Offline operation passes with a local model installed.
 
@@ -92,14 +93,14 @@ Exit tests:
 Gates: all five apply. Build includes the workflow runner; migrations add memory, tracking, and execution-log tables and upgrade a 0.2 database; Windows and macOS means pause and cancellation work on both.
 ## Release 0.4: External AI backends
 
-Scope: external AI backends, API providers, consent UI. The design of the subscription-CLI integration depends on Decision D1, made in Task A6. This plan does not assume D1's outcome, and 0.4 scope for the subscription backends stays conditional on it.
+Scope: external AI backends, API providers, consent UI. The design of the subscription-CLI integration depends on Decision D1, made in Task A6. This plan does not assume D1's outcome, and 0.4 scope for the subscription backends stays conditional on it. Hosted API providers likewise depend on Decision D4.
 
-Requirements: FR-3.9 to FR-3.19 (subscription items conditional on D1), FR-3.30, FR-12.3.
+Requirements: FR-3.9 to FR-3.19 (subscription items conditional on D1, hosted API items on D4), FR-3.30.
 
 Exit tests:
 - Each API provider in FR-3.15 to FR-3.19 whose [policy register](policy-register.md) verdict permits the operation runs through the task router with capability declarations, schema validation, timeouts, retries, and fallback. A provider or model whose verdict is `unknown` or `blocked` is refused, and a test proves it.
 - Consent UI blocks any external call until the user gives explicit data-sharing consent, and shows what will be sent.
-- Prompt-injection tests pass for untrusted text sent to external backends.
+- Prompt-injection tests pass for untrusted text sent to external backends. FR-12.3 lands in 0.2; this test extends it to hosted backends.
 - Subscription backends: scope and tests defined after D1; the terms review for each CLI is recorded before any of them ships.
 - No mandatory key: the app still works end to end with no provider configured.
 

@@ -302,8 +302,9 @@ Metrics are measurable per release. Targets are proposals for the owner to confi
 - Zero application submissions occur without verified connector permission and explicit user authorization.
 - Zero generated claims lack evidence provenance.
 - Every consequential action has an audit row, except delete-all, which removes the log.
-- No secret value appears in logs, exports, the audit log, or IPC messages to the webview.
+- No secret value appears in logs, exports, the audit log, or IPC messages to the webview. If Decision D5 accepts the recovery-key file, that file is the one exception, conditional on D5.
 
 ## 9. Open items
 
-- Decision D1 (external AI backend design) and decisions D2 and D3 are made in Task A6 of the plan. This PRD does not assume their outcomes.
+- Decision D1 (external AI backend design), decisions D2 and D3, D4 (user-held API keys), D5 (recovery-key file), and D6 (encryption approach) are made in Task A6 of the plan. This PRD does not assume their outcomes.
+- Some requirements are met only in part, or not yet, under today's vendor and site terms; see the register's [Policy impact](policy-register.md#policy-impact) table: FR-3.9, FR-3.10, FR-3.11, FR-3.15 to FR-3.17, FR-5.2, FR-5.4, FR-5.7 to FR-5.9, FR-9.3, FR-9.4.

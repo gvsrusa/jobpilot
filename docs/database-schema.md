@@ -49,7 +49,7 @@ erDiagram
 |---|---|---|
 | `settings` | Key/value application settings. `value` is JSON text. | Supporting storage |
 | `audit_log` | Append-only record of consequential actions (backup, restore, export, delete, secret change). `actor` is `gui`, `cli`, or `system`. `detail` is JSON text and never holds a secret value. Delete-all removes this table's rows by design. | FR-12.7 |
-| `secret_index` | Names of secrets held in the OS credential store, with creation time. It never stores values. | FR-2.9, FR-12.2 |
+| `secret_index` | Names of secrets held in the OS credential store, with creation time. It never stores values. Restore keeps the live rows, because the secrets stay in the credential store. | FR-2.9, FR-12.2 |
 | `documents` | User documents. `id` is a text identifier. Timestamps are text. | FR-2.3, FR-2.11, FR-3.23 |
 | `documents_fts` | FTS5 virtual table over `documents.title` and `documents.body`. | FR-2.2, FR-3.21 |
 
@@ -75,9 +75,11 @@ Known limit: `unicode61` does not segment Chinese, Japanese, or Korean text. Whe
 | Item | Location |
 |---|---|
 | Document files | `<root>/documents/` |
-| Backups and snapshots | `<root>/backups/<label>-<UTC stamp>/` with `jobpilot.db`, `documents/`, and `manifest.json` |
+| Backups and snapshots | `<root>/backups/<label>-<UTC stamp>/` with `jobpilot.db`, `documents/`, and `manifest.json`. A `pre-restore` snapshot made with no open database may also hold `-wal` and `-shm`, and its manifest `schema_version` may be `null`. |
 | Exports | `<root>/exports/` |
 | Secret values | OS credential store, service `io.github.gvsrusa.jobpilot` |
+
+Nothing deletes snapshots automatically. `pre-migrate`, `pre-restore`, and from 0.2 `pre-discard` folders stay until the user removes them or delete-all runs with backups included.
 
 ## 2. Migration rules
 

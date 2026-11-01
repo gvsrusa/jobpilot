@@ -24,6 +24,7 @@ Only the first five screens (shell, recovery, status, documents, data) belong to
 | 11 | Application review and pause state | 0.6 | FR-9.2 to FR-9.6, FR-9.16 to FR-9.21 |
 | 12 | Terminal panel | 0.2 | FR-10.1, FR-10.2, FR-12.5 |
 | 13 | AI provider consent | 0.4 | FR-3.12, FR-3.30 |
+| 14 | AI: Ollama and models | 0.2 | FR-2.13, FR-3.2 to FR-3.8 |
 
 ### Rules every screen follows
 
@@ -82,8 +83,8 @@ Later releases extend the navigation. Each entry appears only in the release tha
  Data               0.1       6
  Profile            0.2       7
  Resumes            0.2       10 (resume compare)
+ AI                 0.2       14 (Ollama, models); 13 (consent) joins 0.4
  Applications       0.3       history; review screen 11 joins in 0.6
- AI                 0.4       13 (providers and consent)
  Jobs               0.5       8, 9
 
  Bottom panel: Terminal 0.2 (screen 12)
@@ -122,7 +123,7 @@ Text block by error code. The code is always shown, so the user can report it.
 |---|---|---|
 | `schema_too_new` | "This data was written by a newer JobPilot (data schema {db}, this app understands {app}). Nothing was changed. Install a newer JobPilot to open it. Restoring an older backup replaces your current data." | Try again enabled but explained as useful only after an update. Restore enabled with warning. |
 | `in_use` | "Another JobPilot window or the `jobpilot` command is using this data. Close it, then try again. Nothing was changed." | Try again is the default action. Restore is disabled, because restore is refused while another process holds the data (ADR 4). |
-| Migration failure (code from the core error for a failed migration; shown verbatim) | "Updating your data to this version failed. Your data from before the update is kept as a snapshot named `pre-migrate-{from}-{stamp}` in {data root}/backups. Nothing was deleted." | Try again enabled. Restore opens with the `pre-migrate` snapshot listed first. |
+| `migration_failed` | "Updating your data to this version failed. Your data from before the update is kept as a snapshot named `pre-migrate-{from}-{stamp}` in {data root}/backups. Nothing was deleted." | Try again enabled. Restore opens with the `pre-migrate` snapshot listed first. |
 | Any other code | The core message, the code, and "Nothing was changed by this screen." | Try again and Restore enabled. |
 
 Restore opens the backup picker, then the restore warning from the Data screen (screen 6), including the `pre-restore` snapshot notice. Restore here is the same command as on the Data screen.
@@ -243,12 +244,13 @@ Restore warning (dialog opened by Restore). Focus starts on Cancel.
 +------------------------------------------------------------------+
 | Replace your current data with this backup?                      |
 +------------------------------------------------------------------+
-| Backup: {label}-{stamp}   schema {n}   made {date}               |
+| Backup: {label}-{stamp}   schema {n or unknown}   made {date}    |
 |                                                                  |
 | This replaces everything now in JobPilot: documents, settings,   |
-| secret names, and the activity log. A snapshot of your current   |
-| data is saved first as pre-restore-{stamp}, so you can undo      |
-| this by restoring that snapshot.                                 |
+| and the activity log. Secret names stay listed, because the      |
+| secrets stay in your keychain. A snapshot of your current data   |
+| is saved first as pre-restore-{stamp}, so you can undo this by   |
+| restoring that snapshot.                                         |
 | A backup from an older version is updated to this version.       |
 |                                                                  |
 |                         [Cancel]   [Replace my data]             |
@@ -266,6 +268,8 @@ Delete-all dialog. The delete button stays disabled until the field equals the e
 |   the secrets JobPilot stored in your system keychain.           |
 | [ ] Also delete backups and snapshots                            |
 |                                                                  |
+| Keychain secrets are removed for every JobPilot data folder on   |
+| this account, not only this one.                                 |
 | It cannot reach a backup or export you moved elsewhere.          |
 | Deleting the activity log is part of this action, so no record   |
 | of it remains.                                                   |
@@ -276,6 +280,7 @@ Delete-all dialog. The delete button stays disabled until the field equals the e
 +------------------------------------------------------------------+
 ```
 
+- Nothing deletes snapshots automatically. `pre-migrate`, `pre-restore`, and from 0.2 `pre-discard` folders stay in {data root}/backups until the user removes them or ticks "Also delete backups and snapshots".
 - From 0.2 the delete text adds: removing this folder's keychain entries also removes the key for any copied folder or restored backup that shares its key id, and cannot reach a recovery file you saved. A "No recovery key exported" banner shows at the top until the user exports one (threat model section 9).
 - Secret handling: after Save secret the value field is cleared and the value appears nowhere in the page. Only the name remains. There is no read command (plan Task B7 and test `secret_ui_never_displays_values`).
 - Export warns first: the file is plain text, including everything in `documents`.
@@ -486,7 +491,7 @@ When a Copilot or Autonomous run reaches a mandatory pause, the review screen is
 +-------------+----------------------------------------------------------------+
 | ...         | Run paused: waiting for you                                    |
 | Applications+----------------------------------------------------------------+
-|             | Nothing has been submitted. The run waits 30 minutes, then     |
+|             | Nothing has been submitted. The run waits {timeout}, then      |
 |             | stops and hands this over to you.                              |
 |             +----------------------------------------------------------------+
 |             | Mandatory pauses                                               |
@@ -617,13 +622,59 @@ Consent dialog (opened by Review on an eligible, non-local provider). Nothing is
 - Consent is per provider, per sign-in method, and per category. [Allow selected] stays disabled until at least one category is ticked. No category is ticked by default.
 - A verdict change in a release suspends the affected consent until the user confirms again, and the list row says "Suspended: terms changed".
 - Consent records, timestamps, and revocations are listed under the provider and shown in audit entries (FR-12.7).
-- **Release:** 0.4. Subscription rows depend on decision D1, which is open.
+- **Release:** 0.4. Subscription rows depend on decision D1, and hosted API rows on decision D4. Both are open.
 - **Keyboard:** the provider list is one tab stop with arrows. Enter on a row opens its detail. Ineligible rows are focusable so their reason is read. In the dialog, the checkboxes take Space, the focus stays inside, and Esc cancels.
 - **Focus order:** Ollama toggle, Add endpoint, Review, then the Not available list (read-only rows, in order). Dialog: Cancel, category checkboxes, Show exactly what will be sent, Allow selected.
 - **Empty state:** no provider enabled other than No-AI: "JobPilot works without one. Tasks that need AI end with a manual path." This is a normal state, not an error.
 - **Error state:** a revoked or suspended consent shows an alert on the row and blocks calls. A provider that returns a usage-limit error shows "Manage usage" with the vendor link and stops for that task. A user-not-eligible response ends that provider for the session with an explanation and no retry loop.
 
-## 14. Coverage
+## 14. AI: Ollama and models (release 0.2)
+
+This is the first AI screen. It sets up Ollama on this computer (FR-3.2 to FR-3.8). Provider consent stays in 0.4 (screen 13), and that list then joins this view. A loopback Ollama needs no consent, because data stays on the machine.
+
+```text
++-------------+----------------------------------------------------------------+
+| ...         | AI: Ollama and models                                          |
+| AI          +----------------------------------------------------------------+
+|             | No AI is needed. JobPilot works with none. Ollama runs on this |
+|             | computer, so your data stays here and no consent is needed.    |
+|             +----------------------------------------------------------------+
+|             | Ollama         Running at {loopback address}     [Check again] |
+|             | This computer  {memory} memory, {GPU or "no GPU found"},       |
+|             |                {free disk} free                                |
+|             +----------------------------------------------------------------+
+|             | Installed models                                               |
+|             |  {model}   {size}   Fits this computer                         |
+|             |  {model}   {size}   May be slow here                           |
+|             | Drafting model   [ {model}             v ]                     |
+|             | Embedding model  [ {model}             v ]                     |
+|             +----------------------------------------------------------------+
+|             | Available to download (nothing downloads unless you ask)       |
+|             |  {model}   {size}   Fits this computer          [Download...]  |
+|             |  {model}   {size}   Too large for this computer [Download...]  |
+|             |  Downloading {model}   {percent}                [Cancel]       |
++-------------+----------------------------------------------------------------+
+```
+
+Model rows and the status line change with what JobPilot finds:
+
+| State | Detected when | Text shown | Actions |
+|---|---|---|---|
+| Running | Ollama answers on loopback. | The layout above. | Choose models, download, check again. |
+| Not running | Nothing answers on loopback. | "Ollama is not running on this computer. Start it, then check again. JobPilot does not install or start it." | Check again. Model lists are hidden. Tasks use No-AI. |
+| No compatible model | Ollama runs, but no installed model does structured output (FR-3.6) or embeddings (FR-3.7). | "No installed model can do this yet. Download one below." The missing role is named. | Download. Tasks needing that role use No-AI. |
+| Offline | A download cannot reach the network. | "Downloading needs a network. Installed models keep working." | Installed models stay usable (FR-2.13). |
+
+- Downloads start only from Download, followed by a dialog naming the model and its size (FR-3.4). Nothing downloads on first run or in the background. Personal data is never sent in a download.
+- Hardware detection guides and never decides (FR-3.5). A model marked too large can still be downloaded, and the dialog warns first.
+- The address must resolve to loopback (M-21). A non-loopback address is refused until it has its own register row.
+- **Release:** 0.2.
+- **Keyboard:** Tab moves between controls. The model lists are one tab stop each, with arrows inside. Selects open with Space and move with arrows. In the download dialog, focus starts on Cancel and Esc cancels. The AI entry takes the next number in the Ctrl/Cmd shortcut order.
+- **Focus order:** heading, Check again, installed list, Drafting model, Embedding model, available list (Download per row), Cancel for a running download.
+- **Empty state:** Ollama running with no models: "No models installed. Download one below, or keep working without AI." This is a normal state, not an error.
+- **Error state:** a failed or cancelled download shows an alert with its code on that row and leaves installed models alone. A refused address shows the reason in an alert. The app keeps working with No-AI in every state above.
+
+## 15. Coverage
 
 | Brief item | Where |
 |---|---|
@@ -639,5 +690,6 @@ Consent dialog (opened by Review on an eligible, non-local provider). Nothing is
 | Application review with pause state | Screen 11 |
 | Terminal panel | Screen 12 |
 | AI provider consent | Screen 13 |
+| Local AI setup | Screen 14 |
 
-Open items for the owner: the migration-failure error code is whatever the core `Db` error serializes to, and the recovery screen shows it verbatim; the pause-panel timeout (30 minutes) and the Ctrl+` and F6 keys are proposals; the Sign in with ChatGPT row exists only if decision D1 adopts it.
+Open items for the owner: the pause-panel `{timeout}` (proposed as 30 minutes in [agents](agents.md#4-the-nine-agents)) and the Ctrl+` and F6 keys are proposals; the Sign in with ChatGPT row exists only if decision D1 adopts it.

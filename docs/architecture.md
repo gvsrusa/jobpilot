@@ -2,7 +2,7 @@
 
 Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md), [PRD](prd.md), and [milestone plan](milestones.md). Requirement IDs (`FR-<section>.<n>`) come from the PRD. Nothing here is implemented yet. This document describes release 0.1 in detail and names later pieces only as extension points.
 
-Related documents, planned and not yet written: [AI providers](ai-providers.md), [policy register](policy-register.md), [threat model](security/threat-model.md), [agents](agents.md). They own connector, AI, security, and agent design. This document does not specify those designs. The database is described in [database-schema.md](database-schema.md).
+Related documents: [AI providers](ai-providers.md), [policy register](policy-register.md), [threat model](security/threat-model.md), [agents](agents.md). They own connector, AI, security, and agent design. This document does not specify those designs. The database is described in [database-schema.md](database-schema.md).
 
 ## 1. Principles
 
@@ -146,7 +146,7 @@ Data root layout, resolved by `AppPaths`:
 
 `Db::open` order: create directories; take a shared lock on `jobpilot.lock` (a held exclusive lock maps to `in_use`); connect with `create_if_missing`, WAL, a 5 second busy timeout, and foreign keys on; read the highest applied migration and return `schema_too_new` if it exceeds the version the app knows; if migrations are pending, take the exclusive lock, write a `pre-migrate-<from>` snapshot when upgrading an existing database, run the migrations, and return to the shared lock.
 
-Backup layout: `backups/<label>-<UTC stamp>/` holds `jobpilot.db` (written with `VACUUM INTO`), a copy of `documents/`, and `manifest.json` with `{format: 1, schema_version, created_at}`. Restore validates the backup before touching live data, writes a `pre-restore` snapshot, closes the handle, takes the exclusive lock, copies to temporary names inside the root, removes stale `-wal` and `-shm` files, renames the copies into place, reopens (which migrates older backups forward), and then writes the audit row. A failure before the renames leaves live data unchanged.
+Backup layout: `backups/<label>-<UTC stamp>/` holds `jobpilot.db` (written with `VACUUM INTO`), a copy of `documents/`, and `manifest.json` with `{format: 1, schema_version, created_at}`. Restore validates the backup before touching live data, writes a `pre-restore` snapshot, closes the handle, takes the exclusive lock, copies to temporary names inside the root, removes stale `-wal` and `-shm` files, renames the copies into place, reopens (which migrates older backups forward), puts back the live `secret_index` names because secret values are never in a backup, and then writes the audit row. A failure before the renames leaves live data unchanged. Nothing deletes snapshots automatically.
 
 Planned later modules (candidate profile, resume engine, task router, connector SDK, workflow runner, permissions engine) will be added to this crate in later releases. Their designs belong to the documents listed at the top and are not decided here.
 

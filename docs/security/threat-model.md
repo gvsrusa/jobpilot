@@ -40,7 +40,7 @@ The encryption, search, and consent rules all use these classes. The `sensitive`
 
 | Class | Examples | At rest | FTS5 | Embeddings | May reach a model |
 |---|---|---|---|---|---|
-| Secret | API keys, Sign in with ChatGPT tokens, field encryption key | OS credential store only | Never | Never | Never |
+| Secret | API keys, Sign in with ChatGPT tokens, field encryption key | OS credential store only, plus the recovery file if Decision D5 accepts it | Never | Never | Never |
 | Sensitive | Work authorization and sponsorship status, compensation history, answers classed sensitive (FR-8.7) | AES-GCM column | Never | Never | Only under consent for `sensitive`, which is off unless ticked separately, and never in one prompt with untrusted text (M-19) |
 | Personal | Contact details, resume text, non-sensitive career memory, application history, user documents | Plain column | Yes | Yes, locally (FR-2.4) | Under consent for its category |
 | Untrusted | Job text, company text, hosted form text, page content | Plain column, marked by source | Yes | Yes, locally | Only inside marked data blocks (M-19), under consent for `job_text` or `company_text` |
@@ -99,7 +99,7 @@ FR-12.3 says the application prevents prompt injection. No known filter can dete
 
 Instruction-like text in a posting is shown to the user as a finding and is never obeyed or silently dropped (M-34). A planted word may be a legitimate test of whether an applicant read the post, so the choice is the user's.
 
-**Gap in the release plan.** The [milestones](../milestones.md) assign FR-12.3 to 0.4, and the only injection exit test covers external backends. Job-specific generation (FR-7.5) sends posting text to a local model in 0.2. This document therefore schedules M-19, M-23, and M-34 for 0.2, ahead of that assignment. No milestone exit test covers them until 0.4, and the owner should add one to 0.2.
+**Release placement.** Job-specific generation (FR-7.5) sends posting text to a local model in 0.2, so the [milestones](../milestones.md) assign FR-12.3 to 0.2, and this document schedules M-19, M-23, and M-34 there. The 0.2 exit test runs the injection corpus against the local backend, and a 0.4 exit test extends it to hosted backends.
 
 ## 5. STRIDE by boundary
 
@@ -200,17 +200,19 @@ A coding agent that reads a job posting while holding Bash runs as the user. It 
 | `gemini` with a paid key | Not reviewed. | Treated as tool-enabled. No untrusted text unless a no-tools configuration is documented and tested. |
 | User-driven `claude` or `codex` session | Full tools, under the user's control. | The router never sends it work and JobPilot pipes nothing into it. A posting the user pastes there is the user's own act, and the launcher warns against it. |
 
-Enforcement is a proposed provider capability, `no_tools`. Tasks whose data categories include `job_text` or `company_text` require it. `map_form_field` and `classify_answer` declare `job_text`, because they carry form text, including form questions stored in career memory. Since [absent capabilities are false](../ai-providers.md#capability-and-policy-vocabulary), a provider that does not declare it is skipped. [AI providers](../ai-providers.md) needs this row added to its vocabulary. Provider-side `web_search` is off on these tasks for the same reason.
+Enforcement is the provider capability `no_tools`. Tasks whose data categories include `job_text` or `company_text` require it. `map_form_field` and `classify_answer` declare `job_text`, because they carry form text, including form questions stored in career memory. Since [absent capabilities are false](../ai-providers.md#capability-and-policy-vocabulary), a provider that does not declare it is skipped. Provider-side `web_search` is off on these tasks for the same reason.
 
 Open interaction: an allow-listed child environment would strip `CLAUDE_CODE_OAUTH_TOKEN`. Whether an adapter may do that is an [open question to Anthropic](../policy-register.md#open-written-questions), because stripping may "restrict" a sign-in method. M-15 therefore cannot be finalized for this adapter until Anthropic answers. A no-tools flag raises a smaller version of the same question and should be added to it.
 
 ## 8. Encryption decision
 
-**Decision: field-level AES-GCM for sensitive columns, with the key in the OS keychain, delivered in 0.2 (FR-12.1). Not SQLCipher.**
+**Recommended, pending owner Decision D6 in Task A6: field-level AES-GCM for sensitive columns, with the key in the OS keychain, delivered in 0.2 (FR-12.1). The alternative is SQLCipher.**
 
-SQLCipher is rejected because SQLx ships bundled SQLite and the FTS5 index cannot be encrypted field by field. Taking SQLCipher would mean replacing that bundled build on both OS targets. The second half of the reason is a cost of the chosen design, not a fault of SQLCipher: FTS5 tokens must stay readable to match, so field encryption cannot reach them.
+Against SQLCipher: a whole-file key in the keychain makes keychain loss strand the whole database rather than some columns. The CLI process also needs the key to open the database at all, even for commands that touch no sensitive field. The `bundled-sqlcipher` build is unverified on both OSes, and it would replace the bundled SQLite build that SQLx uses.
 
-Consequences:
+For SQLCipher: it would also encrypt plain personal text and the FTS index. Field encryption cannot do that, because FTS5 tokens must stay readable to match, so that is a cost of the recommended design and not a fault of SQLCipher.
+
+Consequences of field encryption:
 
 - **FTS content is therefore limited to non-sensitive text.** No sensitive column enters any FTS5 table. The same rule applies to embeddings (M-11).
 - A sensitive field cannot be searched. It is found through the record that holds it, or by exact key.
@@ -222,9 +224,9 @@ Design:
 - Associated data: table, column, row id, and key id, so ciphertext cannot be swapped between rows or read under the wrong key.
 - One data key per data root, created at first need with a random `key_id`. It is stored in the OS credential store under service `io.github.gvsrusa.jobpilot`, account `data-key-<key_id>`. Two roots made with `JOBPILOT_HOME` therefore hold separate entries, and neither can overwrite or delete the other's key. No write replaces an existing entry. The key never crosses IPC to the webview and never reaches logs, data exports, the audit log, or a backup.
 - Each ciphertext carries its `key_id` in a header. The database also stores this root's key ids and a key-check value, which is a fixed text encrypted under the key. A backup carries both, so a restored database names the key it needs.
-- API-key entries are named by `secret_index` and do share names across roots. A loss there is repaired by entering the key again, so this design does not change them.
+- API-key entries are named by `secret_index` and do share names across roots. A loss there is repaired by entering the key again, so this design does not change them. Delete-all in one root therefore removes them for every root on this OS account, and the 0.1 delete dialog says so.
 - A backup holds sensitive columns as ciphertext only. It also copies `documents/` and plain columns such as `documents.body`, so free-form text in a backup is readable. A data export (FR-2.7) writes sensitive fields as plain text, because the user owns them, and warns before writing. It is the one place where they leave encrypted storage on purpose.
-- A migration that encrypts an existing column must also deal with the plain copy in its `pre-migrate` snapshot.
+- A migration that encrypts an existing column must also deal with the plain copy in its `pre-migrate` snapshot. Nothing else deletes snapshots automatically: `pre-migrate`, `pre-restore`, and `pre-discard` folders stay until the user removes them or delete-all runs with backups included.
 
 Key rotation is out of scope for 0.2.
 
@@ -238,7 +240,7 @@ The planned control for free-form text is user marking plus redaction before pro
 
 ### Recovery-key export
 
-Defined for 0.2 (M-12). Command names are proposals.
+Defined for 0.2 (M-12), conditional on Decision D5. Command names are proposals.
 
 1. The app prompts the user to export a recovery key when it creates the data key, and keeps showing "no recovery key exported" in the data view until that is done.
 2. The GUI command takes no key argument and returns only `{key_id, path}`. Rust opens the native save dialog and writes the file itself, so the key never crosses IPC. No new webview capability is needed.
@@ -249,7 +251,7 @@ Defined for 0.2 (M-12). Command names are proposals.
 7. The action writes an audit row with the key id only.
 8. The app tells the user that this file plus a copy of the database opens every sensitive field. It belongs offline or in a password manager, away from backups.
 
-This is a deliberate, narrow exception to the rule that secret values never reach exports. It is a separate file, made only by this explicit action, written only outside the data root, and never part of a data export. The webview, logs, and audit log rules hold in full. A passphrase-wrapped form would protect a stolen file, but adds a passphrase the user can also lose, and has to be typed somewhere other than the webview. It is not in 0.2, and the code carries a `ponytail:` comment naming this ceiling.
+If Decision D5 accepts it, this is the one deliberate, narrow exception to the rule that secret values never reach exports. It is a separate file, made only by this explicit action, written only outside the data root, and never part of a data export. The webview, logs, and audit log rules hold in full. A passphrase-wrapped form would protect a stolen file, but adds a passphrase the user can also lose, and has to be typed somewhere other than the webview. It is not in 0.2, and the code carries a `ponytail:` comment naming this ceiling.
 
 ### Recovery
 
@@ -282,27 +284,27 @@ Delete-all removes the entries for this root's key ids from the credential store
 |---|---|---|---|---|
 | M-01 | Strict webview CSP, no remote content, no network in 0.1. Minimal capabilities: the dialog plugin's `dialog:allow-open` only. | Planned 0.1 | FR-12.2 | Part |
 | M-02 | Every IPC command validates input in Rust. No command takes a free path, raw SQL, or a shell string. | Planned 0.1 | None of its own | None |
-| M-03 | No `secret_get` command. Secret values have no read path outside Rust callers, and stay out of logs, exports, and audit rows. Errors never echo them. | Planned 0.1 | FR-2.9, FR-12.2 | Yes |
+| M-03 | No `secret_get` command. Secret values have no read path outside Rust callers, and stay out of logs, exports, and audit rows. Errors never echo them. If Decision D5 accepts the recovery file (M-12), that file is the one exception. | Planned 0.1 | FR-2.9, FR-12.2 | Yes |
 | M-04 | Text from outside the app renders as inert text. No raw HTML rendering, no remote images. | Planned 0.1 | FR-12.3 | None |
 | M-05 | Append-only audit rows for consequential actions, from `gui`, `cli`, or `system`, with no secret values. Delete-all removes the log by design. From 0.3 it also covers emergency pause and external calls; from 0.6, submissions. | Planned 0.1, extended 0.3, 0.4, 0.6 | FR-12.7 | Yes |
 | M-06 | One data root, user-only by default. The advisory lock refuses restore and delete-all with `in_use` while another process is attached. `JOBPILOT_HOME` is shown in the status view. | Planned 0.1 | FR-2.3 | Part |
 | M-07 | Restore validates the backup before touching live data and writes a `pre-restore` snapshot. Refuses newer schemas. From 0.2 it also reports the backup's key id and state first. | Planned 0.1, extended 0.2 | FR-2.6, FR-12.9 | Yes |
-| M-08 | Delete-all removes the data root and this root's credential store entries, including its data keys from 0.2, and leaves other roots' data keys alone. | Planned 0.1, extended 0.2 | FR-2.8, FR-12.10 | Part |
+| M-08 | Delete-all removes the data root and this root's credential store entries, including its data keys from 0.2, and leaves other roots' data keys alone. API-key entries are shared across roots, so they go for every root on this OS account. | Planned 0.1, extended 0.2 | FR-2.8, FR-12.10 | Part |
 | M-09 | The data view recommends disk encryption, warns against storing sensitive details in free-form documents, warns that exports are plain text, and warns against a cloud-synced data root. | Planned 0.1 | FR-12.1 | None |
-| M-10 | AES-256-GCM on sensitive columns, as in [section 8](#8-encryption-decision). | Planned 0.2 | FR-12.1 | Yes |
+| M-10 | AES-256-GCM on sensitive columns, as in [section 8](#8-encryption-decision), pending Decision D6. | Planned 0.2 | FR-12.1 | Yes |
 | M-11 | Sensitive-class text stays out of FTS5 and embeddings. User marking plus redaction for free-form text: marked documents and user-marked resume lines are withheld from prompts, FTS5, and embeddings. The generator marks a document that repeats a Sensitive-class value. Marked bodies stay plain on disk. | Planned 0.2 | FR-12.1, FR-2.2 | None |
-| M-12 | Recovery-key export and import, key ids per root, and the distinct key states, as in [section 9](#9-keychain-loss-and-the-recovery-key). | Planned 0.2 | FR-12.1, FR-12.2 | None |
+| M-12 | Recovery-key export and import (conditional on Decision D5), key ids per root, and the distinct key states, as in [section 9](#9-keychain-loss-and-the-recovery-key). | Planned 0.2 | FR-12.1, FR-12.2 | None |
 | M-13 | Delete-all, restore, and discard of locked fields confirm through a Rust-owned native dialog before job text can reach the webview. | Planned 0.2 | FR-12.10 | None |
 | M-14 | Restricted terminal: the PTY runs an allow-list, not a general shell. In 0.2 that is the bundled `jobpilot` CLI. User-started `claude` and `codex` join it only if D1 adopts them; there is no launcher for `agy`. No CLI command prints a secret value. Recovery-key commands and the commands M-13 confirms are refused in the panel, through a marker only the Rust PTY layer sets. Scrollback is neither stored nor read into a workflow. Agents have no terminal access. | Planned 0.2, extended 0.4 | FR-12.5 | Yes |
 | M-15 | Spawn rules: resolved absolute path, shown to the user for vendor CLIs; argument arrays, never a shell string; untrusted text through standard input, never argv; empty temporary working directory; killed on timeout, cancel, pause, or app exit. Child environment allow-list, except where [section 7](#7-cli-adapters-and-untrusted-text) leaves it open. | Planned 0.2 for PTY, 0.4 for CLIs, 0.6 for Playwright | FR-12.5 | Part |
 | M-16 | Output validation on every backend, as in [AI providers](../ai-providers.md#output-validation): size, JSON, schema, task checks. URLs, paths, and commands in output are data only. | Planned 0.2 | FR-12.6, FR-3.25 | Yes |
 | M-17 | Every generated claim maps to evidence or the output is rejected. Templates render plain fields, so no hidden text reaches a document. The user sees the comparison with the original. | Planned 0.2 | FR-7.10, FR-7.11, FR-7.12 | Yes |
 | M-18 | Work-authorization guard: output may not state or imply authorization beyond what the user recorded. Matching compares stated values per country, and a missing value stays "not stated". | Planned 0.2, extended 0.5 | FR-4.9, FR-4.10 | Yes |
-| M-19 | Marked data blocks for untrusted text. No model tools. Sensitive-class fields never share a prompt with untrusted text. | Planned 0.2 | FR-12.3 | Part (0.4) |
+| M-19 | Marked data blocks for untrusted text. No model tools. Sensitive-class fields never share a prompt with untrusted text. | Planned 0.2 | FR-12.3 | Part (0.2, 0.4) |
 | M-20 | Only user-entered or user-approved material is evidence. Generated output and untrusted text never are. | Planned 0.2 | FR-7.3, FR-7.11 | None |
 | M-21 | Ollama and user-named endpoints must resolve to loopback. A non-loopback URL is refused until it has its own register row. | Planned 0.2, extended 0.4 | FR-3.19 | Part |
 | M-22 | PDF and DOCX parsing under size, time, and memory limits, with no macros, no external references, and no path taken from file content. | Planned 0.2 | FR-7.1, FR-7.2 | None |
-| M-23 | Injection test corpus of hostile postings, covering the paths in [section 6](#6-threats-to-the-two-fixed-product-rules). Runs against each model-backed task and grows with each release. | Planned 0.2, extended 0.4, 0.5, 0.6 | FR-12.3 | Part (0.4) |
+| M-23 | Injection test corpus of hostile postings, covering the paths in [section 6](#6-threats-to-the-two-fixed-product-rules). Runs against each model-backed task and grows with each release. | Planned 0.2, extended 0.4, 0.5, 0.6 | FR-12.3 | Part (0.2, 0.4) |
 | M-24 | Deterministic workflows. Step order is fixed in Rust, and each agent has a static permission set enforced by the runner. See [agents](../agents.md#3-permission-vocabulary). | Planned 0.3 | FR-11.10, FR-11.11 | Yes |
 | M-25 | Emergency pause, as in [agents](../agents.md#8-emergency-pause). Reachable from a native menu and the CLI, so it does not depend on the webview. Halts browsers in 0.6. | Planned 0.3, extended 0.6 | FR-12.8 | Yes |
 | M-26 | Execution logs and checkpoints hold no prompts, outputs, secrets, or decrypted sensitive values. | Planned 0.3 | FR-11.12, FR-11.15 | Part |
@@ -313,7 +315,7 @@ Delete-all removes the entries for this root's key ids from the credential store
 | M-31 | CLI adapter rule in [section 7](#7-cli-adapters-and-untrusted-text), enforced through `no_tools`. Conditional on D1 and on each register row. | Planned 0.4 | FR-3.12, FR-12.3, FR-12.5 | Part |
 | M-32 | JobPilot never reads, copies, or stores a CLI's login files, keychain entries, or tokens. Bundles no vendor CLI. | Planned 0.4 | FR-3.12, FR-3.14 | None |
 | M-33 | Connector gate: status comes from the build-time register, and a connector's own declaration must match it, otherwise it counts as `unknown`. Declared rate limits are enforced. Proposal: connectors are compiled in, with no runtime plugin loading until a sandbox exists. | Planned 0.5 | FR-5.1, FR-5.11 to FR-5.15 | Part |
-| M-34 | Import normalizes untrusted text: HTML to plain text, a size limit, hidden text dropped from what the model sees. Instruction-like text is shown to the user as a finding. | Planned 0.2 for pasted text, 0.5 for connectors | FR-12.3 | None |
+| M-34 | Import normalizes untrusted text: HTML to plain text, a size limit, hidden text dropped from what the model sees. Instruction-like text is shown to the user as a finding. | Planned 0.2 for pasted text, 0.5 for connectors | FR-12.3 | Part (0.2) |
 | M-35 | Browser isolation: separate process and temporary profile per run, no user profile or cookies, no extensions, downloads off, egress limited to the permitted origin, profile deleted at the end. | Planned 0.6 | FR-12.4 | Yes |
 | M-36 | Permissions engine: decides each browser action against the register row, mode, and user authorization. Refuses by default. | Planned 0.6 | FR-9.5, FR-9.6 | Yes |
 | M-37 | Fill guard: fills visible, labelled fields on the permitted origin only, and uploads only the files the run named. Re-reads the page before submission and pauses on any change from what the user reviewed. A pre-filled sensitive value counts as unconfirmed. | Planned 0.6 | FR-9.10, FR-9.17 | None |

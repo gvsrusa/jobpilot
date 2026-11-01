@@ -22,7 +22,7 @@
 - Toolchain: `rust-toolchain.toml` pins `1.99.1`. `packageManager` pins `pnpm@12.16.1`.
 - SQL uses runtime `sqlx::query`, not `query!`, so builds need no `DATABASE_URL` or `sqlx-cli`.
 - `.gitattributes` forces `*.sql text eol=lf`; SQLx migration hashes differ across CRLF and LF.
-- Secret values never cross IPC to the webview, never reach logs, exports, or the audit log.
+- Secret values never cross IPC to the webview, never reach logs, exports, or the audit log. If Decision D5 accepts the recovery-key file (0.2), that file is the one exception, conditional on D5.
 - Consequential actions (backup, restore, export, delete, secret change) write an audit row, except delete-all, which removes the log.
 - Never claim a feature works until its test has passed on both OSes (CI is the Windows evidence).
 - Commits and PR bodies end with the attribution lines from the session instructions.
@@ -85,7 +85,7 @@ One section per release with scope, exit tests, and the spec's five milestone ga
 | 0.1 | Shell, core DB, FTS5, settings, documents, backup, export, delete, keychain, CLI skeleton, CI, unsigned installers |
 | 0.2 | Profile, field encryption, resume parsing and generation, Ollama, task router, embeddings, xterm.js PTY panel, CLI sidecar in the installer |
 | 0.3 | Career memory, application tracking, deterministic workflow runner, execution logs, emergency pause |
-| 0.4 | External AI backends (design depends on Decision D1 in Task A6), API providers, consent UI |
+| 0.4 | External AI backends (design depends on Decision D1 in Task A6), API providers (hosted rows depend on Decision D4), consent UI |
 | 0.5 | Connector SDK, read-only discovery, job intelligence (spec section 6) |
 | 0.6 | Playwright runtime, permissions engine, Manual and Copilot modes; Autonomous mode only for connectors passing review |
 | 1.0 | Signing and notarization, auto-update, security review, public docs |
@@ -142,7 +142,7 @@ git commit -m "docs: add architecture and database schema"
 
 **Interfaces:**
 - Consumes: findings below.
-- Produces: Decision D1 options for Task A6; `Capability` and policy-status vocabulary for releases 0.4 to 0.6.
+- Produces: Decision D1 and D4 options for Task A6; `Capability` and policy-status vocabulary for releases 0.2 to 0.6.
 
 Findings so far, to be re-read and cited from primary sources:
 
@@ -161,7 +161,7 @@ One row per integration in spec sections 3B, 3C, and 5 (including Lever, RemoteO
 
 - [ ] **Step 2: Write `docs/ai-providers.md`**
 
-Must contain: the four backends; `TaskRouter` contract (task type, JSON schema, capability declaration, timeout, retry, fallback order ending in No-AI); output validation; per-provider consent record (provider, data categories, timestamp, revocation); and Decision D1 with the options listed in Task A6.
+Must contain: the four backends; `TaskRouter` contract (task type, JSON schema, capability declaration, timeout, retry, fallback order ending in No-AI); output validation; per-provider consent record (provider, data categories, timestamp, revocation); and Decisions D1 and D4 with the options listed in Task A6.
 
 - [ ] **Step 3: Check, then commit**
 
@@ -184,7 +184,7 @@ git commit -m "docs: add policy register and AI provider specification"
 
 - [ ] **Step 1: Write `docs/security/threat-model.md`**
 
-STRIDE per trust boundary: webview to Rust, Rust to subprocess, app to model, job page to agent, app to filesystem. Must treat job descriptions and web pages as untrusted prompt-injection input. Must record the encryption decision: field-level AES-GCM for sensitive columns with the key in the OS keychain (0.2), not SQLCipher, because SQLx ships bundled SQLite and the FTS5 index cannot be encrypted field by field; state that FTS content is therefore limited to non-sensitive text. Must state keychain loss makes encrypted fields unrecoverable and define the recovery-key export.
+STRIDE per trust boundary: webview to Rust, Rust to subprocess, app to model, job page to agent, app to filesystem. Must treat job descriptions and web pages as untrusted prompt-injection input. Must record the encryption recommendation for Decision D6: field-level AES-GCM for sensitive columns with the key in the OS keychain (0.2), with the case for and against SQLCipher; state that under field encryption FTS content is limited to non-sensitive text. Must state keychain loss makes encrypted fields unrecoverable and define the recovery-key export.
 
 - [ ] **Step 2: Write `docs/agents.md`**
 
@@ -204,7 +204,7 @@ git commit -m "docs: add threat model and agent workflows"
 
 - [ ] **Step 1: Write ASCII wireframes**
 
-Cover: app shell and navigation, recovery screen, status, documents, data and privacy, profile, job list, job detail with score explanation, resume compare with evidence, application review with pause state, terminal panel, AI provider consent. Mark which belong to 0.1. Note keyboard navigation and focus order for each.
+Cover: app shell and navigation, recovery screen, status, documents, data and privacy, profile, job list, job detail with score explanation, resume compare with evidence, application review with pause state, terminal panel, AI provider consent, local AI setup. Mark which belong to 0.1. Note keyboard navigation and focus order for each.
 
 - [ ] **Step 2: Commit**
 
@@ -224,11 +224,15 @@ gh pr create --base main --head docs/architecture --title "docs: architecture pa
 
 - [ ] **Step 2: Stop and get written owner decisions**
 
-Part B must not start before D2 and D3 are answered. D1 may stay open until the 0.4 plan.
+Part B must not start before D2, D3, D5, and D6 are answered. D1 and D4 may stay open until the 0.4 plan.
 
-- **D1, subscription AI.** Spec section 3B asks for Claude Code, Gemini CLI, and Codex integrations, and also says to validate terms. Current findings conflict for consumer logins. Recommended: (a) ship CLI adapters in API-key mode only; (b) add a user-launched interactive terminal session for the owner's own CLI, with no background routing, subject to primary-source review; (c) enable any consumer-login path only after a primary source or written vendor answer allows it, recorded in the policy register. Alternatives: API providers and Ollama only, or seek written vendor permission first.
-- **D2, autonomous submission.** Applicant-side keys are not available from at least Greenhouse. Recommended: Autonomous mode ships default-off and can have zero eligible connectors at 1.0, with Copilot mode as the main path.
-- **D3, unsigned 0.x builds.** Recommended: 0.x installers are ad-hoc signed on macOS and unsigned on Windows, so users see OS warnings. Paid signing arrives at 1.0.
+- **D1, subscription AI.** Spec section 3B asks for Claude Code, Gemini CLI, and Codex integrations, and also says to validate terms. Current findings conflict for consumer logins. Recommended: (a) ship CLI adapters in API-key mode only; (b) add a user-launched interactive terminal session for the owner's own CLI, with no background routing, subject to primary-source review; (c) enable any consumer-login path only after a primary source or written vendor answer allows it, recorded in the policy register. Alternatives: API providers and Ollama only, or seek written vendor permission first. Option (a) cannot ship today unless D4 selects standard BYOK or a vendor answers in writing, because all three adapters are `unknown`. FR-3.10 cannot be met as a subscription integration. Sign in with ChatGPT is the only vendor-documented automated hosted path, and it is a preview.
+- **D2, autonomous submission and Copilot.** Applicant-side keys are not available from Greenhouse, Lever, or Ashby, and no site has an `allowed` Copilot row. Recommended: Autonomous stays default-off and can have zero eligible connectors at 1.0; Manual is the shipping path; Copilot runs on real sites only after a site row opens. **Question for the owner:** is "silent site = unknown = no Copilot fill" the standard you want, since it removes FR-9.3 from every real site? Or may Copilot run where no clause forbids it, recorded as "no clause found"? The first keeps the register as written and waits on vendors. The second opens Copilot on the Greenhouse, Lever, and Ashby hosted forms, puts the risk of a later objection on the user, and needs the register's Copilot rule changed; Indeed stays `blocked`, and Workday and LinkedIn stay shut because a clause may reach them or was not read.
+- **D3, unsigned 0.x builds.** Recommended: 0.x installers are ad-hoc signed on macOS and unsigned on Windows, so users see OS warnings. Paid signing arrives at 1.0. Added cost: ad-hoc signing gives each build a different code identity, so every 0.x upgrade and the CLI can trigger keychain prompts or denials for the 0.2 data key.
+- **D4, user-held API keys.** Spec section 3C offers optional API providers, but the register's rule leaves OpenAI, Anthropic, and Google `unknown`, OpenRouter with zero eligible models, and only loopback endpoints running. That rule came from a project ruling, not from the owner. Options: **strict** (current): a key opens only where a primary clause covers an individual key owner using third-party client software. **Standard BYOK**: a user-held key in a local client is the user's own use, and JobPilot shows the vendor's terms on the consent screen. Consequence of strict: the product today is Ollama, loopback endpoints, and No-AI, with three read connectors (Lever, RemoteOK, We Work Remotely), Manual apply only, and Sign in with ChatGPT if D1(c) is adopted. FR-3.15 to FR-3.17 wait on vendor answers that may never come. Consequence of standard BYOK: hosted providers can ship in 0.4 once the register's rule and rows are re-decided, but "not for consumer use" stays unresolved, so a vendor could act against the user's own key or account. Free Gemini keys stay `blocked`, and non-loopback endpoints stay `unknown`, either way. Recommended: standard BYOK for direct API calls, with the written questions still sent. Reasoning and evidence are in `docs/ai-providers.md`.
+- **D5, recovery-key file.** The recovery file in threat model section 9 places the data key in a file, which conflicts with the constraint "Secret values never ... reach ... exports" and with a plain reading of FR-12.2. Options: (a) accept it as the one exception: a separate file, made only by explicit action, outside the data root, never part of a data export; (b) refuse it: no exception, and keychain loss makes encrypted fields unrecoverable with no way back; (c) passphrase-wrap it: a stolen file is protected, but the user gains a passphrase to lose, and it must be typed somewhere other than the webview. Recommended: (a). Every exception note in the docs is conditional on this answer.
+- **D6, encryption approach.** Threat model section 8 compares two designs. Against SQLCipher: a whole-file key in the keychain makes keychain loss strand the whole database rather than some columns; the CLI process also needs the key; the `bundled-sqlcipher` build is unverified on both OSes. For SQLCipher: it would also encrypt plain personal text and the FTS index, which field-level encryption leaves readable in a copied database. Recommended: field-level encryption as now.
+- **Owner item, schema rule 7.** Accept or strike rule 7 in `docs/database-schema.md` ("A migration that creates a table holding personal data must say how backup, export, and delete-all handle it."). The rule came from review, not from the spec.
 
 - [ ] **Step 3: Merge the PR after approval and record decisions in `docs/milestones.md`**
 
@@ -391,7 +395,7 @@ Plus `documents_fts` as an external-content FTS5 table over `title, body` with `
 
 `Db::open` order: create dirs; try a shared lock on `lock()` using `File::try_lock_shared` (`WouldBlock` maps to `InUse`); connect with `create_if_missing(true)`, WAL, `busy_timeout(5s)`, foreign keys on; read the max applied version and return `SchemaTooNew` if above `app_schema_version()`; if migrations are pending, swap to the exclusive lock, call `snapshot(paths, pool, "pre-migrate-<from>")` when `from > 0`, run `sqlx::migrate!()`, then return to the shared lock.
 
-`snapshot` makes `backups/<label>-<UTC stamp>/` holding `VACUUM INTO 'jobpilot.db'`, a copy of `documents/`, and `manifest.json` with `{format: 1, schema_version, created_at}`. The stamp comes from SQLite `strftime`. Append `-1`, `-2` if `create_dir` finds the folder exists. Build the VACUUM path with a bound parameter.
+`snapshot` makes `backups/<label>-<UTC stamp>/` holding `VACUUM INTO 'jobpilot.db'`, a copy of `documents/`, and `manifest.json` with `{format: 1, schema_version, created_at}`. The stamp comes from SQLite `strftime`. Append `-1`, `-2` if `create_dir` finds the folder exists. Build the VACUUM path with a bound parameter. Nothing deletes snapshots automatically: `pre-migrate`, `pre-restore`, and from 0.2 `pre-discard` folders stay until the user removes them or delete-all runs with `include_backups`.
 
 - [ ] **Step 4: Run tests and confirm they pass**
 
@@ -490,7 +494,7 @@ git commit -m "feat(core): add settings, audit log, and full-text documents"
 - Produces:
 
 ```rust
-pub struct BackupInfo { pub path: PathBuf, pub created_at: String, pub schema_version: i64 } // Serialize
+pub struct BackupInfo { pub path: PathBuf, pub created_at: String, pub schema_version: Option<i64> } // Serialize
 pub async fn backup::create(db: &Db, actor: &str) -> Result<BackupInfo>;
 pub async fn backup::list(paths: &AppPaths) -> Result<Vec<BackupInfo>>; // newest first, skips invalid
 pub async fn backup::restore(db: Db, source: &Path, actor: &str) -> Result<Db>;
@@ -526,7 +530,10 @@ pub async fn backup::restore_offline(paths: &AppPaths, source: &Path, actor: &st
 #[tokio::test] async fn list_skips_invalid_folders() { /* junk folder ignored, newest first */ }
 #[tokio::test] async fn restore_offline_recovers_when_db_cannot_open() {
     // plant _sqlx_migrations version 9999 so Db::open fails; restore_offline succeeds;
-    // the unopenable files are kept in a backups/pre-restore-* folder
+    // the unopenable files are kept in a backups/pre-restore-* folder, and list returns it
+}
+#[tokio::test] async fn restore_keeps_secret_index_of_live_secrets() {
+    // raw secret_index row A; backup; raw row B; restore; SELECT from secret_index has A and B
 }
 ```
 
@@ -540,19 +547,19 @@ Expected: compile errors for missing `backup` module.
 `restore` order is fixed:
 
 1. Validate before touching live data: read the manifest, compare `schema_version`, open the source read-only, and run `PRAGMA integrity_check`.
-2. Write `snapshot(.., "pre-restore")` while the pool is still open.
+2. Write `snapshot(.., "pre-restore")` while the pool is still open, and read the live `secret_index` rows into memory.
 3. `db.close()`, then `lock_exclusive`. `InUse` here means another process is attached.
-4. Copy the source database and documents to temp names inside `root`.
+4. Copy the source database, any `-wal` and `-shm` beside it, and documents to temp names inside `root`.
 5. Delete `jobpilot.db-wal` and `jobpilot.db-shm`, then rename temp files over the live paths.
 6. Release the lock and `Db::open`, which migrates older backups forward.
-7. Write the audit row in the newly opened database.
+7. Insert the saved `secret_index` rows with `INSERT OR IGNORE`, because secret values are never in a backup and their keychain entries are untouched, so `delete_all` must still find them. Then write the audit row in the newly opened database.
 
-`restore_offline` follows the same order with no pool: step 2 copies the live files as they are into `pre-restore`, because the database cannot open. A failure in steps 1 to 3 leaves live data unchanged. Take the temp copy before any rename so disk-full fails safely.
+`restore_offline` follows the same order with no pool, because the database cannot open. Step 2 copies `jobpilot.db`, `jobpilot.db-wal`, and `jobpilot.db-shm` when present, plus `documents/`, into `pre-restore`, and writes `manifest.json` whose `schema_version` is read through a raw read-only connection, falling back to `null` if unreadable. The same connection reads the live `secret_index` rows for step 7; if they cannot be read, restore continues without them, and those keychain entries are no longer indexed. A snapshot with `schema_version: null` is listed, but restoring it is refused with `InvalidBackup` unless it opens: step 1 then reads the version from the opened source. A failure in steps 1 to 3 leaves live data unchanged. Take the temp copy before any rename so disk-full fails safely.
 
 - [ ] **Step 4: Run tests and confirm they pass**
 
 Run: `cargo test -p jobpilot-core --test backup`
-Expected: 9 passed.
+Expected: 10 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -595,7 +602,7 @@ Keychain service: `io.github.gvsrusa.jobpilot`. Test override: `JOBPILOT_SECRET_
     // "delete" -> ConfirmationRequired; data intact
 }
 #[tokio::test] async fn delete_all_removes_data_and_can_keep_backups() {
-    // include_backups=false: db and documents gone, backups kept; true: root empty but for lock
+    // include_backups=false: db, documents, and exports gone, backups kept; true: root empty but for lock
 }
 #[tokio::test] async fn delete_refused_while_another_handle_open() { /* InUse; data intact */ }
 #[tokio::test] #[ignore = "touches the OS keychain"] async fn keychain_round_trip() {
@@ -615,7 +622,7 @@ Use `keyring = "4"` default `v1` API (`Entry::new`, `set_password`, `get_passwor
 
 `export_all` writes `exports/jobpilot-export-<stamp>/` atomically (temp folder, then rename) with `data.json` as `{format: 1, schema_version, exported_at, tables: {name: [rows]}}` and a copy of `documents/`. Discover tables from `sqlite_master` and build `json_object` from `pragma_table_info`, so future tables cannot be missed.
 
-`delete_all` consumes `Db`; on any error the handle is closed and callers reopen. It checks `confirm == "DELETE"` first, then reads secret names, closes the pool, takes `lock_exclusive`, deletes keychain entries, then removes files. A keychain failure returns the error before files are removed, so the call can be retried.
+`delete_all` consumes `Db`; on any error the handle is closed and callers reopen. It checks `confirm == "DELETE"` first, then reads secret names, closes the pool, takes `lock_exclusive`, deletes keychain entries, then removes files. A keychain failure returns the error before files are removed, so the call can be retried. Delete-all always removes `exports/`; `include_backups` controls only `backups/`.
 
 - [ ] **Step 4: Run tests, including real keychain tests on macOS**
 
@@ -788,7 +795,7 @@ export const useUiStore: UseBoundStore<StoreApi<{ view: 'status' | 'documents' |
   setView(v: 'status' | 'documents' | 'data'): void }>>;
 ```
 
-Hand-written types in `ipc.ts`. `ponytail: hand-kept in sync with commands.rs; add tauri-specta when the command count makes drift a real problem.`
+Hand-written types in `ipc.ts`, where `BackupInfo.schema_version` is `number | null`. `ponytail: hand-kept in sync with commands.rs; add tauri-specta when the command count makes drift a real problem.`
 
 - [ ] **Step 1: Write failing tests**
 
