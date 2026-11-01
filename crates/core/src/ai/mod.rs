@@ -19,6 +19,18 @@ pub mod ollama;
 pub mod router;
 pub mod validate;
 
+/// What a failed attempt may write to `task_runs` beside the error code. Errors can carry a
+/// provider's own text, so only these exact words leave it.
+pub const RUN_REASONS: &[&str] = &[
+    "not_logged_in",
+    "permission_denied",
+    "bad_reply",
+    "cli_error",
+    "error_max_turns",
+    "error_during_execution",
+    "error_max_structured_output_retries",
+];
+
 /// Absent capabilities are false: a declaration lists only what the provider proves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

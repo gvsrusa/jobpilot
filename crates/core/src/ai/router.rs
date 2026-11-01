@@ -14,7 +14,7 @@ use super::ollama::{DEFAULT_URL, Ollama};
 use super::validate::validate;
 use super::{
     Availability, CancellationToken, Capability, DataCategory, Declaration, Outcome, Prompt,
-    Provider, ProviderId, TaskSpec, TaskType, consent, spec,
+    Provider, ProviderId, RUN_REASONS, TaskSpec, TaskType, consent, spec,
 };
 use crate::audit;
 use crate::db::Db;
@@ -22,6 +22,7 @@ use crate::error::{Error, Result};
 use crate::settings;
 
 const CANCEL_POLL: Duration = Duration::from_millis(100);
+const NOT_LOGGED_IN: &str = "not_logged_in";
 const OLLAMA: &str = "ollama";
 const CLAUDE_CODE: &str = "claude_code";
 
@@ -52,8 +53,13 @@ struct Row<'a> {
 }
 
 enum Step<T> {
-    Done { value: T, attempts: u32 },
+    Done {
+        value: T,
+        attempts: u32,
+    },
     Next,
+    /// As `Next`, and the user must sign in, so the task end says so rather than `no_ai`.
+    SignIn,
     Cancelled,
 }
 
@@ -155,6 +161,7 @@ impl Router {
             });
         }
         prompt.schema = spec.schema;
+        let mut sign_in = false;
 
         for provider in &self.providers {
             let provider = provider.as_ref();
@@ -174,6 +181,7 @@ impl Router {
                     });
                 }
                 Step::Next => {}
+                Step::SignIn => sign_in = true,
                 Step::Cancelled => return Ok(Outcome::Cancelled),
             }
         }
@@ -184,6 +192,11 @@ impl Router {
         }
         Ok(match NoAi.complete(&prompt, cancel.clone()).await {
             Err(Error::ManualRequired(reason)) => {
+                let reason = if sign_in {
+                    NOT_LOGGED_IN.into()
+                } else {
+                    reason
+                };
                 log_no_ai(&task, "manual_required", Some(&reason)).await?;
                 Outcome::ManualRequired { reason }
             }
@@ -226,7 +239,7 @@ impl Router {
                 };
                 match self.try_provider(&task, provider, call).await? {
                     Step::Done { value, .. } => return Ok((model.clone(), value)),
-                    Step::Next => {}
+                    Step::Next | Step::SignIn => {}
                     Step::Cancelled => return Err(Error::Cancelled),
                 }
             }
@@ -333,12 +346,14 @@ impl Router {
                 return Ok(Step::Cancelled);
             }
             record.outcome = "failed";
-            record.reason = Some(error.code());
+            let reason = run_reason(&error);
+            record.reason = Some(reason);
             log(task, record).await?;
 
             match error {
                 Error::Timeout | Error::Io(_) => {}
                 Error::Validation(_) if !validation_failed => validation_failed = true,
+                _ if reason == NOT_LOGGED_IN => return Ok(Step::SignIn),
                 _ => return Ok(Step::Next),
             }
         }
@@ -372,6 +387,15 @@ fn refusal(spec: &TaskSpec) -> Option<&'static str> {
 fn carries_untrusted_text(spec: &TaskSpec) -> bool {
     let untrusted = [DataCategory::JobText, DataCategory::CompanyText];
     spec.categories.iter().any(|c| untrusted.contains(c))
+}
+
+/// The sub-reason when it is on the allow-list, else the error code: never provider text.
+fn run_reason(error: &Error) -> &'static str {
+    let (Error::Refused(why) | Error::Failed(why)) = error else {
+        return error.code();
+    };
+    let known = RUN_REASONS.iter().find(|reason| *reason == why);
+    known.copied().unwrap_or(error.code())
 }
 
 /// Data leaves the machine. Fails closed: anything but Ollama counts, whatever it declares.

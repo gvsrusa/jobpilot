@@ -6,6 +6,7 @@ if [ "$1" = "--version" ]; then
     exit "${MOCK_CLAUDE_VERSION_EXIT:-0}"
 fi
 [ -n "$MOCK_CLAUDE_PID" ] && echo "$$" >> "$MOCK_CLAUDE_PID"
+[ -n "$MOCK_CLAUDE_CWD" ] && { pwd; ls -A; } > "$MOCK_CLAUDE_CWD"
 if [ -n "$MOCK_CLAUDE_SLEEP" ]; then
     sleep "$MOCK_CLAUDE_SLEEP"
     [ -n "$MOCK_CLAUDE_DONE" ] && : > "$MOCK_CLAUDE_DONE"
@@ -20,7 +21,6 @@ if [ -n "$MOCK_CLAUDE_STDIN" ]; then
     cat > "$MOCK_CLAUDE_STDIN"
 fi
 [ -n "$MOCK_CLAUDE_ENV" ] && env > "$MOCK_CLAUDE_ENV"
-[ -n "$MOCK_CLAUDE_CWD" ] && { pwd; ls -A; } > "$MOCK_CLAUDE_CWD"
 if [ -n "$MOCK_CLAUDE_REPLY" ]; then
     cat "$MOCK_CLAUDE_REPLY"
 else

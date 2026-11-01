@@ -16,7 +16,7 @@ use tokio::process::{Child, Command};
 use super::validate::MAX_OUTPUT_BYTES;
 use super::{
     Availability, BoxFuture, CancellationToken, Capability, Declaration, Prompt, Provider,
-    ProviderId,
+    ProviderId, RUN_REASONS,
 };
 use crate::error::{Error, Result};
 
@@ -25,7 +25,7 @@ pub const TERMS_DATE: &str = "2026-11-01";
 
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 /// The CLI's own text: `Not logged in · Please run /login`.
-const NOT_LOGGED_IN: &[u8] = b"Not logged in";
+const NOT_LOGGED_IN: &str = "Not logged in";
 
 /// Copied from the parent; everything else is dropped, API keys and tokens above all.
 /// `USER` is the keychain account and the two config-dir names decide the keychain service,
@@ -76,8 +76,10 @@ impl ClaudeCode {
     }
 
     /// The exact argument list. The job text is never in it: that goes to stdin (M-15).
-    /// `--tools ""` removes the built-in tools, `--strict-mcp-config` and an empty
-    /// `--setting-sources` keep out MCP servers, hooks, and plugins.
+    /// `--tools ""` removes the built-in tools, `--strict-mcp-config` keeps out MCP servers,
+    /// `--disable-slash-commands` skills and commands, and an empty `--setting-sources` the
+    /// user, project, and local settings. None of them unloads plugins: the real `init` still
+    /// lists them. The threat model records that residual.
     /// `--json-schema` works through a `StructuredOutput` tool the CLI adds, which only hands
     /// the reply back. It alone is allowed; denying it (`--disallowedTools "*"`) turns the
     /// reply into free text with a `permission_denials` entry (real 2.1.316 run).
@@ -101,6 +103,7 @@ impl ClaudeCode {
             "--allowedTools",
             "StructuredOutput",
             "--strict-mcp-config",
+            "--disable-slash-commands",
             "--setting-sources",
             "",
             "--no-session-persistence",
@@ -237,59 +240,65 @@ impl Provider for ClaudeCode {
     }
 }
 
-/// `--output-format json` gives one result object, or with verbose on an array of events
-/// ending in the result. Which one arrives can depend on the user's own CLI config.
+/// `--output-format json` gives one result event, or with verbose on an array of events
+/// ending in it. Which one arrives can depend on the user's own CLI config. Anything that
+/// is not marked `type: result` is a shape this code has never seen, so it does not count.
 fn result_event(stdout: &[u8]) -> Option<Value> {
+    let is_result = |event: &Value| event["type"] == "result";
     match serde_json::from_slice::<Value>(stdout).ok()? {
-        Value::Array(events) => events.into_iter().rfind(|event| event["type"] == "result"),
-        reply @ Value::Object(_) => Some(reply),
+        Value::Array(events) => events.into_iter().rfind(is_result),
+        reply if is_result(&reply) => Some(reply),
         _ => None,
     }
 }
 
-/// A login failure can be a result with `subtype: success`, so that is checked first. Only
-/// a failed reply is searched: a good reply may quote the words from a posting.
+/// Fails closed on drift: a CLI update that drops or retypes a field here ends the attempt,
+/// since each one is what proves the reply clean. Every code is on `RUN_REASONS`. A login
+/// failure can be `subtype: success`, so it is checked first, and only in a failed reply:
+/// a good one may quote the words from a posting.
 fn read_reply(stdout: &[u8], status: ExitStatus) -> Result<String> {
-    let logged_out = stdout
-        .windows(NOT_LOGGED_IN.len())
-        .any(|window| window == NOT_LOGGED_IN);
+    let bad_reply = || Error::Failed("bad_reply".into());
+    let cli_error = || Error::Failed("cli_error".into());
     let refused_login = || Error::Refused("not_logged_in".into());
-    let exit = || match status.code() {
-        Some(code) => format!("exit_{code}"),
-        None => "killed".to_string(),
-    };
 
     let Some(reply) = result_event(stdout) else {
-        return Err(match (logged_out, status.success()) {
-            (true, _) => refused_login(),
-            (false, true) => Error::Failed("bad_reply".into()),
-            (false, false) => Error::Failed(exit()),
+        return Err(if String::from_utf8_lossy(stdout).contains(NOT_LOGGED_IN) {
+            refused_login()
+        } else if status.success() {
+            bad_reply()
+        } else {
+            cli_error()
         });
     };
 
-    let subtype = reply["subtype"].as_str().unwrap_or("unknown");
-    if reply["is_error"].as_bool() == Some(true) || subtype != "success" {
-        return Err(if logged_out {
-            refused_login()
-        } else {
-            Error::Refused(subtype.to_string())
-        });
+    let clean = reply["is_error"] == false && reply["subtype"] == "success";
+    let text = reply["result"].as_str().unwrap_or_default();
+    if !clean && text.contains(NOT_LOGGED_IN) {
+        return Err(refused_login());
+    }
+    let (Some(is_error), Some(subtype), Some(denials)) = (
+        reply["is_error"].as_bool(),
+        reply["subtype"].as_str(),
+        reply["permission_denials"].as_array(),
+    ) else {
+        return Err(bad_reply());
+    };
+    if is_error || subtype != "success" {
+        let known = RUN_REASONS.contains(&subtype);
+        return Err(Error::Refused(
+            if known { subtype } else { "cli_error" }.into(),
+        ));
     }
     // A tool was reached for and denied, so this is not the reply the task asked for.
-    let denied = match &reply["permission_denials"] {
-        Value::Null => false,
-        Value::Array(denials) => !denials.is_empty(),
-        _ => true,
-    };
-    if denied {
+    if !denials.is_empty() {
         return Err(Error::Refused("permission_denied".into()));
     }
     if !status.success() {
-        return Err(Error::Failed(exit()));
+        return Err(cli_error());
     }
     match (&reply["structured_output"], reply["result"].as_str()) {
         (Value::Null, Some(text)) => Ok(text.to_string()),
-        (Value::Null, None) => Err(Error::Failed("bad_reply".into())),
+        (Value::Null, None) => Err(bad_reply()),
         (structured, _) => Ok(structured.to_string()),
     }
 }
@@ -298,8 +307,10 @@ fn read_reply(stdout: &[u8], status: ExitStatus) -> Result<String> {
 /// direct child only, and a `.cmd` shim or a helper would live on. It must drop before the
 /// `Child`, which `run` gets by declaring it later: on Windows the tree walk starts from a
 /// live parent, and on macOS the pid must not have been reaped and reused.
-// ponytail: a crash of the app itself leaves the child to finish on its own. A Windows job
-// object and a macOS watchdog would close that; a child outlives the app by 60 s at most.
+// ponytail: nothing kills the child if the app dies without dropping this. The 60 s limit
+// lives in the router, so it dies too, and `process_group(0)` also hides the child from a
+// terminal Ctrl-C. The ceiling is the CLI's own run, which this app does not bound; broken
+// pipes are all it notices. A Windows job object and a macOS watchdog would close that.
 struct KillTree(Option<u32>);
 
 impl KillTree {

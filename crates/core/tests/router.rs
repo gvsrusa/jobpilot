@@ -152,7 +152,7 @@ impl Provider for Mock {
                 Some(Reply::Text(text)) => Ok(text),
                 Some(Reply::Timeout) => Err(Error::Timeout),
                 Some(Reply::Io) => Err(Error::Io(std::io::Error::other("reset"))),
-                Some(Reply::Refused) => Err(Error::Refused("not_logged_in".into())),
+                Some(Reply::Refused) => Err(Error::Refused("not_allowed".into())),
                 Some(Reply::Unavailable) => Err(Error::Unavailable),
                 Some(Reply::Hang) => {
                     let _guard = DropCount(self.counters.clone());

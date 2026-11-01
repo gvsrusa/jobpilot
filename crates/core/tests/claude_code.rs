@@ -190,6 +190,17 @@ async fn assert_pids_gone(cli: &MockCli) {
 #[cfg(windows)]
 async fn assert_pids_gone(_cli: &MockCli) {}
 
+/// Recorded by the mock before it sleeps, so a killed run has it too.
+fn assert_cwd_removed(cli: &MockCli) {
+    let listing = cli.read("cwd");
+    let cwd = listing
+        .lines()
+        .next()
+        .expect("the mock never started")
+        .trim();
+    assert!(!Path::new(cwd).exists(), "{cwd} was left behind");
+}
+
 /// The mock writes `done` when its sleep ends, so a survivor shows on every OS.
 async fn assert_never_finished(cli: &MockCli, sleep: Duration) {
     tokio::time::sleep(sleep).await;
@@ -215,7 +226,12 @@ async fn argv_disables_every_tool_and_setting_source() {
         assert_eq!(after("--output-format"), "json");
         assert_eq!(after("--permission-mode"), "dontAsk");
         assert_eq!(after("--json-schema"), SCHEMA);
-        for flag in ["-p", "--strict-mcp-config", "--no-session-persistence"] {
+        for flag in [
+            "-p",
+            "--strict-mcp-config",
+            "--disable-slash-commands",
+            "--no-session-persistence",
+        ] {
             assert!(lines.contains(&flag), "{flag} missing");
         }
     }
@@ -225,6 +241,7 @@ async fn argv_disables_every_tool_and_setting_source() {
         "--allowedTools StructuredOutput",
         "--setting-sources \"\"",
         "--strict-mcp-config",
+        "--disable-slash-commands",
     ] {
         assert!(args.contains(part), "{part} missing from {args}");
     }
@@ -255,6 +272,7 @@ fn argv_is_exactly_the_verified_list() {
             "--allowedTools",
             "StructuredOutput",
             "--strict-mcp-config",
+            "--disable-slash-commands",
             "--setting-sources",
             "",
             "--no-session-persistence",
@@ -325,7 +343,7 @@ async fn working_directory_is_fresh_empty_and_removed() {
 #[tokio::test]
 async fn structured_output_is_returned_and_result_is_fallback() {
     let cli = MockCli::with_reply(
-        r#"{"subtype":"success","is_error":false,"result":"ignored","structured_output":{"a":1}}"#,
+        r#"{"type":"result","permission_denials":[],"subtype":"success","is_error":false,"result":"ignored","structured_output":{"a":1}}"#,
         &[],
     );
     let text = complete(&cli.claude()).await.unwrap();
@@ -335,8 +353,8 @@ async fn structured_output_is_returned_and_result_is_fallback() {
     );
 
     for reply in [
-        r#"{"subtype":"success","is_error":false,"result":"{\"b\":2}"}"#,
-        r#"{"subtype":"success","is_error":false,"result":"{\"b\":2}","structured_output":null}"#,
+        r#"{"type":"result","permission_denials":[],"subtype":"success","is_error":false,"result":"{\"b\":2}"}"#,
+        r#"{"type":"result","permission_denials":[],"subtype":"success","is_error":false,"result":"{\"b\":2}","structured_output":null}"#,
     ] {
         let cli = MockCli::with_reply(reply, &[]);
         assert_eq!(complete(&cli.claude()).await.unwrap(), r#"{"b":2}"#);
@@ -345,21 +363,27 @@ async fn structured_output_is_returned_and_result_is_fallback() {
 
 #[tokio::test]
 async fn error_result_is_refused_not_ok() {
-    let cli = MockCli::with_reply(r#"{"is_error":true,"subtype":"error_max_turns"}"#, &[]);
+    let cli = MockCli::with_reply(
+        r#"{"type":"result","permission_denials":[],"is_error":true,"subtype":"error_max_turns"}"#,
+        &[],
+    );
     let error = complete(&cli.claude()).await.unwrap_err();
     assert!(matches!(&error, Error::Refused(why) if why == "error_max_turns"));
 
-    // `is_error` alone, then `subtype` alone, then neither word at all.
+    // `is_error` alone maps to a fixed code; a subtype off the list never travels.
     for (reply, why) in [
         (
-            r#"{"is_error":true,"subtype":"success","result":"x"}"#,
-            "success",
+            r#"{"type":"result","permission_denials":[],"is_error":true,"subtype":"success","result":"x"}"#,
+            "cli_error",
         ),
         (
-            r#"{"is_error":false,"subtype":"error_during_execution"}"#,
+            r#"{"type":"result","permission_denials":[],"is_error":false,"subtype":"error_during_execution"}"#,
             "error_during_execution",
         ),
-        (r#"{"result":"x"}"#, "unknown"),
+        (
+            r#"{"type":"result","permission_denials":[],"is_error":true,"subtype":"secret raw text"}"#,
+            "cli_error",
+        ),
     ] {
         let cli = MockCli::with_reply(reply, &[]);
         let error = complete(&cli.claude()).await.unwrap_err();
@@ -382,15 +406,33 @@ async fn a_permission_denial_is_refused_even_on_success() {
         "{error}"
     );
 
-    // Fails closed on a shape it does not know.
-    let odd = r#"{"subtype":"success","is_error":false,"result":"x","permission_denials":"Bash"}"#;
-    let cli = MockCli::with_reply(odd, &[]);
-    let error = complete(&cli.claude()).await.unwrap_err();
-    assert!(matches!(error, Error::Refused(_)), "{error}");
-
-    let empty = r#"{"subtype":"success","is_error":false,"result":"x","permission_denials":[]}"#;
+    let empty = r#"{"type":"result","subtype":"success","is_error":false,"result":"x","permission_denials":[]}"#;
     let cli = MockCli::with_reply(empty, &[]);
     assert_eq!(complete(&cli.claude()).await.unwrap(), "x");
+}
+
+/// A CLI update that drops or retypes a field this code relies on must not pass as clean.
+#[tokio::test]
+async fn drifted_replies_fail_closed() {
+    for reply in [
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"x"}"#,
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"x","permission_denials":null}"#,
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"x","permission_denials":"Bash"}"#,
+        r#"{"type":"result","subtype":"success","result":"x","permission_denials":[]}"#,
+        r#"{"type":"result","subtype":"success","is_error":"false","result":"x","permission_denials":[]}"#,
+        r#"{"type":"result","is_error":false,"result":"x","permission_denials":[]}"#,
+        r#"{"type":"result","subtype":7,"is_error":false,"result":"x","permission_denials":[]}"#,
+        r#"{"subtype":"success","is_error":false,"result":"x","permission_denials":[]}"#,
+        r#"{"type":"answer","subtype":"success","is_error":false,"result":"x","permission_denials":[]}"#,
+        r#"[{"subtype":"success","is_error":false,"result":"x","permission_denials":[]}]"#,
+    ] {
+        let cli = MockCli::with_reply(reply, &[]);
+        let error = complete(&cli.claude()).await.unwrap_err();
+        assert!(
+            matches!(&error, Error::Failed(why) if why == "bad_reply"),
+            "{reply}: {error}"
+        );
+    }
 }
 
 /// The recorded smoke run got an array through the adapter's own argv, with no `--verbose`.
@@ -404,7 +446,7 @@ async fn an_event_array_is_read_from_its_last_result_event() {
     assert_eq!(complete(&cli.claude()).await.unwrap(), r#"{"a":1}"#);
 
     let failed = r#"[{"type":"system","subtype":"init"},
-        {"type":"result","subtype":"error_max_turns","is_error":true}]"#;
+        {"type":"result","subtype":"error_max_turns","is_error":true,"permission_denials":[]}]"#;
     let cli = MockCli::with_reply(failed, &[]);
     let error = complete(&cli.claude()).await.unwrap_err();
     assert!(
@@ -425,8 +467,7 @@ async fn an_event_array_is_read_from_its_last_result_event() {
 /// It arrives as a result with `subtype: success` and `is_error: true`.
 #[tokio::test]
 async fn not_logged_in_is_reported_from_json_and_from_plain_text() {
-    let json_reply =
-        r#"{"subtype":"success","is_error":true,"result":"Not logged in · Please run /login"}"#;
+    let json_reply = r#"{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login"}"#;
     for (reply, exit) in [
         (json_reply, "1"),
         ("Not logged in · Please run /login", "1"),
@@ -440,15 +481,90 @@ async fn not_logged_in_is_reported_from_json_and_from_plain_text() {
     }
 }
 
+/// The sign-in failure must reach the user, and the log, not end as a plain No-AI. The login
+/// reply is matched before the drift checks, so a sparse one still counts.
+#[tokio::test]
+async fn logged_out_reaches_the_task_end_and_the_log() {
+    for reply in [
+        r#"{"type":"result","subtype":"success","is_error":true,"result":"Not logged in Â· Please run /login","permission_denials":[]}"#,
+        r#"{"type":"result","is_error":true,"result":"Not logged in Â· Please run /login"}"#,
+        "Not logged in Â· Please run /login",
+    ] {
+        let (_tmp, db) = setup().await;
+        let cli = MockCli::with_reply(reply, &[("MOCK_CLAUDE_EXIT", "1")]);
+        let router = Router::with_providers(vec![Box::new(cli.claude())]);
+        let outcome = router
+            .run(
+                &db,
+                "gui",
+                TaskType::ParseJob,
+                job_prompt(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            Outcome::ManualRequired {
+                reason: "not_logged_in".into()
+            }
+        );
+        let failed = ("failed".to_string(), Some("not_logged_in".to_string()));
+        assert_eq!(reasons(&db).await, [failed], "one attempt, no retry");
+    }
+}
+
+/// `task_runs` gets the fixed word; other failures still end as plain No-AI.
+#[tokio::test]
+async fn run_log_carries_fixed_sub_reasons_only() {
+    let denied = r#"{"type":"result","subtype":"success","is_error":false,"result":"{}",
+        "permission_denials":[{"tool_name":"StructuredOutput"}]}"#;
+    let raw =
+        r#"{"type":"result","subtype":"secret raw text","is_error":true,"permission_denials":[]}"#;
+    for (reply, code) in [
+        (denied, "permission_denied"),
+        (raw, "cli_error"),
+        ("boom", "bad_reply"),
+    ] {
+        let (_tmp, db) = setup().await;
+        let cli = MockCli::with_reply(reply, &[]);
+        let router = Router::with_providers(vec![Box::new(cli.claude())]);
+        let outcome = router
+            .run(
+                &db,
+                "gui",
+                TaskType::ParseJob,
+                job_prompt(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            Outcome::ManualRequired {
+                reason: "no_ai".into()
+            }
+        );
+        let failed = ("failed".to_string(), Some(code.to_string()));
+        assert_eq!(reasons(&db).await, [failed]);
+    }
+}
+
 /// A posting can say anything, and a good reply can quote it.
 #[tokio::test]
 async fn a_good_reply_quoting_the_login_message_is_not_a_login_failure() {
     let cli = MockCli::with_reply(
-        r#"{"subtype":"success","is_error":false,"structured_output":{"note":"Not logged in"}}"#,
+        r#"{"type":"result","permission_denials":[],"subtype":"success","is_error":false,"structured_output":{"note":"Not logged in"}}"#,
         &[],
     );
     let text = complete(&cli.claude()).await.unwrap();
     assert!(text.contains("Not logged in"));
+
+    let cli = MockCli::with_reply(
+        r#"{"type":"result","permission_denials":[],"subtype":"success","is_error":false,"result":"Not logged in"}"#,
+        &[],
+    );
+    assert_eq!(complete(&cli.claude()).await.unwrap(), "Not logged in");
 }
 
 #[tokio::test]
@@ -456,7 +572,7 @@ async fn exit_and_garbage_are_failures_with_codes() {
     let cli = MockCli::with_reply("boom", &[("MOCK_CLAUDE_EXIT", "3")]);
     let error = complete(&cli.claude()).await.unwrap_err();
     assert!(
-        matches!(&error, Error::Failed(why) if why == "exit_3"),
+        matches!(&error, Error::Failed(why) if why == "cli_error"),
         "{error}"
     );
 
@@ -474,11 +590,11 @@ async fn exit_and_garbage_are_failures_with_codes() {
         "{error}"
     );
 
-    let ok = r#"{"subtype":"success","is_error":false,"result":"{}"}"#;
+    let ok = r#"{"type":"result","permission_denials":[],"subtype":"success","is_error":false,"result":"{}"}"#;
     let cli = MockCli::with_reply(ok, &[("MOCK_CLAUDE_EXIT", "4")]);
     let error = complete(&cli.claude()).await.unwrap_err();
     assert!(
-        matches!(&error, Error::Failed(why) if why == "exit_4"),
+        matches!(&error, Error::Failed(why) if why == "cli_error"),
         "{error}"
     );
 }
@@ -512,6 +628,7 @@ async fn timeout_kills_the_child() {
 
     let failed = ("failed".to_string(), Some("timeout".to_string()));
     assert_eq!(reasons(&db).await, [failed.clone(), failed]);
+    assert_cwd_removed(&cli);
     assert_pids_gone(&cli).await;
     assert_never_finished(&cli, OUTLIVE).await;
 }
@@ -539,6 +656,7 @@ async fn cancel_kills_the_child_and_its_children() {
         "took {:?}",
         clock.elapsed()
     );
+    assert_cwd_removed(&cli);
     assert_pids_gone(&cli).await;
     assert_never_finished(&cli, OUTLIVE).await;
 }
@@ -661,7 +779,8 @@ async fn from_settings_drops_ollama_on_a_non_loopback_url() {
 #[tokio::test]
 async fn router_runs_a_task_through_the_cli_and_writes_the_audit_row() {
     let (_tmp, db) = setup().await;
-    let reply = json!({"subtype": "success", "is_error": false,
+    let reply = json!({"type": "result", "subtype": "success", "is_error": false,
+        "permission_denials": [],
         "structured_output": serde_json::from_str::<Value>(JOB).unwrap()});
     let cli = MockCli::with_reply(&reply.to_string(), &[]);
     let router = Router::with_providers(vec![Box::new(cli.claude())]);
