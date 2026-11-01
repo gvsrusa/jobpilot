@@ -20,6 +20,8 @@ type Props = {
   pending: boolean;
   error?: unknown;
   confirmDisabled?: boolean;
+  /** Destructive by default; a warning that only needs a yes uses `default`. */
+  confirmVariant?: "destructive" | "default";
 };
 
 /**
@@ -70,7 +72,7 @@ export function ConfirmDialog(props: Props) {
             >
               Cancel
             </Button>
-            <Button type="submit" variant="destructive" disabled={pending || confirmDisabled}>
+            <Button type="submit" variant={props.confirmVariant ?? "destructive"} disabled={pending || confirmDisabled}>
               {pending ? props.busyLabel : props.confirmLabel}
             </Button>
           </DialogFooter>

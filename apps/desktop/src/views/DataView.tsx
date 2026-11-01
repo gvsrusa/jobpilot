@@ -1,13 +1,15 @@
 import { useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { ErrorAlert } from "@/components/ErrorAlert";
 import { PageHeading } from "@/components/PageHeading";
 import { RestoreDialog, type RestoreTarget } from "@/components/RestoreDialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { ipc, pickFolder } from "@/lib/ipc";
+import { ipc, pickFolder, type KeyState } from "@/lib/ipc";
+import { isLocked, offersImportAndDiscard } from "@/lib/keys";
 import { useApplyStatus, useStatus } from "@/lib/status";
 import { baseName, formatDate } from "@/lib/utils";
 
@@ -82,7 +84,11 @@ function BackupsSection({ onRestore }: { onRestore(t: RestoreTarget): void }) {
 }
 
 function ExportSection({ root }: { root: string }) {
-  const exported = useMutation({ mutationFn: ipc.dataExport });
+  const [asking, setAsking] = useState(false);
+  const exported = useMutation({
+    mutationFn: ipc.dataExport,
+    onSettled: () => setAsking(false),
+  });
   return (
     <Section id="export" title="Export">
       <p className="text-sm">
@@ -96,10 +102,28 @@ function ExportSection({ root }: { root: string }) {
         </p>
       )}
       <div>
-        <Button variant="outline" onClick={() => exported.mutate()} disabled={exported.isPending}>
+        <Button variant="outline" onClick={() => setAsking(true)} disabled={exported.isPending}>
           {exported.isPending ? "Exporting..." : "Export all data..."}
         </Button>
       </div>
+      {asking && (
+        <ConfirmDialog
+          title="Write your data as plain text?"
+          confirmLabel="Write plain text export"
+          busyLabel="Exporting..."
+          confirmVariant="default"
+          pending={exported.isPending}
+          onCancel={() => setAsking(false)}
+          onConfirm={() => exported.mutate()}
+        >
+          <p>
+            JobPilot keeps some fields encrypted: work authorization, notes, and knowledge you
+            marked sensitive. The export writes them as plain text. Anyone who can read the
+            exports folder can read them, and a cloud-synced or shared folder would copy them.
+          </p>
+          <p>Delete the file when you no longer need it.</p>
+        </ConfirmDialog>
+      )}
     </Section>
   );
 }
@@ -276,9 +300,11 @@ function DeleteSection({ root }: { root: string }) {
             <Label htmlFor="delete-backups">Also delete backups and snapshots</Label>
           </div>
           <p>
-            Keychain secrets are removed for every JobPilot data folder on this account, not only
-            this one. It cannot reach a backup or export you moved elsewhere. Deleting the
-            activity log is part of this action, so no record of it remains.
+            Keychain secrets are removed for this data folder. A copied folder or a restored backup
+            that shares this folder's key id loses its key too, and its locked fields can then
+            be read only with a recovery file. This cannot reach a recovery file, backup, or
+            export you saved elsewhere. Deleting the activity log is part of this action, so no
+            record of it remains.
           </p>
           <div className="grid gap-1.5">
             <Label htmlFor="delete-confirm">Type DELETE to confirm</Label>
@@ -295,6 +321,121 @@ function DeleteSection({ root }: { root: string }) {
   );
 }
 
+const KEY_TEXT: Record<"key_unavailable" | "key_missing" | "key_mismatch", string> = {
+  key_unavailable:
+    "Your keychain did not answer. Unlock it, then retry. No import and no discard are offered.",
+  key_missing: "The key for this data is not on this machine.",
+  key_mismatch: "The key found does not match this data.",
+};
+
+/** A key change moves what every sensitive field shows, so cached rows are dropped. */
+function useKeyChange() {
+  const client = useQueryClient();
+  return (state: KeyState) => {
+    client.setQueryData(["keystate"], state);
+    void client.invalidateQueries({ queryKey: ["status"] });
+    void client.resetQueries({ predicate: (q) => q.queryKey[0] !== "status" && q.queryKey[0] !== "keystate" });
+  };
+}
+
+function LockedFields() {
+  const key = useQuery({ queryKey: ["keystate"], queryFn: ipc.keyState });
+  const changed = useKeyChange();
+  const run = (fn: () => Promise<KeyState>) => ({ mutationFn: fn, onSuccess: changed });
+  const retry = useMutation(run(ipc.keyRetry));
+  const importKey = useMutation(run(ipc.recoveryKeyImport));
+  const discard = useMutation(run(ipc.discardLockedFields));
+  const state = key.data;
+  const busy = retry.isPending || importKey.isPending || discard.isPending;
+  const cancelled = (e: unknown) => (e && (e as { code?: string }).code === "cancelled" ? null : e);
+  if (key.error) return <ErrorAlert error={key.error} />;
+  if (!isLocked(state)) return null;
+  return (
+    <Section id="locked" title="Locked fields">
+      <p className="text-sm text-muted-foreground">key id: {state.key_id}</p>
+      <p className="text-sm">{KEY_TEXT[state.state]}</p>
+      {state.state === "key_unavailable" && <p className="text-sm text-muted-foreground">{state.reason}</p>}
+      <ErrorAlert error={cancelled(retry.error) ?? cancelled(importKey.error) ?? cancelled(discard.error)} />
+      <div className="flex flex-wrap gap-2">
+        <Button variant="outline" disabled={busy} onClick={() => retry.mutate()}>
+          Retry
+        </Button>
+        {offersImportAndDiscard(state) && (
+          <>
+            <Button variant="outline" disabled={busy} onClick={() => importKey.mutate()}>
+              Import recovery key file...
+            </Button>
+            <Button variant="destructive" disabled={busy} onClick={() => discard.mutate()}>
+              Discard locked fields...
+            </Button>
+          </>
+        )}
+      </div>
+    </Section>
+  );
+}
+
+function KeyBanners() {
+  const client = useQueryClient();
+  const status = useStatus();
+  const s = status.data;
+  const exportKey = useMutation({
+    mutationFn: ipc.recoveryKeyExport,
+    onSuccess: () => client.invalidateQueries({ queryKey: ["status"] }),
+  });
+  const dismiss = useMutation({
+    mutationFn: ipc.swapWarningClear,
+    onSuccess: () => client.invalidateQueries({ queryKey: ["status"] }),
+  });
+  if (!s) return null;
+  const restored = s.restored_key_state;
+  const cancelled = exportKey.error && (exportKey.error as { code?: string }).code === "cancelled";
+  return (
+    <>
+      {s.swap_interrupted && (
+        <Alert>
+          <AlertDescription className="flex items-center justify-between gap-3">
+            <span>The last restore was interrupted. Check your data, then dismiss.</span>
+            <Button size="sm" variant="outline" onClick={() => dismiss.mutate()}>
+              Dismiss
+            </Button>
+          </AlertDescription>
+        </Alert>
+      )}
+      {restored && isLocked(restored) && (
+        <Alert variant="destructive">
+          <AlertDescription>
+            {restored.state === "key_missing" &&
+              `The restored backup's key (${restored.key_id}) is not on this computer, so its locked fields stay locked. Import its recovery key file below.`}
+            {restored.state === "key_mismatch" &&
+              `The restored backup's key (${restored.key_id}) does not match its data, so its locked fields stay locked.`}
+            {restored.state === "key_unavailable" &&
+              "The keychain did not answer after the restore, so locked fields stay locked until you retry."}
+          </AlertDescription>
+        </Alert>
+      )}
+      {s.recovery_key_exported === false && (
+        <Alert>
+          <AlertTitle>No recovery key exported</AlertTitle>
+          <AlertDescription className="grid gap-2">
+            <span>
+              Without a recovery file, a lost keychain means your locked fields cannot be read
+              again. Save the file outside this data folder.
+            </span>
+            {exportKey.data && <span>Saved to {exportKey.data.path}</span>}
+            {!cancelled && <ErrorAlert error={exportKey.error} />}
+            <div>
+              <Button size="sm" variant="outline" disabled={exportKey.isPending} onClick={() => exportKey.mutate()}>
+                Export recovery key...
+              </Button>
+            </div>
+          </AlertDescription>
+        </Alert>
+      )}
+    </>
+  );
+}
+
 export function DataView() {
   const status = useStatus();
   const [target, setTarget] = useState<RestoreTarget | null>(null);
@@ -302,6 +443,8 @@ export function DataView() {
   return (
     <div className="grid max-w-3xl gap-4">
       <PageHeading>Data and privacy</PageHeading>
+      <KeyBanners />
+      <LockedFields />
       <Section id="before" title="Before you store anything">
         <ul className="list-disc pl-5 text-sm">
           <li>Turn on disk encryption (FileVault, BitLocker).</li>

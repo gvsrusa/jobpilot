@@ -218,6 +218,8 @@ describe("data", () => {
     const { user } = renderApp();
     await open(user, "Data");
     await user.click(screen.getByRole("button", { name: /Export all data/ }));
+    // 0.2: the plain-text warning comes first
+    await user.click(await screen.findByRole("button", { name: "Write plain text export" }));
     expect(await screen.findByText(/exports\/export-1/)).toBeInTheDocument();
   });
 
