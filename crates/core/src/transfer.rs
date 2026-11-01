@@ -193,12 +193,18 @@ async fn names_to_erase(db: &Db, confirm: &str) -> Result<Vec<String>> {
     if !db.paths().marker().is_file() {
         return Err(Error::RootNotOwned(db.paths().root().to_path_buf()));
     }
-    // A key can have ciphertext and no row, and no other root's id is in either list.
+    // A key can have ciphertext and no row, and no other root's id is in either list. A
+    // restored row can hold any text, and on Windows a name that is too long fails before
+    // the store is asked, so it would fail every retry. No such id has an entry.
     let mut key_ids: Vec<String> = sqlx::query_scalar("SELECT key_id FROM data_keys")
         .fetch_all(&db.pool)
         .await?;
     key_ids.extend(crypto::held_key_ids(db).await?);
-    let mut names: Vec<String> = key_ids.iter().map(|id| crypto::account(id)).collect();
+    let mut names: Vec<String> = key_ids
+        .iter()
+        .filter(|id| crypto::is_key_id(id.as_bytes()))
+        .map(|id| crypto::account(id))
+        .collect();
     names.extend(secrets::names(db).await?);
     Ok(names)
 }
@@ -259,5 +265,32 @@ mod tests {
         let db = Db::open(&paths).await.unwrap();
         delete_all(db, "DELETE", true).await.unwrap();
         assert!(!paths.db().exists());
+    }
+
+    #[tokio::test]
+    async fn only_real_key_ids_become_keychain_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::new(tmp.path().join("data"));
+        let db = Db::open(&paths).await.unwrap();
+        let long = "a".repeat(100_000);
+        for key_id in [long.as_str(), "", "ABCDEF0123456789", "00112233aabbccdd"] {
+            sqlx::query(
+                "INSERT INTO data_keys (key_id, created_at, key_check, active) \
+                 VALUES (?, 't', x'00', 0)",
+            )
+            .bind(key_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("INSERT INTO secret_index (name, created_at) VALUES ('openai', 't')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let names = names_to_erase(&db, "DELETE").await.unwrap();
+        db.close().await;
+
+        assert_eq!(names, ["data-key-00112233aabbccdd", "openai"]);
     }
 }

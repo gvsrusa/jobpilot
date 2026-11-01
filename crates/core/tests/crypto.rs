@@ -833,3 +833,150 @@ fn key_state_serializes_with_a_state_tag() {
         serde_json::json!({ "state": "key_unavailable", "key_id": "k", "reason": "r" })
     );
 }
+
+/// A row whose key-check opens under nothing, so only "no such entry" can be its answer.
+async fn add_row(db: &Db, key_id: &str, created_at: &str, active: bool) {
+    sqlx::query(
+        "INSERT INTO data_keys (key_id, created_at, key_check, active) VALUES (?, ?, x'00', ?)",
+    )
+    .bind(key_id)
+    .bind(created_at)
+    .bind(active)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+}
+
+async fn reactivations(db: &Db) -> usize {
+    let rows = audit::recent(db, 100).await.unwrap();
+    rows.iter()
+        .filter(|row| row.action == "data_key_reactivated")
+        .count()
+}
+
+/// Each test has its own lost key: entries are shared by every test process.
+const LOST_KEY_ID: &str = "c0c1c2c3c4c5c6c7";
+const MISMATCHED_KEY_ID: &str = "d0d1d2d3d4d5d6d7";
+const HELD_KEY_ID: &str = "e0e1e2e3e4e5e6e7";
+const NEWER_KEY_ID: &str = "f0f1f2f3f4f5f6f7";
+const OLDER_KEY_ID: &str = "a1a2a3a4a5a6a7a8";
+
+/// The active key goes inactive, and `lost`, a key with no entry, takes over as active.
+async fn lose_the_active_key(db: &Db, lost: &str) {
+    sqlx::query("UPDATE data_keys SET active = 0")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    add_row(db, lost, "9999", true).await;
+}
+
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn a_readable_inactive_key_replaces_a_missing_active_one_with_no_ciphertext() {
+    let (_tmp, paths) = temp_root();
+    let (db, key_id, _guard) = unlocked_root(&paths).await;
+    lose_the_active_key(&db, LOST_KEY_ID).await;
+
+    let state = crypto::state(&db).await.unwrap();
+
+    assert_eq!(
+        state,
+        KeyState::Unlocked {
+            key_id: key_id.clone()
+        }
+    );
+    let active: Vec<_> = key_rows(&db)
+        .await
+        .into_iter()
+        .filter(|row| row.2 == 1)
+        .map(|row| row.0)
+        .collect();
+    assert_eq!(active, [key_id]);
+    assert_eq!(
+        key_rows(&db).await.len(),
+        2,
+        "no row goes and no key is made"
+    );
+    assert_eq!(reactivations(&db).await, 1);
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn a_readable_inactive_key_replaces_a_mismatched_active_one_with_no_ciphertext() {
+    let (_tmp, paths) = temp_root();
+    let (db, key_id, _guard) = unlocked_root(&paths).await;
+    lose_the_active_key(&db, MISMATCHED_KEY_ID).await;
+    let _other = EntryGuard(MISMATCHED_KEY_ID.to_owned());
+    entry(MISMATCHED_KEY_ID)
+        .set_password(&"ab".repeat(32))
+        .unwrap();
+
+    let state = crypto::state(&db).await.unwrap();
+
+    assert_eq!(state, KeyState::Unlocked { key_id });
+    assert_eq!(
+        entry(MISMATCHED_KEY_ID).get_password().unwrap(),
+        "ab".repeat(32)
+    );
+    db.close().await;
+}
+
+// A readable active key stays, even with a newer readable row beside it.
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn a_readable_active_key_stays_active_beside_a_newer_readable_one() {
+    let (_tmp, paths) = temp_root();
+    let (db, key_id, _guard) = unlocked_root(&paths).await;
+    add_row(&db, NEWER_KEY_ID, "9999", false).await;
+
+    let state = crypto::state(&db).await.unwrap();
+
+    assert_eq!(state, KeyState::Unlocked { key_id });
+    assert_eq!(reactivations(&db).await, 0);
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn with_ciphertext_a_readable_inactive_key_does_not_replace_the_active_one() {
+    let (_tmp, paths) = temp_root();
+    let (db, _key_id, _guard) = unlocked_root(&paths).await;
+    lose_the_active_key(&db, HELD_KEY_ID).await;
+    sqlx::query(
+        "INSERT INTO work_authorization (country, ciphertext, key_id, updated_at) \
+         VALUES ('PT', x'00', ?, 't')",
+    )
+    .bind(HELD_KEY_ID)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let state = crypto::state(&db).await.unwrap();
+
+    let expected = KeyState::KeyMissing {
+        key_id: HELD_KEY_ID.to_owned(),
+    };
+    assert_eq!(state, expected);
+    assert_eq!(reactivations(&db).await, 0);
+    db.close().await;
+}
+
+// Discard and import name what the state names, so that stays the active key.
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn with_nothing_readable_the_active_key_is_the_one_named() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    add_row(&db, OLDER_KEY_ID, "1000", true).await;
+    add_row(&db, NEWER_KEY_ID, "9999", false).await;
+
+    let state = crypto::state(&db).await.unwrap();
+
+    let expected = KeyState::KeyMissing {
+        key_id: OLDER_KEY_ID.to_owned(),
+    };
+    assert_eq!(state, expected);
+    assert_eq!(reactivations(&db).await, 0);
+    db.close().await;
+}

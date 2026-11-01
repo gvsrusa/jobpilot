@@ -701,3 +701,28 @@ async fn delete_all_after_a_restore_removes_the_outgoing_key() {
 
     assert!(!outgoing.present());
 }
+
+// Windows refuses a name this long before asking the store, so every retry would fail.
+#[tokio::test]
+async fn an_id_no_key_can_have_cannot_block_deletion() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    for key_id in [
+        "x".repeat(100_000),
+        String::new(),
+        "NOT-A-KEY-ID-16C".into(),
+    ] {
+        sqlx::query(
+            "INSERT INTO data_keys (key_id, created_at, key_check, active) \
+             VALUES (?, 't', x'00', 0)",
+        )
+        .bind(key_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    transfer::delete_all(db, "DELETE", true).await.unwrap();
+
+    assert!(!paths.db().exists());
+}

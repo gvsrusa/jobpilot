@@ -118,7 +118,7 @@ pub async fn list(paths: &AppPaths) -> Result<Vec<BackupInfo>> {
     let mut found = Vec::new();
     for entry in entries {
         let path = entry?.path();
-        if !path.join(DB_FILE).is_file() {
+        if !is_plain_file(&path.join(DB_FILE)) {
             continue;
         }
         if let Ok(manifest) = read_manifest(&path) {
@@ -235,9 +235,31 @@ async fn prepare(db: &Db, source: &Path, migrator: &Migrator) -> Result<(Validat
     Ok((validated, live))
 }
 
+/// A backup is untrusted, so this looks before anything opens the path: opening a FIFO
+/// waits for ever, on the lock the desktop holds for a restore, and a link reads whatever
+/// it points at.
+// ponytail: looks by name and then opens, so a file swapped in between gets through. Only
+// another process of this user can do that, and it can already write the live data.
+fn is_plain_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|found| found.is_file())
+}
+
+/// What SQLite opens itself beside a database that is not immutable: each is absent or a
+/// plain file. A read-only connection can leave an empty `-shm`, so one may be there.
+fn sidecars_are_plain(database: &Path) -> bool {
+    ["-wal", "-shm", "-journal"].iter().all(|suffix| {
+        let beside = sidecar(database, suffix);
+        fs::symlink_metadata(&beside).is_err() || is_plain_file(&beside)
+    })
+}
+
 fn read_manifest(dir: &Path) -> Result<Manifest> {
     let invalid = |error: String| Error::InvalidBackup(format!("manifest: {error}"));
-    let bytes = fs::read(dir.join("manifest.json")).map_err(|e| invalid(e.to_string()))?;
+    let file = dir.join("manifest.json");
+    if !is_plain_file(&file) {
+        return Err(invalid("no regular file".into()));
+    }
+    let bytes = fs::read(file).map_err(|e| invalid(e.to_string()))?;
     let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
     if manifest.format != 1 {
         return Err(invalid(format!("unknown format {}", manifest.format)));
@@ -258,8 +280,16 @@ async fn validate(source: &Path, migrator: &Migrator) -> Result<Validated> {
         return Err(Error::InvalidBackup("no documents folder".into()));
     }
     let database = source.join(DB_FILE);
-    if manifest.wal && !sidecar(&database, "-wal").is_file() {
+    if !is_plain_file(&database) {
+        return Err(Error::InvalidBackup("no regular database file".into()));
+    }
+    if manifest.wal && !is_plain_file(&sidecar(&database, "-wal")) {
         return Err(Error::InvalidBackup("its WAL is missing".into()));
+    }
+    if manifest.wal && !sidecars_are_plain(&database) {
+        return Err(Error::InvalidBackup(
+            "a file beside its database is not a regular file".into(),
+        ));
     }
     // The manifest is only a claim, so the database's own version decides.
     let (db, keys) = check_database(&database, manifest.wal).await?;
@@ -354,8 +384,11 @@ async fn read_keys(pool: &SqlitePool) -> Result<Vec<KeyRow>> {
 /// A folder stays listed whatever its database holds: a snapshot of a broken database is
 /// what the recovery screen must still offer. So one that cannot be read has no ids.
 async fn key_ids_in(dir: &Path, with_wal: bool) -> Vec<String> {
-    let options = read_only(&dir.join(DB_FILE), with_wal);
-    let Ok(pool) = SqlitePool::connect_with(options).await else {
+    let database = dir.join(DB_FILE);
+    if with_wal && !sidecars_are_plain(&database) {
+        return Vec::new();
+    }
+    let Ok(pool) = SqlitePool::connect_with(read_only(&database, with_wal)).await else {
         return Vec::new();
     };
     let keys = read_keys(&pool).await.unwrap_or_default();

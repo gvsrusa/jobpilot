@@ -326,13 +326,27 @@ async fn existing_key(db: &Db) -> Result<Option<Found>> {
     }
 
     let active = keys.iter().find(|key| key.2);
+    let active = active.map(|key| (key.0.clone(), key.1.clone()));
     match active {
-        Some((key_id, key_check, _)) if held.iter().all(|id| id == key_id) => {
-            let proof = Proof::KeyCheck(key_check.clone());
-            Ok(Some(read_active(key_id.clone(), proof).await))
+        Some((key_id, key_check)) if held.iter().all(|id| *id == key_id) => {
+            let found = read_active(key_id.clone(), Proof::KeyCheck(key_check)).await;
+            // With no ciphertext, a lost active key strands nothing, so a readable key
+            // listed beside it takes over. Unavailable says nothing about the key, so it
+            // stays. When none can, the state still names the active key.
+            let lost = matches!(
+                found,
+                Err(KeyState::KeyMissing { .. } | KeyState::KeyMismatch { .. })
+            );
+            if lost && held.is_empty() && keys.len() > 1 {
+                let stand_in = prove_every_key(db, keys, held, Some(key_id)).await?;
+                if stand_in.is_ok() {
+                    return Ok(Some(stand_in));
+                }
+            }
+            Ok(Some(found))
         }
-        _ => {
-            let active = active.map(|key| key.0.clone());
+        active => {
+            let active = active.map(|(key_id, _)| key_id);
             Ok(Some(prove_every_key(db, keys, held, active).await?))
         }
     }
@@ -706,7 +720,7 @@ fn aad(table: &str, column: &str, row_id: &str, key_id: &str) -> String {
     format!("{table}\x1f{column}\x1f{row_id}\x1f{key_id}")
 }
 
-fn is_key_id(id: &[u8]) -> bool {
+pub(crate) fn is_key_id(id: &[u8]) -> bool {
     id.len() == KEY_ID_LEN && id.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 

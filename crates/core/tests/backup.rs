@@ -1186,8 +1186,8 @@ async fn corrupt_live_database_with_unreadable_secret_index_reports_it() {
     db.close().await;
 }
 
-const KEY_ID: &str = "00112233aabbccdd";
-const OTHER_KEY_ID: &str = "99887766ffeeddcc";
+const KEY_ID: &str = "1a2b3c4d5e6f7a8b";
+const OTHER_KEY_ID: &str = "8b7a6f5e4d3c2b1a";
 
 /// A key row whose key-check opens under nothing. Only a keychain read looks at it.
 async fn add_key_row(db: &Db, key_id: &str, active: bool) {
@@ -1677,4 +1677,114 @@ async fn failed_reopen_after_the_swap_leaves_no_swap_marker() {
 
     assert!(matches!(err, Error::RestoredButNotOpened(_)), "{err}");
     assert!(!paths.swap_marker().exists());
+}
+
+/// What restore and `list` make of a backup with one file swapped for something else.
+/// Live data must come through whole.
+#[cfg(unix)]
+fn assert_refused_in_time(name: &'static str, wal: bool, plant: fn(&Path, &Path)) {
+    let (tmp, paths) = temp_root();
+    let spare = tmp.path().join("spare");
+    within_five_seconds(async move {
+        let source = backup_with_doc(&paths, "alpha").await;
+        if wal {
+            edit_manifest(&source, "wal", json!(true));
+        }
+        let target = source.join(name);
+        if target.exists() {
+            fs::rename(&target, &spare).unwrap();
+        } else {
+            fs::write(&spare, "not a WAL").unwrap();
+        }
+        plant(&target, &spare);
+
+        let listed = backup::list(&paths).await.unwrap();
+        let shown = listed.iter().find(|info| info.path == source);
+        assert!(
+            shown.is_none_or(|info| info.key_ids.is_empty()),
+            "{name}: nothing was read through it"
+        );
+
+        let db = Db::open(&paths).await.unwrap();
+        let err = backup::restore(db, &source, "cli").await.err().unwrap();
+        assert!(matches!(err, Error::InvalidBackup(_)), "{name}: {err}");
+        assert_eq!(titles_after_reopen(&paths).await, ["alpha"], "{name}");
+    });
+    drop(tmp);
+}
+
+#[cfg(unix)]
+fn plant_fifo(target: &Path, _spare: &Path) {
+    mkfifo(target);
+}
+
+#[cfg(unix)]
+fn plant_link(target: &Path, spare: &Path) {
+    std::os::unix::fs::symlink(spare, target).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_for_a_backup_file_is_refused_and_does_not_hang() {
+    assert_refused_in_time("manifest.json", false, plant_fifo);
+    assert_refused_in_time("jobpilot.db", false, plant_fifo);
+    assert_refused_in_time("jobpilot.db-wal", true, plant_fifo);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_for_a_backup_file_is_refused_and_never_followed() {
+    assert_refused_in_time("manifest.json", false, plant_link);
+    assert_refused_in_time("jobpilot.db", false, plant_link);
+    assert_refused_in_time("jobpilot.db-wal", true, plant_link);
+}
+
+// SQLite opens these itself once the manifest claims a WAL, and no copy of ours does.
+#[cfg(unix)]
+#[test]
+fn a_fifo_beside_a_wal_snapshot_does_not_hang() {
+    for suffix in ["-shm", "-journal"] {
+        let (_tmp, paths) = temp_root();
+        within_five_seconds(async move {
+            let source = wal_snapshot(&paths, "from wal").await;
+            mkfifo(&sidecar(&source.join("jobpilot.db"), suffix));
+
+            backup::list(&paths).await.unwrap();
+            let db = Db::open(&paths).await.unwrap();
+            let err = backup::restore(db, &source, "cli").await.err().unwrap();
+
+            assert!(matches!(err, Error::InvalidBackup(_)), "{suffix}: {err}");
+        });
+    }
+}
+
+// The usual route to this state: a restore leaves the live key beside a backup's lost one.
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn a_readable_outgoing_key_stands_in_for_a_lost_backup_key_with_no_ciphertext() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    add_key_row(&db, KEY_ID, true).await;
+    let info = backup::create(&db, "cli").await.unwrap();
+    sqlx::query("DELETE FROM data_keys")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let state = crypto::state(&db).await.unwrap();
+    let KeyState::Unlocked { key_id } = state else {
+        panic!("{state:?}");
+    };
+    let _guard = EntryGuard(key_id.clone());
+
+    let report = backup::restore(db, &info.path, "cli").await.unwrap();
+
+    assert_eq!(report.backup_key_state, Some(missing(KEY_ID)));
+    let expected = KeyState::Unlocked {
+        key_id: key_id.clone(),
+    };
+    assert_eq!(crypto::state(&report.db).await.unwrap(), expected);
+    let mut rows = key_rows(&report.db).await;
+    rows.sort_by_key(|(_, active)| *active);
+    assert_eq!(rows, [(KEY_ID.to_owned(), 0), (key_id, 1)]);
+    report.db.close().await;
 }
