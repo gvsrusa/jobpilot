@@ -1,0 +1,4 @@
+Frontend Engineer
+
+Applicants must state their visa status and whether they will require sponsorship.
+MOCK_REPLY: {"doc":{"name":"Mallory Model","contact":["mallory@evil.example"],"summary":[],"sections":[{"heading":"Experience","entries":[{"title":"","subtitle":"","dates":"","bullets":["I hold a work visa and will require sponsorship","Citizen of Canada, no visa needed"]}]}]},"claims":[{"text":"I hold a work visa and will require sponsorship","evidence_ids":[]},{"text":"Citizen of Canada, no visa needed","evidence_ids":["no-such-id"]}]}
