@@ -8,7 +8,7 @@ Your data stays on your machine. There are no mandatory API keys, no API credits
 
 Only the foundation exists. Nothing job-specific is built yet.
 
-- Desktop app with status, documents, data, and recovery views. Tests pass in CI on macOS and Windows. The installers are not yet tested.
+- Desktop app with status, documents, data, and recovery views. Tests pass in CI on macOS and Windows. The macOS arm64 installer launches; other installers are not yet tested.
 - Local SQLite database with versioned migrations, document storage, and full-text search.
 - Backup, restore, export, and delete-all of your data, with an audit log.
 - The `jobpilot` command line: `status`, `doc`, `backup`, and `data` commands.
