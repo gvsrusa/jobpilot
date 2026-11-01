@@ -232,6 +232,19 @@ pub(crate) async fn export_authorization(db: &Db) -> Result<(String, bool)> {
     Ok((text, true))
 }
 
+/// The notes, for `drafts` to keep out of generated text; it never sets a value. With no
+/// rows, nothing is asked of the keychain.
+pub(crate) async fn authorization_notes(db: &Db) -> Result<Vec<String>> {
+    let held: i64 = sqlx::query_scalar("SELECT count(*) FROM work_authorization")
+        .fetch_one(&db.pool)
+        .await?;
+    if held == 0 {
+        return Ok(Vec::new());
+    }
+    let rows = read_authorization(db).await?;
+    Ok(rows.into_iter().map(|row| row.note).collect())
+}
+
 async fn read_authorization(db: &Db) -> Result<Vec<WorkAuthorization>> {
     let stored: Vec<(String, Vec<u8>, String)> = sqlx::query_as(
         "SELECT country, ciphertext, key_id FROM work_authorization ORDER BY country",

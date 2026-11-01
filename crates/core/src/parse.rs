@@ -310,8 +310,9 @@ fn decode_into(text: &str, out: &mut String) {
 
 // --------------------------------------------------------------- structure
 
-const SUMMARY_HEADINGS: [&str; 4] = ["summary", "profile", "objective", "professional summary"];
-const KNOWN_HEADINGS: [&str; 18] = [
+pub(crate) const SUMMARY_HEADINGS: [&str; 4] =
+    ["summary", "profile", "objective", "professional summary"];
+pub(crate) const KNOWN_HEADINGS: [&str; 18] = [
     "experience",
     "work experience",
     "professional experience",

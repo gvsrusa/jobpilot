@@ -5,6 +5,7 @@ pub mod backup;
 pub mod crypto;
 pub mod db;
 pub mod documents;
+pub mod drafts;
 pub mod error;
 pub mod knowledge;
 pub mod parse;
