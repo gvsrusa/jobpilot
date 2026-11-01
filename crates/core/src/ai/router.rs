@@ -2,12 +2,15 @@
 //! every step. The contract is `docs/ai-providers.md`, "TaskRouter contract".
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::json;
 
+use super::claude_code::ClaudeCode;
 use super::noai::NoAi;
+use super::ollama::{DEFAULT_URL, Ollama};
 use super::validate::validate;
 use super::{
     Availability, CancellationToken, Capability, DataCategory, Declaration, Outcome, Prompt,
@@ -19,6 +22,8 @@ use crate::error::{Error, Result};
 use crate::settings;
 
 const CANCEL_POLL: Duration = Duration::from_millis(100);
+const OLLAMA: &str = "ollama";
+const CLAUDE_CODE: &str = "claude_code";
 
 /// Providers in user order. No-AI is not in the list: it runs last, outside the checks.
 /// Holds no `Db`, so build one per call and nothing blocks a restore.
@@ -54,10 +59,42 @@ enum Step<T> {
 
 impl Router {
     /// Settings: `ai.order` (`["ollama","claude_code"]`, default `["ollama"]`), `ai.enabled`
-    /// (`{ollama: bool, claude_code: bool}`), `ai.ollama_url`, `ai.drafting_model`,
-    /// `ai.embedding_model`. NoAi only until the adapters land in Tasks 12 and 13.
-    pub async fn from_settings(_db: &Db) -> Result<Router> {
-        Ok(Router::with_providers(Vec::new()))
+    /// (`{ollama: bool, claude_code: bool}`; Ollama defaults on, Claude off, because data
+    /// leaves the machine), `ai.ollama_url`, `ai.drafting_model`, `ai.embedding_model`.
+    /// Spawns nothing and opens no socket: availability is checked when a task runs.
+    pub async fn from_settings(db: &Db) -> Result<Router> {
+        let order: Option<Vec<String>> = settings::get(db, "ai.order")
+            .await?
+            .and_then(|value| serde_json::from_value(value).ok());
+        let order = order.unwrap_or_else(|| vec![OLLAMA.to_string()]);
+        let enabled = settings::get(db, "ai.enabled").await?.unwrap_or_default();
+        let on = |name: &str, default: bool| enabled[name].as_bool().unwrap_or(default);
+
+        let mut providers: Vec<Box<dyn Provider>> = Vec::new();
+        let mut seen: Vec<&str> = Vec::new();
+        for name in &order {
+            if seen.contains(&name.as_str()) {
+                continue;
+            }
+            seen.push(name);
+            match name.as_str() {
+                OLLAMA if on(OLLAMA, true) => {
+                    // A bad setting costs Ollama, not every task: No-AI must still run.
+                    match ollama_from_settings(db).await? {
+                        Some(ollama) => providers.push(Box::new(ollama)),
+                        None => eprintln!("ollama: ai.ollama_url refused, provider left out"),
+                    }
+                }
+                CLAUDE_CODE if on(CLAUDE_CODE, false) => {
+                    // No binary stays listed, so the run log shows it as unavailable.
+                    let claude = ClaudeCode::locate()
+                        .unwrap_or_else(|_| ClaudeCode::with_binary(PathBuf::new(), None));
+                    providers.push(Box::new(claude));
+                }
+                _ => {}
+            }
+        }
+        Ok(Router::with_providers(providers))
     }
 
     /// No-AI is always the real one, so anything else claiming that id is dropped.
@@ -307,6 +344,19 @@ impl Router {
         }
         Ok(Step::Next)
     }
+}
+
+/// `None` when the address is refused.
+async fn ollama_from_settings(db: &Db) -> Result<Option<Ollama>> {
+    let text = async |key: &str| -> Result<Option<String>> {
+        let value = settings::get(db, key).await?;
+        Ok(value.and_then(|value| value.as_str().map(str::to_string)))
+    };
+    let url = text("ai.ollama_url").await?;
+    let url = url.as_deref().unwrap_or(DEFAULT_URL);
+    let drafting = text("ai.drafting_model").await?;
+    let embedding = text("ai.embedding_model").await?;
+    Ok(Ollama::new(url, drafting, embedding).ok())
 }
 
 /// A task no provider may run, whatever it declares. Sensitive values never travel beside

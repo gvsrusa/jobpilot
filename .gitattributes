@@ -3,3 +3,4 @@
 *.png binary
 *.ico binary
 *.icns binary
+crates/core/tests/mock-claude/claude.cmd text eol=crlf

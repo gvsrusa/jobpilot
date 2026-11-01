@@ -1257,7 +1257,10 @@ async fn router_keeps_user_order_and_always_ends_with_the_real_no_ai() {
     assert_eq!(calls(&counters), 0);
 
     let from_settings = Router::from_settings(&db).await.unwrap();
-    assert_eq!(from_settings.provider_ids(), [ProviderId::NoAi]);
+    assert_eq!(
+        from_settings.provider_ids(),
+        [ProviderId::Ollama, ProviderId::NoAi]
+    );
 }
 
 fn vectors(count: usize) -> Reply {

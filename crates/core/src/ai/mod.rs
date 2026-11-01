@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
+pub mod claude_code;
 pub mod consent;
 pub mod noai;
 pub mod ollama;
