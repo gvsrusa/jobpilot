@@ -31,6 +31,7 @@ pub const RUN_REASONS: &[&str] = &[
     "permission_denied",
     "bad_reply",
     "cli_error",
+    "prompt_too_large",
     "error_max_turns",
     "error_during_execution",
     "error_max_structured_output_retries",
@@ -116,7 +117,7 @@ static EMBED: TaskSpec = TaskSpec {
     attempts: 2,
 };
 
-/// Timeouts are not here: they come from `Declaration.timeout`, 60 s remote, 300 s local.
+/// Timeouts are not here: they come from `Declaration.timeout`, 180 s Claude, 300 s local.
 pub fn spec(task: TaskType) -> &'static TaskSpec {
     match task {
         TaskType::ParseJob => &PARSE_JOB,
@@ -162,6 +163,18 @@ pub struct Prompt {
     pub user: String,
     /// The router sets this to the task's schema before any provider sees it.
     pub schema: &'static str,
+}
+
+/// Token estimates assume one token per this many UTF-8 bytes. Counting bytes, not characters,
+/// keeps it high enough for CJK, where a three-byte character can be a token or more.
+pub const BYTES_PER_TOKEN: usize = 2;
+
+impl Prompt {
+    /// An upper estimate for routing. The real count depends on a model's tokenizer.
+    pub fn estimated_tokens(&self) -> usize {
+        let bytes = self.system.len() + self.user.len() + self.schema.len();
+        bytes.div_ceil(BYTES_PER_TOKEN)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

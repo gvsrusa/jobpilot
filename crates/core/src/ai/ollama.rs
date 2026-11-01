@@ -21,6 +21,8 @@ use crate::hardware::{self, Hardware};
 
 pub const DEFAULT_URL: &str = "http://127.0.0.1:11434";
 
+/// Sent as `num_ctx`, so this is the window a call really gets, up to the model's own maximum.
+pub const CONTEXT_LIMIT: usize = 8192;
 const CANCEL_POLL: Duration = Duration::from_millis(100);
 const QUICK: Duration = Duration::from_secs(3);
 /// A pull progress line is a few hundred bytes. A longer one is not Ollama talking.
@@ -242,6 +244,16 @@ impl Ollama {
         if response.status() == StatusCode::NOT_FOUND {
             return Err(Error::Refused("model_not_found".into()));
         }
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            // Ollama's two wordings of an overflow both say "context length".
+            let body = response.text().await.map_err(net)?;
+            return Err(if body.contains("context length") {
+                Error::Refused("prompt_too_large".into())
+            } else {
+                Error::Failed(format!("http_{status}"))
+            });
+        }
         read_json(response).await
     }
 }
@@ -258,7 +270,7 @@ impl Provider for Ollama {
                 Capability::NoTools,
             ],
             local: true,
-            context_limit: 8192,
+            context_limit: CONTEXT_LIMIT,
             timeout: Duration::from_secs(300),
             sign_in: "none".into(),
         }
@@ -315,7 +327,11 @@ impl Provider for Ollama {
                 ],
                 "format": format,
                 "stream": false,
-                "options": {"temperature": 0},
+                // Both default to true, and either would cut the prompt with a normal 200:
+                // the rules and the block's markers can go first. A refusal is the safe end.
+                "truncate": false,
+                "shift": false,
+                "options": {"temperature": 0, "num_ctx": CONTEXT_LIMIT},
             });
             let reply = self.post("/api/chat", body).await?;
             reply["message"]["content"]

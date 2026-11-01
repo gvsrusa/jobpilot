@@ -5,11 +5,15 @@
 //! is stored with its claim statuses, flagged lines included (FR-7.12): the compare screen
 //! shows them and export refuses them.
 
+use std::cmp::Reverse;
+use std::collections::HashSet;
+
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::ai::ollama::CONTEXT_LIMIT;
 use crate::ai::router::Router;
-use crate::ai::{CancellationToken, Outcome, Prompt, ProviderId, TaskType, spec};
+use crate::ai::{BYTES_PER_TOKEN, CancellationToken, Outcome, Prompt, ProviderId, TaskType, spec};
 use crate::db::Db;
 use crate::drafts::{self, ClaimInput, Draft, usable};
 use crate::error::{Error, Result};
@@ -20,6 +24,12 @@ use crate::render::{ResumeDoc, cover_letter_doc};
 
 const OPEN: &str = "<<<UNTRUSTED_POSTING>>>";
 const CLOSE: &str = "<<<END_UNTRUSTED_POSTING>>>";
+/// The smallest window any provider declares, so a typical prompt fits every provider.
+// ponytail: a provider with a larger window gets no more evidence. Pass the limit in when one
+// needs it.
+const PROMPT_BYTES: usize = CONTEXT_LIMIT * BYTES_PER_TOKEN;
+/// Evidence a long posting cannot push out: past this the prompt is too large, which says so.
+const MIN_EVIDENCE_BYTES: usize = 2_000;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Generated {
@@ -46,9 +56,11 @@ struct Reply {
     output: serde_json::Value,
     basic: ProfileBasic,
     posting: JobText,
+    cancel: CancellationToken,
 }
 
-/// `Err(ManualRequired)` with no usable backend, so the UI opens the editor (FR-3.23).
+/// `Err(ManualRequired)` so the UI opens the editor (FR-3.23): reason `no_evidence` before
+/// anything is sent, `prompt_too_large` when no provider can take the prompt, or no backend.
 pub async fn resume(
     db: &Db,
     router: &Router,
@@ -64,7 +76,7 @@ pub async fn resume(
     store(db, "resume", reply, doc, claims).await
 }
 
-/// `Err(ManualRequired)` with no usable backend, so the UI opens the editor (FR-3.23).
+/// Fails as [`resume`] does.
 pub async fn cover_letter(
     db: &Db,
     router: &Router,
@@ -81,45 +93,80 @@ pub async fn cover_letter(
 }
 
 /// The fixed prompt for a drafting task. Takes [`ProfileBasic`], not `Profile`, so no
-/// authorization value can reach it, and drops any item a draft may not cite.
+/// authorization value can reach it, and drops any item a draft may not cite. Evidence goes
+/// in by rank until the prompt would pass [`PROMPT_BYTES`].
 pub fn build_prompt(
     task: TaskType,
     basic: &ProfileBasic,
     evidence: &[KnowledgeItem],
     posting: &JobText,
 ) -> Prompt {
-    let cited: Vec<String> = evidence
-        .iter()
-        .filter(|item| usable(item))
-        .map(|item| format!("[{}] {}: {}", item.id, item.kind, item.body))
-        .collect();
     let modes: Vec<String> = basic
         .work_modes
         .iter()
         .map(|mode| format!("{mode:?}"))
         .collect();
-    let profile = format!(
+    let profile = neutralise(&format!(
         "name: {}\ncontact: {}\nwork modes: {}",
         basic.name,
         contact(basic).join("; "),
         modes.join(", ")
-    );
+    ));
+    let job = neutralise(&posting.normalized);
+    let user = |cited: &str| {
+        format!("EVIDENCE\n{cited}\n\nPROFILE\n{profile}\n\n{OPEN}\n{job}\n{CLOSE}\n")
+    };
+    let system = system_text(task);
+    let schema = spec(task).schema;
+    let room = PROMPT_BYTES
+        .saturating_sub(system.len() + schema.len() + user("").len())
+        .max(MIN_EVIDENCE_BYTES);
+    let cited = ranked_lines(evidence, &job, room).join("\n");
     Prompt {
-        system: system_text(task),
-        user: format!(
-            "EVIDENCE\n{}\n\nPROFILE\n{}\n\n{OPEN}\n{}\n{CLOSE}\n",
-            neutralise(&cited.join("\n")),
-            neutralise(&profile),
-            neutralise(&posting.normalized),
-        ),
-        schema: spec(task).schema,
+        user: user(&neutralise(&cited)),
+        system,
+        schema,
     }
+}
+
+fn words(text: &str) -> HashSet<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Citable items, those sharing most words with the posting first, as long as they fit in
+/// `room`. An item too big for what is left is passed over, unless nothing else fits: then
+/// the top one goes in and the router judges the size.
+// ponytail: word overlap, offline and free. A language written without spaces ranks poorly,
+// and one kind of item can crowd out another. Embeddings can replace it when they rank better.
+fn ranked_lines(evidence: &[KnowledgeItem], job: &str, room: usize) -> Vec<String> {
+    let wanted = words(job);
+    let mut items: Vec<&KnowledgeItem> = evidence.iter().filter(|item| usable(item)).collect();
+    items.sort_by_cached_key(|item| Reverse(words(&item.body).intersection(&wanted).count()));
+    let lines = items
+        .iter()
+        .map(|item| format!("[{}] {}: {}", item.id, item.kind, item.body));
+    let mut left = room;
+    let mut kept = Vec::new();
+    for line in lines.clone() {
+        if line.len() < left {
+            left -= line.len() + 1;
+            kept.push(line);
+        }
+    }
+    if kept.is_empty() {
+        kept.extend(lines.take(1));
+    }
+    kept
 }
 
 fn system_text(task: TaskType) -> String {
     let shape = if task == TaskType::DraftCoverLetter {
         "Reply with `paragraphs`. Each one is a claim: its `text` and the `evidence_ids` that \
-         support it."
+         support it.\n\
+         State nothing about the employer except what the posting says."
             .to_string()
     } else {
         let headings: Vec<String> = KNOWN_HEADINGS
@@ -137,8 +184,9 @@ fn system_text(task: TaskType) -> String {
         )
     };
     format!(
-        "You draft job application material for one candidate, from the EVIDENCE list and the \
-         PROFILE block and from nothing else.\n\
+        "You draft job application material for one candidate. Facts about the candidate come \
+         only from the EVIDENCE list and the PROFILE block. The posting decides which of them \
+         to stress and how to word them, and is never a source of facts about the candidate.\n\
          Never fabricate professional qualifications or employment history.\n\
          Never state or imply work authorization or visa eligibility.\n\
          Every claim must cite `evidence_ids` from the EVIDENCE list, by the id in square \
@@ -169,15 +217,11 @@ fn neutralise(text: &str) -> String {
     clean
 }
 
-/// One entry per profile value, which is what `drafts` accepts as the user's own contact.
+/// The email only. Countries, regions, and cities are where the user wants to work, not where
+/// they are, so printing them would state something the profile does not hold.
 fn contact(basic: &ProfileBasic) -> Vec<String> {
-    std::iter::once(&basic.email)
-        .chain(&basic.cities)
-        .chain(&basic.regions)
-        .chain(&basic.countries)
-        .filter(|value| !value.is_empty())
-        .cloned()
-        .collect()
+    let email = (!basic.email.is_empty()).then(|| basic.email.clone());
+    email.into_iter().collect()
 }
 
 async fn ask(
@@ -191,8 +235,11 @@ async fn ask(
     let posting = knowledge::get_job_text(db, job_text_id).await?;
     let basic = profile::basic(db).await?;
     let evidence = knowledge::evidence(db).await?;
+    if evidence.is_empty() {
+        return Err(Error::ManualRequired("no_evidence".into()));
+    }
     let prompt = build_prompt(task, &basic, &evidence, &posting);
-    match router.run(db, actor, task, prompt, cancel).await? {
+    match router.run(db, actor, task, prompt, cancel.clone()).await? {
         Outcome::Ok {
             provider, output, ..
         } => Ok(Reply {
@@ -200,6 +247,7 @@ async fn ask(
             output,
             basic,
             posting,
+            cancel,
         }),
         Outcome::ManualRequired { reason } => Err(Error::ManualRequired(reason)),
         Outcome::Failed { reason } => Err(Error::Failed(reason)),
@@ -230,6 +278,9 @@ async fn store(
 ) -> Result<Generated> {
     if claims.is_empty() {
         return Err(Error::Validation("the reply holds no text".into()));
+    }
+    if reply.cancel.is_cancelled() {
+        return Err(Error::Cancelled);
     }
     let Reply {
         provider, posting, ..

@@ -74,7 +74,7 @@ Each task type declares:
 | Required capabilities | What a provider must declare, from the vocabulary above. | FR-3.26 |
 | Data categories | What this task sends. Used for the consent check. | FR-3.30 |
 | Automation mode | `reviewed` when a person reviews the result before anything is acted on (Manual, Copilot, ordinary drafting), or `unreviewed` for any step of an Autonomous submission. | FR-9.6 |
-| Timeout | Per attempt. Proposed defaults: 60 seconds for remote, 300 seconds for local. | FR-3.27 |
+| Timeout | Per attempt. Defaults: 180 seconds for Claude Code, 300 seconds for local. | FR-3.27 |
 | Retry policy | Attempt limit and which failures retry. | FR-3.28 |
 | Fallback order | User's ordered list of enabled backends, always ending in No-AI. | FR-3.29 |
 | No-AI behaviour | The deterministic path, or `manual_required` when none exists. | FR-3.20 to FR-3.23 |
@@ -98,8 +98,9 @@ Ineligible providers are skipped, and the reason is logged. Fallback never widen
 
 - A timeout cancels the attempt and kills any child process.
 - Proposed retry limit: two attempts per provider.
-- Retry: network errors, 429 and 5xx responses, and one output-validation failure. Honor `Retry-After`.
-- Do not retry: authentication failures, policy refusals, consent refusals, cancellation, or a second validation failure. Move to the next provider.
+- Retry: for a local provider, network errors, 429 and 5xx responses, and one output-validation failure. Honor `Retry-After`. For an external provider, one output-validation failure only.
+- Do not retry: a timeout or network error on an external provider (the attempt may already have spent usage), authentication failures, policy refusals, consent refusals, cancellation, or a second validation failure. Move to the next provider.
+- A prompt whose estimate (UTF-8 bytes / 2, with system text and schema) passes a provider's context limit skips that provider, as does an overflow the provider reports. If nothing else takes the task, it ends `manual_required` with reason `prompt_too_large`. Ollama calls send `num_ctx`, `truncate: false`, and `shift: false`, so an overflow is an error and not a silent cut.
 - Usage-limit errors from a ChatGPT plan (`subscription_sharing_usage_limit_exceeded`) end that provider for the task and show the user a **Manage usage** link, as OpenAI's UI guidelines require.
 - `subscription_sharing_user_not_eligible` (403) ends that provider for the session. Explain the restriction to the user. OpenAI's guide says "do not repeat the same request or loop through OAuth".
 - Emergency pause (FR-12.8) cancels every in-flight task.

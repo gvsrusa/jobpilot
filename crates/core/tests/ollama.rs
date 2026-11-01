@@ -6,7 +6,7 @@ use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use jobpilot_core::ai::ollama::{DEFAULT_URL, Fit, Ollama, OllamaStatus};
+use jobpilot_core::ai::ollama::{CONTEXT_LIMIT, DEFAULT_URL, Fit, Ollama, OllamaStatus};
 use jobpilot_core::ai::router::Router;
 use jobpilot_core::ai::{
     Availability, CancellationToken, Capability, Outcome, Prompt, Provider, TaskType, spec,
@@ -288,6 +288,9 @@ async fn complete_sends_schema_as_format_and_returns_content() {
     assert_eq!(sent["stream"], json!(false));
     assert_eq!(sent["model"], json!("gemma3:4b"));
     assert_eq!(sent["options"]["temperature"], json!(0));
+    assert_eq!(sent["options"]["num_ctx"], json!(CONTEXT_LIMIT));
+    assert_eq!(sent["truncate"], json!(false));
+    assert_eq!(sent["shift"], json!(false));
     assert_eq!(
         sent["messages"][0],
         json!({"role": "system", "content": "sys"})
@@ -416,6 +419,76 @@ async fn missing_model_is_failed_not_hang() {
         other => panic!("{:?}", other.map(|_| ())),
     }
     assert!(start.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn context_overflow_is_refused_as_prompt_too_large() {
+    for wording in [
+        "the input length exceeds the context length",
+        "the prompt is longer than the context length currently available to the model",
+    ] {
+        let fake = Fake::start(vec![
+            ("/api/tags", Reply::Json(200, tag_routes(&["gemma3:4b"]))),
+            ("/api/chat", Reply::Json(400, json!({"error": wording}))),
+        ]);
+        let ollama = Ollama::new(&fake.url, Some("gemma3:4b".into()), None).unwrap();
+        match ollama.complete(&prompt(), CancellationToken::new()).await {
+            Err(Error::Refused(reason)) => assert_eq!(reason, "prompt_too_large"),
+            other => panic!("{wording}: {:?}", other.map(|_| ())),
+        }
+    }
+}
+
+#[tokio::test]
+async fn another_http_error_keeps_its_status_code() {
+    let fake = Fake::start(vec![
+        ("/api/tags", Reply::Json(200, tag_routes(&["gemma3:4b"]))),
+        (
+            "/api/chat",
+            Reply::Json(400, json!({"error": "bad format"})),
+        ),
+    ]);
+    let ollama = Ollama::new(&fake.url, Some("gemma3:4b".into()), None).unwrap();
+    match ollama.complete(&prompt(), CancellationToken::new()).await {
+        Err(Error::Failed(reason)) => assert_eq!(reason, "http_400"),
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+}
+
+#[tokio::test]
+async fn overflow_through_the_router_ends_manual_with_its_reason() {
+    let (_tmp, db) = setup().await;
+    let fake = Fake::start(vec![
+        ("/api/tags", Reply::Json(200, tag_routes(&["gemma3:4b"]))),
+        (
+            "/api/chat",
+            Reply::Json(
+                400,
+                json!({"error": "the input length exceeds the context length"}),
+            ),
+        ),
+    ]);
+    let ollama = Ollama::new(&fake.url, Some("gemma3:4b".into()), None).unwrap();
+    let router = Router::with_providers(vec![Box::new(ollama)]);
+
+    let outcome = router
+        .run(
+            &db,
+            "gui",
+            TaskType::ParseJob,
+            prompt(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        Outcome::ManualRequired {
+            reason: "prompt_too_large".into()
+        }
+    );
+    assert_eq!(fake.hits("/api/chat").len(), 1);
 }
 
 #[tokio::test]

@@ -23,6 +23,7 @@ use crate::settings;
 
 const CANCEL_POLL: Duration = Duration::from_millis(100);
 const NOT_LOGGED_IN: &str = "not_logged_in";
+const PROMPT_TOO_LARGE: &str = "prompt_too_large";
 const OLLAMA: &str = "ollama";
 const CLAUDE_CODE: &str = "claude_code";
 
@@ -39,6 +40,8 @@ struct Task<'a> {
     actor: &'a str,
     spec: &'a TaskSpec,
     cancel: &'a CancellationToken,
+    /// [`Prompt::estimated_tokens`]; 0 for a task with no prompt.
+    tokens: usize,
 }
 
 /// One `task_runs` row. `reason` is a code, never a message: rows hold no prompts,
@@ -58,8 +61,8 @@ enum Step<T> {
         attempts: u32,
     },
     Next,
-    /// As `Next`, and the user must sign in, so the task end says so rather than `no_ai`.
-    SignIn,
+    /// As `Next`, with a reason the user can act on, so the task end says it, not `no_ai`.
+    Manual(&'static str),
     Cancelled,
 }
 
@@ -148,11 +151,13 @@ impl Router {
         mut prompt: Prompt,
         cancel: CancellationToken,
     ) -> Result<Outcome> {
+        prompt.schema = spec.schema;
         let task = Task {
             db,
             actor,
             spec,
             cancel: &cancel,
+            tokens: prompt.estimated_tokens(),
         };
         if let Some(reason) = refusal(spec) {
             log(&task, row("router", 0, "refused", Some(reason), db).await?).await?;
@@ -160,8 +165,8 @@ impl Router {
                 reason: reason.into(),
             });
         }
-        prompt.schema = spec.schema;
-        let mut sign_in = false;
+        // What the user can act on, when every provider has passed.
+        let mut manual = None;
 
         for provider in &self.providers {
             let provider = provider.as_ref();
@@ -181,7 +186,7 @@ impl Router {
                     });
                 }
                 Step::Next => {}
-                Step::SignIn => sign_in = true,
+                Step::Manual(reason) => manual = Some(reason),
                 Step::Cancelled => return Ok(Outcome::Cancelled),
             }
         }
@@ -192,11 +197,7 @@ impl Router {
         }
         Ok(match NoAi.complete(&prompt, cancel.clone()).await {
             Err(Error::ManualRequired(reason)) => {
-                let reason = if sign_in {
-                    NOT_LOGGED_IN.into()
-                } else {
-                    reason
-                };
+                let reason = manual.map_or(reason, str::to_string);
                 log_no_ai(&task, "manual_required", Some(&reason)).await?;
                 Outcome::ManualRequired { reason }
             }
@@ -223,6 +224,7 @@ impl Router {
             actor: "system",
             spec: spec(TaskType::Embed),
             cancel: &cancel,
+            tokens: 0,
         };
         let model = settings::get(db, "ai.embedding_model")
             .await?
@@ -239,7 +241,7 @@ impl Router {
                 };
                 match self.try_provider(&task, provider, call).await? {
                     Step::Done { value, .. } => return Ok((model.clone(), value)),
-                    Step::Next | Step::SignIn => {}
+                    Step::Next | Step::Manual(_) => {}
                     Step::Cancelled => return Err(Error::Cancelled),
                 }
             }
@@ -281,7 +283,11 @@ impl Router {
                 row(&name, 0, "skipped", Some(&reason), task.db).await?,
             )
             .await?;
-            return Ok(Step::Next);
+            return Ok(if reason == PROMPT_TOO_LARGE {
+                Step::Manual(PROMPT_TOO_LARGE)
+            } else {
+                Step::Next
+            });
         }
 
         // Check 5, last on purpose: an ineligible provider is not even probed.
@@ -350,10 +356,13 @@ impl Router {
             record.reason = Some(reason);
             log(task, record).await?;
 
+            // A timed-out or broken external attempt may already have spent the user's usage.
             match error {
-                Error::Timeout | Error::Io(_) => {}
+                Error::Timeout | Error::Io(_) if !is_external(&declaration) => {}
                 Error::Validation(_) if !validation_failed => validation_failed = true,
-                _ if reason == NOT_LOGGED_IN => return Ok(Step::SignIn),
+                _ if reason == NOT_LOGGED_IN || reason == PROMPT_TOO_LARGE => {
+                    return Ok(Step::Manual(reason));
+                }
                 _ => return Ok(Step::Next),
             }
         }
@@ -411,7 +420,9 @@ fn is_external(declaration: &Declaration) -> bool {
 /// 3. Mode: every task in 0.2 is `reviewed`, so there is nothing to refuse. `TaskSpec` gains
 ///    a mode with the first `unreviewed` task.
 /// 4. Every required capability is declared. Absent means false, so this fails closed, and
-///    untrusted text demands `no_tools` whatever the spec lists.
+///    untrusted text demands `no_tools` whatever the spec lists. The prompt must also fit
+///    the declared context: a provider that cuts a prompt can lose the rules and the markers
+///    and still answer.
 /// 5. Availability, in `try_provider`.
 async fn ineligible(task: &Task<'_>, declaration: &Declaration) -> Result<Option<String>> {
     if is_external(declaration) {
@@ -429,12 +440,16 @@ async fn ineligible(task: &Task<'_>, declaration: &Declaration) -> Result<Option
     if carries_untrusted_text(task.spec) && !declares(Capability::NoTools) {
         return Ok(Some(code(&Capability::NoTools)));
     }
-    Ok(task
+    let missing = task
         .spec
         .required
         .iter()
         .find(|capability| !declares(**capability))
-        .map(code))
+        .map(code);
+    if missing.is_none() && task.tokens > declaration.context_limit {
+        return Ok(Some(PROMPT_TOO_LARGE.into()));
+    }
+    Ok(missing)
 }
 
 /// Ends `work` at the timeout or within one poll of the cancel, whichever is first.

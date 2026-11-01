@@ -195,8 +195,9 @@ impl Provider for ClaudeCode {
             id: ProviderId::ClaudeCode,
             capabilities: vec![Capability::StructuredOutput, Capability::NoTools],
             local: false,
+            // The standard window. The router's estimate runs high, so no margin is taken here.
             context_limit: 200_000,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_secs(180),
             sign_in: format!("claude cli on its own login ({})", self.bin.display()),
         }
     }

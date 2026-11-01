@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use jobpilot_core::ai::ollama::CONTEXT_LIMIT;
 use jobpilot_core::ai::router::Router;
 use jobpilot_core::ai::{
     Availability, BoxFuture, CancellationToken, Capability, DataCategory, Declaration, Prompt,
@@ -34,6 +35,7 @@ struct Seen {
 struct Mock {
     id: ProviderId,
     local: bool,
+    limit: usize,
     replies: Mutex<VecDeque<String>>,
     seen: Arc<Seen>,
 }
@@ -45,6 +47,7 @@ impl Mock {
         let mock = Mock {
             id,
             local,
+            limit: CONTEXT_LIMIT,
             replies: Mutex::new(replies),
             seen: seen.clone(),
         };
@@ -58,7 +61,7 @@ impl Provider for Mock {
             id: self.id.clone(),
             capabilities: vec![Capability::StructuredOutput, Capability::NoTools],
             local: self.local,
-            context_limit: 8192,
+            context_limit: self.limit,
             timeout: Duration::from_secs(5),
             sign_in: "test".into(),
         }
@@ -357,20 +360,40 @@ fn cover_letter_system_names_paragraphs_not_claims() {
 }
 
 #[test]
+fn facts_about_the_candidate_have_one_source_and_the_posting_tailors() {
+    for task in [TaskType::DraftResume, TaskType::DraftCoverLetter] {
+        let prompt = build_prompt(task, &basic(), &[], &posting("Job"));
+        assert!(!prompt.system.contains("from nothing else"));
+        assert!(prompt.system.contains(
+            "Facts about the candidate come only from the EVIDENCE list and the PROFILE block."
+        ));
+        assert!(prompt.system.contains("never a source of facts"));
+    }
+}
+
+#[test]
+fn only_the_letter_limits_what_is_said_about_the_employer() {
+    let line = "State nothing about the employer except what the posting says.";
+    let letter = build_prompt(TaskType::DraftCoverLetter, &basic(), &[], &posting("Job"));
+    let resume = build_prompt(TaskType::DraftResume, &basic(), &[], &posting("Job"));
+    assert!(letter.system.contains(line));
+    assert!(!resume.system.contains(line));
+}
+
+#[test]
 fn profile_block_has_name_contact_and_work_modes_only() {
     let prompt = build_prompt(TaskType::DraftResume, &basic(), &[], &posting("Job"));
-    for wanted in [
-        "Ada Lovelace",
-        "ada@example.com",
-        "Lisbon",
-        "Lisbon District",
-        "PT",
-        "Remote",
-        "Hybrid",
-    ] {
+    for wanted in ["Ada Lovelace", "ada@example.com", "Remote", "Hybrid"] {
         assert!(prompt.user.contains(wanted), "{wanted} is missing");
     }
-    for unwanted in ["ZXQ/Time_Zone", "zxq-language", "zxq-employment", "EUR"] {
+    for unwanted in [
+        "ZXQ/Time_Zone",
+        "zxq-language",
+        "zxq-employment",
+        "EUR",
+        "Lisbon",
+        "PT",
+    ] {
         assert!(!prompt.user.contains(unwanted), "{unwanted} leaked");
     }
     assert!(!prompt.user.contains("ZXQ posting title"));
@@ -429,6 +452,152 @@ async fn generating_never_sends_a_marked_or_unapproved_item() {
     }
 }
 
+// ---- the size of the prompt -------------------------------------------------------------
+
+fn filler(n: usize) -> Vec<KnowledgeItem> {
+    (0..n)
+        .map(|i| {
+            let body = format!("ordinary item {i} {}", "padding ".repeat(100));
+            evidence_item(&format!("filler-{i}"), &body, true, false, false)
+        })
+        .collect()
+}
+
+#[test]
+fn evidence_is_capped_so_a_typical_prompt_fits_the_smallest_window() {
+    let job = posting(&"We build compilers in Rust for embedded targets. ".repeat(100));
+    for task in [TaskType::DraftResume, TaskType::DraftCoverLetter] {
+        let prompt = build_prompt(task, &basic(), &filler(300), &job);
+        assert!(
+            prompt.estimated_tokens() <= CONTEXT_LIMIT,
+            "{task:?}: {}",
+            prompt.estimated_tokens()
+        );
+        assert!(prompt.user.contains("filler-0"), "{task:?}");
+        assert!(!prompt.user.contains("filler-299"), "{task:?}");
+    }
+}
+
+#[test]
+fn the_items_closest_to_the_posting_go_in_first() {
+    let mut evidence = filler(300);
+    evidence.push(evidence_item(
+        "best-id",
+        "Rust compilers for embedded targets",
+        true,
+        false,
+        false,
+    ));
+    let job = posting("We build compilers in Rust for embedded targets.");
+    let prompt = build_prompt(TaskType::DraftResume, &basic(), &evidence, &job);
+    let best = prompt
+        .user
+        .find("[best-id]")
+        .expect("the best match is kept");
+    assert!(best < prompt.user.find("[filler-0]").unwrap());
+    assert_eq!(
+        prompt.user.find("[best-id]"),
+        prompt
+            .user
+            .find("EVIDENCE\n")
+            .map(|at| at + "EVIDENCE\n".len())
+    );
+}
+
+#[test]
+fn an_item_too_big_for_the_room_is_passed_over_for_smaller_ones() {
+    let huge = format!("Rust {}", "x".repeat(19_000));
+    let evidence = [
+        evidence_item("huge-id", &huge, true, false, false),
+        evidence_item("small-id", "A smaller item", true, false, false),
+    ];
+    let prompt = build_prompt(TaskType::DraftResume, &basic(), &evidence, &posting("Rust"));
+    assert!(!prompt.user.contains("huge-id"));
+    assert!(prompt.user.contains("small-id"));
+}
+
+#[test]
+fn when_nothing_fits_the_top_item_goes_in_and_the_router_judges() {
+    let huge = "x".repeat(19_000);
+    let evidence = [evidence_item("huge-id", &huge, true, false, false)];
+    let prompt = build_prompt(TaskType::DraftResume, &basic(), &evidence, &posting("Rust"));
+    assert!(prompt.user.contains("huge-id"));
+    assert!(prompt.estimated_tokens() > CONTEXT_LIMIT);
+}
+
+#[test]
+fn the_cap_counts_bytes_so_cjk_evidence_fits_too() {
+    let evidence: Vec<KnowledgeItem> = (0..100)
+        .map(|i| {
+            let body = "\u{6f22}".repeat(400);
+            evidence_item(&format!("cjk-{i}"), &body, true, false, false)
+        })
+        .collect();
+    let prompt = build_prompt(TaskType::DraftResume, &basic(), &evidence, &posting("Rust"));
+    assert!(prompt.user.contains("cjk-0"));
+    assert!(prompt.estimated_tokens() <= CONTEXT_LIMIT);
+}
+
+#[test]
+fn a_long_posting_cannot_push_out_all_the_evidence() {
+    let job = posting(&"Long posting text. ".repeat(1_000));
+    let prompt = build_prompt(TaskType::DraftResume, &basic(), &filler(10), &job);
+    assert!(prompt.user.contains("[filler-0]"));
+    assert!(prompt.user.contains("[filler-1]"));
+}
+
+#[tokio::test]
+async fn an_oversized_posting_is_manual_required_and_sends_nothing() {
+    let w = world().await;
+    let huge = "Rust engineer wanted. ".repeat(9_000);
+    let job = knowledge::import_job_text(&w.db, "Huge", &huge)
+        .await
+        .unwrap();
+    let (router, seen) = router(vec![reply_citing(&[(BULLET, &[&w.item.id])])]);
+
+    let resume = generate::resume(&w.db, &router, "gui", &job.id, CancellationToken::new()).await;
+    let letter =
+        generate::cover_letter(&w.db, &router, "gui", &job.id, CancellationToken::new()).await;
+
+    for made in [resume, letter] {
+        assert!(
+            matches!(&made, Err(Error::ManualRequired(reason)) if reason == "prompt_too_large"),
+            "{made:?}"
+        );
+    }
+    assert!(seen.prompts.lock().unwrap().is_empty());
+    assert_eq!(draft_count(&w.db).await, 0);
+}
+
+#[tokio::test]
+async fn an_overflow_on_a_small_provider_falls_to_the_next() {
+    let w = world().await;
+    let categories = [
+        DataCategory::JobText,
+        DataCategory::ProfileBasic,
+        DataCategory::ResumeText,
+    ];
+    consent::give(&w.db, CLAUDE, &categories, "2026-11-01", "gui")
+        .await
+        .unwrap();
+    let (mut small, small_seen) = Mock::new(ProviderId::Ollama, true, Vec::new());
+    small.limit = 50;
+    let (large, large_seen) = Mock::new(
+        ProviderId::ClaudeCode,
+        false,
+        vec![reply_citing(&[(BULLET, &[&w.item.id])])],
+    );
+    let router = Router::with_providers(vec![Box::new(small), Box::new(large)]);
+
+    let made = generate::resume(&w.db, &router, "gui", &w.job.id, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(made.provider, ProviderId::ClaudeCode);
+    assert!(small_seen.prompts.lock().unwrap().is_empty());
+    assert_eq!(large_seen.prompts.lock().unwrap().len(), 1);
+}
+
 // ---- resumes ----------------------------------------------------------------------------
 
 #[tokio::test]
@@ -453,10 +622,7 @@ async fn valid_reply_becomes_a_versioned_draft_with_ok_claims() {
     assert_eq!(first.draft.job_text_id.as_deref(), Some(w.job.id.as_str()));
     assert_eq!(first.draft.provider.as_deref(), Some("ollama"));
     assert_eq!(first.draft.doc.name, "Ada Lovelace");
-    assert_eq!(
-        first.draft.doc.contact,
-        ["ada@example.com", "Lisbon", "Lisbon District", "PT"]
-    );
+    assert_eq!(first.draft.doc.contact, ["ada@example.com"]);
     let claims = drafts::claims(&w.db, &first.draft.id).await.unwrap();
     assert_eq!(claims.len(), 1);
     assert_eq!(claims[0].status, "ok");
@@ -632,7 +798,82 @@ async fn an_empty_reply_stores_nothing() {
     assert_eq!(draft_count(&w.db).await, 0);
 }
 
+#[tokio::test]
+async fn ids_of_a_draft_a_lineage_or_a_claim_are_not_evidence() {
+    let w = world().await;
+    let (router, _) = router(vec![reply_citing(&[(BULLET, &[&w.item.id])])]);
+    let earlier = generate::resume(&w.db, &router, "gui", &w.job.id, CancellationToken::new())
+        .await
+        .unwrap();
+    let claim = drafts::claims(&w.db, &earlier.draft.id).await.unwrap()[0]
+        .id
+        .clone();
+    let draft_id = earlier.draft.id.clone();
+    let lineage = earlier.draft.lineage_id.clone();
+    let (router, _) = self::router(vec![reply_citing(&[
+        ("Cites a draft", &[&draft_id]),
+        ("Cites a lineage", &[&lineage]),
+        ("Cites a claim", &[&claim]),
+    ])]);
+
+    let made = generate::resume(&w.db, &router, "gui", &w.job.id, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(made.blocked, 3);
+    let claims = drafts::claims(&w.db, &made.draft.id).await.unwrap();
+    assert!(claims.iter().all(|claim| claim.status == "no_evidence"));
+}
+
+#[tokio::test]
+async fn no_email_means_no_contact_line() {
+    let w = world().await;
+    let mut profile = basic();
+    profile.email = String::new();
+    profile::set_basic(&w.db, profile).await.unwrap();
+    let (router, _) = router(vec![reply_citing(&[(BULLET, &[&w.item.id])])]);
+
+    let made = generate::resume(&w.db, &router, "gui", &w.job.id, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(made.draft.doc.contact.is_empty());
+}
+
 // ---- outcomes ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn no_evidence_is_manual_required_before_anything_is_sent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open(&AppPaths::new(tmp.path().join("data")))
+        .await
+        .unwrap();
+    profile::set_basic(&db, basic()).await.unwrap();
+    knowledge::add(&db, "note", "Waiting for approval", "parsed", None)
+        .await
+        .unwrap();
+    let job = knowledge::import_job_text(&db, "Role", "Rust")
+        .await
+        .unwrap();
+    let (router, seen) = router(vec![reply_citing(&[(BULLET, &[])])]);
+
+    let resume = generate::resume(&db, &router, "gui", &job.id, CancellationToken::new()).await;
+    let letter =
+        generate::cover_letter(&db, &router, "gui", &job.id, CancellationToken::new()).await;
+
+    for made in [resume, letter] {
+        assert!(
+            matches!(&made, Err(Error::ManualRequired(reason)) if reason == "no_evidence"),
+            "{made:?}"
+        );
+    }
+    assert!(seen.prompts.lock().unwrap().is_empty());
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM task_runs")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(runs, 0);
+}
 
 #[tokio::test]
 async fn no_backend_is_manual_required() {

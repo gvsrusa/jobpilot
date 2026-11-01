@@ -314,7 +314,8 @@ fn declaration_is_external_no_tools_and_names_the_binary() {
         [Capability::StructuredOutput, Capability::NoTools]
     );
     assert!(!declaration.local);
-    assert_eq!(declaration.timeout, Duration::from_secs(60));
+    assert_eq!(declaration.timeout, Duration::from_secs(180));
+    assert_eq!(declaration.context_limit, 200_000);
     assert_eq!(
         declaration.sign_in,
         "claude cli on its own login (/opt/bin/claude)"
@@ -626,8 +627,9 @@ async fn timeout_kills_the_child() {
     assert!(clock.elapsed() < WITHIN, "took {:?}", clock.elapsed());
     assert!(matches!(outcome, Outcome::ManualRequired { .. }));
 
+    // One row: a timed-out attempt may have spent usage, so it is not sent again.
     let failed = ("failed".to_string(), Some("timeout".to_string()));
-    assert_eq!(reasons(&db).await, [failed.clone(), failed]);
+    assert_eq!(reasons(&db).await, [failed]);
     assert_cwd_removed(&cli);
     assert_pids_gone(&cli).await;
     assert_never_finished(&cli, OUTLIVE).await;

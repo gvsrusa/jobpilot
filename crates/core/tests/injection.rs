@@ -50,7 +50,9 @@ impl Provider for SteeredProvider {
             id: ProviderId::Ollama,
             capabilities: vec![Capability::StructuredOutput, Capability::NoTools],
             local: true,
-            context_limit: 8192,
+            // Wide enough that `10_oversize` reaches the model: this corpus tests what happens
+            // to steered output. tests/generate.rs pins the size refusal at the real limit.
+            context_limit: 1_000_000,
             timeout: Duration::from_secs(5),
             sign_in: "test".into(),
         }

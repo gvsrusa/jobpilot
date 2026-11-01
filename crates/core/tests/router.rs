@@ -29,6 +29,7 @@ enum Reply {
     Timeout,
     Io,
     Refused,
+    TooLarge,
     Unavailable,
     Hang,
     Vectors(Vec<Vec<f32>>),
@@ -153,6 +154,7 @@ impl Provider for Mock {
                 Some(Reply::Timeout) => Err(Error::Timeout),
                 Some(Reply::Io) => Err(Error::Io(std::io::Error::other("reset"))),
                 Some(Reply::Refused) => Err(Error::Refused("not_allowed".into())),
+                Some(Reply::TooLarge) => Err(Error::Refused("prompt_too_large".into())),
                 Some(Reply::Unavailable) => Err(Error::Unavailable),
                 Some(Reply::Hang) => {
                     let _guard = DropCount(self.counters.clone());
@@ -552,7 +554,7 @@ async fn revoking_between_attempts_stops_the_retry() {
     consent::give(&db, CLAUDE, &job_text, "2026-11-01", "gui")
         .await
         .unwrap();
-    let mut claude = Mock::claude(vec![Reply::Timeout, text(JOB)]);
+    let mut claude = Mock::claude(vec![text("not json"), text(JOB)]);
     claude.revoke_during_call = Some(db.pool.clone());
     let counters = claude.counters();
     let router = Router::with_providers(vec![claude.boxed()]);
@@ -940,7 +942,7 @@ async fn each_external_attempt_is_audited_and_local_ones_are_not() {
         .await
         .unwrap();
     let ollama = Mock::ollama(vec![Reply::Refused]);
-    let claude = Mock::claude(vec![Reply::Timeout, text(JOB)]);
+    let claude = Mock::claude(vec![text("not json"), text(JOB)]);
     let router = Router::with_providers(vec![ollama.boxed(), claude.boxed()]);
 
     parse_job(&router, &db).await;
@@ -1559,4 +1561,195 @@ fn router_futures_are_send() {
         is_send(&router.embed(db, &[], CancellationToken::new()));
     }
     let _ = check;
+}
+
+// ---- prompt size and external retries -----------------------------------------------------
+
+/// A prompt as the router will measure it, with this task's schema in it.
+fn sized_prompt(user: &str) -> Prompt {
+    Prompt {
+        system: "sys".into(),
+        user: user.into(),
+        schema: spec(TaskType::ParseJob).schema,
+    }
+}
+
+async fn run_prompt(router: &Router, db: &Db, prompt: Prompt) -> Outcome {
+    router
+        .run(
+            db,
+            "gui",
+            TaskType::ParseJob,
+            prompt,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+}
+
+#[test]
+fn the_estimate_counts_every_part_in_bytes_and_rounds_up() {
+    let prompt = |system: &str, user: &str, schema: &'static str| Prompt {
+        system: system.into(),
+        user: user.into(),
+        schema,
+    };
+    assert_eq!(prompt("", "", "").estimated_tokens(), 0);
+    assert_eq!(prompt("a", "", "").estimated_tokens(), 1);
+    assert_eq!(prompt("ab", "cd", "ef").estimated_tokens(), 3);
+    assert_eq!(prompt("ab", "cd", "e").estimated_tokens(), 3);
+    assert_eq!(prompt("", "\u{6f22}\u{5b57}", "").estimated_tokens(), 3);
+}
+
+#[tokio::test]
+async fn a_prompt_at_the_limit_runs_and_one_past_it_is_skipped() {
+    let (_tmp, db) = setup().await;
+    let tokens = sized_prompt("usr").estimated_tokens();
+
+    let mut fits = Mock::ollama(vec![text(JOB)]);
+    fits.declaration.context_limit = tokens;
+    let router = Router::with_providers(vec![fits.boxed()]);
+    let outcome = run_prompt(&router, &db, sized_prompt("usr")).await;
+    assert!(is_ok(&outcome, ProviderId::Ollama, 1), "{outcome:?}");
+
+    let mut over = Mock::ollama(vec![text(JOB)]);
+    over.declaration.context_limit = tokens - 1;
+    let counters = over.counters();
+    let router = Router::with_providers(vec![over.boxed()]);
+    let outcome = run_prompt(&router, &db, sized_prompt("usr")).await;
+
+    assert_eq!(outcome, manual("prompt_too_large"));
+    assert_eq!(calls(&counters), 0);
+    assert_eq!(counters.probes.load(Ordering::SeqCst), 0);
+    assert_eq!(skip_reasons(&db, "ollama").await, ["prompt_too_large"]);
+    let last = rows(&db).await.pop().unwrap();
+    assert_eq!(last.0, "no_ai");
+    assert_eq!(last.3.as_deref(), Some("prompt_too_large"));
+}
+
+#[tokio::test]
+async fn the_schema_counts_toward_the_size() {
+    let (_tmp, db) = setup().await;
+    let mut small = Mock::ollama(vec![text(JOB)]);
+    // Room for the text alone, not for the schema the router adds.
+    small.declaration.context_limit = 16;
+    let router = Router::with_providers(vec![small.boxed()]);
+    let bare = Prompt {
+        system: "sys".into(),
+        user: "usr".into(),
+        schema: "",
+    };
+
+    assert_eq!(
+        run_prompt(&router, &db, bare).await,
+        manual("prompt_too_large")
+    );
+}
+
+#[tokio::test]
+async fn cjk_text_is_measured_high_enough() {
+    let (_tmp, db) = setup().await;
+    let user = "\u{6f22}".repeat(4_000);
+    let schema_tokens = sized_prompt("").estimated_tokens();
+    let mut small = Mock::ollama(vec![text(JOB)]);
+    // Enough at two characters a token, too little for the bytes this text really takes.
+    small.declaration.context_limit = schema_tokens + 3_000;
+    let counters = small.counters();
+    let router = Router::with_providers(vec![small.boxed()]);
+
+    let outcome = run_prompt(&router, &db, sized_prompt(&user)).await;
+
+    assert_eq!(outcome, manual("prompt_too_large"));
+    assert_eq!(calls(&counters), 0);
+}
+
+#[tokio::test]
+async fn a_small_provider_falls_through_to_a_larger_one() {
+    let (_tmp, db) = setup().await;
+    let job_text = [DataCategory::JobText];
+    consent::give(&db, CLAUDE, &job_text, "2026-11-01", "gui")
+        .await
+        .unwrap();
+    let mut small = Mock::ollama(vec![text(JOB)]);
+    small.declaration.context_limit = 10;
+    let first = small.counters();
+    let large = Mock::claude(vec![text(JOB)]);
+    let router = Router::with_providers(vec![small.boxed(), large.boxed()]);
+
+    let outcome = run_prompt(&router, &db, sized_prompt("usr")).await;
+
+    assert!(is_ok(&outcome, ProviderId::ClaudeCode, 1), "{outcome:?}");
+    assert_eq!(calls(&first), 0);
+}
+
+#[tokio::test]
+async fn an_ineligible_provider_reports_that_and_not_the_size() {
+    let (_tmp, db) = setup().await;
+    let mut claude = Mock::claude(vec![text(JOB)]);
+    claude.declaration.context_limit = 10;
+    let router = Router::with_providers(vec![claude.boxed()]);
+
+    let outcome = run_prompt(&router, &db, sized_prompt("usr")).await;
+
+    assert_eq!(outcome, manual("no_ai"));
+    assert_eq!(skip_reasons(&db, CLAUDE).await, ["consent"]);
+}
+
+#[tokio::test]
+async fn an_overflow_the_provider_reports_is_not_retried_and_reaches_the_user() {
+    let (_tmp, db) = setup().await;
+    let ollama = Mock::ollama(vec![Reply::TooLarge, text(JOB)]);
+    let counters = ollama.counters();
+    let router = Router::with_providers(vec![ollama.boxed()]);
+
+    assert_eq!(parse_job(&router, &db).await, manual("prompt_too_large"));
+
+    assert_eq!(calls(&counters), 1);
+    let first = rows(&db).await.remove(0);
+    assert_eq!(first.2, "failed");
+    assert_eq!(first.3.as_deref(), Some("prompt_too_large"));
+}
+
+#[tokio::test]
+async fn claude_is_never_sent_again_after_a_timeout_or_broken_call() {
+    for failure in [Reply::Timeout, Reply::Io] {
+        let (_tmp, db) = setup().await;
+        let job_text = [DataCategory::JobText];
+        consent::give(&db, CLAUDE, &job_text, "2026-11-01", "gui")
+            .await
+            .unwrap();
+        let claude = Mock::claude(vec![failure, text(JOB)]);
+        let counters = claude.counters();
+        let router = Router::with_providers(vec![claude.boxed()]);
+
+        assert_eq!(parse_job(&router, &db).await, manual("no_ai"));
+
+        assert_eq!(calls(&counters), 1);
+    }
+}
+
+#[tokio::test]
+async fn claude_is_retried_once_after_a_validation_failure() {
+    let (_tmp, db) = setup().await;
+    let job_text = [DataCategory::JobText];
+    consent::give(&db, CLAUDE, &job_text, "2026-11-01", "gui")
+        .await
+        .unwrap();
+    let claude = Mock::claude(vec![text("not json"), text(JOB)]);
+    let router = Router::with_providers(vec![claude.boxed()]);
+
+    let outcome = parse_job(&router, &db).await;
+
+    assert!(is_ok(&outcome, ProviderId::ClaudeCode, 2), "{outcome:?}");
+}
+
+#[tokio::test]
+async fn ollama_is_still_retried_after_a_timeout() {
+    let (_tmp, db) = setup().await;
+    let ollama = Mock::ollama(vec![Reply::Timeout, text(JOB)]);
+    let router = Router::with_providers(vec![ollama.boxed()]);
+
+    let outcome = parse_job(&router, &db).await;
+
+    assert!(is_ok(&outcome, ProviderId::Ollama, 2), "{outcome:?}");
 }
