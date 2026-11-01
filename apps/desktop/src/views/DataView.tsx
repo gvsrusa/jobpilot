@@ -223,20 +223,20 @@ function DeleteSection({ root }: { root: string }) {
   const [typed, setTyped] = useState("");
   const [withBackups, setWithBackups] = useState(false);
   const [done, setDone] = useState(false);
-  const del = useMutation({
-    mutationFn: () => ipc.dataDelete(typed, withBackups),
-    onSuccess: (status) => {
-      setOpen(false);
-      setDone(true);
-      applyStatus(status);
-    },
-  });
   const close = () => {
     setOpen(false);
     setTyped("");
     setWithBackups(false);
     del.reset();
   };
+  const del = useMutation({
+    mutationFn: () => ipc.dataDelete(typed, withBackups),
+    onSuccess: (status) => {
+      close();
+      setDone(true);
+      applyStatus(status);
+    },
+  });
   return (
     <Section id="delete" title="Delete all data">
       {done && <p role="status" className="text-sm">All JobPilot data was deleted.</p>}

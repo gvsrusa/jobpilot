@@ -111,6 +111,41 @@ describe("data", () => {
     });
   });
 
+  it("second_delete_requires_typing_again_with_backups_unchecked", async () => {
+    const b = backend();
+    const { user } = renderApp();
+    await open(user, "Data");
+    await user.click(screen.getByRole("button", { name: /Delete all data/ }));
+    let dialog = await screen.findByRole("dialog");
+    await user.type(within(dialog).getByLabelText(/Type DELETE/), "DELETE");
+    await user.click(within(dialog).getByLabelText(/Also delete backups/));
+    await user.click(within(dialog).getByRole("button", { name: "Delete everything" }));
+    await waitFor(() => expect(count(b, "data_delete")).toBe(1));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+
+    await user.click(screen.getByRole("button", { name: /Delete all data/ }));
+    dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByLabelText(/Type DELETE/)).toHaveValue("");
+    expect(within(dialog).getByLabelText(/Also delete backups/)).not.toBeChecked();
+    expect(within(dialog).getByRole("button", { name: "Delete everything" })).toBeDisabled();
+  });
+
+  it("restore_and_delete_drop_cached_documents", async () => {
+    backend({ documents_list: () => [{ id: "1", title: "Old", body: "", created_at: "", updated_at: "" }] });
+    const { user, client } = renderApp();
+    await open(user, "Documents");
+    await screen.findByRole("button", { name: "Old" });
+    await user.click(screen.getByRole("button", { name: "Data" }));
+    await screen.findByRole("heading", { name: "Data and privacy" });
+    expect(client.getQueryData(["documents"])).toBeDefined();
+    await user.click(screen.getByRole("button", { name: /Delete all data/ }));
+    const dialog = await screen.findByRole("dialog");
+    await user.type(within(dialog).getByLabelText(/Type DELETE/), "DELETE");
+    await user.click(within(dialog).getByRole("button", { name: "Delete everything" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(client.getQueryData(["documents"])).toBeUndefined();
+  });
+
   it("delete_that_leaves_recovery_routes_to_recovery", async () => {
     backend({ data_delete: () => recovery("io", "could not reopen") });
     const { user } = renderApp();
