@@ -15,6 +15,7 @@ use serde_json::json;
 use zeroize::Zeroizing;
 
 use crate::audit;
+use crate::crypto::KEY_ACCOUNT_PREFIX;
 use crate::db::Db;
 use crate::error::{Error, Result};
 
@@ -26,6 +27,7 @@ const SERVICE: &str = "io.github.gvsrusa.jobpilot";
 /// `delete_all` can find, never a keychain entry it cannot.
 pub async fn set(db: &Db, name: &str, value: &str, actor: &str) -> Result<()> {
     check_name(name)?;
+    refuse_data_key(name)?;
     let added = sqlx::query(
         "INSERT INTO secret_index (name, created_at) \
          VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
@@ -69,6 +71,7 @@ pub fn get(name: &str) -> Result<Option<String>> {
 /// `NotFound` when this root does not list `name`: the entry could belong to another
 /// root. The row outlives the keychain entry, so a failure here can be retried.
 pub async fn delete(db: &Db, name: &str, actor: &str) -> Result<()> {
+    refuse_data_key(name)?;
     let listed: Option<i64> = sqlx::query_scalar("SELECT 1 FROM secret_index WHERE name = ?")
         .bind(name)
         .fetch_optional(&db.pool)
@@ -142,6 +145,19 @@ fn check_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// `set` and `delete` are open to the webview, and a key id is not secret: the audit log
+/// shows it. Replacing or removing that entry would destroy the only copy of the data
+/// key. Windows matches credential names without regard to case, so this does too.
+fn refuse_data_key(name: &str) -> Result<()> {
+    let prefix = name.get(..KEY_ACCOUNT_PREFIX.len());
+    if prefix.is_some_and(|prefix| prefix.eq_ignore_ascii_case(KEY_ACCOUNT_PREFIX)) {
+        return Err(Error::Refused(
+            "this name is reserved for the data key".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// `JOBPILOT_SECRET_SERVICE` lets the real keychain tests stay clear of the app's own
 /// entries. Empty means unset, as with `JOBPILOT_HOME`.
 fn service() -> String {
@@ -191,6 +207,19 @@ mod tests {
         ] {
             let message = secret_error(error).to_string();
             assert!(!message.contains("hunter2"), "{message}");
+        }
+    }
+
+    #[test]
+    fn only_data_key_names_are_reserved() {
+        for name in ["data-key-00112233aabbccdd", "DATA-KEY-x", "Data-Key-"] {
+            assert!(
+                matches!(refuse_data_key(name), Err(Error::Refused(_))),
+                "{name}"
+            );
+        }
+        for name in ["data-key", "openai", "my-data-key-1", "é"] {
+            assert!(refuse_data_key(name).is_ok(), "{name}");
         }
     }
 

@@ -262,8 +262,8 @@ Opening the database never touches the credential store, so `jobpilot status`, d
 | `key_not_loaded` | Nothing has asked for the key on this handle. It says nothing about the key. | Normal for all non-sensitive work. No import, no discard, and no new key; the first sensitive use replaces it. |
 | Unlocked | The entry exists and the key-check value decrypts. | Normal. |
 | `key_unavailable` | The store cannot answer: locked keychain, denied prompt, service error, or an unsigned update whose access is refused. Any result other than an explicit "no such entry" lands here. | Temporary. Offers retry only. No import, no discard, and no new key. |
-| `key_missing` | The store answers that no entry exists for this `key_id`. This covers keychain loss, a new machine, and a backup restored after delete-all or after a discard. | Offers recovery import for the named key id, or discard. |
-| `key_mismatch` | The store returns a key that fails the key-check, or rows carry a `key_id` the key-check does not. | Offers recovery import for the named key id, or discard. The stored entry is left as it is. |
+| `key_missing` | The store answers that no entry exists for this `key_id`, and for every key id the database lists when none is active. This covers keychain loss, a new machine, and a backup restored after delete-all or after a discard. | Offers recovery import for the named key id, or discard. |
+| `key_mismatch` | The store returns a key that fails the key-check, or rows carry a `key_id` the key-check does not, or an entry exists for ciphertext that no active key row covers. | Offers recovery import for the named key id, or discard. The stored entry is left as it is. |
 
 The last three states stay distinct because only one of them is safe to retry and the others can lead to irreversible loss. A 0.2 test must confirm on both OSes what each credential store returns for a locked store and a denied prompt.
 
@@ -273,7 +273,8 @@ Rules:
 2. The user picks the recovery file in a Rust-owned native dialog, or with the CLI in an ordinary terminal. The command is refused in the PTY panel. The source must be an existing regular file, opened without following a symlink, checked on the open handle, and within a size limit, so `/dev/stdin` and terminal devices are refused. Errors never echo its contents.
 3. Core checks the file against the database's `key_id` and key-check value. A wrong key is refused and nothing changes. A matching key is added as a new entry under its own account and fields unlock. An audit row records the key id.
 4. With no recovery file, the user may discard locked fields, from `key_missing` or `key_mismatch` only. This is irreversible for the live data, so it needs the native confirmation in M-13, which names the key id, and it is refused in the PTY panel. Core first writes a `pre-discard` snapshot, so a recovery file found later can still open the old ciphertext through a restore. It then clears those columns, creates a new key under a new `key_id`, and writes an audit row. The app prompts for a new recovery key.
-5. Restore reports the backup's `key_id` and its state before touching live data (M-07). It removes no key entry, so the `pre-restore` snapshot stays readable, and the restored database's key id list gains the outgoing id.
+5. A database whose key rows have none active, as a restore can leave, is classified through the store like any other. With no ciphertext and a readable listed key, that key becomes active again, with an audit row. No key is created.
+6. Restore reports the backup's `key_id` and its state before touching live data (M-07). It removes no key entry, so the `pre-restore` snapshot stays readable, and the restored database's key id list gains the outgoing id.
 
 Delete-all removes the entries for this root's key ids from the credential store, and no others (M-08). A copied root or a backup restored into a second root shares its `key_id` with the original, so delete-all in either removes the key for both. It also cannot reach a recovery file or a backup the user moved elsewhere. The delete screen says both.
 

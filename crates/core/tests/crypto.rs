@@ -2,7 +2,7 @@
 //! `.cargo/config.toml`. The rest never depend on what the keychain answers.
 
 use jobpilot_core::crypto::{self, DataKey, KEY_ACCOUNT_PREFIX, KeyState};
-use jobpilot_core::{AppPaths, Db, Error, audit};
+use jobpilot_core::{AppPaths, Db, Error, audit, secrets};
 use tempfile::TempDir;
 
 const KEY_ID: &str = "00112233aabbccdd";
@@ -297,23 +297,43 @@ async fn racing_first_creations_leave_one_key() {
     db.close().await;
 }
 
-// A restore can leave rows with none active. Rows exist, so no key may be made. This
-// stops before the keychain, so it needs none.
+async fn add_key_row(db: &Db, key_id: &str, created_at: &str, key_check: &[u8]) {
+    sqlx::query(
+        "INSERT INTO data_keys (key_id, created_at, key_check, active) VALUES (?, ?, ?, 0)",
+    )
+    .bind(key_id)
+    .bind(created_at)
+    .bind(key_check)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+}
+
+/// The key-check of a key made of sevens. Keychain tests run in parallel against one
+/// service, so each needs an id of its own.
+fn sealed_key_check(key_id: &str) -> Vec<u8> {
+    DataKey::from_bytes(key_id, [7; 32])
+        .encrypt("data_keys", "key_check", key_id, crypto::key_check_text())
+        .unwrap()
+}
+
+fn reactivated_rows(log: &[audit::AuditEntry]) -> usize {
+    let rows = log.iter().filter(|e| e.action == "data_key_reactivated");
+    rows.count()
+}
+
+// A restore can leave rows with none active. Rows exist, so no key may be made, and the
+// store decides what they mean. `crypto::tests` pins the store-error cases.
 #[tokio::test]
+#[ignore = "touches the OS keychain"]
 async fn rows_without_an_active_key_never_create_one() {
     let (_tmp, paths) = temp_root();
     let db = Db::open(&paths).await.unwrap();
-    for (key_id, created_at) in [(KEY_ID, "1000"), (OTHER_KEY_ID, "9999")] {
-        sqlx::query(
-            "INSERT INTO data_keys (key_id, created_at, key_check, active) \
-             VALUES (?, ?, x'00', 0)",
-        )
-        .bind(key_id)
-        .bind(created_at)
-        .execute(&db.pool)
-        .await
-        .unwrap();
-    }
+    const OLDER: &str = "a000000000000001";
+    const NEWER: &str = "a000000000000002";
+    let check = sealed_key_check(OLDER);
+    add_key_row(&db, OLDER, "1000", &check).await;
+    add_key_row(&db, NEWER, "9999", b"\0").await;
     let before = key_rows(&db).await;
 
     let state = crypto::state(&db).await.unwrap();
@@ -321,19 +341,68 @@ async fn rows_without_an_active_key_never_create_one() {
     assert_eq!(
         state,
         KeyState::KeyMissing {
-            key_id: OTHER_KEY_ID.into()
-        }
+            key_id: NEWER.into()
+        },
+        "a clean no-entry for every id names the newest"
     );
     assert_eq!(key_rows(&db).await, before);
+    assert_eq!(reactivated_rows(&audit::recent(&db, 10).await.unwrap()), 0);
+
+    let _guard = EntryGuard(OLDER.into());
+    entry(OLDER).set_password(&"07".repeat(32)).unwrap();
+
+    let state = crypto::state(&db).await.unwrap();
+
+    assert_eq!(
+        state,
+        KeyState::Unlocked {
+            key_id: OLDER.into()
+        }
+    );
+    let rows = key_rows(&db).await;
+    assert_eq!(rows.len(), 2, "reactivated, not created");
+    assert_eq!(rows.iter().filter(|row| row.2 == 1).count(), 1);
+    assert_eq!(rows.iter().find(|row| row.0 == OLDER).unwrap().2, 1);
+
+    let key = crypto::unlocked(&db).await.unwrap();
+    assert_eq!(key.key_id(), OLDER);
+    let log = audit::recent(&db, 10).await.unwrap();
+    assert_eq!(reactivated_rows(&log), 1, "the second use finds it active");
+    let row = log
+        .iter()
+        .find(|e| e.action == "data_key_reactivated")
+        .unwrap();
+    assert_eq!(row.detail, serde_json::json!({ "key_id": OLDER }));
     db.close().await;
 }
 
-// The foreign key refuses this, so it takes a damaged file. Ciphertext still blocks a
-// new key, whichever table lost its row, and this too stops before the keychain.
+// A readable key beside ciphertext is never made active: nothing says they belong.
 #[tokio::test]
-async fn ciphertext_without_a_key_row_never_creates_one() {
+#[ignore = "touches the OS keychain"]
+async fn ciphertext_without_an_active_key_is_never_reactivated_over() {
     let (_tmp, paths) = temp_root();
     let db = Db::open(&paths).await.unwrap();
+    const HELD: &str = "a000000000000003";
+    let check = sealed_key_check(HELD);
+    add_key_row(&db, HELD, "1000", &check).await;
+    add_orphan_ciphertext(&db, HELD).await;
+    let _guard = EntryGuard(HELD.into());
+    entry(HELD).set_password(&"07".repeat(32)).unwrap();
+
+    let state = crypto::state(&db).await.unwrap();
+
+    assert_eq!(
+        state,
+        KeyState::KeyMismatch {
+            key_id: HELD.into()
+        }
+    );
+    assert_eq!(key_rows(&db).await[0].2, 0);
+    db.close().await;
+}
+
+/// The foreign key refuses this, so it takes a damaged file.
+async fn add_orphan_ciphertext(db: &Db, key_id: &str) {
     let mut raw = db.pool.acquire().await.unwrap();
     sqlx::query("PRAGMA foreign_keys = OFF")
         .execute(&mut *raw)
@@ -343,7 +412,7 @@ async fn ciphertext_without_a_key_row_never_creates_one() {
         "INSERT INTO work_authorization (country, ciphertext, key_id, updated_at) \
          VALUES ('PT', x'00', ?, 't')",
     )
-    .bind(OTHER_KEY_ID)
+    .bind(key_id)
     .execute(&mut *raw)
     .await
     .unwrap();
@@ -351,17 +420,65 @@ async fn ciphertext_without_a_key_row_never_creates_one() {
         .execute(&mut *raw)
         .await
         .unwrap();
-    drop(raw);
+}
 
-    let state = crypto::state(&db).await.unwrap();
+// Ciphertext blocks a new key whichever table lost its row. The ids it lists are read
+// from the store: with no key-check, an entry there is a mismatch and only a clean
+// no-entry is missing. `crypto::tests` pins the store-error case.
+#[tokio::test]
+#[ignore = "touches the OS keychain"]
+async fn ciphertext_without_a_key_row_never_creates_one() {
+    const ORPHAN: &str = "a000000000000004";
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    add_orphan_ciphertext(&db, ORPHAN).await;
 
     assert_eq!(
-        state,
+        crypto::state(&db).await.unwrap(),
         KeyState::KeyMissing {
-            key_id: OTHER_KEY_ID.into()
+            key_id: ORPHAN.into()
         }
     );
     assert!(key_rows(&db).await.is_empty());
+
+    let _guard = EntryGuard(ORPHAN.into());
+    entry(ORPHAN).set_password(&"07".repeat(32)).unwrap();
+
+    assert_eq!(
+        crypto::state(&db).await.unwrap(),
+        KeyState::KeyMismatch {
+            key_id: ORPHAN.into()
+        }
+    );
+    assert!(key_rows(&db).await.is_empty());
+    db.close().await;
+}
+
+// Both refusals come before any keychain call, so this needs no keychain. A planted row
+// proves `delete` refuses on the name, not because the name is unlisted.
+#[tokio::test]
+async fn secret_commands_refuse_data_key_names() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let name = format!("{KEY_ACCOUNT_PREFIX}{KEY_ID}");
+
+    let set = secrets::set(&db, &name, "replacement", "gui").await;
+    assert!(matches!(set, Err(Error::Refused(_))), "{set:?}");
+    assert!(secrets::names(&db).await.unwrap().is_empty());
+
+    let upper = name.to_uppercase();
+    let set = secrets::set(&db, &upper, "replacement", "gui").await;
+    assert!(matches!(set, Err(Error::Refused(_))), "{set:?}");
+
+    sqlx::query("INSERT INTO secret_index (name, created_at) VALUES (?, 't')")
+        .bind(&name)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let delete = secrets::delete(&db, &name, "gui").await;
+    assert!(matches!(delete, Err(Error::Refused(_))), "{delete:?}");
+    assert_eq!(secrets::names(&db).await.unwrap(), [name]);
+    assert!(audit::recent(&db, 10).await.unwrap().is_empty());
     db.close().await;
 }
 

@@ -226,15 +226,6 @@ pub async fn unlocked(db: &Db) -> Result<DataKey> {
     })
 }
 
-/// Makes this root's first key, audited as `data_key_created`. With a key already in
-/// `data_keys` it makes nothing and behaves as [`unlocked`].
-pub async fn create_first_key(db: &Db, actor: &str) -> Result<DataKey> {
-    match first_key(db, actor).await? {
-        Some(key) => Ok(key),
-        None => unlocked(db).await,
-    }
-}
-
 /// The state a key would have on this machine, with no `Db`. Blocks on the keychain,
 /// so async callers run it in `spawn_blocking`.
 pub fn key_state_of(key_id: &str, key_check: &[u8]) -> KeyState {
@@ -269,27 +260,37 @@ fn no_key_yet(reason: String) -> KeyState {
     }
 }
 
-/// `None` only when this root holds no key row and no ciphertext. With no active row
-/// the newest key is named and reported missing: rows exist, so a new key must not be
-/// made, and nothing says which entry would be right. Ciphertext with no key row takes
-/// a damaged or hand-edited file, as the foreign key refuses it, and names its own key.
+/// `None` only when this root holds no key row and no ciphertext.
 async fn existing_key(db: &Db) -> Result<Option<Found>> {
-    let row: Option<(String, Vec<u8>, bool)> = sqlx::query_as(
-        "SELECT key_id, key_check, active FROM data_keys \
-         ORDER BY active DESC, created_at DESC, key_id LIMIT 1",
+    if let Some(found) = active_key(db).await? {
+        return Ok(Some(found));
+    }
+    let keys: Vec<(String, Vec<u8>)> =
+        sqlx::query_as("SELECT key_id, key_check FROM data_keys ORDER BY created_at DESC, key_id")
+            .fetch_all(&db.pool)
+            .await?;
+    // ponytail: only work_authorization holds ciphertext so far. Every later ciphertext
+    // column joins this query and the checks in `active_key`, `add_first_key`, and `reactivate`.
+    let held: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT key_id FROM work_authorization ORDER BY key_id")
+            .fetch_all(&db.pool)
+            .await?;
+    if keys.is_empty() && held.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(without_active_key(db, keys, held).await?))
+}
+
+async fn active_key(db: &Db) -> Result<Option<Found>> {
+    let row: Option<(String, Vec<u8>)> = sqlx::query_as(
+        "SELECT key_id, key_check FROM data_keys WHERE active = 1 \
+         ORDER BY created_at DESC, key_id LIMIT 1",
     )
     .fetch_optional(&db.pool)
     .await?;
-    let Some((key_id, key_check, active)) = row else {
-        let orphan: Option<String> =
-            sqlx::query_scalar("SELECT key_id FROM work_authorization LIMIT 1")
-                .fetch_optional(&db.pool)
-                .await?;
-        return Ok(orphan.map(|key_id| Err(KeyState::KeyMissing { key_id })));
+    let Some((key_id, key_check)) = row else {
+        return Ok(None);
     };
-    if !active {
-        return Ok(Some(Err(KeyState::KeyMissing { key_id })));
-    }
 
     let lookup = key_id.clone();
     let read = secrets::keychain(move || Ok(read_key(&lookup, &key_check))).await;
@@ -304,8 +305,6 @@ async fn existing_key(db: &Db) -> Result<Option<Found>> {
         }
     };
 
-    // ponytail: only work_authorization holds ciphertext so far. Every later
-    // ciphertext column joins this check.
     let foreign: Option<String> =
         sqlx::query_scalar("SELECT key_id FROM work_authorization WHERE key_id <> ? LIMIT 1")
             .bind(&key_id)
@@ -317,8 +316,120 @@ async fn existing_key(db: &Db) -> Result<Option<Found>> {
     }))
 }
 
+/// Task 5's restore can leave key rows with none active, and damage can leave ciphertext
+/// with no key row. Rows exist, so no key is made here: the store classifies what is
+/// left, in [`settle`]. A key id with no row has no key-check, so an empty one stands
+/// in: any value stored there reads as a mismatch, which is what such rows are.
+async fn without_active_key(
+    db: &Db,
+    keys: Vec<(String, Vec<u8>)>,
+    held: Vec<String>,
+) -> Result<Found> {
+    let mut probes = keys;
+    for key_id in &held {
+        if !probes.iter().any(|(id, _)| id == key_id) {
+            probes.push((key_id.clone(), Vec::new()));
+        }
+    }
+
+    let stop_at_a_key = held.is_empty();
+    let read = secrets::keychain(move || {
+        let mut found = Vec::new();
+        for (key_id, key_check) in &probes {
+            let read = read_key(key_id, key_check);
+            let done = stop_at_a_key && read.is_ok();
+            found.push(read);
+            if done {
+                break;
+            }
+        }
+        Ok(found)
+    })
+    .await;
+    let found = match read {
+        Ok(found) => found,
+        Err(error) => return Ok(Err(no_key_yet(error.to_string()))),
+    };
+
+    match settle(found, &held) {
+        Ok(key) => reactivate(db, key).await,
+        Err(state) => Ok(Err(state)),
+    }
+}
+
+/// `Ok` means a readable key with no ciphertext about, which is safe to make active.
+/// A store error outranks every other answer, because it says nothing about the key:
+/// `KeyMissing` needs a clean "no such entry" for every id. An entry that exists but
+/// cannot be proven is a mismatch, as is a readable key that ciphertext sits beside
+/// with no active row to say the two belong together.
+fn settle(found: Vec<Found>, held: &[String]) -> Found {
+    let (mut readable, mut unavailable, mut mismatch, mut missing) = (None, None, None, None);
+    for read in found {
+        match read {
+            Ok(key) => readable = readable.or(Some(key)),
+            Err(state @ KeyState::KeyUnavailable { .. }) => {
+                unavailable = unavailable.or(Some(state))
+            }
+            Err(state @ KeyState::KeyMismatch { .. }) => mismatch = mismatch.or(Some(state)),
+            Err(state) => missing = missing.or(Some(state)),
+        }
+    }
+    let beside_ciphertext = match (readable, held.first()) {
+        (Some(key), None) => return Ok(key),
+        (Some(_), Some(key_id)) => Some(KeyState::KeyMismatch {
+            key_id: key_id.clone(),
+        }),
+        (None, _) => None,
+    };
+    Err(unavailable
+        .or(beside_ciphertext)
+        .or(mismatch)
+        .or(missing)
+        .unwrap_or_else(|| no_key_yet("no key was read".into())))
+}
+
+/// Every condition is part of the update, so a handle that lost a race changes nothing
+/// and uses what the winner left.
+async fn reactivate(db: &Db, key: DataKey) -> Result<Found> {
+    let mut write = db.pool.begin().await?;
+    let updated = sqlx::query(
+        "UPDATE data_keys SET active = 1 WHERE key_id = ? \
+         AND NOT EXISTS (SELECT 1 FROM data_keys WHERE active = 1) \
+         AND NOT EXISTS (SELECT 1 FROM work_authorization)",
+    )
+    .bind(key.key_id())
+    .execute(&mut *write)
+    .await?
+    .rows_affected()
+        == 1;
+    if !updated {
+        write.rollback().await?;
+        return Ok(active_key(db)
+            .await?
+            .unwrap_or_else(|| Err(no_key_yet("the key rows changed during the read".into()))));
+    }
+    let detail = json!({ "key_id": key.key_id() });
+    audit::record_to(
+        &mut *write,
+        "system",
+        "data_key_reactivated",
+        Some(key.key_id()),
+        detail,
+    )
+    .await?;
+    write.commit().await?;
+    Ok(Ok(key))
+}
+
 fn read_key(key_id: &str, key_check: &[u8]) -> Found {
-    let stored = match secrets::get(&account(key_id)) {
+    classify(key_id, secrets::get(&account(key_id)), key_check)
+}
+
+/// What the store's answer means. Only `Ok(None)`, an explicit "no such entry", is
+/// `KeyMissing`. Telling that from an error is what keeps a locked keychain from
+/// offering to discard the user's data.
+fn classify(key_id: &str, stored: Result<Option<String>>, key_check: &[u8]) -> Found {
+    let stored = match stored {
         Ok(Some(stored)) => Zeroizing::new(stored),
         Ok(None) => {
             return Err(KeyState::KeyMissing {
@@ -470,6 +581,142 @@ mod tests {
         assert_eq!(parse_key(&"a".repeat(63)), None);
         assert_eq!(parse_key(&format!("+f{}", "a".repeat(62))), None);
         assert_eq!(parse_key(&"g".repeat(64)), None);
+    }
+
+    const KEY_ID: &str = "00112233aabbccdd";
+    const OTHER_KEY_ID: &str = "99887766ffeeddcc";
+
+    fn key_check(key: &DataKey) -> Vec<u8> {
+        key.encrypt("data_keys", "key_check", key.key_id(), key_check_text())
+            .unwrap()
+    }
+
+    fn unavailable(key_id: &str) -> KeyState {
+        KeyState::KeyUnavailable {
+            key_id: key_id.into(),
+            reason: "locked".into(),
+        }
+    }
+
+    fn missing(key_id: &str) -> KeyState {
+        KeyState::KeyMissing {
+            key_id: key_id.into(),
+        }
+    }
+
+    fn mismatch(key_id: &str) -> KeyState {
+        KeyState::KeyMismatch {
+            key_id: key_id.into(),
+        }
+    }
+
+    fn state_after(found: Vec<Found>, held: &[String]) -> KeyState {
+        state_of(&settle(found, held))
+    }
+
+    #[test]
+    fn a_store_error_is_unavailable_and_only_no_entry_is_missing() {
+        let key = DataKey::from_bytes(KEY_ID, [7; 32]);
+        let check = key_check(&key);
+
+        let error = classify(KEY_ID, Err(Error::Secret("locked".into())), &check);
+        let KeyState::KeyUnavailable { key_id, reason } = state_of(&error) else {
+            panic!("{:?}", state_of(&error));
+        };
+        assert_eq!(key_id, KEY_ID);
+        assert!(reason.contains("locked"), "{reason}");
+
+        assert_eq!(
+            state_of(&classify(KEY_ID, Ok(None), &check)),
+            missing(KEY_ID)
+        );
+
+        let wrong = Ok(Some("ab".repeat(32)));
+        assert_eq!(state_of(&classify(KEY_ID, wrong, &check)), mismatch(KEY_ID));
+        let garbage = Ok(Some("hunter2".to_owned()));
+        assert_eq!(
+            state_of(&classify(KEY_ID, garbage, &check)),
+            mismatch(KEY_ID)
+        );
+
+        let right = classify(KEY_ID, Ok(Some(key.to_hex())), &check)
+            .ok()
+            .unwrap();
+        assert_eq!(right.key_id(), KEY_ID);
+    }
+
+    // An id with no key row passes an empty key-check, so a real entry is not a key we
+    // can trust, and must not read as missing.
+    #[test]
+    fn a_stored_value_with_no_key_check_is_a_mismatch() {
+        let key = DataKey::from_bytes(KEY_ID, [7; 32]);
+        let read = classify(KEY_ID, Ok(Some(key.to_hex())), &[]);
+        assert_eq!(state_of(&read), mismatch(KEY_ID));
+    }
+
+    #[test]
+    fn a_readable_key_with_no_ciphertext_is_to_be_reactivated() {
+        let found = vec![
+            Err(unavailable(OTHER_KEY_ID)),
+            Ok(DataKey::from_bytes(KEY_ID, [7; 32])),
+        ];
+        let key = settle(found, &[]).ok().unwrap();
+        assert_eq!(key.key_id(), KEY_ID);
+    }
+
+    #[test]
+    fn a_store_error_outranks_every_other_answer_without_an_active_key() {
+        let held = [KEY_ID.to_owned()];
+        for (found, held) in [
+            (vec![Err(unavailable(KEY_ID))], &[][..]),
+            (
+                vec![Err(missing(OTHER_KEY_ID)), Err(unavailable(KEY_ID))],
+                &[][..],
+            ),
+            (
+                vec![Err(unavailable(KEY_ID)), Err(missing(OTHER_KEY_ID))],
+                &held[..],
+            ),
+            (
+                vec![Err(mismatch(OTHER_KEY_ID)), Err(unavailable(KEY_ID))],
+                &held[..],
+            ),
+            (
+                vec![
+                    Ok(DataKey::from_bytes(OTHER_KEY_ID, [7; 32])),
+                    Err(unavailable(KEY_ID)),
+                ],
+                &held[..],
+            ),
+        ] {
+            assert_eq!(state_after(found, held), unavailable(KEY_ID));
+        }
+    }
+
+    #[test]
+    fn missing_needs_a_clean_no_entry_for_every_id() {
+        let held = [KEY_ID.to_owned()];
+        assert_eq!(
+            state_after(
+                vec![Err(missing(OTHER_KEY_ID)), Err(missing(KEY_ID))],
+                &held
+            ),
+            missing(OTHER_KEY_ID)
+        );
+        assert_eq!(
+            state_after(
+                vec![Err(missing(OTHER_KEY_ID)), Err(mismatch(KEY_ID))],
+                &held
+            ),
+            mismatch(KEY_ID)
+        );
+    }
+
+    #[test]
+    fn a_readable_key_beside_ciphertext_is_never_reactivated() {
+        let held = [OTHER_KEY_ID.to_owned()];
+        let found = vec![Ok(DataKey::from_bytes(KEY_ID, [7; 32]))];
+        assert_eq!(state_after(found, &held), mismatch(OTHER_KEY_ID));
     }
 
     #[tokio::test]

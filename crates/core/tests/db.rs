@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use jobpilot_core::crypto::KeyState;
 use jobpilot_core::{AppPaths, Db, Error, MIGRATOR, app_schema_version};
 use sqlx::SqlSafeStr;
 use sqlx::migrate::{Migration, MigrationType, Migrator};
@@ -190,5 +191,50 @@ async fn failed_migration_keeps_snapshot_and_data() {
     // The failure left no lock behind and the database still opens at the old version.
     let db = Db::open(&paths).await.unwrap();
     assert_eq!(db.schema_version().await.unwrap(), app_schema_version());
+    db.close().await;
+}
+
+// A 0.1 database gains the 0.2 tables with its data intact and no key: the key waits for
+// the first sensitive use.
+#[tokio::test]
+async fn foundation_database_migrates_to_data_keys_without_a_key() {
+    let (_tmp, paths) = temp_root();
+    let foundation: Vec<Migration> = MIGRATOR
+        .iter()
+        .filter(|m| m.version == 1)
+        .cloned()
+        .collect();
+    let db = Db::open_with(&paths, &Migrator::with_migrations(foundation))
+        .await
+        .unwrap();
+    assert_eq!(db.schema_version().await.unwrap(), 1);
+    add_row(&db).await;
+    db.close().await;
+
+    let db = Db::open(&paths).await.unwrap();
+
+    assert_eq!(db.schema_version().await.unwrap(), app_schema_version());
+    assert_eq!(read_row(&db.pool).await, "kept");
+    assert_eq!(snapshots(&paths, "pre-migrate-1").len(), 1);
+    assert_eq!(db.key_state(), KeyState::NotLoaded);
+    for table in ["data_keys", "profile", "work_authorization"] {
+        let rows: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0, "{table}");
+    }
+    let orphan = sqlx::query(
+        "INSERT INTO work_authorization (country, ciphertext, key_id, updated_at) \
+         VALUES ('PT', x'00', 'no-such-key', 't')",
+    )
+    .execute(&db.pool)
+    .await;
+    assert!(orphan.is_err(), "ciphertext needs a listed key");
+    let second_profile = sqlx::query("INSERT INTO profile VALUES ('other', '{}', 't')")
+        .execute(&db.pool)
+        .await;
+    assert!(second_profile.is_err(), "one profile per root");
     db.close().await;
 }
