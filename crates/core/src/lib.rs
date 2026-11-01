@@ -10,6 +10,7 @@ pub mod knowledge;
 pub mod paths;
 pub mod profile;
 pub mod recovery;
+pub mod render;
 pub mod secrets;
 pub mod settings;
 pub mod transfer;
