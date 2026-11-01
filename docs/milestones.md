@@ -1,6 +1,6 @@
 # JobPilot AI: Milestone Plan
 
-Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) and [PRD](prd.md). Requirement IDs are `FR-<section>.<n>` from the PRD. Nothing here is implemented yet.
+Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) and [PRD](prd.md). Requirement IDs are `FR-<section>.<n>` from the PRD. Releases 0.1 and 0.2 are built; 0.3 onward are plans.
 
 ## Process
 
@@ -78,6 +78,20 @@ Exit tests:
 - The router works end to end with Claude Code alone, Ollama alone, or No-AI, and a test proves each.
 
 Gates: all five apply. Build includes the bundled CLI sidecar and the consent code; migrations add profile, encrypted-field, and consent-record tables on top of 0.1 data; Windows and macOS means PTY, keychain, and Ollama paths pass on both.
+### 0.2 gate record
+
+Recorded on 2026-11-01 at the 0.2 candidate. Details and the full lists are in [release 0.2.0](releases/0.2.0.md).
+
+| Gate | Result |
+|---|---|
+| 1. Build | macOS arm64: `pnpm tauri build --no-bundle` built a release app, and that app launched on a temporary data folder and showed v0.2.0, schema 5. The sidecar builds on the host triple. Windows and x86_64 builds exist only as CI runs; the installers were not built or installed. |
+| 2. Tests | macOS, local: 589 passed, 0 failed, 76 ignored; frontend 87 passed. CI (macOS and Windows) last passed both jobs at `2da4305`; the run at the 0.2 head was still running when this was written. |
+| 3. Migrations | Fresh database: `schema_version` 5. A copy of a 0.1 database made with the 0.1 CLI opened with the 0.2 binary at version 5, wrote `pre-migrate-1-*`, and kept `doc list` identical. |
+| 4. Windows and macOS | Windows ran the automated suites in CI at `2da4305` only. ConPTY, the terminal panel, native dialogs, and Windows credential denial were never run by a person. |
+| 5. Docs and risks | Updated; risks are in the release notes. |
+
+Exit tests not proven end to end: "Ollama discovery ... work against a local model" (no Ollama server was installed; a fake server and a unit-tested wording only), "Offline operation passes with a local model installed" (same reason), and "The PTY panel runs the bundled CLI" (tested through the PTY layer and the CLI line interpreter, not through a painted panel).
+
 ## Release 0.3: Career memory and application tracking
 
 Scope: career memory, application tracking, deterministic workflow runner, execution logs, emergency pause.

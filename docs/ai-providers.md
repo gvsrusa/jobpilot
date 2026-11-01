@@ -1,6 +1,6 @@
 # JobPilot AI: AI Provider Integration Specification
 
-Status: draft for owner approval. Date: 2026-11-01. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) section 3, [PRD](prd.md), and [policy register](policy-register.md). Nothing here is implemented yet. `TaskRouter` below is a contract description, not an API. The Rust design belongs to the 0.2 and 0.4 plans.
+Status: draft for owner approval, with the 0.2 implementation noted inline. Date: 2026-11-01. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) section 3, [PRD](prd.md), and [policy register](policy-register.md). Release 0.2 implements the router for Ollama, Claude Code, and No-AI; `Router` in `crates/core/src/ai/router.rs` is the Rust form of `TaskRouter` below. The other backends arrive in 0.4.
 
 Every statement about what a vendor permits comes from the [policy register](policy-register.md), which holds the quotes, URLs, and dates. That register is engineering review, not legal advice, and its entries must be re-read at each release. The owner decided on 2026-11-01 that JobPilot is a personal, non-commercial app and waived AI subscription policy concerns, accepting any account risk (decisions D1 and D4). The register's [owner decisions](policy-register.md#owner-decisions-2026-11-01) set what the product does with AI provider rows. The waiver covers vendor terms only: `no_tools`, the mode check, and consent all still apply.
 
@@ -109,6 +109,33 @@ Ineligible providers are skipped, and the reason is logged. Fallback never widen
 
 A task ends in exactly one of: `ok` (validated output, provider, and attempt count), `manual_required`, `cancelled`, or `failed` (typed reason). Each attempt writes an execution log with task type, provider, data categories, duration, and outcome. Logs never contain prompts, outputs, or secrets. A call to an external provider writes an audit row (FR-12.7).
 
+## As built in 0.2
+
+The names below are the Rust names in `crates/core/src/ai/`. The vocabulary above is the contract; this is what the code does.
+
+| Contract term | 0.2 code |
+|---|---|
+| `TaskRouter` | `Router` (`router.rs`). `Router::from_settings(&Db)` builds it from the user's order and enabled flags; `run(db, task, prompt, cancel)` and `embed(...)` take the `Db`, so the router holds none. |
+| Task types | `TaskType::{ParseJob, DraftResume, DraftCoverLetter, Embed}` with one `TaskSpec` each (`mod.rs`). `semantic_match`, `map_form_field`, and `classify_answer` have no 0.2 task. |
+| Provider | trait `Provider` (`declaration`, `available`, `complete`, `embed`). Implementations: `Ollama`, `ClaudeCode`, `NoAi`. `ProviderId` has exactly those three variants, so a provider the owner decisions leave out has no way in. |
+| Results | `Outcome::{Ok, ManualRequired, Cancelled, Failed}`. |
+| Cancellation | one `CancellationToken` type, polled every 100 ms. Revoking consent, Ctrl-C, and app exit fire it, and a dropped attempt kills its child. |
+| Consent key | `ProviderId::ClaudeCode` displays as `claude_code/cli_login`, and that text is the `consent.provider` value. |
+
+**Ollama local-model detection.** A model counts as local only when its `/api/tags` row has no `remote_model` and no `remote_host` (absent or empty), `size > 0`, and a name that neither ends in `:cloud` nor contains `-cloud`. Any other row is remote: hidden from the screen and ineligible in routing check 2. The same rule gates the embedding model, so a `:cloud` embedding model cannot pass as local. A fixture test pins both cases. Evidence: https://docs.ollama.com/api/tags and https://docs.ollama.com/cloud, read 2026-11-01. Re-check at each release.
+
+**Claude Code argv.** The adapter runs the `claude` the user installed, found, in order, through `JOBPILOT_CLAUDE_BIN`, the `ai.claude_path` setting, the `PATH`, the usual install folders, and a login-shell lookup (a GUI launch does not inherit the shell's `PATH`). The job text goes to standard input and never to argv. The argument list is fixed:
+
+```text
+-p --output-format json --json-schema <schema> --tools "" --allowedTools StructuredOutput
+--strict-mcp-config --disable-slash-commands --setting-sources "" --no-session-persistence
+--permission-mode dontAsk --system-prompt <system> [--model <model>]
+```
+
+`--tools ""` removes every built-in tool. `--allowedTools StructuredOutput` keeps the one tool `--json-schema` needs to hand the reply back; `--disallowedTools "*"` was tried and turns the reply into free text (real run, 2.1.316). `--bare` is never used, because it ignores the OAuth login. The child runs in an empty temporary directory with an allow-listed environment, 180 seconds per attempt. A test pins the list (`argv_is_exactly_the_verified_list`), and an ignored smoke test (`real_claude_has_no_tools_smoke`, which also needs `JOBPILOT_REAL_CLAUDE_SMOKE=1`) checks a real `init` event for the tool list. The plugins the owner installed still appear in `init`; see the [threat model](security/threat-model.md#7-cli-adapters-and-untrusted-text).
+
+**Retries as built.** Ollama is retried on network errors, 429, 5xx, and one validation failure. Claude Code is retried once after a validation failure only, never after a timeout or a broken call, because the attempt may already have spent usage. A prompt over a provider's context limit skips it with `prompt_too_large`; Ollama reports an overflow as an error because the call sends `num_ctx`, `truncate: false`, and `shift: false`. The overflow wording was tested against a fake server only.
+
 ## Output validation
 
 All model output is untrusted (FR-12.6). Validation runs on every backend, including local.
@@ -116,11 +143,11 @@ All model output is untrusted (FR-12.6). Validation runs on every backend, inclu
 1. Size check, then parse as JSON. Output outside the schema fails.
 2. Validate against the task's JSON schema. Provider-side structured output helps but never replaces this step.
 3. Run task-specific checks:
-   - Every claim in generated material maps to evidence in the knowledge base, or the output is rejected (FR-7.11, FR-7.12).
+   - Every line of generated material is a claim that cites evidence ids from the list the prompt supplied (FR-7.11, FR-7.12). A reply whose claims do not match the document's lines, or that invents a heading, stores nothing and fails validation. A claim that cites no usable evidence (an id outside the list counts as none), or that states work authorization, is **stored flagged** (`no_evidence`, `authorization_statement`) and blocks export until the user edits or removes it. It is not rejected and not retried. Matching is by id and by word, so a paraphrase can pass; the user's review is the final control.
    - No output may state or imply work authorization or visa eligibility beyond what the user recorded (FR-4.10).
    - Answers classed sensitive or legally consequential go to the user for confirmation (FR-8.8).
    - URLs, file paths, and commands in output are data. Nothing in output triggers a tool, a shell command, or a navigation.
-4. On failure, retry once, then move to the next provider, then No-AI.
+4. On a failed size, JSON, or schema check, retry once, then move to the next provider, then No-AI. A flagged claim is not a failure of this kind: the draft is stored and the user resolves the flag.
 
 Untrusted input is handled separately (FR-12.3). Job postings and web pages go to the model inside marked data blocks, and text in them is never treated as instructions. Live examples exist: Remote OK job descriptions contain planted words and tags meant to catch automated applicants. The threat model owns the injection tests.
 
