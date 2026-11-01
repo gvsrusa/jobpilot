@@ -3,7 +3,7 @@
 use std::future::Future;
 
 use clap::{Subcommand, ValueEnum};
-use jobpilot_core::ai::claude_code::TERMS_DATE;
+use jobpilot_core::ai::claude_code::{self, TERMS_DATE};
 use jobpilot_core::ai::ollama::{Ollama, OllamaStatus};
 use jobpilot_core::ai::router::{Router, ollama_from_settings};
 use jobpilot_core::ai::{self, CancellationToken, DataCategory, ProviderId, consent};
@@ -210,10 +210,13 @@ pub async fn ai(db: &Db, command: AiCommand) -> Result<Output> {
         }
         AiCommand::ClaudePath { path } => {
             let path = path.trim();
-            if !path.is_empty() && !std::path::Path::new(path).is_absolute() {
-                return Err(Error::Validation("give the full path to claude".into()));
+            let given = std::path::Path::new(path);
+            if !path.is_empty() && !(given.is_absolute() && claude_code::has_claude_name(given)) {
+                return Err(Error::Validation(
+                    "give the full path to a program named claude".into(),
+                ));
             }
-            let key = crate::shell::CLAUDE_PATH_SETTING;
+            let key = claude_code::PATH_SETTING;
             jobpilot_core::settings::set(db, key, &json!(path)).await?;
             out(
                 json!({ "claude_path": path }),

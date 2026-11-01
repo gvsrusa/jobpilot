@@ -18,7 +18,9 @@ use super::{
     Availability, BoxFuture, CancellationToken, Capability, Declaration, Prompt, Provider,
     ProviderId, RUN_REASONS,
 };
+use crate::db::Db;
 use crate::error::{Error, Result};
+use crate::settings;
 
 pub const PROVIDER: &str = "claude_code/cli_login";
 pub const TERMS_DATE: &str = "2026-11-01";
@@ -63,12 +65,18 @@ impl ClaudeCode {
             return Ok(ClaudeCode::with_binary(std::path::absolute(bin)?, None));
         }
         let path = std::env::var_os("PATH").ok_or(Error::Unavailable)?;
-        std::env::split_paths(&path)
-            .filter(|entry| entry.is_absolute())
-            .flat_map(|entry| BIN_NAMES.iter().map(move |name| entry.join(name)))
-            .find(|candidate| is_program(candidate))
+        search(absolute_dirs(&path))
             .map(|bin| ClaudeCode::with_binary(bin, None))
             .ok_or(Error::Unavailable)
+    }
+
+    /// The full discovery (`find_binary`), so a GUI launch with a minimal `PATH` still
+    /// finds `claude`. Not found leaves the adapter listed but unavailable.
+    pub async fn locate_in(db: &Db, model: Option<String>) -> Result<ClaudeCode> {
+        find_binary(Some(db))
+            .await
+            .map(|bin| ClaudeCode::with_binary(bin, model))
+            .map_err(|_| Error::Unavailable)
     }
 
     pub fn with_binary(bin: PathBuf, model: Option<String>) -> ClaudeCode {
@@ -380,4 +388,161 @@ fn is_program(path: &Path) -> bool {
 #[cfg(windows)]
 fn is_program(path: &Path) -> bool {
     path.is_file()
+}
+
+/// The setting that names the `claude` binary when discovery cannot find it.
+pub const PATH_SETTING: &str = "ai.claude_path";
+const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A relative entry would run whatever sits in the working directory.
+pub fn absolute_dirs(path: &std::ffi::OsStr) -> Vec<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|entry| entry.is_absolute())
+        .collect()
+}
+
+pub fn not_found() -> String {
+    format!(
+        "claude was not found. Install Claude Code, or set its full path with \
+         `jobpilot ai claude-path <path>` (setting {PATH_SETTING}) in an ordinary terminal."
+    )
+}
+
+/// Only a program named like Claude Code's own is ever run from a configured path, so a
+/// setting cannot turn into "run this other program".
+pub fn checked(bin: PathBuf, source: &str) -> std::result::Result<PathBuf, String> {
+    if bin.is_absolute() && has_claude_name(&bin) && is_program(&bin) {
+        Ok(bin)
+    } else {
+        Err(format!(
+            "{source} points to {}, which is not an executable named claude. {}",
+            bin.display(),
+            not_found()
+        ))
+    }
+}
+
+pub fn has_claude_name(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    #[cfg(unix)]
+    return name == "claude";
+    #[cfg(windows)]
+    return ["claude", "claude.exe", "claude.cmd"]
+        .iter()
+        .any(|allowed| name.eq_ignore_ascii_case(allowed));
+}
+
+/// Order: `JOBPILOT_CLAUDE_BIN`, the `ai.claude_path` setting, `PATH`, the usual install
+/// folders, then one lookup through the owner's login shell. GUI launches on macOS carry a
+/// minimal `PATH`, which is why the last two exist. A setting that is set but wrong is an
+/// error, never a silent fall through to something else.
+pub async fn find_binary(db: Option<&Db>) -> std::result::Result<PathBuf, String> {
+    if let Some(bin) = std::env::var_os("JOBPILOT_CLAUDE_BIN").filter(|bin| !bin.is_empty()) {
+        return checked(PathBuf::from(bin), "JOBPILOT_CLAUDE_BIN");
+    }
+    if let Some(bin) = path_setting(db).await {
+        return checked(PathBuf::from(bin), PATH_SETTING);
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    if let Some(found) = search(
+        absolute_dirs(&path)
+            .into_iter()
+            .chain(fallback_dirs(home_dir())),
+    ) {
+        return Ok(found);
+    }
+    #[cfg(unix)]
+    if let Some(found) = login_shell_lookup(&std::env::var_os("SHELL").unwrap_or_default()).await {
+        return Ok(found);
+    }
+    Err(not_found())
+}
+
+/// A failure to read the setting just means discovery continues without it.
+async fn path_setting(db: Option<&Db>) -> Option<String> {
+    let value = settings::get(db?, PATH_SETTING).await.ok()??;
+    let path = value.as_str()?.trim();
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+fn home_dir() -> Option<PathBuf> {
+    ["HOME", "USERPROFILE"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .find(|home| !home.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Where Claude Code's installers and the common package managers put it.
+pub fn fallback_dirs(home: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = home {
+        dirs.push(home.join(".local").join("bin"));
+        dirs.push(home.join(".claude").join("local"));
+        dirs.push(home.join(".npm-global").join("bin"));
+        dirs.push(home.join(".bun").join("bin"));
+    }
+    #[cfg(unix)]
+    dirs.extend(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"].map(PathBuf::from));
+    #[cfg(windows)]
+    for name in ["APPDATA", "LOCALAPPDATA"] {
+        if let Some(base) = std::env::var_os(name).map(PathBuf::from) {
+            dirs.push(base.join("npm"));
+            dirs.push(base.join("Programs").join("claude"));
+        }
+    }
+    dirs
+}
+
+pub fn search(dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    dirs.into_iter()
+        .flat_map(|dir| BIN_NAMES.iter().map(move |name| dir.join(name)))
+        .find(|candidate| is_program(candidate))
+}
+
+/// Asks the owner's login shell where `claude` is: a fixed command, never user input. The
+/// shell's startup files may print noise, so the last absolute line is the answer.
+#[cfg(unix)]
+pub async fn login_shell_lookup(shell: &std::ffi::OsStr) -> Option<PathBuf> {
+    let shell = Path::new(shell);
+    if !shell.is_absolute() {
+        return None;
+    }
+    let lookup = Command::new(shell)
+        .args(["-l", "-c", "command -v claude"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(LOGIN_SHELL_TIMEOUT, lookup)
+        .await
+        .ok()?
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| PathBuf::from(line.trim()))
+        .rfind(|path| path.is_absolute() && has_claude_name(path) && is_program(path))
+}
+
+#[cfg(test)]
+mod locate_tests {
+    use super::*;
+
+    #[test]
+    fn relative_path_entries_are_dropped() {
+        let joined = std::env::join_paths(["rel/bin", "/abs/bin", "."]).unwrap();
+        assert_eq!(absolute_dirs(&joined), vec![PathBuf::from("/abs/bin")]);
+    }
+
+    #[test]
+    fn only_claude_names_pass() {
+        assert!(has_claude_name(Path::new("/x/claude")));
+        assert!(!has_claude_name(Path::new("/bin/sh")));
+        assert!(!has_claude_name(Path::new("/x/claude-evil")));
+        assert!(!has_claude_name(Path::new("/x/Claude.sh")));
+        let message = checked(PathBuf::from("/bin/sh"), PATH_SETTING).unwrap_err();
+        assert!(message.contains("ai.claude_path"), "{message}");
+    }
 }

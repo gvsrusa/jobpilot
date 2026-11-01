@@ -277,7 +277,7 @@ pub async fn status(db: &Db) -> Result<AiStatus> {
         },
     };
     let consent = consent::active(db, &ProviderId::ClaudeCode.to_string()).await?;
-    let claude_code = match ClaudeCode::locate() {
+    let claude_code = match ClaudeCode::locate_in(db, None).await {
         Ok(claude) => ClaudeStatus {
             available: matches!(claude.available().await, Availability::Available),
             path: Some(claude.path().display().to_string()),

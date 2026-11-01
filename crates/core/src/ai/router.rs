@@ -96,7 +96,8 @@ impl Router {
                 }
                 CLAUDE_CODE if on(CLAUDE_CODE, false) => {
                     // No binary stays listed, so the run log shows it as unavailable.
-                    let claude = ClaudeCode::locate()
+                    let claude = ClaudeCode::locate_in(db, None)
+                        .await
                         .unwrap_or_else(|_| ClaudeCode::with_binary(PathBuf::new(), None));
                     providers.push(Box::new(claude));
                 }

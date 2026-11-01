@@ -72,6 +72,7 @@ impl Command {
         matches!(
             self,
             Command::Backup(BackupCommand::Restore { .. })
+                | Command::Ai(ai::AiCommand::ClaudePath { .. })
                 | Command::Data(
                     DataCommand::Delete { .. }
                         | DataCommand::RecoveryKey(_)
