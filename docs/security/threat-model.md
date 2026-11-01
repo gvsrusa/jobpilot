@@ -222,7 +222,7 @@ Design:
 
 - Cipher: AES-256-GCM with a fresh random 96-bit nonce per write.
 - Associated data: table, column, row id, and key id, so ciphertext cannot be swapped between rows or read under the wrong key.
-- One data key per data root, created at first need with a random `key_id`. It is stored in the OS credential store under service `io.github.gvsrusa.jobpilot`, account `data-key-<key_id>`. Two roots made with `JOBPILOT_HOME` therefore hold separate entries, and neither can overwrite or delete the other's key. No write replaces an existing entry. The key never crosses IPC to the webview and never reaches logs, data exports, the audit log, or a backup.
+- One data key per data root, created at the first sensitive read or write with a random `key_id`, never at open. It is stored in the OS credential store under service `io.github.gvsrusa.jobpilot`, account `data-key-<key_id>`. Two roots made with `JOBPILOT_HOME` therefore hold separate entries, and neither can overwrite or delete the other's key. No write replaces an existing entry. The key never crosses IPC to the webview and never reaches logs, data exports, the audit log, or a backup.
 - Each ciphertext carries its `key_id` in a header. The database also stores this root's key ids and a key-check value, which is a fixed text encrypted under the key. A backup carries both, so a restored database names the key it needs.
 - API-key entries are named by `secret_index` and do share names across roots. A loss there is repaired by entering the key again, so this design does not change them. Delete-all in one root therefore removes them for every root on this OS account, and the 0.1 delete dialog says so.
 - A backup holds sensitive columns as ciphertext only. It also copies `documents/` and plain columns such as `documents.body`, so free-form text in a backup is readable. A data export (FR-2.7) writes sensitive fields as plain text, because the user owns them, and warns before writing. It is the one place where they leave encrypted storage on purpose.
@@ -255,20 +255,21 @@ Under Decision D5 (accepted 2026-11-01), this is the one deliberate, narrow exce
 
 ### Recovery
 
-On open, core reads the database's `key_id` and asks the credential store for that entry. The result is one of four states. In the last three the app starts normally with sensitive fields shown as locked, and any task that needs them ends `manual_required`.
+Opening the database never touches the credential store, so `jobpilot status`, document commands, and backup cannot wait on a keychain prompt. On the first sensitive read or write, and on Retry, core reads the database's `key_id` and asks the store for that entry, off the async runtime, and keeps the resulting state on the open handle. No key value is kept: each sensitive operation reads the entry again. The state is one of five. Before first use it is `key_not_loaded`. In the last three the app works normally with sensitive fields shown as locked, and any task that needs them ends `manual_required`.
 
 | State | Detected when | Behaviour |
 |---|---|---|
+| `key_not_loaded` | Nothing has asked for the key on this handle. It says nothing about the key. | Normal for all non-sensitive work. No import, no discard, and no new key; the first sensitive use replaces it. |
 | Unlocked | The entry exists and the key-check value decrypts. | Normal. |
 | `key_unavailable` | The store cannot answer: locked keychain, denied prompt, service error, or an unsigned update whose access is refused. Any result other than an explicit "no such entry" lands here. | Temporary. Offers retry only. No import, no discard, and no new key. |
 | `key_missing` | The store answers that no entry exists for this `key_id`. This covers keychain loss, a new machine, and a backup restored after delete-all or after a discard. | Offers recovery import for the named key id, or discard. |
 | `key_mismatch` | The store returns a key that fails the key-check, or rows carry a `key_id` the key-check does not. | Offers recovery import for the named key id, or discard. The stored entry is left as it is. |
 
-The states stay distinct because only one of them is safe to retry and the others can lead to irreversible loss. A 0.2 test must confirm on both OSes what each credential store returns for a locked store and a denied prompt.
+The last three states stay distinct because only one of them is safe to retry and the others can lead to irreversible loss. A 0.2 test must confirm on both OSes what each credential store returns for a locked store and a denied prompt.
 
 Rules:
 
-1. The app never creates a new key while ciphertext or a key-check value exists, since that would strand the old fields. The one exception is rule 4 below.
+1. The first key is created at first sensitive use, never at open. The app never creates a new key while ciphertext or a key-check value exists, since that would strand the old fields. The one exception is rule 4 below.
 2. The user picks the recovery file in a Rust-owned native dialog, or with the CLI in an ordinary terminal. The command is refused in the PTY panel. The source must be an existing regular file, opened without following a symlink, checked on the open handle, and within a size limit, so `/dev/stdin` and terminal devices are refused. Errors never echo its contents.
 3. Core checks the file against the database's `key_id` and key-check value. A wrong key is refused and nothing changes. A matching key is added as a new entry under its own account and fields unlock. An audit row records the key id.
 4. With no recovery file, the user may discard locked fields, from `key_missing` or `key_mismatch` only. This is irreversible for the live data, so it needs the native confirmation in M-13, which names the key id, and it is refused in the PTY panel. Core first writes a `pre-discard` snapshot, so a recovery file found later can still open the old ciphertext through a restore. It then clears those columns, creates a new key under a new `key_id`, and writes an audit row. The app prompts for a new recovery key.

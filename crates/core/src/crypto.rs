@@ -1,13 +1,15 @@
 //! The data key and AES-256-GCM field encryption (D6). A bug here makes the owner's
 //! sensitive fields unreadable, so these rules are fixed:
 //!
-//! - A key is created only while `data_keys` is empty. Any row there, active or not,
-//!   may have ciphertext tied to it, so a second key would strand that data.
+//! - `Db::open` never touches the keychain. The key is read, or the first one made, on
+//!   the first sensitive read or write, so plain work never waits on a system prompt.
+//!   Until then the state is `NotLoaded`, which blocks nothing that is not sensitive.
+//! - A key is created only while `data_keys` and every ciphertext column are empty. Any
+//!   row there, active or not, may have data tied to it, and a second key would strand it.
 //! - Only an explicit "no such entry" from the store is `KeyMissing`. Anything else the
 //!   store says is `KeyUnavailable`, which is temporary: a locked keychain must never
 //!   read as a lost one, because the user may discard data over a lost key.
 //! - A value that fails the key-check is `KeyMismatch`, and the entry is left as it is.
-//! - No state but a database failure fails `Db::open`. A locked app still opens.
 //!
 //! The key lives only in the keychain. This module holds it for one call at a time.
 
@@ -38,10 +40,23 @@ const BODY_START: usize = NONCE_START + NONCE_LEN;
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum KeyState {
-    Unlocked { key_id: String },
-    KeyUnavailable { key_id: String, reason: String },
-    KeyMissing { key_id: String },
-    KeyMismatch { key_id: String },
+    /// Nothing has asked for the key on this handle. Says nothing about the key, so it
+    /// offers neither import nor discard.
+    #[serde(rename = "key_not_loaded")]
+    NotLoaded,
+    Unlocked {
+        key_id: String,
+    },
+    KeyUnavailable {
+        key_id: String,
+        reason: String,
+    },
+    KeyMissing {
+        key_id: String,
+    },
+    KeyMismatch {
+        key_id: String,
+    },
 }
 
 /// The key, or the state that says why there is none.
@@ -189,21 +204,17 @@ pub fn key_check_text() -> &'static [u8] {
     b"jobpilot-key-check-v1"
 }
 
-/// Reads the key state at open, making the first key if this root has none. Only
-/// `Db::open` calls this; everyone else calls [`state`].
-pub async fn load(db: &Db) -> Result<KeyState> {
-    state(db).await
-}
-
-/// Asks the store again and updates [`Db::key_state`]. A first key that could not be
-/// stored at open is tried again here, so the Retry button can finish that job.
+/// Asks the store, making the first key if this root has none, and updates
+/// [`Db::key_state`]. This is the first-use path and the Retry button: every call
+/// asks again, so a first key that could not be stored is tried again here.
 pub async fn state(db: &Db) -> Result<KeyState> {
     let found = resolve(db).await?;
     Ok(publish(db, &found))
 }
 
-/// The key, for one operation. It is read from the keychain on every call and kept
-/// nowhere, so `Db` needs no secret and a key removed from the store stops working.
+/// The key, for one operation: the entry point of every seal and open. The key is read
+/// from the keychain on every call and kept nowhere, so `Db` caches the state and no
+/// secret, and a key removed from the store stops working.
 pub async fn unlocked(db: &Db) -> Result<DataKey> {
     let found = resolve(db).await?;
     publish(db, &found);
@@ -211,7 +222,7 @@ pub async fn unlocked(db: &Db) -> Result<DataKey> {
         KeyState::KeyUnavailable { reason, .. } => Error::KeyUnavailable(reason),
         KeyState::KeyMissing { key_id } => Error::KeyMissing { key_id },
         KeyState::KeyMismatch { key_id } => Error::KeyMismatch { key_id },
-        KeyState::Unlocked { .. } => Error::Locked,
+        KeyState::Unlocked { .. } | KeyState::NotLoaded => Error::Locked,
     })
 }
 
@@ -258,9 +269,10 @@ fn no_key_yet(reason: String) -> KeyState {
     }
 }
 
-/// `None` only when `data_keys` is empty. With no active row the newest key is named
-/// and reported missing: rows exist, so a new key must not be made, and nothing says
-/// which entry would be right.
+/// `None` only when this root holds no key row and no ciphertext. With no active row
+/// the newest key is named and reported missing: rows exist, so a new key must not be
+/// made, and nothing says which entry would be right. Ciphertext with no key row takes
+/// a damaged or hand-edited file, as the foreign key refuses it, and names its own key.
 async fn existing_key(db: &Db) -> Result<Option<Found>> {
     let row: Option<(String, Vec<u8>, bool)> = sqlx::query_as(
         "SELECT key_id, key_check, active FROM data_keys \
@@ -269,7 +281,11 @@ async fn existing_key(db: &Db) -> Result<Option<Found>> {
     .fetch_optional(&db.pool)
     .await?;
     let Some((key_id, key_check, active)) = row else {
-        return Ok(None);
+        let orphan: Option<String> =
+            sqlx::query_scalar("SELECT key_id FROM work_authorization LIMIT 1")
+                .fetch_optional(&db.pool)
+                .await?;
+        return Ok(orphan.map(|key_id| Err(KeyState::KeyMissing { key_id })));
     };
     if !active {
         return Ok(Some(Err(KeyState::KeyMissing { key_id })));
@@ -334,7 +350,7 @@ async fn first_key(db: &Db, actor: &str) -> Result<Option<DataKey>> {
 /// The keychain goes first, so a row never names a key that was not stored. `None`
 /// means another handle got there first, and its key is the one to use.
 ///
-/// Two handles can both find `data_keys` empty, so the empty check is part of the
+/// Two handles can both find this root empty, so the empty check is part of the
 /// insert. The loser removes its own entry, whose id no row has ever named. After any
 /// other failure the entry stays: a commit that reports failure may still have landed,
 /// and an unused entry costs nothing while a removed one would lose the key.
@@ -353,7 +369,8 @@ async fn add_first_key(
     let inserted = sqlx::query(
         "INSERT INTO data_keys (key_id, created_at, key_check, active) \
          SELECT ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, 1 \
-         WHERE NOT EXISTS (SELECT 1 FROM data_keys)",
+         WHERE NOT EXISTS (SELECT 1 FROM data_keys) \
+         AND NOT EXISTS (SELECT 1 FROM work_authorization)",
     )
     .bind(key.key_id())
     .bind(key_check)
@@ -440,8 +457,11 @@ fn parse_key(hex: &str) -> Option<[u8; 32]> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use super::*;
     use crate::paths::AppPaths;
+    use crate::{backup, documents, settings, transfer};
 
     #[test]
     fn hex_round_trips_and_refuses_what_is_not_hex() {
@@ -453,21 +473,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_first_write_inserts_no_row_and_opens_locked() {
+    async fn failed_first_write_inserts_no_row() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = AppPaths::new(tmp.path().join("data"));
         let db = Db::open(&paths).await.unwrap();
-        let created: Vec<String> = sqlx::query_scalar("SELECT key_id FROM data_keys")
-            .fetch_all(&db.pool)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM data_keys")
-            .execute(&db.pool)
-            .await
-            .unwrap();
-        secrets::remove_all(created.iter().map(|id| account(id)).collect())
-            .await
-            .ok();
 
         let key = DataKey::generate().unwrap();
         let failing = async { Err(Error::Secret("locked".into())) };
@@ -486,12 +495,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, 0);
-        let audited: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE detail = ?")
-            .bind(json!({ "key_id": "" }).to_string())
+        assert!(audit::recent(&db, 10).await.unwrap().is_empty());
+        db.close().await;
+    }
+
+    /// Counts every route to the keychain, so it needs no keychain to run. No other test
+    /// in this binary may reach `secrets::entry`: this one reads a process-wide count.
+    #[tokio::test]
+    async fn plain_work_makes_no_keychain_call() {
+        let calls = || secrets::KEYCHAIN_CALLS.load(Ordering::SeqCst);
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::new(tmp.path().join("data"));
+        let before = calls();
+
+        let db = Db::open(&paths).await.unwrap();
+        let doc = documents::create(&db, "Title", "body").await.unwrap();
+        documents::get(&db, &doc.id).await.unwrap();
+        documents::search(&db, "body").await.unwrap();
+        settings::set(&db, "k", &serde_json::json!("v"))
+            .await
+            .unwrap();
+        backup::create(&db, "cli").await.unwrap();
+        transfer::export_all(&db, "cli").await.unwrap();
+        db.schema_version().await.unwrap();
+        db.close().await;
+        let db = Db::open(&paths).await.unwrap();
+
+        assert_eq!(calls(), before);
+        assert_eq!(db.key_state(), KeyState::NotLoaded);
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM data_keys")
             .fetch_one(&db.pool)
             .await
             .unwrap();
-        assert_eq!(audited, 0);
+        assert_eq!(rows, 0);
         db.close().await;
+
+        // The seam itself: an empty name stops before the OS, but it passed through.
+        assert!(secrets::get("").is_err());
+        assert_eq!(calls(), before + 1);
     }
 }

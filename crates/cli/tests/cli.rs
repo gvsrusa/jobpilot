@@ -3,13 +3,10 @@ use std::process::{Command, Output};
 
 use jobpilot_core::{AppPaths, Db, app_schema_version, documents};
 
-/// Its own keychain service: on macOS an entry made by one binary makes another binary
-/// wait on a system prompt, and these tests open a root from both.
 fn run(home: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_jobpilot"))
         .args(args)
         .env("JOBPILOT_HOME", home)
-        .env("JOBPILOT_SECRET_SERVICE", "jobpilot-test-cli")
         .output()
         .unwrap()
 }

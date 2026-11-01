@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool};
 
-use crate::crypto::{self, KeyState};
+use crate::crypto::KeyState;
 use crate::error::{Error, Result};
 use crate::paths::{APP_ID, AppPaths};
 
@@ -58,24 +58,12 @@ impl Db {
             let pool = connect(paths).await?;
             match pending_migration(&pool, migrator).await {
                 Ok(None) => {
-                    let db = Db {
+                    return Ok(Db {
                         pool,
                         lock,
                         paths: paths.clone(),
-                        key_state: Mutex::new(KeyState::KeyUnavailable {
-                            key_id: String::new(),
-                            reason: "the key store has not been asked yet".into(),
-                        }),
-                    };
-                    // A key state short of Unlocked is a normal open. Only a database
-                    // failure comes back as an error here.
-                    return match crypto::load(&db).await {
-                        Ok(_) => Ok(db),
-                        Err(error) => {
-                            db.close().await;
-                            Err(error)
-                        }
-                    };
+                        key_state: Mutex::new(KeyState::NotLoaded),
+                    });
                 }
                 Ok(Some(_)) => {
                     pool.close().await;
@@ -112,7 +100,9 @@ impl Db {
         &self.paths
     }
 
-    /// The state read at open or at the latest `crypto::state`. Never touches the store.
+    /// The state from the last time the key was asked for, or `NotLoaded`. Never touches
+    /// the store, so it is safe anywhere. `Db::open` does not read the key:
+    /// `crypto::state` and `crypto::unlocked` do.
     pub fn key_state(&self) -> KeyState {
         self.key_state
             .lock()

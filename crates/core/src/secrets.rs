@@ -122,7 +122,14 @@ async fn remove_row(db: &Db, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Every keychain call passes through `entry`, so counting here covers them all.
+#[cfg(test)]
+pub(crate) static KEYCHAIN_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 fn entry(name: &str) -> Result<keyring::Entry> {
+    #[cfg(test)]
+    KEYCHAIN_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     check_name(name)?;
     keyring::Entry::new(&service(), name).map_err(secret_error)
 }

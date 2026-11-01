@@ -44,8 +44,9 @@ async fn key_rows(db: &Db) -> Vec<(String, Vec<u8>, i64)> {
 /// A root with its first key, which the keychain must have accepted.
 async fn unlocked_root(paths: &AppPaths) -> (Db, String, EntryGuard) {
     let db = Db::open(paths).await.unwrap();
-    let KeyState::Unlocked { key_id } = db.key_state() else {
-        panic!("{:?}", db.key_state());
+    let state = crypto::state(&db).await.unwrap();
+    let KeyState::Unlocked { key_id } = state else {
+        panic!("{state:?}");
     };
     let guard = EntryGuard(key_id.clone());
     (db, key_id, guard)
@@ -53,7 +54,7 @@ async fn unlocked_root(paths: &AppPaths) -> (Db, String, EntryGuard) {
 
 #[tokio::test]
 #[ignore = "touches the OS keychain"]
-async fn first_open_creates_one_active_key_and_audits() {
+async fn first_use_creates_one_active_key_and_audits() {
     let (_tmp, paths) = temp_root();
     let (db, key_id, _guard) = unlocked_root(&paths).await;
 
@@ -88,8 +89,16 @@ async fn first_open_creates_one_active_key_and_audits() {
     db.close().await;
 
     let db = Db::open(&paths).await.unwrap();
-    assert_eq!(db.key_state(), KeyState::Unlocked { key_id });
-    assert_eq!(key_rows(&db).await.len(), 1, "a second open adds nothing");
+    assert_eq!(
+        db.key_state(),
+        KeyState::NotLoaded,
+        "open never asks the store"
+    );
+    assert_eq!(
+        crypto::state(&db).await.unwrap(),
+        KeyState::Unlocked { key_id }
+    );
+    assert_eq!(key_rows(&db).await.len(), 1, "a second use adds nothing");
     db.close().await;
 }
 
@@ -105,7 +114,7 @@ async fn open_never_creates_a_second_key_while_ciphertext_exists() {
     let db = Db::open(&paths).await.unwrap();
 
     assert_eq!(
-        db.key_state(),
+        crypto::state(&db).await.unwrap(),
         KeyState::KeyMissing {
             key_id: key_id.clone()
         }
@@ -140,7 +149,7 @@ async fn wrong_key_in_store_is_mismatch() {
     let db = Db::open(&paths).await.unwrap();
 
     assert_eq!(
-        db.key_state(),
+        crypto::state(&db).await.unwrap(),
         KeyState::KeyMismatch {
             key_id: key_id.clone()
         }
@@ -288,30 +297,29 @@ async fn racing_first_creations_leave_one_key() {
     db.close().await;
 }
 
-// A restore can leave rows with none active. Rows exist, so no key may be made, whatever
-// the keychain says, and open still succeeds.
+// A restore can leave rows with none active. Rows exist, so no key may be made. This
+// stops before the keychain, so it needs none.
 #[tokio::test]
 async fn rows_without_an_active_key_never_create_one() {
     let (_tmp, paths) = temp_root();
     let db = Db::open(&paths).await.unwrap();
-    let opened: Vec<_> = key_rows(&db).await;
-    let _guards: Vec<_> = opened.iter().map(|row| EntryGuard(row.0.clone())).collect();
-    sqlx::query("UPDATE data_keys SET active = 0")
+    for (key_id, created_at) in [(KEY_ID, "1000"), (OTHER_KEY_ID, "9999")] {
+        sqlx::query(
+            "INSERT INTO data_keys (key_id, created_at, key_check, active) \
+             VALUES (?, ?, x'00', 0)",
+        )
+        .bind(key_id)
+        .bind(created_at)
         .execute(&db.pool)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO data_keys (key_id, created_at, key_check, active) VALUES (?, '9999', x'00', 0)")
-        .bind(OTHER_KEY_ID)
-        .execute(&db.pool)
-        .await
-        .unwrap();
+    }
     let before = key_rows(&db).await;
-    db.close().await;
 
-    let db = Db::open(&paths).await.unwrap();
+    let state = crypto::state(&db).await.unwrap();
 
     assert_eq!(
-        db.key_state(),
+        state,
         KeyState::KeyMissing {
             key_id: OTHER_KEY_ID.into()
         }
@@ -320,20 +328,69 @@ async fn rows_without_an_active_key_never_create_one() {
     db.close().await;
 }
 
+// The foreign key refuses this, so it takes a damaged file. Ciphertext still blocks a
+// new key, whichever table lost its row, and this too stops before the keychain.
+#[tokio::test]
+async fn ciphertext_without_a_key_row_never_creates_one() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let mut raw = db.pool.acquire().await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *raw)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO work_authorization (country, ciphertext, key_id, updated_at) \
+         VALUES ('PT', x'00', ?, 't')",
+    )
+    .bind(OTHER_KEY_ID)
+    .execute(&mut *raw)
+    .await
+    .unwrap();
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *raw)
+        .await
+        .unwrap();
+    drop(raw);
+
+    let state = crypto::state(&db).await.unwrap();
+
+    assert_eq!(
+        state,
+        KeyState::KeyMissing {
+            key_id: OTHER_KEY_ID.into()
+        }
+    );
+    assert!(key_rows(&db).await.is_empty());
+    db.close().await;
+}
+
+// `key_state` before any use is the one value that says nothing about the key.
+#[tokio::test]
+async fn state_before_first_use_is_not_loaded_and_opens_plain_work() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+
+    assert_eq!(db.key_state(), KeyState::NotLoaded);
+    jobpilot_core::documents::create(&db, "Title", "body")
+        .await
+        .unwrap();
+    assert_eq!(db.key_state(), KeyState::NotLoaded);
+    assert!(key_rows(&db).await.is_empty());
+    db.close().await;
+}
+
 #[tokio::test]
 async fn export_lists_key_ids_and_no_key_material() {
     let (_tmp, paths) = temp_root();
     let db = Db::open(&paths).await.unwrap();
-    let _guards: Vec<_> = key_rows(&db)
-        .await
-        .iter()
-        .map(|row| EntryGuard(row.0.clone()))
-        .collect();
-    sqlx::query("INSERT OR IGNORE INTO data_keys (key_id, created_at, key_check, active) VALUES (?, 't', x'0102', 0)")
-        .bind(OTHER_KEY_ID)
-        .execute(&db.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO data_keys (key_id, created_at, key_check, active) VALUES (?, 't', x'0102', 0)",
+    )
+    .bind(OTHER_KEY_ID)
+    .execute(&db.pool)
+    .await
+    .unwrap();
     sqlx::query("INSERT INTO work_authorization (country, ciphertext, key_id, updated_at) VALUES ('PT', x'0102', ?, 't')")
         .bind(OTHER_KEY_ID)
         .execute(&db.pool)
@@ -491,6 +548,10 @@ fn key_check_text_is_fixed() {
 
 #[test]
 fn key_state_serializes_with_a_state_tag() {
+    assert_eq!(
+        serde_json::to_value(KeyState::NotLoaded).unwrap(),
+        serde_json::json!({ "state": "key_not_loaded" })
+    );
     let value = serde_json::to_value(KeyState::KeyMissing { key_id: "k".into() }).unwrap();
     assert_eq!(
         value,
