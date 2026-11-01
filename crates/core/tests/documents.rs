@@ -88,9 +88,34 @@ async fn search_accepts_any_user_text() {
         "title:x",
         "",
         "   ",
+        "a\0b",
+        "\0",
+        "alpha\0",
     ] {
         assert!(documents::search(&db, q).await.is_ok(), "{q}");
     }
+}
+
+#[tokio::test]
+async fn search_ignores_a_nul_byte() {
+    let (_tmp, db) = open().await;
+    let doc = documents::create(&db, "alpha", "body").await.unwrap();
+    let hits = documents::search(&db, "alpha\0").await.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, doc.id);
+}
+
+#[tokio::test]
+async fn audit_limit_is_clamped() {
+    let (_tmp, db) = open().await;
+    for n in 0..3 {
+        audit::record(&db, "gui", "act", None, json!({ "n": n }))
+            .await
+            .unwrap();
+    }
+    assert_eq!(audit::recent(&db, -1).await.unwrap().len(), 1);
+    assert_eq!(audit::recent(&db, 0).await.unwrap().len(), 1);
+    assert_eq!(audit::recent(&db, i64::MAX).await.unwrap().len(), 3);
 }
 
 #[test]

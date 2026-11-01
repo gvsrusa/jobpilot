@@ -37,6 +37,7 @@ JOBPILOT_SECRET_SERVICE=jobpilot-test cargo test --workspace -- --ignored
 All files live under one root: `JOBPILOT_HOME` if set, else the platform data directory for `io.github.gvsrusa.jobpilot`.
 
 - JobPilot writes a `.jobpilot-root` marker in the root. It refuses to write to or delete a folder that lacks the marker, so a mistaken root is never damaged.
+- A GUI launched from Finder or the Start menu does not inherit a `JOBPILOT_HOME` set in your shell, so it uses the platform data directory.
 - `JOBPILOT_HOME` must point to a new (nonexistent or empty) folder. An existing folder with other files is rejected.
 
 ```bash

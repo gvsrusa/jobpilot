@@ -1031,6 +1031,29 @@ async fn backup_missing_a_table_is_refused_with_live_data_intact() {
     db.close().await;
 }
 
+// DDL owned by sqlx or SQLite is not ours to compare: a library bump must not
+// strand every backup made before it.
+#[tokio::test]
+async fn backup_with_different_library_ddl_still_restores() {
+    let (_tmp, paths) = temp_root();
+    let source = backup_with_doc(&paths, "alpha").await;
+    let pool =
+        SqlitePool::connect_with(SqliteConnectOptions::new().filename(source.join("jobpilot.db")))
+            .await
+            .unwrap();
+    sqlx::query("ALTER TABLE _sqlx_migrations ADD COLUMN planted TEXT")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let db = Db::open(&paths).await.unwrap();
+    add_doc(&db, "bravo").await;
+    let db = backup::restore(db, &source, "cli").await.unwrap();
+    assert_eq!(titles(&db).await, ["alpha"]);
+    db.close().await;
+}
+
 // A table the backup lacks fails loudly even with no saved rows to insert into it.
 #[tokio::test]
 async fn backup_missing_a_table_is_refused_with_no_live_secrets() {

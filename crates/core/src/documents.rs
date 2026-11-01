@@ -118,6 +118,8 @@ pub async fn search(db: &Db, query: &str) -> Result<Vec<SearchHit>> {
 /// Turns user text into an FTS5 query of quoted terms, so no input is parsed as
 /// FTS syntax. `None` when no terms remain.
 pub fn fts_query(input: &str) -> Option<String> {
+    // A NUL ends the string for FTS5 ("unterminated string"), so it separates terms.
+    let input = input.replace('\0', " ");
     let terms: Vec<String> = input
         .split_whitespace()
         .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))

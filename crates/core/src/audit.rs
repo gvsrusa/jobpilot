@@ -48,8 +48,10 @@ pub(crate) async fn record_to(
     Ok(())
 }
 
-/// Newest first. `id` breaks ties between rows in the same millisecond.
+/// Newest first. `id` breaks ties between rows in the same millisecond. `limit` is
+/// clamped to 1..=1000: SQLite reads a negative `LIMIT` as no limit.
 pub async fn recent(db: &Db, limit: i64) -> Result<Vec<AuditEntry>> {
+    let limit = limit.clamp(1, 1000);
     let rows = sqlx::query(
         "SELECT id, at, actor, action, target, detail FROM audit_log ORDER BY id DESC LIMIT ?",
     )

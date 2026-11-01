@@ -112,6 +112,10 @@ pub async fn restore(db: Db, source: &Path, actor: &str) -> Result<Db> {
 #[doc(hidden)]
 pub async fn restore_with(db: Db, source: &Path, actor: &str, migrator: &Migrator) -> Result<Db> {
     let paths = db.paths().clone();
+    // ponytail: a refused attempt (`InUse`, from the lock below) has already written a
+    // `pre-restore` snapshot. An early `lock_exclusive` probe cannot work: this
+    // process holds a shared lock through `db`, so it would always report `InUse`,
+    // and dropping that lock first opens the gap `Db::open_with` describes.
     let prepared = prepare(&db, source, migrator).await;
     db.close().await;
     let (wal, secrets) = match prepared {
@@ -430,10 +434,18 @@ async fn check_schema(pool: &SqlitePool, migrator: &Migrator) -> Result<()> {
     }
 }
 
+/// Only what JobPilot's migrations define. sqlx's bookkeeping, SQLite's internals,
+/// and FTS5's shadow tables are written by libraries whose DDL may change with a
+/// version bump, which would make every older backup unrestorable.
 async fn schema_of(pool: &SqlitePool) -> Result<Vec<(String, Option<String>)>> {
-    Ok(sqlx::query_as("SELECT name, sql FROM sqlite_master")
-        .fetch_all(pool)
-        .await?)
+    Ok(sqlx::query_as(
+        "SELECT name, sql FROM sqlite_master \
+         WHERE name NOT LIKE '\\_sqlx\\_%' ESCAPE '\\' \
+           AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+           AND name NOT IN (SELECT name FROM pragma_table_list WHERE type = 'shadow')",
+    )
+    .fetch_all(pool)
+    .await?)
 }
 
 /// Step 5. A folder cannot be renamed over a folder, so the live one moves aside.
