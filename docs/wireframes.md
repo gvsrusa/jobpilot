@@ -270,9 +270,10 @@ Delete-all dialog. The delete button stays disabled until the field equals the e
 |   the secrets JobPilot stored in your system keychain.           |
 | [ ] Also delete backups and snapshots                            |
 |                                                                  |
-| Keychain secrets are removed for every JobPilot data folder on   |
-| this account, not only this one.                                 |
-| It cannot reach a backup or export you moved elsewhere.          |
+| Keychain secrets are removed for this data folder. A copied      |
+| folder or restored backup that shares its key id loses its key   |
+| too. This cannot reach a recovery file, backup, or export you    |
+| saved elsewhere.                                                 |
 | Deleting the activity log is part of this action, so no record   |
 | of it remains.                                                   |
 |                                                                  |

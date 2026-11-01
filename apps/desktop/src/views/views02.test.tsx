@@ -155,6 +155,14 @@ describe("profile", () => {
     expect(count(b, "profile_set_basic")).toBe(1);
   });
 
+  it("add_a_country_button_opens_the_countries_input", async () => {
+    backend({ profile_get: () => profile() });
+    const { user } = renderApp();
+    await go(user, "Profile", "Profile");
+    await user.click(await screen.findByRole("button", { name: "Add a country" }));
+    expect(screen.getByRole("textbox", { name: "Add country" })).toHaveFocus();
+  });
+
   it("chip_field_keyboard_adds_and_backspace_removes", async () => {
     backend({ profile_get: () => profile({}, { languages: ["English"] }) });
     const { user } = renderApp();
@@ -227,6 +235,24 @@ describe("resumes", () => {
     expect(within(version).getAllByRole("option")).toHaveLength(3);
     expect(version).toHaveDisplayValue("v3 (current), edited");
     expect(screen.queryByLabelText("Draft")).toBeNull();
+  });
+
+  it("imported_resume_without_a_job_is_shown", async () => {
+    let imported = false;
+    const up = draft({ id: "u1", lineage_id: "U", origin: "uploaded", job_text_id: null, title: "My CV" });
+    resumeBackend({
+      resume_list: () => (imported ? [up] : []),
+      resume_import: () => {
+        imported = true;
+        return { draft_id: "u1", lineage_id: "U", items: 3, warnings: [] };
+      },
+      resume_compare: () => ({ ...COMPARE, generated: [], blocked: 0 }),
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    await user.click(await screen.findByRole("button", { name: "Import resume..." }));
+    expect(await screen.findByLabelText("Version")).toBeInTheDocument();
+    expect(screen.queryByText("No generated resume for this job yet.")).toBeNull();
   });
 
   it("resumes_empty_state_offers_editor_without_backend", async () => {
@@ -394,6 +420,51 @@ describe("ai", () => {
     await waitFor(() => expect(count(b, "ai_set_claude_path")).toBe(1));
   });
 
+  it("ai_use_automatic_clears_the_claude_path", async () => {
+    const b = backend({
+      ai_status: () =>
+        aiWith({ claude_code: { available: true, path: "/opt/claude", consent: null } }),
+      ai_clear_claude_path: () => undefined,
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    await user.click(await screen.findByRole("button", { name: "Use automatic" }));
+    await waitFor(() => expect(count(b, "ai_clear_claude_path")).toBe(1));
+  });
+
+  it("suggested_models_use_core_fit_thresholds_and_say_estimated", async () => {
+    // 6 GB: qwen2.5:7b needs 4.7*1.2=5.64 GB, over 75% (4.5) but within 6, so may be slow.
+    backend({
+      ai_status: () =>
+        aiWith({
+          ollama: { state: "running", url: "http://127.0.0.1:11434", version: "1", models: [] },
+          hardware: { ...AI_OFF.hardware, total_memory: 6_000_000_000 },
+        }),
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const list = within(await screen.findByRole("region", { name: /Suggested models \(sizes approximate/ }));
+    const row = list.getByText("qwen2.5:7b").closest("li")!;
+    expect(within(row).getByText("Estimated: May be slow here")).toBeInTheDocument();
+    expect(within(list.getByText("llama3.2:3b").closest("li")!).getByText("Estimated: Fits this computer")).toBeInTheDocument();
+  });
+
+  it("download_error_claims_network_only_for_network_codes", async () => {
+    backend({
+      ai_status: () =>
+        aiWith({ ollama: { state: "running", url: "http://127.0.0.1:11434", version: "1", models: [] } }),
+      ai_pull: () => {
+        throw { code: "refused", message: "refused: not_local" };
+      },
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    await user.click(await screen.findByRole("button", { name: "Download llama3.2:3b" }));
+    await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Download" }));
+    expect(await screen.findByText("refused: not_local")).toBeInTheDocument();
+    expect(screen.queryByText(/needs a network/)).toBeNull();
+  });
+
   it("ai_order_moves_a_provider_and_saves", async () => {
     const b = backend({ ai_status: () => AI_OFF, ai_set_order: () => undefined });
     const { user } = renderApp();
@@ -409,17 +480,35 @@ describe("data", () => {
 
   it("data_shows_locked_panel_and_recovery_banner", async () => {
     backend({
-      ...withStatus({ key_state: LOCKED, recovery_key_exported: false }),
-      key_state: () => LOCKED,
+      ...withStatus({ key_state: UNLOCKED, recovery_key_exported: false }),
+      key_state: () => UNLOCKED,
     });
+    const { user } = renderApp();
+    await go(user, "Data", "Data and privacy");
+    expect(await screen.findByText("No recovery key exported")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export recovery key..." })).toBeInTheDocument();
+  });
+
+  it("fresh_install_shows_no_recovery_banner", async () => {
+    backend({
+      ...withStatus({ key_state: null, recovery_key_exported: false }),
+      key_state: () => ({ state: "key_unavailable", key_id: "", reason: "no_key_yet" }),
+    });
+    const { user } = renderApp();
+    await go(user, "Data", "Data and privacy");
+    await screen.findByRole("heading", { name: "Backups" });
+    expect(screen.queryByText("No recovery key exported")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Export recovery key..." })).toBeNull();
+  });
+
+  it("locked_panel_lists_import_and_discard", async () => {
+    backend({ key_state: () => LOCKED });
     const { user } = renderApp();
     await go(user, "Data", "Data and privacy");
     expect(await screen.findByText(/key id: k9/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Import recovery key file..." })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Discard locked fields..." })).toBeInTheDocument();
-    expect(screen.getByText("No recovery key exported")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Export recovery key..." })).toBeInTheDocument();
   });
 
   it("unavailable_key_offers_retry_but_no_import_or_discard", async () => {

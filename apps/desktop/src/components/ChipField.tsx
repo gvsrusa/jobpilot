@@ -1,9 +1,12 @@
-import { useId, useState } from "react";
+import { useId, useImperativeHandle, useState, type Ref } from "react";
 import { X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
+export type ChipHandle = { open(): void };
+
 type Props = {
+  ref?: Ref<ChipHandle>;
   label: string;
   addLabel: string;
   values: string[];
@@ -24,6 +27,7 @@ export function ChipField(props: Props) {
   const [adding, setAdding] = useState(false);
   const [text, setText] = useState("");
   const [problem, setProblem] = useState<string | null>(null);
+  useImperativeHandle(props.ref, () => ({ open: () => setAdding(true) }), []);
   return (
     <div role="group" aria-label={label} className="grid grid-cols-[10rem_1fr] items-start gap-x-4">
       <span className="pt-1.5 text-sm text-muted-foreground">{label}</span>

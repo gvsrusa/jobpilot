@@ -270,6 +270,8 @@ export const ipc = {
     invoke<void>("ai_enable", { provider, enabled }),
   /** Rust opens the picker: no path crosses from here. */
   aiSetClaudePath: () => invoke<void>("ai_set_claude_path"),
+  /** Back to finding `claude` by itself. Rust confirms in a native dialog. */
+  aiClearClaudePath: () => invoke<void>("ai_clear_claude_path"),
   /** Rust confirms in a native dialog. */
   aiSetOllamaUrl: (url: string) => invoke<void>("ai_set_ollama_url", { url }),
   /** Rust confirms in a native dialog. */

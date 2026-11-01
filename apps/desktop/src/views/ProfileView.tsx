@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ChipField } from "@/components/ChipField";
+import { ChipField, type ChipHandle } from "@/components/ChipField";
 import { ErrorAlert } from "@/components/ErrorAlert";
 import { PageHeading } from "@/components/PageHeading";
 import { Button } from "@/components/ui/button";
@@ -50,6 +50,7 @@ function ProfileForm({
   onSave(basic: ProfileBasic, rows: WorkAuthorization[], removed: string[]): void;
 }) {
   const locked = profile.locked;
+  const addCountry = useRef<ChipHandle>(null);
   const [basic, setBasic] = useState(profile.basic);
   // Only what the user changed is written; a row nobody touched stays as it is.
   const [touched, setTouched] = useState<Record<string, WorkAuthorization>>({});
@@ -119,6 +120,7 @@ function ProfileForm({
         {LIST_FIELDS.map(([field, label, addLabel]) => (
           <ChipField
             key={field}
+            ref={field === "countries" ? addCountry : undefined}
             label={label}
             addLabel={addLabel}
             values={basic[field]}
@@ -255,7 +257,7 @@ function ProfileForm({
             type="button"
             variant="outline"
             size="sm"
-            onClick={() => document.querySelector<HTMLButtonElement>('button[aria-label="Add country"]')?.click()}
+            onClick={() => addCountry.current?.open()}
           >
             Add a country
           </Button>

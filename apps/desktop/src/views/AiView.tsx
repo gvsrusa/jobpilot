@@ -26,19 +26,25 @@ const GB = 2 ** 30;
 const gb = (bytes: number) => `${(bytes / GB).toFixed(bytes < GB ? 2 : 1)} GB`;
 const size = (bytes: number) => (bytes < 1_000_000_000 ? `${Math.round(bytes / 1e6)} MB` : `${(bytes / 1e9).toFixed(1)} GB`);
 
-// ponytail: Ollama has no listing of what it could download, so this short list is kept here
-// with approximate sizes and the fit is a memory rule of thumb. It guides and never decides
-// (FR-3.5). Past a handful of entries, move it to a data file the user can edit.
+// ponytail: Ollama has no listing of what it could download, so this short list is kept here.
+// Names and sizes were checked on ollama.com on 2026-11-01 (llama3.2:3b 2.0GB, qwen2.5:7b
+// 4.7GB, nomic-embed-text 274MB). Past a handful of entries, move it to a data file.
 const SUGGESTED = [
-  { name: "llama3.2:3b", bytes: 2_000_000_000, role: "drafting" },
-  { name: "qwen2.5:7b", bytes: 4_700_000_000, role: "drafting" },
-  { name: "nomic-embed-text", bytes: 274_000_000, role: "embedding" },
+  { name: "llama3.2:3b", bytes: 2_000_000_000 },
+  { name: "qwen2.5:7b", bytes: 4_700_000_000 },
+  { name: "nomic-embed-text", bytes: 274_000_000 },
 ];
 
+/** Core's `hardware::fit`, same thresholds: size plus 20% fits within 75% of memory. */
 function fitFor(bytes: number, memory: number): Fit {
-  if (bytes * 1.5 <= memory) return "fits";
-  return bytes <= memory ? "may_slow" : "too_large";
+  const need = BigInt(bytes) * 6n;
+  const total = BigInt(memory) * 5n;
+  if (need * 4n <= total * 3n) return "fits";
+  return need <= total ? "may_slow" : "too_large";
 }
+
+// ponytail: Task 20 has no network-specific code; these are the ones a failed connection can produce.
+const NETWORK_CODES = new Set(["io", "timeout"]);
 
 const CATEGORIES: [DataCategory, string][] = [
   ["job_text", "Job text"],
@@ -154,6 +160,7 @@ export function AiView() {
   );
   const setOrder = useAction((order: Provider[]) => ipc.aiSetOrder(order));
   const pickClaude = useAction<void>(() => ipc.aiSetClaudePath());
+  const clearClaude = useAction<void>(() => ipc.aiClearClaudePath());
   const revoke = useAction<void>(async () => {
     await ipc.aiConsentRevoke("claude_code");
     await ipc.aiEnable("claude_code", false);
@@ -184,7 +191,7 @@ export function AiView() {
       </p>
       <ErrorAlert
         error={
-          ai.error ?? enable.error ?? setModels.error ?? setOrder.error ?? pickClaude.error ?? revoke.error ?? setUrl.error
+          ai.error ?? enable.error ?? setModels.error ?? setOrder.error ?? pickClaude.error ?? clearClaude.error ?? revoke.error ?? setUrl.error
         }
       />
       {s && (
@@ -254,6 +261,12 @@ export function AiView() {
                     </li>
                   ))}
                 </ul>
+                {installed.length > 0 && !installed.some((m) => m.family.toLowerCase().includes("embed") || m.name.includes("embed")) && (
+                  <p className="text-sm">
+                    No installed model can do embeddings yet. Download one below. Search then uses
+                    No-AI matching.
+                  </p>
+                )}
                 {installed.length > 0 &&
                   (
                     [
@@ -286,7 +299,7 @@ export function AiView() {
                   ))}
               </Section>
 
-              <Section id="available" title="Available to download (nothing downloads unless you ask)">
+              <Section id="available" title="Suggested models (sizes approximate; nothing downloads unless you ask)">
                 <ul className="grid gap-1 text-sm">
                   {SUGGESTED.filter((m) => !installed.some((i) => i.name === m.name)).map((m) => {
                     const fit = fitFor(m.bytes, s.hardware.total_memory);
@@ -295,7 +308,7 @@ export function AiView() {
                       <li key={m.name} className="flex items-center gap-3">
                         <span className="font-mono">{m.name}</span>
                         <span>{size(m.bytes)}</span>
-                        <span data-fit>{FIT[fit]}</span>
+                        <span data-fit>{`Estimated: ${FIT[fit]}`}</span>
                         {busy ? (
                           <Button size="sm" variant="outline" onClick={() => cancelPull.mutate()}>
                             Cancel download
@@ -324,7 +337,9 @@ export function AiView() {
                 {pullError && pullError.code !== "cancelled" && (
                   <>
                     <ErrorAlert error={pull.error} />
-                    <p className="text-sm">Downloading needs a network. Installed models keep working.</p>
+                    {NETWORK_CODES.has(pullError.code) && (
+                      <p className="text-sm">Downloading needs a network. Installed models keep working.</p>
+                    )}
                   </>
                 )}
                 {pullError?.code === "cancelled" && <p className="text-sm">Download cancelled.</p>}
@@ -336,14 +351,17 @@ export function AiView() {
             <p className="text-sm">
               {`Claude Code  ${s.claude_code.available ? "available" : "not found"}  ${s.claude_code.path ?? ""}`.trimEnd()}
             </p>
-            {!s.claude_code.available && (
-              <div className="flex items-center gap-3 text-sm">
-                <span>Unavailable: install claude, or point JobPilot at it.</span>
+            <div className="flex items-center gap-3 text-sm">
+              {!s.claude_code.available && <span>Unavailable: install claude, or point JobPilot at it.</span>}
+              {!s.claude_code.available && (
                 <Button size="sm" variant="outline" onClick={() => pickClaude.mutate()}>
                   Choose claude...
                 </Button>
-              </div>
-            )}
+              )}
+              <Button size="sm" variant="outline" onClick={() => clearClaude.mutate()}>
+                Use automatic
+              </Button>
+            </div>
             {s.claude_code.consent ? (
               <div className="grid gap-2 text-sm">
                 <p>

@@ -379,6 +379,8 @@ function KeyBanners() {
   const client = useQueryClient();
   const status = useStatus();
   const s = status.data;
+  // `recovery_key_exported` is false with no key too, and then there is nothing to export.
+  const key = useQuery({ queryKey: ["keystate"], queryFn: ipc.keyState });
   const exportKey = useMutation({
     mutationFn: ipc.recoveryKeyExport,
     onSuccess: () => client.invalidateQueries({ queryKey: ["status"] }),
@@ -414,7 +416,7 @@ function KeyBanners() {
           </AlertDescription>
         </Alert>
       )}
-      {s.recovery_key_exported === false && (
+      {s.recovery_key_exported === false && key.data?.state === "unlocked" && (
         <Alert>
           <AlertTitle>No recovery key exported</AlertTitle>
           <AlertDescription className="grid gap-2">

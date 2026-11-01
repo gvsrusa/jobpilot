@@ -217,8 +217,13 @@ export function ResumesView() {
   });
   const importResume = useMutation({
     mutationFn: ipc.resumeImport,
-    onSuccess: () => {
-      setLineageChoice(null);
+    // A resume imported with no job is still shown: its lineage is chosen by name.
+    onSuccess: (imported) => {
+      setKind("resume");
+      setLineageChoice(imported.lineage_id);
+      setDraftChoice(imported.draft_id);
+      setOriginalId(null);
+      setSelected(0);
       void refresh();
     },
   });
@@ -354,7 +359,7 @@ export function ResumesView() {
                   {groups.map((g) => (
                     <option key={g[0].lineage_id} value={g[0].lineage_id}>
                       {latest(g).title}
-                      {tied(g, job?.id ?? null) ? "" : " (other job)"}
+                      {tied(g, job?.id ?? null) ? "" : g[0].job_text_id ? " (other job)" : " (no job)"}
                     </option>
                   ))}
                 </select>
