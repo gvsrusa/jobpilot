@@ -3,6 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool};
 
@@ -127,7 +128,7 @@ fn lock_result(result: std::result::Result<(), TryLockError>) -> Result<()> {
 
 /// Unlocks before closing: Windows only promises that closing a locked handle
 /// frees the lock eventually. A failed unlock still gets the OS release on drop.
-fn release(lock: File) {
+pub(crate) fn release(lock: File) {
     let _ = lock.unlock();
 }
 
@@ -161,7 +162,7 @@ async fn applied_versions(pool: &SqlitePool) -> Result<Vec<i64>> {
         .await?)
 }
 
-async fn current_version(pool: &SqlitePool) -> Result<i64> {
+pub(crate) async fn current_version(pool: &SqlitePool) -> Result<i64> {
     let applied = applied_versions(pool).await?;
     Ok(applied.into_iter().max().unwrap_or(0))
 }
@@ -198,18 +199,52 @@ async fn migrate(paths: &AppPaths, pool: &SqlitePool, migrator: &Migrator) -> Re
         .map_err(|error| Error::MigrationFailed(error.to_string()))
 }
 
+/// `manifest.json`, the one file that makes a folder under `backups/` a snapshot.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct Manifest {
+    pub format: i64,
+    /// `None` only when the database of an offline snapshot could not be read.
+    pub schema_version: Option<i64>,
+    pub created_at: String,
+    /// True when a `-wal` beside the database is part of the snapshot. A WAL is not
+    /// bound to its database, so any other `-wal` there is a stranger and is ignored.
+    #[serde(default)]
+    pub wal: bool,
+}
+
+impl Manifest {
+    pub fn new(schema_version: Option<i64>, created_at: String, wal: bool) -> Self {
+        Self {
+            format: 1,
+            schema_version,
+            created_at,
+            wal,
+        }
+    }
+
+    pub fn write(&self, dir: &Path) -> Result<()> {
+        let text = serde_json::to_string(self).map_err(io::Error::other)?;
+        Ok(fs::write(dir.join("manifest.json"), text)?)
+    }
+}
+
+/// The folder-name stamp and the `created_at` value. `now` is fixed for one
+/// statement, so both name the same instant.
+pub(crate) async fn utc_stamps(pool: &SqlitePool) -> Result<(String, String)> {
+    Ok(sqlx::query_as(
+        "SELECT strftime('%Y%m%dT%H%M%SZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+    )
+    .fetch_one(pool)
+    .await?)
+}
+
 /// Writes `backups/<label>-<UTC stamp>/` holding the database, `documents/`, and
 /// `manifest.json`. The manifest goes last, so a folder left by a crash or a full
 /// disk has none and `backup::list` skips it.
 // ponytail: no retention. Snapshots stay until the user removes them or delete-all
 // runs with include_backups, so disk use grows with every migration and restore.
 pub(crate) async fn snapshot(paths: &AppPaths, pool: &SqlitePool, label: &str) -> Result<PathBuf> {
-    // `now` is fixed for one statement, so both values name the same instant.
-    let (stamp, created_at): (String, String) = sqlx::query_as(
-        "SELECT strftime('%Y%m%dT%H%M%SZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-    )
-    .fetch_one(pool)
-    .await?;
+    let (stamp, created_at) = utc_stamps(pool).await?;
     let schema_version = current_version(pool).await?;
 
     let dir = new_snapshot_dir(&paths.backups(), &format!("{label}-{stamp}"))?;
@@ -228,17 +263,12 @@ pub(crate) async fn snapshot(paths: &AppPaths, pool: &SqlitePool, label: &str) -
         .await
         .map_err(io::Error::other)??;
 
-    let manifest = serde_json::json!({
-        "format": 1,
-        "schema_version": schema_version,
-        "created_at": created_at,
-    });
-    fs::write(dir.join("manifest.json"), manifest.to_string())?;
+    Manifest::new(Some(schema_version), created_at, false).write(&dir)?;
     Ok(dir)
 }
 
 /// `create_dir` fails on an existing folder, so a snapshot never lands in another.
-fn new_snapshot_dir(backups: &Path, name: &str) -> Result<PathBuf> {
+pub(crate) fn new_snapshot_dir(backups: &Path, name: &str) -> Result<PathBuf> {
     fs::create_dir_all(backups)?;
     let mut dir = backups.join(name);
     let mut attempt = 0;
@@ -254,7 +284,7 @@ fn new_snapshot_dir(backups: &Path, name: &str) -> Result<PathBuf> {
     }
 }
 
-fn copy_dir(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn copy_dir(from: &Path, to: &Path) -> io::Result<()> {
     fs::create_dir_all(to)?;
     let entries = match fs::read_dir(from) {
         Ok(entries) => entries,
