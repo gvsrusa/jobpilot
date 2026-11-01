@@ -10,7 +10,7 @@ FR-3.1 requires four backends. Users pick which are enabled. None is mandatory, 
 
 | Backend | Requirements | Release | What ships |
 |---|---|---|---|
-| Local AI | FR-3.2 to FR-3.8 | 0.2 | Ollama on the user's machine: model discovery, user-started downloads, hardware detection, structured outputs, embeddings. No data leaves the machine, so no consent record is needed for a loopback Ollama. |
+| Local AI | FR-3.2 to FR-3.8 | 0.2 | Ollama on the user's machine: model discovery, user-started downloads, hardware detection, structured outputs, embeddings. No data leaves the machine, so no consent record is needed for a model that runs locally under loopback Ollama. Ollama cloud models do not qualify, see routing check 2. |
 | Subscription AI | FR-3.9 to FR-3.14 | 0.4, conditional on D1 | Depends on Decision D1. See the status table below. |
 | API providers | FR-3.15 to FR-3.19 | 0.4, hosted rows conditional on D4 | Built for OpenAI, Anthropic, Google, OpenRouter, and user-named endpoints, but each runs only where its register verdict allows. Today OpenAI, Anthropic, and Google are `unknown`, OpenRouter has no eligible model, and only loopback endpoints can run. Keys stay in the OS credential store (FR-2.9) and never cross IPC. |
 | No-AI fallback | FR-3.20 to FR-3.23 | 0.1, 0.5, 0.6 | Deterministic matching, FTS5 search, rule-based form mapping, manual editing. Always available and always last. |
@@ -84,10 +84,10 @@ Examples of No-AI behaviour: `semantic_match` falls back to deterministic scorin
 
 For each backend in fallback order, a provider is eligible only if all of these hold, checked in this order:
 
-1. Policy status for this provider and sign-in method is `allowed`, or `user-assisted` for a loopback endpoint the user named. Ollama on loopback has no third party and needs no register row. User-driven CLI sessions are never eligible.
-2. Model check. Providers declaring `local_execution` skip this check: a model running on this machine has no vendor row, and its licence is the user's concern. For every other provider, the chosen model's origin is known, and that vendor's register rows permit it. An aggregator cannot widen a vendor's verdict: on OpenRouter, an OpenAI, Anthropic, or Google model takes that vendor's direct-API row, including `blocked` free-tier rows for personal data, and any other model is `unknown` until its terms are reviewed. Unknown origin is ineligible.
+1. Policy status for this provider and sign-in method is `allowed`, or `user-assisted` for a loopback endpoint the user named. Ollama running a local model on loopback has no third party and needs no register row. User-driven CLI sessions are never eligible.
+2. Model check. `local_execution` is decided per model, not per provider. Ollama can serve cloud models through the same loopback address after sign-in, so a loopback address does not prove local execution. A model counts as local only when the 0.2 plan's detection confirms it; otherwise it is ineligible, and it skips no check. A confirmed local model skips this check: it has no vendor row, and its licence is the user's concern. For every other provider, the chosen model's origin is known, and that vendor's register rows permit it. An aggregator cannot widen a vendor's verdict: on OpenRouter, an OpenAI, Anthropic, or Google model takes that vendor's direct-API row, including `blocked` free-tier rows for personal data, and any other model is `unknown` until its terms are reviewed. Unknown origin is ineligible.
 3. Mode check. The register's cross-provider rows are applied against the automation mode and the model origin, not just the provider. An `unreviewed` task refuses every OpenAI-origin model. An `unreviewed` task also refuses any provider that cannot leave human confirmation in place. A task acting on a site needs that site's own row, whichever model runs it.
-4. An active consent record covers this provider and every data category in the task, unless the provider is `local_execution`.
+4. An active consent record covers this provider and every data category in the task, unless the chosen model is confirmed local.
 5. It declares every required capability.
 6. It is available: installed, signed in, and within known usage limits.
 

@@ -532,6 +532,12 @@ pub async fn backup::restore_offline(paths: &AppPaths, source: &Path, actor: &st
     // plant _sqlx_migrations version 9999 so Db::open fails; restore_offline succeeds;
     // the unopenable files are kept in a backups/pre-restore-* folder, and list returns it
 }
+#[tokio::test] async fn restore_of_offline_snapshot_keeps_wal_writes() {
+    // snapshot with wal:true and rows only in its WAL: restoring it keeps those rows
+}
+#[tokio::test] async fn restore_ignores_stray_wal_beside_backup() {
+    // a foreign -wal beside a normal backup does not change the restored rows
+}
 #[tokio::test] async fn restore_keeps_secret_index_of_live_secrets() {
     // raw secret_index row A; backup; raw row B; restore; SELECT from secret_index has A and B
 }
@@ -549,17 +555,17 @@ Expected: compile errors for missing `backup` module.
 1. Validate before touching live data: read the manifest, compare `schema_version`, open the source read-only, and run `PRAGMA integrity_check`.
 2. Write `snapshot(.., "pre-restore")` while the pool is still open, and read the live `secret_index` rows into memory.
 3. `db.close()`, then `lock_exclusive`. `InUse` here means another process is attached.
-4. Copy the source database, any `-wal` and `-shm` beside it, and documents to temp names inside `root`.
-5. Delete `jobpilot.db-wal` and `jobpilot.db-shm`, then rename temp files over the live paths.
+4. Copy the source database and documents to temp names inside `root`. Ignore any `-wal` or `-shm` beside the source, unless its manifest says `wal: true`. In that case copy the WAL beside the temp database, open the temp database, run `PRAGMA wal_checkpoint(TRUNCATE)`, and close it. SQLite does not bind a WAL to its database, so a WAL must never move into the live root.
+5. Delete `jobpilot.db-wal` and `jobpilot.db-shm`, then rename the single temp database, and the temp documents, over the live paths.
 6. Release the lock and `Db::open`, which migrates older backups forward.
 7. Insert the saved `secret_index` rows with `INSERT OR IGNORE`, because secret values are never in a backup and their keychain entries are untouched, so `delete_all` must still find them. Then write the audit row in the newly opened database.
 
-`restore_offline` follows the same order with no pool, because the database cannot open. Step 2 copies `jobpilot.db`, `jobpilot.db-wal`, and `jobpilot.db-shm` when present, plus `documents/`, into `pre-restore`, and writes `manifest.json` whose `schema_version` is read through a raw read-only connection, falling back to `null` if unreadable. The same connection reads the live `secret_index` rows for step 7; if they cannot be read, restore continues without them, and those keychain entries are no longer indexed. A snapshot with `schema_version: null` is listed, but restoring it is refused with `InvalidBackup` unless it opens: step 1 then reads the version from the opened source. A failure in steps 1 to 3 leaves live data unchanged. Take the temp copy before any rename so disk-full fails safely.
+`restore_offline` follows the same order with no pool, because the database cannot open, and takes `lock_exclusive` before step 2 so no writer can tear the database and WAL apart. Step 2 copies `jobpilot.db`, `jobpilot.db-wal`, and `jobpilot.db-shm` when present, plus `documents/`, into `pre-restore`, and writes `manifest.json` with `wal: true` when a WAL was copied and a `schema_version` read through a raw read-only connection, falling back to `null` if unreadable. The same connection reads the live `secret_index` rows for step 7; if they cannot be read, restore continues without them, and those keychain entries are no longer indexed. A snapshot with `schema_version: null` is listed, but restoring it is refused with `InvalidBackup` unless it opens: step 1 then reads the version from the opened source. A failure in steps 1 to 3 leaves live data unchanged. Take the temp copy before any rename so disk-full fails safely.
 
 - [ ] **Step 4: Run tests and confirm they pass**
 
 Run: `cargo test -p jobpilot-core --test backup`
-Expected: 10 passed.
+Expected: 12 passed.
 
 - [ ] **Step 5: Commit**
 

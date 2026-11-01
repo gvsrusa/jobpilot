@@ -630,14 +630,14 @@ Consent dialog (opened by Review on an eligible, non-local provider). Nothing is
 
 ## 14. AI: Ollama and models (release 0.2)
 
-This is the first AI screen. It sets up Ollama on this computer (FR-3.2 to FR-3.8). Provider consent stays in 0.4 (screen 13), and that list then joins this view. A loopback Ollama needs no consent, because data stays on the machine.
+This is the first AI screen. It sets up Ollama on this computer (FR-3.2 to FR-3.8). Provider consent stays in 0.4 (screen 13), and that list then joins this view. A local model under loopback Ollama needs no consent, because data stays on the machine. Ollama cloud models are not offered: they are hidden, and refused by routing check 2 in docs/ai-providers.md.
 
 ```text
 +-------------+----------------------------------------------------------------+
 | ...         | AI: Ollama and models                                          |
 | AI          +----------------------------------------------------------------+
-|             | No AI is needed. JobPilot works with none. Ollama runs on this |
-|             | computer, so your data stays here and no consent is needed.    |
+|             | No AI is needed. JobPilot works with none. Local models run on |
+|             | this computer, so your data stays here. Cloud models are off.  |
 |             +----------------------------------------------------------------+
 |             | Ollama         Running at {loopback address}     [Check again] |
 |             | This computer  {memory} memory, {GPU or "no GPU found"},       |
