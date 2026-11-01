@@ -1,0 +1,230 @@
+//! The `#[ignore]`d tests use the real OS keychain, under the service from
+//! `.cargo/config.toml`. The rest never reach it.
+
+use jobpilot_core::crypto::{self, KEY_ACCOUNT_PREFIX, KeyState};
+use jobpilot_core::profile::{
+    self, EmploymentType, ProfileBasic, Stated, WorkAuthorization, WorkMode,
+};
+use jobpilot_core::{AppPaths, Db, Error, audit, transfer};
+use tempfile::TempDir;
+
+const NOTE: &str = "ZXQ-AUTH-NOTE";
+
+fn temp_root() -> (TempDir, AppPaths) {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = AppPaths::new(tmp.path().join("data"));
+    (tmp, paths)
+}
+
+fn entry(key_id: &str) -> keyring::Entry {
+    let service = std::env::var("JOBPILOT_SECRET_SERVICE")
+        .expect("set JOBPILOT_SECRET_SERVICE=jobpilot-test");
+    assert_ne!(service, "io.github.gvsrusa.jobpilot");
+    keyring::Entry::new(&service, &format!("{KEY_ACCOUNT_PREFIX}{key_id}")).unwrap()
+}
+
+/// Removes a key's keychain entry even when an assertion fails first.
+struct EntryGuard(String);
+
+impl Drop for EntryGuard {
+    fn drop(&mut self) {
+        let _ = entry(&self.0).delete_credential();
+    }
+}
+
+async fn unlock(db: &Db) -> EntryGuard {
+    let KeyState::Unlocked { key_id } = crypto::state(db).await.unwrap() else {
+        panic!("keychain did not unlock");
+    };
+    EntryGuard(key_id)
+}
+
+fn sample() -> ProfileBasic {
+    let list = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    ProfileBasic {
+        name: "Ana".into(),
+        email: "ana@example.com".into(),
+        countries: list(&["PT", "CA"]),
+        regions: list(&["Lisboa", "Ontario"]),
+        cities: list(&["Lisbon", "Toronto"]),
+        currencies: list(&["EUR", "CAD"]),
+        time_zones: list(&["Europe/Lisbon"]),
+        languages: list(&["en", "pt"]),
+        work_modes: vec![WorkMode::Remote, WorkMode::Hybrid],
+        employment_types: vec![EmploymentType {
+            country: "PT".into(),
+            kind: "Contract".into(),
+        }],
+    }
+}
+
+fn auth(country: &str) -> WorkAuthorization {
+    WorkAuthorization {
+        country: country.into(),
+        authorized: Stated::Yes,
+        needs_sponsorship: Stated::No,
+        note: NOTE.into(),
+    }
+}
+
+async fn raw_row(db: &Db, country: &str) -> (Vec<u8>, String) {
+    sqlx::query_as("SELECT ciphertext, key_id FROM work_authorization WHERE country = ?")
+        .bind(country)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+}
+
+type Change = dyn Fn(&mut ProfileBasic);
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+#[tokio::test]
+async fn basic_round_trips_every_multi_valued_field() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let saved = profile::set_basic(&db, sample()).await.unwrap();
+    assert_eq!(saved, sample());
+    assert_eq!(profile::basic(&db).await.unwrap(), sample());
+    // Plain work never touched the keychain.
+    assert_eq!(db.key_state(), KeyState::NotLoaded);
+    db.close().await;
+}
+
+#[tokio::test]
+async fn validation_rejects_bad_codes_and_empty_chips() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let cases: Vec<Box<Change>> = vec![
+        Box::new(|b| b.countries = vec!["Portugal".into()]),
+        Box::new(|b| b.currencies = vec!["EU".into()]),
+        Box::new(|b| b.cities = vec!["".into()]),
+        Box::new(|b| b.languages = vec!["  ".into()]),
+        Box::new(|b| b.cities = vec!["x".into(); 51]),
+        Box::new(|b| b.email = "nope".into()),
+        Box::new(|b| b.name = "n".repeat(201)),
+    ];
+    for change in cases {
+        let mut basic = ProfileBasic::default();
+        change(&mut basic);
+        let result = profile::set_basic(&db, basic).await;
+        assert!(matches!(result, Err(Error::Validation(_))), "{result:?}");
+    }
+    assert_eq!(profile::basic(&db).await.unwrap(), ProfileBasic::default());
+    db.close().await;
+}
+
+#[tokio::test]
+async fn lower_case_codes_are_stored_upper_case() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let basic = ProfileBasic {
+        countries: vec![" pt ".into()],
+        currencies: vec!["eur".into()],
+        ..ProfileBasic::default()
+    };
+    let saved = profile::set_basic(&db, basic).await.unwrap();
+    assert_eq!(saved.countries, ["PT"]);
+    assert_eq!(saved.currencies, ["EUR"]);
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn authorization_is_ciphertext_at_rest() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let _guard = unlock(&db).await;
+    profile::set_authorization(&db, auth("PT")).await.unwrap();
+
+    let (blob, _) = raw_row(&db, "PT").await;
+    assert!(blob.starts_with(b"JPK1"));
+    assert!(!contains(&blob, NOTE.as_bytes()));
+    let got = profile::get(&db).await.unwrap();
+    assert_eq!(got.authorization, vec![auth("PT")]);
+    assert!(!got.locked);
+    db.close().await;
+
+    for name in ["jobpilot.db", "jobpilot.db-wal"] {
+        let path = paths.root().join(name);
+        if let Ok(bytes) = std::fs::read(&path) {
+            assert!(!contains(&bytes, NOTE.as_bytes()), "{name}");
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn save_basic_while_locked_keeps_ciphertext() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let guard = unlock(&db).await;
+    profile::set_authorization(&db, auth("PT")).await.unwrap();
+    let before = raw_row(&db, "PT").await;
+    db.close().await;
+
+    entry(&guard.0).delete_credential().unwrap();
+    let db = Db::open(&paths).await.unwrap();
+    profile::set_basic(&db, sample()).await.unwrap();
+    let got = profile::get(&db).await.unwrap();
+    assert!(got.locked);
+    assert!(got.authorization.is_empty());
+    assert_eq!(got.basic, sample());
+    assert_eq!(raw_row(&db, "PT").await, before);
+    let result = profile::set_authorization(&db, auth("CA")).await;
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(raw_row(&db, "PT").await, before);
+    db.close().await;
+}
+
+#[tokio::test]
+async fn adding_a_country_never_adds_a_stated_value() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let basic = ProfileBasic {
+        countries: vec!["DE".into()],
+        ..ProfileBasic::default()
+    };
+    profile::set_basic(&db, basic).await.unwrap();
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM work_authorization")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+    db.close().await;
+}
+
+#[test]
+fn stated_defaults_to_not_stated() {
+    assert_eq!(Stated::default(), Stated::NotStated);
+}
+
+#[tokio::test]
+#[ignore]
+async fn export_writes_authorization_plain_and_audits_the_warning() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let _guard = unlock(&db).await;
+    profile::set_authorization(&db, auth("PT")).await.unwrap();
+
+    let dir = transfer::export_all(&db, "cli").await.unwrap();
+    let text = std::fs::read_to_string(dir.join("work_authorization.json")).unwrap();
+    assert!(text.contains("\"authorized\":\"yes\""), "{text}");
+    let entries = audit::recent(&db, 10).await.unwrap();
+    let export = entries.iter().find(|e| e.action == "export").unwrap();
+    assert_eq!(export.detail["sensitive_plain"], true);
+    db.close().await;
+}
+
+#[tokio::test]
+async fn export_with_no_authorization_asks_nothing_of_the_keychain() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let dir = transfer::export_all(&db, "cli").await.unwrap();
+    let text = std::fs::read_to_string(dir.join("work_authorization.json")).unwrap();
+    assert_eq!(text, "[]");
+    assert_eq!(db.key_state(), KeyState::NotLoaded);
+    db.close().await;
+}

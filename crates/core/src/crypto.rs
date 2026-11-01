@@ -241,12 +241,29 @@ pub async fn state(db: &Db) -> Result<KeyState> {
 pub async fn unlocked(db: &Db) -> Result<DataKey> {
     let found = resolve(db).await?;
     publish(db, &found);
-    found.map_err(|state| match state {
+    found.map_err(state_error)
+}
+
+fn state_error(state: KeyState) -> Error {
+    match state {
         KeyState::KeyUnavailable { reason, .. } => Error::KeyUnavailable(reason),
         KeyState::KeyMissing { key_id } => Error::KeyMissing { key_id },
         KeyState::KeyMismatch { key_id } => Error::KeyMismatch { key_id },
         KeyState::Unlocked { .. } | KeyState::NotLoaded => Error::Locked,
-    })
+    }
+}
+
+/// The key a ciphertext header names, for one open. Two proven ids can exist, and
+/// [`unlocked`] returns only one of them.
+pub(crate) async fn key_by_id(db: &Db, key_id: &str) -> Result<DataKey> {
+    let Some(proof) = proof_of(db, key_id).await? else {
+        return Err(Error::KeyMissing {
+            key_id: key_id.to_owned(),
+        });
+    };
+    let lookup = key_id.to_owned();
+    let found = secrets::keychain(move || Ok(read_key(&lookup, &proof))).await?;
+    found.map_err(state_error)
 }
 
 /// The state a key would have on this machine, with no `Db`. Blocks on the keychain,

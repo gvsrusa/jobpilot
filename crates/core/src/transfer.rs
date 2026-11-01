@@ -17,9 +17,11 @@ use crate::db::{
 };
 use crate::error::{Error, Result};
 use crate::paths::AppPaths;
+use crate::profile;
 use crate::secrets;
 
-/// Writes `exports/jobpilot-export-<stamp>/`, holding `data.json` and a copy of
+/// Writes `exports/jobpilot-export-<stamp>/`, holding `data.json`, `work_authorization.json`
+/// (plain when the key is unlocked, else a locked marker; callers warn first) and a copy of
 /// `documents/`. A folder under that name is always complete: it is built under a
 /// temporary name and renamed last.
 pub async fn export_all(db: &Db, actor: &str) -> Result<PathBuf> {
@@ -31,15 +33,18 @@ pub async fn export_all(db: &Db, actor: &str) -> Result<PathBuf> {
         "tables": read_tables(&db.pool).await?,
     });
     let text = serde_json::to_string_pretty(&data).map_err(io::Error::other)?;
+    let (authorization, sensitive_plain) = profile::export_authorization(db).await?;
 
     let (exports, documents) = (db.paths().exports(), db.paths().documents());
-    let dir =
-        tokio::task::spawn_blocking(move || write_export(&exports, &documents, &stamp, &text))
-            .await
-            .map_err(io::Error::other)??;
+    let dir = tokio::task::spawn_blocking(move || {
+        write_export(&exports, &documents, &stamp, &text, &authorization)
+    })
+    .await
+    .map_err(io::Error::other)??;
 
     let target = dir.to_string_lossy();
-    audit::record(db, actor, "export", Some(&target), json!({})).await?;
+    let detail = json!({ "sensitive_plain": sensitive_plain });
+    audit::record(db, actor, "export", Some(&target), detail).await?;
     Ok(dir)
 }
 
@@ -103,10 +108,16 @@ fn rows_sql(table: &str, columns: &[String]) -> String {
     )
 }
 
-fn write_export(exports: &Path, documents: &Path, stamp: &str, text: &str) -> Result<PathBuf> {
+fn write_export(
+    exports: &Path,
+    documents: &Path,
+    stamp: &str,
+    text: &str,
+    authorization: &str,
+) -> Result<PathBuf> {
     let name = format!("jobpilot-export-{stamp}");
     let temp = new_snapshot_dir(exports, &format!("tmp-{name}"))?;
-    let finished = fill_and_publish(&temp, exports, documents, &name, text);
+    let finished = fill_and_publish(&temp, exports, documents, &name, text, authorization);
     if finished.is_err() {
         let _ = fs::remove_dir_all(&temp);
     }
@@ -119,8 +130,10 @@ fn fill_and_publish(
     documents: &Path,
     name: &str,
     text: &str,
+    authorization: &str,
 ) -> io::Result<PathBuf> {
     fs::write(temp.join("data.json"), text)?;
+    fs::write(temp.join("work_authorization.json"), authorization)?;
     copy_dir(documents, &temp.join("documents"))?;
 
     let mut dir = exports.join(name);
