@@ -24,6 +24,6 @@ fi
 if [ -n "$MOCK_CLAUDE_REPLY" ]; then
     cat "$MOCK_CLAUDE_REPLY"
 else
-    printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"","structured_output":{"ok":true}}'
+    printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"","structured_output":{"ok":true},"permission_denials":[]}'
 fi
 exit "${MOCK_CLAUDE_EXIT:-0}"

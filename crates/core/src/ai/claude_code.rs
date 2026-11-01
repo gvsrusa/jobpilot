@@ -78,6 +78,9 @@ impl ClaudeCode {
     /// The exact argument list. The job text is never in it: that goes to stdin (M-15).
     /// `--tools ""` removes the built-in tools, `--strict-mcp-config` and an empty
     /// `--setting-sources` keep out MCP servers, hooks, and plugins.
+    /// `--json-schema` works through a `StructuredOutput` tool the CLI adds, which only hands
+    /// the reply back. It alone is allowed; denying it (`--disallowedTools "*"`) turns the
+    /// reply into free text with a `permission_denials` entry (real 2.1.316 run).
     pub fn argv(&self, schema: &str, system: &str) -> Vec<OsString> {
         // Line breaks are the only change: Windows refuses them in a batch-file argument.
         let schema = serde_json::from_str::<Value>(schema)
@@ -95,8 +98,8 @@ impl ClaudeCode {
             &schema,
             "--tools",
             "",
-            "--disallowedTools",
-            "*",
+            "--allowedTools",
+            "StructuredOutput",
             "--strict-mcp-config",
             "--setting-sources",
             "",
@@ -234,6 +237,16 @@ impl Provider for ClaudeCode {
     }
 }
 
+/// `--output-format json` gives one result object, or with verbose on an array of events
+/// ending in the result. Which one arrives can depend on the user's own CLI config.
+fn result_event(stdout: &[u8]) -> Option<Value> {
+    match serde_json::from_slice::<Value>(stdout).ok()? {
+        Value::Array(events) => events.into_iter().rfind(|event| event["type"] == "result"),
+        reply @ Value::Object(_) => Some(reply),
+        _ => None,
+    }
+}
+
 /// A login failure can be a result with `subtype: success`, so that is checked first. Only
 /// a failed reply is searched: a good reply may quote the words from a posting.
 fn read_reply(stdout: &[u8], status: ExitStatus) -> Result<String> {
@@ -246,10 +259,7 @@ fn read_reply(stdout: &[u8], status: ExitStatus) -> Result<String> {
         None => "killed".to_string(),
     };
 
-    let reply = serde_json::from_slice::<Value>(stdout)
-        .ok()
-        .filter(Value::is_object);
-    let Some(reply) = reply else {
+    let Some(reply) = result_event(stdout) else {
         return Err(match (logged_out, status.success()) {
             (true, _) => refused_login(),
             (false, true) => Error::Failed("bad_reply".into()),
@@ -264,6 +274,15 @@ fn read_reply(stdout: &[u8], status: ExitStatus) -> Result<String> {
         } else {
             Error::Refused(subtype.to_string())
         });
+    }
+    // A tool was reached for and denied, so this is not the reply the task asked for.
+    let denied = match &reply["permission_denials"] {
+        Value::Null => false,
+        Value::Array(denials) => !denials.is_empty(),
+        _ => true,
+    };
+    if denied {
+        return Err(Error::Refused("permission_denied".into()));
     }
     if !status.success() {
         return Err(Error::Failed(exit()));

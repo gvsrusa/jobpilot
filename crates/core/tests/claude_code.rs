@@ -210,7 +210,7 @@ async fn argv_disables_every_tool_and_setting_source() {
             lines[at + 1]
         };
         assert_eq!(after("--tools"), "");
-        assert_eq!(after("--disallowedTools"), "*");
+        assert_eq!(after("--allowedTools"), "StructuredOutput");
         assert_eq!(after("--setting-sources"), "");
         assert_eq!(after("--output-format"), "json");
         assert_eq!(after("--permission-mode"), "dontAsk");
@@ -222,12 +222,17 @@ async fn argv_disables_every_tool_and_setting_source() {
     #[cfg(windows)]
     for part in [
         "--tools \"\"",
+        "--allowedTools StructuredOutput",
         "--setting-sources \"\"",
         "--strict-mcp-config",
     ] {
         assert!(args.contains(part), "{part} missing from {args}");
     }
 
+    assert!(
+        !args.contains("--disallowedTools"),
+        "this denies StructuredOutput"
+    );
     assert!(!args.contains("--bare"));
     assert!(!args.contains("--dangerously-skip-permissions"));
     assert!(!args.contains("--allow-dangerously-skip-permissions"));
@@ -247,8 +252,8 @@ fn argv_is_exactly_the_verified_list() {
             SCHEMA,
             "--tools",
             "",
-            "--disallowedTools",
-            "*",
+            "--allowedTools",
+            "StructuredOutput",
             "--strict-mcp-config",
             "--setting-sources",
             "",
@@ -363,6 +368,57 @@ async fn error_result_is_refused_not_ok() {
             "{error}"
         );
     }
+}
+
+/// The real failure under `--disallowedTools "*"`: `success`, no error, and free text.
+#[tokio::test]
+async fn a_permission_denial_is_refused_even_on_success() {
+    let denial = r#"{"type":"result","subtype":"success","is_error":false,"result":"{\"ok\":true}",
+        "permission_denials":[{"tool_name":"StructuredOutput"}]}"#;
+    let cli = MockCli::with_reply(denial, &[]);
+    let error = complete(&cli.claude()).await.unwrap_err();
+    assert!(
+        matches!(&error, Error::Refused(why) if why == "permission_denied"),
+        "{error}"
+    );
+
+    // Fails closed on a shape it does not know.
+    let odd = r#"{"subtype":"success","is_error":false,"result":"x","permission_denials":"Bash"}"#;
+    let cli = MockCli::with_reply(odd, &[]);
+    let error = complete(&cli.claude()).await.unwrap_err();
+    assert!(matches!(error, Error::Refused(_)), "{error}");
+
+    let empty = r#"{"subtype":"success","is_error":false,"result":"x","permission_denials":[]}"#;
+    let cli = MockCli::with_reply(empty, &[]);
+    assert_eq!(complete(&cli.claude()).await.unwrap(), "x");
+}
+
+/// The recorded smoke run got an array through the adapter's own argv, with no `--verbose`.
+#[tokio::test]
+async fn an_event_array_is_read_from_its_last_result_event() {
+    let events = r#"[{"type":"system","subtype":"init","tools":["StructuredOutput"]},
+        {"type":"result","subtype":"success","structured_output":{"from":"earlier"}},
+        {"type":"result","subtype":"success","is_error":false,"structured_output":{"a":1},
+         "permission_denials":[]}]"#;
+    let cli = MockCli::with_reply(events, &[]);
+    assert_eq!(complete(&cli.claude()).await.unwrap(), r#"{"a":1}"#);
+
+    let failed = r#"[{"type":"system","subtype":"init"},
+        {"type":"result","subtype":"error_max_turns","is_error":true}]"#;
+    let cli = MockCli::with_reply(failed, &[]);
+    let error = complete(&cli.claude()).await.unwrap_err();
+    assert!(
+        matches!(&error, Error::Refused(why) if why == "error_max_turns"),
+        "{error}"
+    );
+
+    let no_result = r#"[{"type":"system","subtype":"init"}]"#;
+    let cli = MockCli::with_reply(no_result, &[]);
+    let error = complete(&cli.claude()).await.unwrap_err();
+    assert!(
+        matches!(&error, Error::Failed(why) if why == "bad_reply"),
+        "{error}"
+    );
 }
 
 /// The CLI's real wording, read from its 2.1.316 binary: `Not logged in · Please run /login`.
@@ -670,6 +726,8 @@ fn shape(value: &Value) -> Value {
                         "result",
                         "structured_output",
                         "permission_denials",
+                        "tools",
+                        "mcp_servers",
                         "terminal_reason",
                     ];
                     let value = if kept.contains(&key.as_str()) {
@@ -691,6 +749,16 @@ fn shape(value: &Value) -> Value {
 
 /// Spends the owner's subscription, once. CI's keychain step runs `--ignored` across the
 /// workspace, so `#[ignore]` alone is not enough: this needs the variable too.
+///
+/// Shape on 2.1.316. The wrapper below adds `--verbose`, so stdout is an array of events,
+/// which also reached the adapter without it in the first recorded run:
+/// - first `{type: "system", subtype: "init", tools: [..], mcp_servers: [], model, cwd,
+///   permissionMode, session_id, plugins, skills, agents, slash_commands, ..}`;
+/// - last `{type: "result", subtype: "success", is_error: false, result: "..",
+///   structured_output: {..}, permission_denials: []}`.
+///
+/// `init.tools` is the proof: exactly `["StructuredOutput"]`, as the controller saw with
+/// `--tools "" --allowedTools StructuredOutput`. The model's own list is only a second look.
 ///
 /// `JOBPILOT_REAL_CLAUDE_SMOKE=1 cargo test -p jobpilot-core --test claude_code -- --ignored`
 ///
@@ -716,7 +784,7 @@ async fn real_claude_has_no_tools_smoke() {
     let raw = tmp.path().join("raw.json");
     let wrapper = tmp.path().join("claude-tee");
     let script = format!(
-        "#!/bin/sh\n'{real}' \"$@\" > '{raw}'\ncode=$?\ncat '{raw}'\nexit $code\n",
+        "#!/bin/sh\n'{real}' \"$@\" --verbose > '{raw}'\ncode=$?\ncat '{raw}'\nexit $code\n",
         raw = raw.display()
     );
     fs::write(&wrapper, script).unwrap();
@@ -735,6 +803,10 @@ async fn real_claude_has_no_tools_smoke() {
 
     let text = fs::read_to_string(&raw).unwrap_or_default();
     let recorded = match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Array(events)) => {
+            let shapes: Vec<Value> = events.iter().map(shape).collect();
+            serde_json::to_string_pretty(&shapes).unwrap()
+        }
         Ok(value) => serde_json::to_string_pretty(&shape(&value)).unwrap(),
         Err(_) => format!("not JSON: {}", text.chars().take(400).collect::<String>()),
     };
@@ -752,8 +824,33 @@ async fn real_claude_has_no_tools_smoke() {
     )
     .unwrap();
 
+    let events: Value = serde_json::from_str(&text).expect("an array of events");
+    let events = events.as_array().expect("--verbose gives an array");
+    let init = events
+        .iter()
+        .find(|e| e["subtype"] == "init")
+        .expect("init");
+    assert_eq!(
+        init["tools"],
+        json!(["StructuredOutput"]),
+        "any other tool fails"
+    );
+    assert_eq!(init["mcp_servers"], json!([]));
+    let result = events
+        .iter()
+        .rfind(|e| e["type"] == "result")
+        .expect("result");
+    assert_eq!(result["permission_denials"], json!([]));
+    assert_eq!(result["is_error"], json!(false));
+    assert_eq!(result["subtype"], json!("success"));
+    assert!(result["structured_output"].is_object());
+
     let Outcome::Ok { output, .. } = outcome else {
         panic!("no reply: {outcome:?}");
     };
-    assert_eq!(output["tool_names"], json!([]));
+    let named = output["tool_names"].as_array().expect("tool_names");
+    assert!(
+        named.iter().all(|name| name == "StructuredOutput"),
+        "{named:?}"
+    );
 }

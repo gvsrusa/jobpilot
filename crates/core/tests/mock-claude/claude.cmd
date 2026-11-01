@@ -13,7 +13,7 @@ if defined MOCK_CLAUDE_STDIN findstr "^" >"%MOCK_CLAUDE_STDIN%"
 if defined MOCK_CLAUDE_ENV set >"%MOCK_CLAUDE_ENV%"
 if defined MOCK_CLAUDE_CWD cd >"%MOCK_CLAUDE_CWD%"
 if defined MOCK_CLAUDE_REPLY goto :reply
-echo {"type":"result","subtype":"success","is_error":false,"result":"","structured_output":{"ok":true}}
+echo {"type":"result","subtype":"success","is_error":false,"result":"","structured_output":{"ok":true},"permission_denials":[]}
 goto :done
 :reply
 type "%MOCK_CLAUDE_REPLY%"
