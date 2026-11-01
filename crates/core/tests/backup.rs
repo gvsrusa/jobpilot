@@ -239,7 +239,13 @@ async fn backup_and_restore_write_audit_rows() {
 #[tokio::test]
 async fn restore_works_under_unicode_path_with_spaces() {
     let tmp = tempfile::tempdir().unwrap();
-    let paths = AppPaths::new(tmp.path().join("José Ñ 日本語 #1?"));
+    // Windows forbids `?` in file names, so only Unix gets it.
+    let name = if cfg!(unix) {
+        "José Ñ 日本語 #1?"
+    } else {
+        "José Ñ 日本語 #1"
+    };
+    let paths = AppPaths::new(tmp.path().join(name));
     let db = Db::open(&paths).await.unwrap();
     add_doc(&db, "alpha").await;
     let info = backup::create(&db, "cli").await.unwrap();

@@ -43,7 +43,7 @@ jobs:
       - run: pnpm test
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo test --workspace --no-fail-fast
 
       - name: Keychain tests (macOS)
         if: runner.os == 'macOS'
