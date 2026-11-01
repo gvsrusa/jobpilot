@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -8,7 +8,7 @@ use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool};
 
 use crate::error::{Error, Result};
-use crate::paths::AppPaths;
+use crate::paths::{APP_ID, AppPaths};
 
 pub static MIGRATOR: Migrator = sqlx::migrate!();
 
@@ -40,6 +40,7 @@ impl Db {
     /// migration; `Db::open` is the only production caller.
     #[doc(hidden)]
     pub async fn open_with(paths: &AppPaths, migrator: &Migrator) -> Result<Db> {
+        claim_root(paths)?;
         for dir in [paths.documents(), paths.backups(), paths.exports()] {
             fs::create_dir_all(dir)?;
         }
@@ -93,6 +94,33 @@ impl Db {
 
     pub fn paths(&self) -> &AppPaths {
         &self.paths
+    }
+}
+
+/// Proves `root` is JobPilot's before anything is created in it. `JOBPILOT_HOME` can
+/// name any folder, and on a case-insensitive volume `<home>/documents` is the user's
+/// `~/Documents`, so an unproven root would have its folders exported and deleted.
+///
+/// A new or empty root gets the marker first, ahead of every other file. The emptiness
+/// check comes before the marker check, so a second process racing a first open sees
+/// the marker with any file it saw, and is never refused.
+pub(crate) fn claim_root(paths: &AppPaths) -> Result<()> {
+    fs::create_dir_all(paths.root())?;
+    let empty = fs::read_dir(paths.root())?.next().is_none();
+    if paths.marker().is_file() {
+        return Ok(());
+    }
+    if !empty {
+        return Err(Error::RootNotOwned(paths.root().to_path_buf()));
+    }
+    let created = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(paths.marker());
+    match created {
+        Ok(mut marker) => Ok(marker.write_all(APP_ID.as_bytes())?),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 

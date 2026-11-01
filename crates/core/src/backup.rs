@@ -28,7 +28,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePo
 
 use crate::audit;
 use crate::db::{
-    Db, MIGRATOR, Manifest, copy_dir, current_version, latest_version, lock_exclusive,
+    Db, MIGRATOR, Manifest, claim_root, copy_dir, current_version, latest_version, lock_exclusive,
     new_snapshot_dir, release, snapshot, utc_stamps,
 };
 use crate::error::{Error, Result};
@@ -153,7 +153,7 @@ async fn offline_with(
 ) -> Result<Db> {
     let manifest = validate(source, migrator).await?;
 
-    fs::create_dir_all(paths.root())?;
+    claim_root(paths)?;
     let lock = lock_exclusive(paths)?;
     let installed = match snapshot_offline(paths).await {
         Ok(secrets) => {

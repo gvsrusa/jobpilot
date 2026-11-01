@@ -4,6 +4,12 @@
 //! Entries are keyed by name alone, so two data roots using one name share an entry.
 // ponytail: 0.1 does not namespace entries per root. Namespace them if a user ever
 // runs two roots with different keys.
+// ponytail: writers to one name are not serialized, and two races can leave a stored
+// entry with no `secret_index` row, which `delete_all` then misses. `set`: when two
+// handles add one new name and the first keychain write fails, its rollback removes
+// the row the second relies on. `delete`: a `set` landing between the keychain removal
+// and the row removal stores a value whose row then goes. Both need simultaneous
+// writers from two processes; hold the row in a transaction if that ever happens.
 
 use serde_json::json;
 
@@ -18,6 +24,7 @@ const SERVICE: &str = "io.github.gvsrusa.jobpilot";
 /// The index row goes first: a crash between the two steps must leave a name that
 /// `delete_all` can find, never a keychain entry it cannot.
 pub async fn set(db: &Db, name: &str, value: &str, actor: &str) -> Result<()> {
+    check_name(name)?;
     let added = sqlx::query(
         "INSERT INTO secret_index (name, created_at) \
          VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
@@ -83,10 +90,11 @@ pub async fn names(db: &Db) -> Result<Vec<String>> {
 }
 
 /// Removes keychain entries. One already gone counts as removed, so a call that failed
-/// partway can run again.
+/// partway can run again. An empty name cannot have an entry, so a stray row is passed
+/// over: it must never block deletion for good.
 pub(crate) async fn remove_all(names: Vec<String>) -> Result<()> {
     keychain(move || {
-        for name in &names {
+        for name in names.iter().filter(|name| !name.is_empty()) {
             match entry(name)?.delete_credential() {
                 Ok(()) | Err(keyring::Error::NoEntry) => {}
                 Err(error) => return Err(secret_error(error)),
@@ -105,12 +113,17 @@ async fn remove_row(db: &Db, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Windows would accept an empty name and macOS refuses one, so it stops here on both.
 fn entry(name: &str) -> Result<keyring::Entry> {
+    check_name(name)?;
+    keyring::Entry::new(&service(), name).map_err(secret_error)
+}
+
+/// Windows would accept an empty name and macOS refuses one, so it stops here on both.
+fn check_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(Error::Secret("the secret name is empty".into()));
     }
-    keyring::Entry::new(&service(), name).map_err(secret_error)
+    Ok(())
 }
 
 /// `JOBPILOT_SECRET_SERVICE` lets the real keychain tests stay clear of the app's own

@@ -671,6 +671,23 @@ async fn list_of_a_root_with_no_backups_is_empty() {
 }
 
 #[tokio::test]
+async fn restore_offline_refuses_a_root_with_files_and_no_marker() {
+    let (_tmp, source_paths) = temp_root();
+    let source = Db::open(&source_paths).await.unwrap();
+    let info = backup::create(&source, "cli").await.unwrap();
+    source.close().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = AppPaths::new(tmp.path());
+    fs::write(paths.root().join("taxes.pdf"), "user data").unwrap();
+
+    let result = backup::restore_offline(&paths, &info.path, "gui").await;
+
+    assert!(matches!(result, Err(Error::RootNotOwned(_))), "{result:?}");
+    let found: Vec<_> = fs::read_dir(paths.root()).unwrap().collect();
+    assert_eq!(found.len(), 1, "a refused root gains nothing");
+}
+
+#[tokio::test]
 async fn restore_offline_recovers_when_db_cannot_open() {
     let (_tmp, paths) = temp_root();
     let source = backup_with_doc(&paths, "alpha").await;

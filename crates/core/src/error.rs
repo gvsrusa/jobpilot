@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::ser::{Serialize, SerializeStruct, Serializer};
 
 #[derive(Debug, thiserror::Error)]
@@ -17,6 +19,9 @@ pub enum Error {
     RestoredButNotOpened(String),
     #[error("data folder is in use by another JobPilot process")]
     InUse,
+    /// The folder holds files and no `.jobpilot-root`, so nothing proves it is ours.
+    #[error("{} is not a JobPilot data folder", .0.display())]
+    RootNotOwned(PathBuf),
     #[error("not available on this system")]
     Unavailable,
     #[error("secret store error: {0}")]
@@ -40,6 +45,7 @@ impl Error {
             Error::InvalidBackup(_) => "invalid_backup",
             Error::RestoredButNotOpened(_) => "restored_not_opened",
             Error::InUse => "in_use",
+            Error::RootNotOwned(_) => "root_not_owned",
             Error::Unavailable => "unavailable",
             Error::Secret(_) => "secret",
             Error::NotFound => "not_found",
@@ -74,6 +80,7 @@ mod tests {
                 "restored_not_opened",
             ),
             (Error::InUse, "in_use"),
+            (Error::RootNotOwned("x".into()), "root_not_owned"),
             (Error::Unavailable, "unavailable"),
             (Error::Secret("x".into()), "secret"),
             (Error::NotFound, "not_found"),

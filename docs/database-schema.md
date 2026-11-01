@@ -79,6 +79,7 @@ Known limit: `unicode61` does not segment Chinese, Japanese, or Korean text. Whe
 | Backups and snapshots | `<root>/backups/<label>-<UTC stamp>/` with `jobpilot.db`, `documents/`, and `manifest.json`. A `pre-restore` snapshot made with no open database may also hold `-wal` and `-shm`, and its manifest `schema_version` may be `null`. |
 | Exports | `<root>/exports/` |
 | Secret values | OS credential store, service `io.github.gvsrusa.jobpilot` |
+| Root ownership marker | `<root>/.jobpilot-root`, holding the app identifier. `Db::open` and offline restore refuse a non-empty root without it (`root_not_owned`), and delete-all keeps it. |
 
 Nothing deletes snapshots automatically. `pre-migrate`, `pre-restore`, and from 0.2 `pre-discard` folders stay until the user removes them or delete-all runs with backups included.
 

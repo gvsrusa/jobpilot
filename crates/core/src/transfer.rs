@@ -130,40 +130,56 @@ fn fill_and_publish(
     Ok(dir)
 }
 
-/// Removes everything JobPilot owns under the root and its keychain entries. This
-/// cannot be undone, and it writes no audit row because it removes the log.
+/// Removes JobPilot's data under the root and its keychain entries. This cannot be
+/// undone, and it writes no audit row because it removes the log.
 ///
 /// Consumes `db`. On any error the handle is closed, so callers run `Db::open` again.
-/// `confirm` must be exactly `"DELETE"`. An error before the files go leaves them
-/// whole, and a call that failed can run again from a fresh handle: keychain entries
-/// already gone count as removed. `exports/` always goes; `include_backups` decides
-/// `backups/`.
+/// `confirm` must be exactly `"DELETE"`, and the root must still hold its marker. An
+/// error before the files go leaves them whole, and a call that failed can run again
+/// from a fresh handle: keychain entries already gone count as removed. `exports/`
+/// always goes; `include_backups` decides `backups/`.
+///
+/// What stays: `.jobpilot-root`, so a retry or the next `Db::open` still finds an owned
+/// root instead of a non-empty one with no proof; `jobpilot.lock`, as it is held; and
+/// any file JobPilot did not name.
 // ponytail: names are read before the lock is won, because no pool is open after it.
 // A secret another process adds and closes inside that gap keeps its keychain entry.
 pub async fn delete_all(db: Db, confirm: &str, include_backups: bool) -> Result<()> {
-    let names = match confirm {
-        "DELETE" => secrets::names(&db).await,
-        _ => Err(Error::ConfirmationRequired),
-    };
+    let names = names_to_erase(&db, confirm).await;
     let paths = db.paths().clone();
     db.close().await;
     let names = names?;
 
     let lock = lock_exclusive(&paths)?;
-    let deleted = erase(&paths, names, include_backups).await;
+    let deleted = erase(&paths, secrets::remove_all(names), include_backups).await;
     release(lock);
     deleted
 }
 
+async fn names_to_erase(db: &Db, confirm: &str) -> Result<Vec<String>> {
+    if confirm != "DELETE" {
+        return Err(Error::ConfirmationRequired);
+    }
+    if !db.paths().marker().is_file() {
+        return Err(Error::RootNotOwned(db.paths().root().to_path_buf()));
+    }
+    secrets::names(db).await
+}
+
 /// The keychain goes first: a failure there must leave `secret_index` to retry from.
-async fn erase(paths: &AppPaths, names: Vec<String>, include_backups: bool) -> Result<()> {
-    secrets::remove_all(names).await?;
+/// Takes that step as a future because a real keychain cannot be made to fail on demand.
+async fn erase(
+    paths: &AppPaths,
+    clear_keychain: impl Future<Output = Result<()>>,
+    include_backups: bool,
+) -> Result<()> {
+    clear_keychain.await?;
     let paths = paths.clone();
     blocking(move || remove_files(&paths, include_backups)).await
 }
 
-/// Only JobPilot's own names go, never the whole root: `JOBPILOT_HOME` can point at a
-/// folder that holds other things. The lock file stays, as it is held.
+/// Only JobPilot's own names go, never the whole root. `remove_dir_all` removes a
+/// symlink at one of those names and leaves its target.
 ///
 /// The database goes last, so a failure partway still reads as "not deleted yet". Its
 /// WAL goes before it because SQLite does not bind a WAL to its database, so a stray
@@ -181,4 +197,29 @@ fn remove_files(paths: &AppPaths, include_backups: bool) -> io::Result<()> {
         remove_if_present(&sidecar(&db, suffix))?;
     }
     remove_if_present(&db)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn keychain_failure_leaves_files_for_a_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::new(tmp.path().join("data"));
+        let db = Db::open(&paths).await.unwrap();
+        fs::write(paths.documents().join("resume.pdf"), "pdf").unwrap();
+        db.close().await;
+
+        let failing = async { Err(Error::Secret("locked".into())) };
+        let result = erase(&paths, failing, true).await;
+
+        assert!(matches!(result, Err(Error::Secret(_))), "{result:?}");
+        assert!(paths.documents().join("resume.pdf").is_file());
+        assert!(paths.db().is_file());
+
+        let db = Db::open(&paths).await.unwrap();
+        delete_all(db, "DELETE", true).await.unwrap();
+        assert!(!paths.db().exists());
+    }
 }

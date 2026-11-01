@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
-const APP_ID: &str = "io.github.gvsrusa.jobpilot";
+pub(crate) const APP_ID: &str = "io.github.gvsrusa.jobpilot";
 
 /// Every file JobPilot owns lives under one root.
 #[derive(Debug, Clone)]
@@ -44,6 +44,11 @@ impl AppPaths {
     pub fn lock(&self) -> PathBuf {
         self.root.join("jobpilot.lock")
     }
+
+    /// Proves the root is JobPilot's, so a mistaken root is never written or deleted.
+    pub fn marker(&self) -> PathBuf {
+        self.root.join(".jobpilot-root")
+    }
 }
 
 fn root_from(home: Option<OsString>) -> Result<PathBuf> {
@@ -69,6 +74,7 @@ mod tests {
         assert_eq!(paths.backups(), root.join("backups"));
         assert_eq!(paths.exports(), root.join("exports"));
         assert_eq!(paths.lock(), root.join("jobpilot.lock"));
+        assert_eq!(paths.marker(), root.join(".jobpilot-root"));
     }
 
     #[test]

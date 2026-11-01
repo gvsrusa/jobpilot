@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use jobpilot_core::{AppPaths, Db, Error, audit, backup, documents, secrets, transfer};
 use serde_json::Value;
@@ -178,7 +178,9 @@ async fn delete_all_removes_data_and_can_keep_backups() {
 
     assert_eq!(
         entries(paths.root()),
-        ["backups", "jobpilot.lock"].map(String::from).into()
+        [".jobpilot-root", "backups", "jobpilot.lock"]
+            .map(String::from)
+            .into()
     );
     assert!(snapshot.path.join("jobpilot.db").is_file());
 
@@ -194,7 +196,8 @@ async fn delete_all_removes_data_and_can_keep_backups() {
 
     assert_eq!(
         entries(paths.root()),
-        ["jobpilot.lock"].map(String::from).into()
+        [".jobpilot-root", "jobpilot.lock"].map(String::from).into(),
+        "these two stay, so a retry can open the root"
     );
 }
 
@@ -210,14 +213,16 @@ async fn delete_all_removes_what_a_crashed_restore_left_and_nothing_foreign() {
         fs::create_dir(root.join(leftover)).unwrap();
         fs::write(root.join(leftover).join("resume.pdf"), "user data").unwrap();
     }
-    // `JOBPILOT_HOME` can point anywhere, so only JobPilot's own names may go.
+    // The marker proves the root, and still only JobPilot's own names may go.
     fs::write(root.join("not-ours.txt"), "keep").unwrap();
 
     transfer::delete_all(db, "DELETE", true).await.unwrap();
 
     assert_eq!(
         entries(root),
-        ["jobpilot.lock", "not-ours.txt"].map(String::from).into()
+        [".jobpilot-root", "jobpilot.lock", "not-ours.txt"]
+            .map(String::from)
+            .into()
     );
 }
 
@@ -237,33 +242,22 @@ async fn delete_refused_while_another_handle_open() {
     other.close().await;
 }
 
-// An empty name fails before any keychain call, so this needs no real keychain.
 #[tokio::test]
-async fn keychain_failure_leaves_files_for_a_retry() {
+async fn an_empty_name_row_cannot_block_deletion() {
     let (_tmp, paths) = temp_root();
     let db = Db::open(&paths).await.unwrap();
-    documents::create(&db, "keep", "body").await.unwrap();
-    fs::write(paths.documents().join("resume.pdf"), "pdf").unwrap();
     add_secret_row(&db, "").await;
+    secrets::delete(&db, "", "cli").await.unwrap();
+    assert!(secrets::names(&db).await.unwrap().is_empty());
 
-    let result = transfer::delete_all(db, "DELETE", true).await;
-
-    assert!(matches!(result, Err(Error::Secret(_))), "{result:?}");
-    assert!(paths.documents().join("resume.pdf").is_file());
-
-    let db = Db::open(&paths).await.unwrap();
-    assert_eq!(documents::list(&db).await.unwrap().len(), 1);
-    assert_eq!(secrets::names(&db).await.unwrap(), [""]);
-    sqlx::query("DELETE FROM secret_index")
-        .execute(&db.pool)
-        .await
-        .unwrap();
+    add_secret_row(&db, "").await;
     transfer::delete_all(db, "DELETE", true).await.unwrap();
+
     assert!(!paths.db().exists());
 }
 
 #[tokio::test]
-async fn failed_set_leaves_no_name_no_audit_row_and_no_value_in_the_error() {
+async fn empty_name_is_refused_before_any_write() {
     let (_tmp, paths) = temp_root();
     let db = Db::open(&paths).await.unwrap();
 
@@ -289,6 +283,128 @@ async fn delete_of_an_unlisted_name_is_not_found() {
     assert!(matches!(result, Err(Error::NotFound)), "{result:?}");
     assert!(audit::recent(&db, 10).await.unwrap().is_empty());
     db.close().await;
+}
+
+fn root_with_a_user_file() -> (TempDir, AppPaths, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = AppPaths::new(tmp.path().join("home"));
+    // On a case-insensitive volume `paths.documents()` is this folder. Refusing the
+    // whole root keeps the assertions true on a case-sensitive volume as well.
+    let file = paths.root().join("Documents").join("taxes.pdf");
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, "user data").unwrap();
+    (tmp, paths, file)
+}
+
+#[tokio::test]
+async fn open_refuses_a_root_with_files_and_no_marker() {
+    let (_tmp, paths, file) = root_with_a_user_file();
+
+    let result = Db::open(&paths).await;
+
+    let Err(error @ Error::RootNotOwned(_)) = result else {
+        panic!("{result:?}");
+    };
+    assert_eq!(error.code(), "root_not_owned");
+    assert!(error.to_string().contains(&*paths.root().to_string_lossy()));
+    assert_eq!(fs::read_to_string(&file).unwrap(), "user data");
+    assert_eq!(
+        entries(paths.root()),
+        ["Documents"].map(String::from).into(),
+        "a refused root gains nothing"
+    );
+}
+
+#[tokio::test]
+async fn open_accepts_a_root_with_the_marker() {
+    let (_tmp, paths, file) = root_with_a_user_file();
+    fs::write(paths.marker(), "io.github.gvsrusa.jobpilot").unwrap();
+
+    let db = Db::open(&paths).await.unwrap();
+
+    db.close().await;
+    assert_eq!(fs::read_to_string(&file).unwrap(), "user data");
+}
+
+#[tokio::test]
+async fn open_marks_a_new_or_empty_root() {
+    let (_tmp, paths) = temp_root();
+    Db::open(&paths).await.unwrap().close().await;
+    assert_eq!(
+        fs::read_to_string(paths.marker()).unwrap(),
+        "io.github.gvsrusa.jobpilot"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let empty = AppPaths::new(tmp.path());
+    Db::open(&empty).await.unwrap().close().await;
+    assert!(empty.marker().is_file());
+}
+
+#[tokio::test]
+async fn delete_all_refuses_a_root_that_lost_its_marker() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    add_secret_row(&db, "kept").await;
+    fs::write(paths.documents().join("resume.pdf"), "pdf").unwrap();
+    fs::remove_file(paths.marker()).unwrap();
+
+    let result = transfer::delete_all(db, "DELETE", true).await;
+
+    assert!(matches!(result, Err(Error::RootNotOwned(_))), "{result:?}");
+    assert!(paths.db().is_file());
+    assert!(paths.documents().join("resume.pdf").is_file());
+}
+
+#[tokio::test]
+async fn wrong_confirmation_wins_over_a_missing_marker() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    fs::remove_file(paths.marker()).unwrap();
+
+    let result = transfer::delete_all(db, "delete", true).await;
+
+    assert!(
+        matches!(result, Err(Error::ConfirmationRequired)),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn reopen_works_after_delete_all() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    transfer::delete_all(db, "DELETE", true).await.unwrap();
+
+    let db = Db::open(&paths).await.unwrap();
+
+    assert!(documents::list(&db).await.unwrap().is_empty());
+    db.close().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn delete_all_removes_folder_symlinks_and_not_their_targets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("outside");
+    let paths = AppPaths::new(tmp.path().join("data"));
+    fs::create_dir(paths.root()).unwrap();
+    for (folder, link) in [("docs", paths.documents()), ("out", paths.exports())] {
+        fs::create_dir_all(outside.join(folder)).unwrap();
+        fs::write(outside.join(folder).join("taxes.pdf"), "user data").unwrap();
+        std::os::unix::fs::symlink(outside.join(folder), link).unwrap();
+    }
+    fs::write(paths.marker(), "io.github.gvsrusa.jobpilot").unwrap();
+    let db = Db::open(&paths).await.unwrap();
+
+    transfer::delete_all(db, "DELETE", true).await.unwrap();
+
+    assert!(fs::symlink_metadata(paths.documents()).is_err());
+    assert!(fs::symlink_metadata(paths.exports()).is_err());
+    for folder in ["docs", "out"] {
+        let file = outside.join(folder).join("taxes.pdf");
+        assert_eq!(fs::read_to_string(file).unwrap(), "user data");
+    }
 }
 
 #[tokio::test]
