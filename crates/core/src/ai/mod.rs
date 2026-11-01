@@ -14,6 +14,7 @@ use crate::error::Result;
 
 pub mod consent;
 pub mod noai;
+pub mod ollama;
 pub mod router;
 pub mod validate;
 

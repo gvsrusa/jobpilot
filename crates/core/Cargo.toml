@@ -21,6 +21,8 @@ jsonschema = { version = "=0.60.2", default-features = false } # no resolve-http
 pdf-extract = "=0.12.1"
 zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
 zeroize = "1"
+reqwest = { version = "=0.13.5", default-features = false, features = ["json", "stream"] }
+sysinfo = { version = "=0.40.1", default-features = false, features = ["system", "disk"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

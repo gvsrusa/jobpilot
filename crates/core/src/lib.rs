@@ -8,6 +8,7 @@ pub mod db;
 pub mod documents;
 pub mod drafts;
 pub mod error;
+pub mod hardware;
 pub mod knowledge;
 pub mod parse;
 pub mod paths;
