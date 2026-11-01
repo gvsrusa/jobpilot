@@ -260,6 +260,24 @@ async fn export_refuses_the_root_spelled_in_another_case() {
     db.close().await;
 }
 
+// A firmlink alias reaches the same folder, and `canonicalize` keeps the alias prefix, so
+// only the folder's identity shows it is the root.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn export_refuses_the_root_through_a_firmlink_alias() {
+    let root = Root::new();
+    let db = Db::open(&root.paths).await.unwrap();
+    let exports = root.paths.exports().canonicalize().unwrap();
+    let alias = Path::new("/System/Volumes/Data").join(exports.strip_prefix("/").unwrap());
+    assert!(alias.is_dir(), "{alias:?} must reach the same folder");
+
+    let result = recovery::export(&db, &alias.join("key.json"), "cli").await;
+
+    assert!(matches!(result, Err(Error::Refused(_))), "{result:?}");
+    assert!(std::fs::read_dir(&exports).unwrap().next().is_none());
+    db.close().await;
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn export_refuses_devices_and_symlinks() {

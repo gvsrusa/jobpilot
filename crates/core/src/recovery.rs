@@ -82,7 +82,8 @@ pub async fn export(db: &Db, out: &Path, actor: &str) -> Result<RecoveryReceipt>
 
 /// `create_new` is `O_CREAT|O_EXCL`, or `CREATE_NEW` on Windows: it does not follow a final
 /// symlink and does not reuse a path, so a device path fails here on `AlreadyExists`. The
-/// handle check is for what a name can reach on Windows, such as `CONOUT$`.
+/// handle check is for what a name can still reach on Windows, such as `CONOUT$`, and
+/// runs before any key byte exists to write.
 fn create_new_regular(out: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -97,10 +98,27 @@ fn create_new_regular(out: &Path) -> Result<File> {
 }
 
 fn require_regular(file: &File) -> Result<()> {
-    if !file.metadata()?.file_type().is_file() {
+    if !file.metadata()?.file_type().is_file() || !is_disk_file(file) {
         return Err(Error::Refused("this is not a regular file".into()));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn is_disk_file(_file: &File) -> bool {
+    true
+}
+
+/// On Windows `is_file` means only "not a folder and not a symlink", so a console or `NUL`
+/// passes it. The handle's own type is what tells them apart.
+#[cfg(windows)]
+fn is_disk_file(file: &File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, GetFileType};
+
+    // SAFETY: the handle is open for as long as `file` is borrowed, and `GetFileType`
+    // only reads it.
+    unsafe { GetFileType(file.as_raw_handle()) == FILE_TYPE_DISK }
 }
 
 async fn write_and_record(db: &Db, mut file: File, actor: &str) -> Result<String> {
@@ -419,6 +437,23 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         assert!(read_recovery_file(&tmp.path().join("missing.json")).is_err());
         assert!(read_recovery_file(tmp.path()).is_err());
+    }
+
+    // A console may not exist in CI, so an open that fails is a refusal too. Runs only on
+    // Windows, so only CI runs it.
+    #[cfg(windows)]
+    #[test]
+    fn windows_devices_are_refused_on_the_handle() {
+        for name in ["NUL", "CONOUT$"] {
+            let path = Path::new(name);
+            assert!(create_new_regular(path).is_err(), "{name}");
+            assert!(read_recovery_file(path).is_err(), "{name}");
+        }
+        let nul = OpenOptions::new().write(true).open("NUL").unwrap();
+        assert!(matches!(require_regular(&nul), Err(Error::Refused(_))));
+        if let Ok(console) = OpenOptions::new().write(true).open("CONOUT$") {
+            assert!(matches!(require_regular(&console), Err(Error::Refused(_))));
+        }
     }
 
     #[cfg(unix)]

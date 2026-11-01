@@ -15,8 +15,8 @@ use crate::crypto::{self, DataKey, KeyState};
 use crate::db::Db;
 use crate::error::{Error, Result};
 
-const TABLE: &str = "work_authorization";
-const COLUMN: &str = "row";
+const TABLE: &str = crypto::AUTHORIZATION_AAD.0;
+const COLUMN: &str = crypto::AUTHORIZATION_AAD.1;
 const MAX_CHIPS: usize = 50;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

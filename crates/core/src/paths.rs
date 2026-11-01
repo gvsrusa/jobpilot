@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -51,18 +52,40 @@ impl AppPaths {
     }
 
     /// True when a file at `path` would land under the root, or that cannot be ruled out.
-    /// Compares resolved directories, so a symlink, a `..`, or another spelling of the
-    /// root's name cannot hide it. A folder that cannot be resolved counts as inside.
+    /// Resolves the parent folder, so a symlink or a `..` cannot hide the root, then looks
+    /// for the root among that folder's ancestors: by device and inode on Unix, as a
+    /// firmlink alias or a bind mount survives `canonicalize`, and by resolved path on
+    /// Windows. A folder that cannot be resolved counts as inside.
     pub fn is_inside_root(&self, path: &Path) -> bool {
         let parent = match path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent,
             _ => Path::new("."),
         };
-        match (parent.canonicalize(), self.root.canonicalize()) {
-            (Ok(parent), Ok(root)) => parent.starts_with(root),
-            _ => true,
+        let Ok(parent) = parent.canonicalize() else {
+            return true;
+        };
+        is_under(&parent, &self.root).unwrap_or(true)
+    }
+}
+
+/// `folder` is resolved, so its ancestors are real folders.
+#[cfg(unix)]
+fn is_under(folder: &Path, root: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = std::fs::metadata(root)?;
+    for ancestor in folder.ancestors() {
+        let seen = std::fs::metadata(ancestor)?;
+        if (seen.dev(), seen.ino()) == (root.dev(), root.ino()) {
+            return Ok(true);
         }
     }
+    Ok(false)
+}
+
+#[cfg(not(unix))]
+fn is_under(folder: &Path, root: &Path) -> io::Result<bool> {
+    Ok(folder.starts_with(root.canonicalize()?))
 }
 
 fn root_from(home: Option<OsString>) -> Result<PathBuf> {

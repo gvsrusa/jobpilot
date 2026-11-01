@@ -203,6 +203,9 @@ impl DataKey {
     }
 }
 
+/// The table and column in the associated data of a `work_authorization` value.
+pub(crate) const AUTHORIZATION_AAD: (&str, &str) = ("work_authorization", "row");
+
 /// What shows that a stored value is a key id's key.
 pub(crate) enum Proof {
     /// `data_keys.key_check`.
@@ -215,9 +218,10 @@ impl Proof {
     fn holds(&self, key: &DataKey) -> bool {
         match self {
             Proof::KeyCheck(key_check) => key.opens(key_check),
-            Proof::Sealed { row_id, ciphertext } => key
-                .decrypt("work_authorization", "row", row_id, ciphertext)
-                .is_ok(),
+            Proof::Sealed { row_id, ciphertext } => {
+                let (table, column) = AUTHORIZATION_AAD;
+                key.decrypt(table, column, row_id, ciphertext).is_ok()
+            }
         }
     }
 }
