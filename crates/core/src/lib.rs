@@ -1,8 +1,11 @@
 //! JobPilot AI core library. All product behaviour lives here.
 
+pub mod audit;
 pub mod db;
+pub mod documents;
 pub mod error;
 pub mod paths;
+pub mod settings;
 
 pub use db::{Db, MIGRATOR, app_schema_version};
 pub use error::{Error, Result};
