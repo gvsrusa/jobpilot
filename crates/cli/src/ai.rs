@@ -54,6 +54,10 @@ pub enum AiCommand {
     Disable {
         provider: ProviderArg,
     },
+    /// Where the `claude` program is, when it cannot be found by itself. Empty clears it.
+    ClaudePath {
+        path: String,
+    },
     #[command(subcommand)]
     Consent(ConsentCommand),
     /// Embed knowledge items that have no vector yet.
@@ -203,6 +207,18 @@ pub async fn ai(db: &Db, command: AiCommand) -> Result<Output> {
             ai::set_order(db, &names).await?;
             let text = format!("order: {}", names.join(", "));
             out(json!({ "order": names }), text)
+        }
+        AiCommand::ClaudePath { path } => {
+            let path = path.trim();
+            if !path.is_empty() && !std::path::Path::new(path).is_absolute() {
+                return Err(Error::Validation("give the full path to claude".into()));
+            }
+            let key = crate::shell::CLAUDE_PATH_SETTING;
+            jobpilot_core::settings::set(db, key, &json!(path)).await?;
+            out(
+                json!({ "claude_path": path }),
+                format!("claude_path: {path}"),
+            )
         }
         AiCommand::Enable { provider } => toggle(db, provider, true).await,
         AiCommand::Disable { provider } => toggle(db, provider, false).await,

@@ -4,6 +4,7 @@ mod ai;
 mod data;
 mod profile;
 mod resume;
+mod shell;
 mod text;
 
 use std::io::Write;
@@ -17,16 +18,16 @@ pub const ACTOR: &str = "cli";
 
 #[derive(Parser)]
 #[command(name = "jobpilot", version, about = "JobPilot AI command line")]
-struct Cli {
+pub struct Cli {
     /// Print machine-readable JSON instead of text.
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
-    command: Command,
+    pub command: Command,
 }
 
 #[derive(Subcommand)]
-enum Command {
+pub enum Command {
     /// Show versions, the data folder, the key state, and AI availability.
     Status,
     /// Manage documents.
@@ -59,12 +60,14 @@ enum Command {
     /// AI providers, models, and consent.
     #[command(subcommand)]
     Ai(ai::AiCommand),
+    /// Restricted prompt used by the app's terminal panel.
+    Shell,
 }
 
 impl Command {
     /// The terminal panel's input has no shell to clear its marker with, so what could
     /// leak a key or destroy data is refused there.
-    fn refused_in_panel(&self) -> bool {
+    pub fn refused_in_panel(&self) -> bool {
         use data::{BackupCommand, DataCommand};
         matches!(
             self,
@@ -92,14 +95,24 @@ pub fn out(value: impl serde::Serialize, text: String) -> Result<Output> {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    if matches!(cli.command, Command::Shell) {
+        // Not through `run`: the panel itself starts this, marker set.
+        let input = tokio::io::BufReader::new(tokio::io::stdin());
+        return match shell::run(input, tokio::io::stdout()).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!(
+                    "error[{}]: {}",
+                    error.code(),
+                    text::sanitize(&message(&error))
+                );
+                ExitCode::from(1)
+            }
+        };
+    }
     match run(cli.command).await {
         Ok(output) => {
-            // Stored and parsed text is untrusted: no escape reaches the terminal.
-            let line = if cli.json {
-                text::sanitize_value(output.json).to_string()
-            } else {
-                text::sanitize(&output.text)
-            };
+            let line = render(output, cli.json);
             let written = if line.is_empty() {
                 Ok(())
             } else {
@@ -114,19 +127,32 @@ async fn main() -> ExitCode {
             }
         }
         Err(error) => {
-            eprintln!(
-                "error[{}]: {}",
-                error.code(),
-                text::sanitize(&message(&error))
-            );
+            eprintln!("{}", error_line(&error));
             ExitCode::from(1)
         }
     }
 }
 
+/// Stored and parsed text is untrusted: no escape reaches the terminal.
+pub fn render(output: Output, json: bool) -> String {
+    if json {
+        text::sanitize_value(output.json).to_string()
+    } else {
+        text::sanitize(&output.text)
+    }
+}
+
+pub fn error_line(error: &Error) -> String {
+    format!(
+        "error[{}]: {}",
+        error.code(),
+        text::sanitize(&message(error))
+    )
+}
+
 fn message(error: &Error) -> String {
     match error {
-        Error::PanelRefused => "Run this in an ordinary terminal, or use the app.".into(),
+        Error::PanelRefused => shell::REFUSAL.into(),
         Error::ManualRequired(reason) if reason == "not_logged_in" => {
             "Claude Code is not signed in. Run `claude` once to log in, then try again.".into()
         }
@@ -134,7 +160,7 @@ fn message(error: &Error) -> String {
     }
 }
 
-async fn run(command: Command) -> Result<Output> {
+pub async fn run(command: Command) -> Result<Output> {
     if command.refused_in_panel() && recovery::panel_marker_set() {
         return Err(Error::PanelRefused);
     }
@@ -170,5 +196,7 @@ async fn with_db(db: &Db, command: Command) -> Result<Output> {
         Command::Resume(command) => resume::resume(db, command).await,
         Command::Letter(command) => resume::letter(db, command).await,
         Command::Ai(command) => ai::ai(db, command).await,
+        // `main` and the shell handle this before any command runs.
+        Command::Shell => Err(Error::PanelRefused),
     }
 }
