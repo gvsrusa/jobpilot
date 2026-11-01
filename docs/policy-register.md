@@ -6,6 +6,30 @@ Status: draft for owner approval. Register date: 2026-11-01. Source: [master spe
 
 **Terms change.** Several sources below changed within the last two months, and OpenAI's Usage Policies change again on 2026-11-20. Every entry is true only for its date read. Each release must re-read the entries it depends on before it ships (see [Release re-check](#release-re-check)).
 
+## Owner decisions (2026-11-01)
+
+JobPilot is the owner's **personal, non-commercial** app. The owner waived AI subscription policy concerns and accepts any account risk. The waiver covers **vendor terms only**. Security controls stay as written: a task with `job_text` or `company_text` still requires `no_tools`, and external data sharing still needs a consent record (FR-3.30).
+
+Every vendor quote and verdict in this register stays as the record of what vendors say. For AI provider rows, the **Product behaviour (owner decision)** column below is what the product does. Where it differs from a row's Verdict or Consequence, this section governs.
+
+| Provider row(s) | Register verdict (vendor record) | Product behaviour (owner decision) |
+|---|---|---|
+| Claude Code: user-started interactive `claude`, own sign-in | `user-assisted` | Ships (D1): a terminal session the user drives, on the owner's own subscription. |
+| Claude Code: `claude --bare -p` with a Console key, and `claude -p` in the background under the user's login | `unknown`, `blocked` | Ships (D1): headless backend the task router may call, through the official `claude` CLI and its own login. Job text goes only with tools disabled. FR-3.9 is met this way. |
+| Claude Code: Claude sign-in inside JobPilot; collect, store, or read Claude tokens (including `claude setup-token`); bundle the binary; hosted service on consumer plans | `blocked`, `unknown` | Unchanged (D1): no token extraction, no reverse engineering, no bundled binary, no hosted service. The CLI's own login is the only sign-in. |
+| Gemini CLI and Codex CLI adapters (`gemini`, `codex exec`), any sign-in method the installed CLI supports | `unknown`; paid-key rows `unknown`, free key `blocked` | Optional (D1): the adapter starts the installed CLI as published. An absent CLI shows as unavailable. A free Gemini key stays refused for personal data. |
+| Sign in with ChatGPT (plan usage) | `allowed` | Optional, subject to eligibility, as before. |
+| Direct API: OpenAI, Anthropic, Google (paid key), OpenRouter | `unknown`, `allowed` with no eligible model | Eligible (D4, standard BYOK) subject to consent and capability checks. The consent screen shows the vendor's terms. FR-3.15, FR-3.16, FR-3.17, and FR-3.18 can ship. |
+| Unchanged AI rows | Free Gemini key `blocked`; Antigravity CLI; legacy Codex app-server sign-in; reading `~/.codex/auth.json`; Vertex AI (unread); non-loopback compatible endpoints; Ollama cloud models; the cross-provider use rules below | Unchanged. The owner's decisions did not cover them. |
+| Copilot fill on a hosted form where the register records "No clause found" or "No clause on automated filling" (Greenhouse, Lever, Ashby) | `unknown` | Runs (D2), recorded as "no clause found". The user reviews and clicks submit. |
+| Copilot fill on any site whose row is `blocked` (Indeed), quotes a clause that may reach it (Workday), or was not read (LinkedIn) | `blocked`, `unknown` | Stays refused. |
+| Autonomous submission | `unknown` | Default off. No connector is enabled by these decisions. |
+| CAPTCHA, MFA, identity verification, legal declarations | n/a | Always pause (FR-9.16 to FR-9.21). |
+
+Other decisions recorded here: D3 accepts unsigned 0.x installers. D5 accepts the recovery-key file as the one exception to "secrets never reach exports". D6 chooses field-level AES-GCM with the key in the OS keychain.
+
+The Verdict and Consequence columns in the AI sections below describe what the vendors say. They are not changed, and the written questions stay open as optional follow-up.
+
 ## How to read this register
 
 The analyzed case is a desktop app run by a user on their own machine, under their own login, with no JobPilot server between the user and the vendor. The separate case where a hosted service acts for users is listed in its own rows. It is a [PRD non-goal](prd.md#4-non-goals) and is recorded only so that nobody builds it by accident.
@@ -17,12 +41,12 @@ Each row covers one operation, because one integration can be fine to read and f
 | `allowed` | A primary source permits this operation for the analyzed case. | May ship, subject to the row's conditions and FR-3.30 consent. |
 | `user-assisted` | A person performs the consequential step in their own browser, terminal, or local server. JobPilot prepares material, makes no request to the third-party site, and drives no browser there. | Manual only. JobPilot never fills a third-party form and never submits. |
 | `blocked` | A primary source forbids it, or a technical gate only the vendor or an employer can open stops it. | Not built. Code paths refuse it. |
-| `unknown` | The source is ambiguous, silent, or could not be read. A site or vendor being silent is `unknown`, whatever the operation. | **Behaves as blocked** until a primary source or written vendor answer resolves it. |
+| `unknown` | The source is ambiguous, silent, or could not be read. A site or vendor being silent is `unknown`, whatever the operation. | **Behaves as blocked** for site rows until a primary source or written vendor answer resolves it, except Copilot fill on a row recording "no clause found" (D2). **AI provider rows follow the [owner decisions](#owner-decisions-2026-11-01)**, not this default. |
 
 Rules for this register:
 
-- Only primary sources (the vendor's own terms, docs, or policies) can set `allowed` or `blocked`. Forums, blogs by third parties, and Medium set nothing.
-- Copilot fill, where JobPilot drives a browser through a form and the user clicks submit, is automation of that site. It needs its own `allowed` row. A human clicking submit does not make it `user-assisted`.
+- Only primary sources (the vendor's own terms, docs, or policies) can set `allowed` or `blocked` in the register. The owner decisions govern what the product does with AI provider rows. Forums, blogs by third parties, and Medium set nothing.
+- Copilot fill, where JobPilot drives a browser through a form and the user clicks submit, is automation of that site. It needs its own `allowed` row, or under owner decision D2 a row that records "no clause found". A row `blocked` for a site stays blocked. A human clicking submit does not make it `user-assisted`.
 - Quotes are short and exact. Link markup and bold in the source are dropped. All dates read are 2026-11-01.
 - The AI use rules below bind by mode and model, not only by provider. The router must apply them (see [Routing](ai-providers.md#routing)).
 - Connectors and providers carry these four values as their policy-review status (FR-5.14). See [AI providers](ai-providers.md#capability-and-policy-vocabulary).
@@ -78,7 +102,7 @@ Not named in the spec. Listed because Google moved Gemini CLI's consumer users h
 
 In every row the user creates their own account and key, and JobPilot's project never receives either.
 
-One rule applies to every vendor: `allowed` only where a primary clause covers an individual key owner using third-party client software for this purpose. Otherwise the row is `unknown` and goes to the [written questions](#open-written-questions). OpenAI, Anthropic, and Google each limit their API terms to business or developer use, so this is one clause type and gets one treatment. The rows differ only in how close their evidence comes. This rule came from a project ruling, not from the owner. The register applies it until the owner answers [Decision D4](ai-providers.md#decision-d4-user-held-api-keys).
+One rule applies to every vendor: `allowed` only where a primary clause covers an individual key owner using third-party client software for this purpose. Otherwise the row is `unknown` and goes to the [written questions](#open-written-questions). OpenAI, Anthropic, and Google each limit their API terms to business or developer use, so this is one clause type and gets one treatment. The rows differ only in how close their evidence comes. This rule came from a project ruling, not from the owner. The owner answered [Decision D4](ai-providers.md#decision-d4-user-held-api-keys) with standard BYOK on 2026-11-01, so the rule records the vendor position and the [owner decisions](#owner-decisions-2026-11-01) set product behaviour.
 
 | Integration | Operation | Primary source URL | Date read | Quoted clause | Verdict | Consequence |
 |---|---|---|---|---|---|---|
@@ -103,29 +127,29 @@ One rule applies to every vendor: `allowed` only where a primary clause covers a
 
 ## Job sources: applicant tracking systems
 
-JobPilot acts for the applicant, who holds no employer key. All three vendors below publish customer terms. No applicant-facing terms were found for their hosted forms, so Copilot fill on them is `unknown`, matching the read rows.
+JobPilot acts for the applicant, who holds no employer key. All three vendors below publish customer terms. No applicant-facing terms were found for their hosted forms, so Copilot fill on them is `unknown`, matching the read rows. Under owner decision D2 that silence lets Copilot run, recorded as "no clause found".
 
 | Integration | Operation | Primary source URL | Date read | Quoted clause | Verdict | Consequence |
 |---|---|---|---|---|---|---|
 | Greenhouse | Read public listings through Job Board API | https://support.greenhouse.io/hc/en-us/articles/10568627186203-Greenhouse-API-overview | 2026-11-01 | "Job Board API is designed to export information about your public job boards and job posts so your web developers can build custom career and application sites." | `unknown` | Off until Greenhouse answers. GET needs no key ("Only the application submission endpoint" does, https://developers.greenhouse.io/job-board.html), but the docs address the employer and say nothing of third-party readers. FR-5.2 ships as user-assisted import meanwhile. |
 | Greenhouse | Submit through Job Board API | https://developers.greenhouse.io/job-board.html | 2026-11-01 | "the HTTP Basic Auth API token is a secret key. Any form posts should be proxied by your own servers." | `blocked` | Employer-side key and server. No applicant path. |
 | Greenhouse | User applies on the hosted form in their own browser | https://www.greenhouse.com/legal | 2026-11-01 | No applicant terms found. The legal page lists a "Master subscription agreement" for "your company". | `user-assisted` | Manual only. JobPilot opens the link, supplies files and text, and records the outcome. |
-| Greenhouse | Copilot fill of the hosted form; user reviews and submits | https://www.greenhouse.com/legal | 2026-11-01 | No clause found. | `unknown` | Copilot off until Greenhouse answers. FR-9.3 at risk. |
+| Greenhouse | Copilot fill of the hosted form; user reviews and submits | https://www.greenhouse.com/legal | 2026-11-01 | No clause found. | `unknown` | Vendor record: no clause either way. Product (D2): Copilot runs, recorded as "no clause found"; the user reviews and submits. A later Greenhouse objection ends it. |
 | Greenhouse | Submit the hosted form with no human | https://www.greenhouse.com/legal | 2026-11-01 | No clause found. | `unknown` | Autonomous refused. |
 | Lever | Read public listings through Postings API | https://github.com/lever/postings-api | 2026-11-01 | "all job postings in the `published` state are publicly viewable. These jobs may be scraped by third parties." | `allowed` | Read-only connector. The README publishes no read limit, so JobPilot sets a low one. The user supplies company site names. Lever's customer terms were not read. |
 | Lever | Submit through Postings API | https://github.com/lever/postings-api | 2026-11-01 | "To use the POST API, you need an API key, which a Super Admin of your account can generate" | `blocked` | Employer-side key. No applicant path. |
 | Lever | User applies on the hosted form in their own browser | https://github.com/lever/postings-api | 2026-11-01 | "directing candidates to Lever's hosted application form is considered a best practice." | `user-assisted` | Manual only. The sentence addresses custom job sites and is no permission for tools. |
-| Lever | Copilot fill of the hosted form; user reviews and submits | https://github.com/lever/postings-api | 2026-11-01 | No clause on automated filling. The page advises "spam mitigations such as captchas". | `unknown` | Copilot off until Lever answers. FR-9.3 at risk. |
+| Lever | Copilot fill of the hosted form; user reviews and submits | https://github.com/lever/postings-api | 2026-11-01 | No clause on automated filling. The page advises "spam mitigations such as captchas". | `unknown` | Vendor record: no clause on filling. Product (D2): Copilot runs, recorded as "no clause found"; the user reviews and submits. CAPTCHAs always pause. |
 | Lever | Submit the hosted form with no human | https://github.com/lever/postings-api | 2026-11-01 | No clause found. | `unknown` | Autonomous refused. |
 | Ashby | Read public listings through Job Postings API | https://developers.ashbyhq.com/docs/public-job-posting-api | 2026-11-01 | "This API allows you to get data for all currently published Job Postings for your organization." | `unknown` | Off until Ashby answers. No key is needed, but the docs address the employer and say nothing of third-party readers. FR-5.4 ships as user-assisted import meanwhile. |
 | Ashby | Submit through `applicationForm.submit` | https://developers.ashbyhq.com/reference/applicationformsubmit | 2026-11-01 | "Requires the candidatesWrite permission." | `blocked` | Employer API credential. No applicant path. |
 | Ashby | User applies on the hosted form in their own browser | https://developers.ashbyhq.com/docs/public-job-posting-api | 2026-11-01 | "URL for the Ashby page where candidates can apply for this job" | `user-assisted` | Manual only. |
-| Ashby | Copilot fill of the hosted form; user reviews and submits | https://developers.ashbyhq.com/docs/public-job-posting-api | 2026-11-01 | No clause on automated filling. | `unknown` | Copilot off until Ashby answers. FR-9.3 at risk. |
+| Ashby | Copilot fill of the hosted form; user reviews and submits | https://developers.ashbyhq.com/docs/public-job-posting-api | 2026-11-01 | No clause on automated filling. | `unknown` | Vendor record: no clause on filling. Product (D2): Copilot runs, recorded as "no clause found"; the user reviews and submits. |
 | Ashby | Submit the hosted form with no human | https://developers.ashbyhq.com/docs/public-job-posting-api | 2026-11-01 | No clause found. | `unknown` | Autonomous refused. |
 | Workday | Automate workday.com itself | https://www.workday.com/en-us/legal/site-terms.html | 2026-11-01 | "Develop or use any applications that interact with our Sites without our prior written consent" | `blocked` | Not built. The terms also bar "data mining, robots or similar data gathering". |
 | Workday | Use Workday APIs | https://www.workday.com/en-us/legal/site-terms.html | 2026-11-01 | "you may not use any Workday APIs without authorization under a separate agreement with Workday" | `blocked` | Not built. |
 | Workday | Read an employer's `myworkdayjobs.com` career site | https://www.workday.com/en-us/legal/site-terms.html | 2026-11-01 | The terms cover pages "that directly reference these Terms". | `unknown` | Off. Each site belongs to an employer, and whether these terms reach it is unclear. One sampled robots.txt allows the site's career paths, which is a crawler rule and not a licence. FR-5.8 ships as user-assisted import. |
-| Workday | Fill a career-site form; user reviews and submits | https://www.workday.com/en-us/legal/site-terms.html | 2026-11-01 | "Develop or use any applications that interact with our Sites without our prior written consent" | `unknown` | Copilot off. If the clause reaches these sites, form filling falls under it. |
+| Workday | Fill a career-site form; user reviews and submits | https://www.workday.com/en-us/legal/site-terms.html | 2026-11-01 | "Develop or use any applications that interact with our Sites without our prior written consent" | `unknown` | Copilot off, and D2 does not open it: the quoted clause may reach these sites, so "no clause found" is not true. |
 | Workday | User applies in their own browser with JobPilot's documents | https://www.workday.com/en-us/legal/site-terms.html | 2026-11-01 | The clauses above concern applications and automated tools. | `user-assisted` | Manual only. JobPilot opens the link, supplies files and text, and tracks the outcome. |
 
 ## Job sources: public boards and career pages
@@ -150,17 +174,17 @@ JobPilot acts for the applicant, who holds no employer key. All three vendors be
 
 ## Policy impact
 
-Re-evaluated with every verdict above. The PRD's FR text is unchanged: an FR here is either met, met in part, or waiting. Release exit tests in the [milestone plan](milestones.md) are conditional on these verdicts.
+Re-evaluated with every verdict above and the [owner decisions](#owner-decisions-2026-11-01). The PRD's FR text is unchanged. The Effect column records the vendor verdicts; "What ships" is the product under the owner decisions. Release exit tests in the [milestone plan](milestones.md) follow "What ships".
 
 | Item | Effect today | What ships meanwhile |
 |---|---|---|
-| FR-3.9 Claude Code | Consumer app-driven `blocked`. API-key adapter `unknown`. | Interactive session the user drives. No adapter. |
-| FR-3.10 Gemini CLI | Not achievable as a subscription integration: consumer login is gone. Paid key `unknown`, free key `blocked`. | Nothing. |
-| FR-3.11 Codex CLI | `codex exec` with a key `unknown`. Plan usage through app-server is `allowed` subject to eligibility and is the only automated Codex route. | Interactive session, and app-server if chosen under D1. |
-| FR-3.15 OpenAI | `unknown`. | Sign in with ChatGPT, if chosen under D1, is the only OpenAI route. |
-| FR-3.16 Anthropic | `unknown`. | Nothing until Anthropic answers. |
-| FR-3.17 Google | `unknown` for paid, `blocked` for free, Vertex AI unread. | Nothing. |
-| FR-3.18 OpenRouter | Account `allowed`, zero eligible models. | Connection code only. |
+| FR-3.9 Claude Code | Consumer app-driven `blocked`. API-key adapter `unknown`. | Per D1: user-driven terminal session, and a headless `claude -p` backend through the official CLI and its own login, `no_tools` for job text. Owner accepts the account risk. |
+| FR-3.10 Gemini CLI | Consumer login is gone. Paid key `unknown`, free key `blocked`. | Per D1: optional adapter on whatever sign-in the installed CLI supports; shows unavailable when absent. Free key refused for personal data. |
+| FR-3.11 Codex CLI | `codex exec` with a key `unknown`. Plan usage through app-server is `allowed` subject to eligibility. | Per D1: interactive session, and an optional `codex exec` adapter on the installed CLI's sign-in. Sign in with ChatGPT stays optional. |
+| FR-3.15 OpenAI | `unknown`. | Per D4: direct API with the user's key, consent screen shows terms. |
+| FR-3.16 Anthropic | `unknown`. | Per D4: direct API with the user's key, consent screen shows terms. |
+| FR-3.17 Google | `unknown` for paid, `blocked` for free, Vertex AI unread. | Per D4: paid key direct. Free key refused for personal data. Vertex AI stays off until read. |
+| FR-3.18 OpenRouter | Account `allowed`, models take the origin vendor's row. | Per D4: OpenAI, Anthropic, and Google models eligible; other models stay `unknown`. |
 | FR-3.19 Compatible endpoints | Loopback only. | User-named loopback server. |
 | FR-5.2 Greenhouse | Read `unknown`. | User-assisted import. |
 | FR-5.3 Lever, FR-5.5 RemoteOK, FR-5.6 We Work Remotely | Read `allowed`. | Read-only connectors with attribution where required. |
@@ -169,14 +193,14 @@ Re-evaluated with every verdict above. The PRD's FR text is unchanged: an FR her
 | FR-5.8 Workday | Read `unknown`, workday.com and APIs `blocked`. | User-assisted import. |
 | FR-5.9 Indeed | Read `blocked`. No connector can exist. | User-assisted import. |
 | FR-5.10 LinkedIn | Met through the user-assisted path. | User-assisted import. |
-| FR-9.3 Copilot mode | **No site has an `allowed` Copilot row.** Greenhouse, Lever, Ashby, and Workday are `unknown`; Indeed is `blocked`; LinkedIn is `unknown`. | Code and tests against local fixture forms. Manual mode for real sites. |
-| FR-9.4 Autonomous mode | No eligible connector. | Default off. |
-| Milestones 0.4 API-provider exit test | Named Google and the other providers as a fixed list. | Now conditional on verdicts. As of this date only loopback endpoints and Sign in with ChatGPT could run. |
+| FR-9.3 Copilot mode | No site has an `allowed` Copilot row. Greenhouse, Lever, Ashby, and Workday are `unknown`; Indeed is `blocked`; LinkedIn is `unknown`. | Per D2: Copilot runs on Greenhouse, Lever, and Ashby hosted forms, recorded as "no clause found". Workday, Indeed, and LinkedIn stay refused. Manual elsewhere. |
+| FR-9.4 Autonomous mode | No eligible connector. | Default off. Pauses for CAPTCHA, MFA, identity verification, and legal declarations always apply. |
+| Milestones 0.4 API-provider exit test | Named Google and the other providers as a fixed list. | Names Claude Code headless and terminal and the direct API providers, per D1 and D4. |
 | Milestones 0.5 read-only connector exit test | Could not pass for FR-5.2, 5.4, 5.7, 5.8, or 5.9. | Now conditional. Three connectors today. |
-| Milestones 0.6 Manual and Copilot exit test | Could not pass on any real site for Copilot. | Now conditional. |
-| Decision D1 | See [AI providers](ai-providers.md#decision-d1-subscription-ai). All three option (a) adapters are `unknown`. | Option (c) is met for OpenAI subject to eligibility. |
-| Decision D2 | Submit keys sit on the employer side at Greenhouse, Lever, and Ashby, and OpenAI bars unreviewed submissions. Copilot has no eligible site today, so D2 now recommends Manual as the shipping path. | D2 asks the owner whether a silent site should stay `unknown`, or whether Copilot may run where no clause forbids it. |
-| Decision D4 | The rule behind every direct API row came from a project ruling. See [AI providers](ai-providers.md#decision-d4-user-held-api-keys). | Strict verdicts stand until the owner answers. |
+| Milestones 0.6 Manual and Copilot exit test | Could not pass on any real site for Copilot. | Passes on Greenhouse, Lever, and Ashby fixtures under D2; other sites refused. |
+| Decision D1 | Decided 2026-11-01. See [AI providers](ai-providers.md#decision-d1-subscription-ai). | Claude Code headless and terminal; Gemini CLI and Codex CLI optional. |
+| Decision D2 | Decided 2026-11-01. Submit keys sit on the employer side at Greenhouse, Lever, and Ashby, and OpenAI bars unreviewed submissions. | Autonomous default-off, Manual ships, Copilot runs where no clause forbids it ("no clause found"). `blocked` site rows stay blocked. |
+| Decision D4 | Decided 2026-11-01: standard BYOK. See [AI providers](ai-providers.md#decision-d4-user-held-api-keys). | Vendor verdicts stay as the record; hosted providers are eligible subject to consent and capability checks. |
 
 ## Open written questions
 

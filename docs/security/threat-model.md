@@ -40,7 +40,7 @@ The encryption, search, and consent rules all use these classes. The `sensitive`
 
 | Class | Examples | At rest | FTS5 | Embeddings | May reach a model |
 |---|---|---|---|---|---|
-| Secret | API keys, Sign in with ChatGPT tokens, field encryption key | OS credential store only, plus the recovery file if Decision D5 accepts it | Never | Never | Never |
+| Secret | API keys, Sign in with ChatGPT tokens, field encryption key | OS credential store only, plus the recovery file accepted under Decision D5 | Never | Never | Never |
 | Sensitive | Work authorization and sponsorship status, compensation history, answers classed sensitive (FR-8.7) | AES-GCM column | Never | Never | Only under consent for `sensitive`, which is off unless ticked separately, and never in one prompt with untrusted text (M-19) |
 | Personal | Contact details, resume text, non-sensitive career memory, application history, user documents | Plain column | Yes | Yes, locally (FR-2.4) | Under consent for its category |
 | Untrusted | Job text, company text, hosted form text, page content | Plain column, marked by source | Yes | Yes, locally | Only inside marked data blocks (M-19), under consent for `job_text` or `company_text` |
@@ -151,7 +151,7 @@ From 0.2, job text can be on screen. Script injected there could call `data_dele
 | Denial of service | Endless pages, huge postings, or redirect loops. | M-22, M-34, M-35 | 0.2, 0.6 |
 | Elevation of privilege | Injected text pushes the agent to submit, skip a pause, relabel a legal declaration, or leave the permitted site. A connector declares a status it does not have. | M-24, M-27, M-33, M-36, M-38 | 0.3, 0.5, 0.6 |
 
-Today no hosted form has an `allowed` Copilot row, so Manual mode is the only mode on real sites. In Manual, JobPilot drives no browser on the site, so the 0.6 rows above apply only to local fixture forms until a site earns a row.
+Under owner decision D2, Copilot runs on hosted forms whose register row records "no clause found" (Greenhouse, Lever, Ashby), so the 0.6 rows above apply to those sites. Other sites get Manual mode only, where JobPilot drives no browser on the site. The pause and injection controls are unchanged.
 
 ### B5: app to filesystem
 
@@ -189,11 +189,11 @@ The PRD fixes two rules: never infer work authorization or visa eligibility (FR-
 - Claude Code docs: "In bare mode Claude has access to the Bash, file read, and file edit tools." (https://code.claude.com/docs/en/headless). So `claude --bare -p`, the command in the register's API-key row, is not tool-free on its own.
 - OpenAI docs: "Don’t expose Codex execution in untrusted or public environments." (https://developers.openai.com/codex/auth, which now redirects to https://learn.chatgpt.com/docs/auth).
 
-A coding agent that reads a job posting while holding Bash runs as the user. It can reach the data root, and an injected sentence becomes a command. Every adapter below is off today, because its register row is not `allowed`. This rule applies if a row opens.
+A coding agent that reads a job posting while holding Bash runs as the user. It can reach the data root, and an injected sentence becomes a command. The owner decisions (D1) make the Claude Code headless adapter, and the optional Gemini CLI and Codex CLI adapters, eligible. The waiver covers vendor terms only, so this rule applies to every adapter that runs.
 
 | Route | Tool exposure | Rule |
 |---|---|---|
-| `claude --bare -p` | Bash, file read, and file edit, per the quote above. The CLI reference says of `--disallowedTools` that `"*"` removes every tool (https://code.claude.com/docs/en/cli-reference). | May handle job text only with every tool removed, proven by an adapter test on the pinned version. Otherwise no untrusted text. |
+| `claude -p` headless (the owner's D1 adapter; `--bare` ignores OAuth, so a subscription login does not use it) | Bash, file read, and file edit by default, per the quote above. The CLI reference says of `--disallowedTools` that `"*"` removes every tool (https://code.claude.com/docs/en/cli-reference). | May handle job text only with every tool removed, proven by an adapter test on the pinned version. Otherwise no untrusted text. |
 | `codex exec` | "By default, codex exec runs in a read-only sandbox." (https://developers.openai.com/codex/noninteractive). The sandbox limits writes. The page shows no way to remove tools, and a read-only agent can still read the user's files. | No documented no-tools configuration was found, so this adapter does not handle untrusted text. |
 | Codex app-server (Sign in with ChatGPT) | Same Codex agent. Its tool surface was not reviewed. | Treated as tool-enabled. No untrusted text unless a no-tools configuration is documented and tested. |
 | Sign in with ChatGPT, direct Responses API | No CLI runs. JobPilot declares no tools. | Not a CLI adapter. May carry job text under its register row and consent. |
@@ -202,11 +202,11 @@ A coding agent that reads a job posting while holding Bash runs as the user. It 
 
 Enforcement is the provider capability `no_tools`. Tasks whose data categories include `job_text` or `company_text` require it. `map_form_field` and `classify_answer` declare `job_text`, because they carry form text, including form questions stored in career memory. Since [absent capabilities are false](../ai-providers.md#capability-and-policy-vocabulary), a provider that does not declare it is skipped. Provider-side `web_search` is off on these tasks for the same reason.
 
-Open interaction: an allow-listed child environment would strip `CLAUDE_CODE_OAUTH_TOKEN`. Whether an adapter may do that is an [open question to Anthropic](../policy-register.md#open-written-questions), because stripping may "restrict" a sign-in method. M-15 therefore cannot be finalized for this adapter until Anthropic answers. A no-tools flag raises a smaller version of the same question and should be added to it.
+The Claude Code headless adapter passes job text only with tools disabled, proven by an adapter test on the pinned version. The child environment is an allow-list, and the adapter does not read, set, or extract the CLI's credentials; the CLI uses its own login (Decision D1).
 
 ## 8. Encryption decision
 
-**Recommended, pending owner Decision D6 in Task A6: field-level AES-GCM for sensitive columns, with the key in the OS keychain, delivered in 0.2 (FR-12.1). The alternative is SQLCipher.**
+**Decided by the owner (D6, 2026-11-01): field-level AES-GCM for sensitive columns, with the key in the OS keychain, delivered in 0.2 (FR-12.1). The alternative, SQLCipher, was not chosen.**
 
 Against SQLCipher: a whole-file key in the keychain makes keychain loss strand the whole database rather than some columns. The CLI process also needs the key to open the database at all, even for commands that touch no sensitive field. The `bundled-sqlcipher` build is unverified on both OSes, and it would replace the bundled SQLite build that SQLx uses.
 
@@ -240,7 +240,7 @@ The planned control for free-form text is user marking plus redaction before pro
 
 ### Recovery-key export
 
-Defined for 0.2 (M-12), conditional on Decision D5. Command names are proposals.
+Defined for 0.2 (M-12). The owner accepted it under Decision D5 (2026-11-01). Command names are proposals.
 
 1. The app prompts the user to export a recovery key when it creates the data key, and keeps showing "no recovery key exported" in the data view until that is done.
 2. The GUI command takes no key argument and returns only `{key_id, path}`. Rust opens the native save dialog and writes the file itself, so the key never crosses IPC. No new webview capability is needed.
@@ -251,7 +251,7 @@ Defined for 0.2 (M-12), conditional on Decision D5. Command names are proposals.
 7. The action writes an audit row with the key id only.
 8. The app tells the user that this file plus a copy of the database opens every sensitive field. It belongs offline or in a password manager, away from backups.
 
-If Decision D5 accepts it, this is the one deliberate, narrow exception to the rule that secret values never reach exports. It is a separate file, made only by this explicit action, written only outside the data root, and never part of a data export. The webview, logs, and audit log rules hold in full. A passphrase-wrapped form would protect a stolen file, but adds a passphrase the user can also lose, and has to be typed somewhere other than the webview. It is not in 0.2, and the code carries a `ponytail:` comment naming this ceiling.
+Under Decision D5 (accepted 2026-11-01), this is the one deliberate, narrow exception to the rule that secret values never reach exports. It is a separate file, made only by this explicit action, written only outside the data root, and never part of a data export. The webview, logs, and audit log rules hold in full. A passphrase-wrapped form would protect a stolen file, but adds a passphrase the user can also lose, and has to be typed somewhere other than the webview. It is not in 0.2, and the code carries a `ponytail:` comment naming this ceiling.
 
 ### Recovery
 
@@ -284,19 +284,19 @@ Delete-all removes the entries for this root's key ids from the credential store
 |---|---|---|---|---|
 | M-01 | Strict webview CSP, no remote content, no network in 0.1. Minimal capabilities: the dialog plugin's `dialog:allow-open` only. | Planned 0.1 | FR-12.2 | Part |
 | M-02 | Every IPC command validates input in Rust. No command takes a free path, raw SQL, or a shell string. | Planned 0.1 | None of its own | None |
-| M-03 | No `secret_get` command. Secret values have no read path outside Rust callers, and stay out of logs, exports, and audit rows. Errors never echo them. If Decision D5 accepts the recovery file (M-12), that file is the one exception. | Planned 0.1 | FR-2.9, FR-12.2 | Yes |
+| M-03 | No `secret_get` command. Secret values have no read path outside Rust callers, and stay out of logs, exports, and audit rows. Errors never echo them. The recovery file (M-12), accepted under Decision D5, is the one exception. | Planned 0.1 | FR-2.9, FR-12.2 | Yes |
 | M-04 | Text from outside the app renders as inert text. No raw HTML rendering, no remote images. | Planned 0.1 | FR-12.3 | None |
 | M-05 | Append-only audit rows for consequential actions, from `gui`, `cli`, or `system`, with no secret values. Delete-all removes the log by design. From 0.3 it also covers emergency pause and external calls; from 0.6, submissions. | Planned 0.1, extended 0.3, 0.4, 0.6 | FR-12.7 | Yes |
 | M-06 | One data root, user-only by default. The advisory lock refuses restore and delete-all with `in_use` while another process is attached. `JOBPILOT_HOME` is shown in the status view. | Planned 0.1 | FR-2.3 | Part |
 | M-07 | Restore validates the backup before touching live data and writes a `pre-restore` snapshot. Refuses newer schemas. From 0.2 it also reports the backup's key id and state first. | Planned 0.1, extended 0.2 | FR-2.6, FR-12.9 | Yes |
 | M-08 | Delete-all removes the data root and this root's credential store entries, including its data keys from 0.2, and leaves other roots' data keys alone. API-key entries are shared across roots, so they go for every root on this OS account. | Planned 0.1, extended 0.2 | FR-2.8, FR-12.10 | Part |
 | M-09 | The data view recommends disk encryption, warns against storing sensitive details in free-form documents, warns that exports are plain text, and warns against a cloud-synced data root. | Planned 0.1 | FR-12.1 | None |
-| M-10 | AES-256-GCM on sensitive columns, as in [section 8](#8-encryption-decision), pending Decision D6. | Planned 0.2 | FR-12.1 | Yes |
+| M-10 | AES-256-GCM on sensitive columns, as in [section 8](#8-encryption-decision), Decision D6 (decided). | Planned 0.2 | FR-12.1 | Yes |
 | M-11 | Sensitive-class text stays out of FTS5 and embeddings. User marking plus redaction for free-form text: marked documents and user-marked resume lines are withheld from prompts, FTS5, and embeddings. The generator marks a document that repeats a Sensitive-class value. Marked bodies stay plain on disk. | Planned 0.2 | FR-12.1, FR-2.2 | None |
-| M-12 | Recovery-key export and import (conditional on Decision D5), key ids per root, and the distinct key states, as in [section 9](#9-keychain-loss-and-the-recovery-key). | Planned 0.2 | FR-12.1, FR-12.2 | None |
+| M-12 | Recovery-key export and import (accepted under Decision D5), key ids per root, and the distinct key states, as in [section 9](#9-keychain-loss-and-the-recovery-key). | Planned 0.2 | FR-12.1, FR-12.2 | None |
 | M-13 | Delete-all, restore, and discard of locked fields confirm through a Rust-owned native dialog before job text can reach the webview. | Planned 0.2 | FR-12.10 | None |
-| M-14 | Restricted terminal: the PTY runs an allow-list, not a general shell. In 0.2 that is the bundled `jobpilot` CLI. User-started `claude` and `codex` join it only if D1 adopts them; there is no launcher for `agy`. No CLI command prints a secret value. Recovery-key commands and the commands M-13 confirms are refused in the panel, through a marker only the Rust PTY layer sets. Scrollback is neither stored nor read into a workflow. Agents have no terminal access. | Planned 0.2, extended 0.4 | FR-12.5 | Yes |
-| M-15 | Spawn rules: resolved absolute path, shown to the user for vendor CLIs; argument arrays, never a shell string; untrusted text through standard input, never argv; empty temporary working directory; killed on timeout, cancel, pause, or app exit. Child environment allow-list, except where [section 7](#7-cli-adapters-and-untrusted-text) leaves it open. | Planned 0.2 for PTY, 0.4 for CLIs, 0.6 for Playwright | FR-12.5 | Part |
+| M-14 | Restricted terminal: the PTY runs an allow-list, not a general shell. In 0.2 that is the bundled `jobpilot` CLI. User-started `claude` joins it under D1, and `codex` and `gemini` if installed; there is no launcher for `agy`. No CLI command prints a secret value. Recovery-key commands and the commands M-13 confirms are refused in the panel, through a marker only the Rust PTY layer sets. Scrollback is neither stored nor read into a workflow. Agents have no terminal access. | Planned 0.2, extended 0.4 | FR-12.5 | Yes |
+| M-15 | Spawn rules: resolved absolute path, shown to the user for vendor CLIs; argument arrays, never a shell string; untrusted text through standard input, never argv; empty temporary working directory; killed on timeout, cancel, pause, or app exit. Child environment allow-list. | Planned 0.2 for PTY, 0.4 for CLIs, 0.6 for Playwright | FR-12.5 | Part |
 | M-16 | Output validation on every backend, as in [AI providers](../ai-providers.md#output-validation): size, JSON, schema, task checks. URLs, paths, and commands in output are data only. | Planned 0.2 | FR-12.6, FR-3.25 | Yes |
 | M-17 | Every generated claim maps to evidence or the output is rejected. Templates render plain fields, so no hidden text reaches a document. The user sees the comparison with the original. | Planned 0.2 | FR-7.10, FR-7.11, FR-7.12 | Yes |
 | M-18 | Work-authorization guard: output may not state or imply authorization beyond what the user recorded. Matching compares stated values per country, and a missing value stays "not stated". | Planned 0.2, extended 0.5 | FR-4.9, FR-4.10 | Yes |
@@ -310,9 +310,9 @@ Delete-all removes the entries for this root's key ids from the credential store
 | M-26 | Execution logs and checkpoints hold no prompts, outputs, secrets, or decrypted sensitive values. | Planned 0.3 | FR-11.12, FR-11.15 | Part |
 | M-27 | Sensitive gate: only the user approves an answer or lowers its sensitivity. A model may raise sensitivity, never lower it. Sensitive or legally consequential answers need confirmation for each use. | Planned 0.3 | FR-8.4, FR-8.7, FR-8.8 | Yes |
 | M-28 | Work-authorization answers are keyed by exact country and never retrieved by similarity. | Planned 0.3 | FR-4.10, FR-8.3 | None |
-| M-29 | Router eligibility checks, as in [AI providers](../ai-providers.md#routing): policy, model origin, automation mode, consent, capability, availability. `blocked` and `unknown` cannot be overridden in settings. Fallback never widens consent. External calls write an audit row. | Planned 0.4 | FR-3.24 to FR-3.29, FR-5.14 | Yes |
+| M-29 | Router eligibility checks, as in [AI providers](../ai-providers.md#routing): policy, model origin, automation mode, consent, capability, availability. Site rows `blocked` and providers outside the owner decisions cannot be overridden in settings. Fallback never widens consent. External calls write an audit row. | Planned 0.4 | FR-3.24 to FR-3.29, FR-5.14 | Yes |
 | M-30 | Consent records per provider, sign-in method, and data category. Suspended when a verdict changes. | Planned 0.4 | FR-3.30 | Yes |
-| M-31 | CLI adapter rule in [section 7](#7-cli-adapters-and-untrusted-text), enforced through `no_tools`. Conditional on D1 and on each register row. | Planned 0.4 | FR-3.12, FR-12.3, FR-12.5 | Part |
+| M-31 | CLI adapter rule in [section 7](#7-cli-adapters-and-untrusted-text), enforced through `no_tools`. Applies to every adapter D1 makes eligible. | Planned 0.4 | FR-3.12, FR-12.3, FR-12.5 | Part |
 | M-32 | JobPilot never reads, copies, or stores a CLI's login files, keychain entries, or tokens. Bundles no vendor CLI. | Planned 0.4 | FR-3.12, FR-3.14 | None |
 | M-33 | Connector gate: status comes from the build-time register, and a connector's own declaration must match it, otherwise it counts as `unknown`. Declared rate limits are enforced. Proposal: connectors are compiled in, with no runtime plugin loading until a sandbox exists. | Planned 0.5 | FR-5.1, FR-5.11 to FR-5.15 | Part |
 | M-34 | Import normalizes untrusted text: HTML to plain text, a size limit, hidden text dropped from what the model sees. Instruction-like text is shown to the user as a finding. | Planned 0.2 for pasted text, 0.5 for connectors | FR-12.3 | Part (0.2) |

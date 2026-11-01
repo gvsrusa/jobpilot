@@ -28,7 +28,7 @@ Only the first five screens (shell, recovery, status, documents, data) belong to
 
 ### Rules every screen follows
 
-- **Policy reality, not aspiration.** Screens show what the [policy register](policy-register.md) allows today. `unknown` behaves as `blocked`. A control that the register forbids is shown disabled with its reason, or is absent when it must not exist (a provider enable switch, a Claude login button). No setting overrides a verdict.
+- **Policy reality, not aspiration.** Screens show what the [policy register](policy-register.md) allows today, with the owner decisions of 2026-11-01 applied to AI providers. For site rows, `unknown` behaves as `blocked`, except Copilot fill on a row recording "no clause found" (D2). A control that is forbidden is shown disabled with its reason, or is absent when it must not exist (a Claude login button). No setting overrides a site verdict.
 - **Secrets are never displayed.** Entry fields for secrets are write-only and cleared after save. The list shows names only (FR-12.2, M-03). There is no reveal button anywhere.
 - **Untrusted text is inert.** Job, company, and page text renders as plain text with no HTML, no remote images, and no live links (M-04, FR-12.3). It carries an "untrusted" label.
 - **Authorization values are user-entered only.** No screen pre-fills, suggests, defaults, infers, or autocompletes work authorization or sponsorship (FR-4.9, FR-4.10). The empty state is "Not stated".
@@ -439,7 +439,7 @@ Jobs come only from connectors whose register read verdict is `allowed` (Lever, 
 
 ## 11. Application review and pause state (release 0.6)
 
-The review screen shows one application before anything happens on the site. It works today in **Manual mode**, the only mode with an eligible register row for hosted forms. The mode choice shows each mode's status and the register reason when a mode is not available.
+The review screen shows one application before anything happens on the site. Manual mode is always available on a `user-assisted` row. Copilot is available on sites whose register row records "no clause found" (Greenhouse, Lever, Ashby; decision D2). The mode choice shows each mode's status and the register reason when a mode is not available.
 
 ```text
 +-------------+----------------------------------------------------------------+
@@ -447,19 +447,18 @@ The review screen shows one application before anything happens on the site. It 
 | Applications+----------------------------------------------------------------+
 |             | Site rule (register 2026-11-01)                                |
 |             |  Greenhouse hosted form: apply by hand = user-assisted         |
-|             |                          fill by tool  = unknown               |
+|             |                          fill by tool  = no clause found       |
 |             +----------------------------------------------------------------+
 |             | How do you want to apply?                                      |
 |             |  (x) Manual    You fill and submit in your own browser.        |
 |             |                JobPilot opens the link, gives you files and    |
 |             |                answers, and records what happened.             |
-|             |  ( ) Copilot   ~~~ Not available                               |
-|             |                Why: this site's Copilot rule is "unknown",     |
-|             |                which is treated as blocked until the site      |
-|             |                answers. Not changeable in settings.            |
+|             |  ( ) Copilot   JobPilot fills the form and uploads files.      |
+|             |                You review and click submit. No clause found    |
+|             |                for this site; it will pause for CAPTCHA, ID    |
+|             |                checks, and legal declarations.                 |
 |             |  ( ) Autonomous ~~~ Not available. Off by default.             |
-|             |                Why: no site or connector qualifies. "unknown"  |
-|             |                or "blocked" on every hosted form today.        |
+|             |                Why: no connector has verified permission.      |
 |             +----------------------------------------------------------------+
 |             | Material for this application                                  |
 |             |  [x] Resume v3 (PDF)          [x] Cover letter v2 (PDF)        |
@@ -476,16 +475,17 @@ Why a mode is unavailable comes from the site's register row and the mode rules.
 
 | Register verdict for that mode and site | Text under the disabled mode |
 |---|---|
-| `unknown` | "The site has not said whether tools may do this. Treated as blocked until it answers." |
+| `unknown` with "no clause found" (Copilot, D2) | Copilot is selectable. Text beside it: "No clause found for this site. You review and submit." |
+| `unknown` otherwise | "The site has not said whether tools may do this. Treated as blocked until it answers." (Workday, LinkedIn) |
 | `blocked` | "The site's terms forbid this. JobPilot will not do it, even if you ask." (Indeed) |
 | Autonomous with no eligible connector | "No site or connector qualifies today. Needs a site rule of allowed, verified permission, and your explicit authorization." |
 | Autonomous with an OpenAI-origin model | "Not allowed with OpenAI models for submissions with no human review." |
 
-Copilot and Autonomous become selectable only for a site with its own `allowed` row, or for local fixture forms during development (no real site is eligible today). No test or setting turns a disabled mode on for a real site.
+Copilot becomes selectable for a site with its own `allowed` row or a row recording "no clause found", and for local fixture forms during development. Autonomous stays default-off and needs verified permission and explicit authorization. No test or setting turns a disabled mode on for a site whose row is `blocked`.
 
 ### Pause state
 
-When a Copilot or Autonomous run reaches a mandatory pause, the review screen is replaced by the pause panel. Today this appears only against local fixture forms, because no real site is eligible. The six pauses from the agent specification are listed so the user always sees the full set, with the active one marked.
+When a Copilot or Autonomous run reaches a mandatory pause, the review screen is replaced by the pause panel. This appears on any Copilot run, including Greenhouse, Lever, and Ashby forms, and CAPTCHA, MFA, identity verification, and legal declarations always trigger it. The six pauses from the agent specification are listed so the user always sees the full set, with the active one marked.
 
 ```text
 +-------------+----------------------------------------------------------------+
@@ -556,7 +556,7 @@ A bottom panel running xterm.js over a Rust PTY. It is a restricted terminal, no
 
 ## 13. AI provider consent (release 0.4)
 
-Providers are listed with the register verdict and the reason. An ineligible provider shows the reason and has **no enable control at all**: no switch, no key field, no sign-in button. No setting overrides a verdict. Verdicts and quoted reasons come from the [policy register](policy-register.md) at the date shown, and the screen shows that date.
+Providers are listed with the register verdict, the reason, and the owner-decision status. An ineligible provider (free Gemini key, non-loopback endpoints, Vertex AI, Ollama cloud models, Antigravity) shows the reason and has **no enable control at all**: no switch, no key field, no sign-in button. No setting overrides that. Providers the owner decisions make eligible show [Review...] and the vendor's terms on the consent dialog. Verdicts and quoted reasons come from the [policy register](policy-register.md) at the date shown, and the screen shows that date.
 
 ```text
 +-------------+----------------------------------------------------------------+
@@ -570,25 +570,20 @@ Providers are listed with the register verdict and the reason. An ineligible pro
 |             | Your own local server (localhost address)   [Add endpoint...]  |
 |             |   Eligible: runs on your machine. No presets.                  |
 |             +----------------------------------------------------------------+
+|             | Claude Code (your own login)                [Review...]        |
+|             |   Headless backend and terminal session. No tools for job text.|
+|             |   Not found? Shows "Unavailable: install claude".              |
 |             | Sign in with ChatGPT                        [Review...]        |
 |             |   Allowed, if you are eligible (Plus or Pro). Preview.         |
-|             |   Shown only if the owner adopts this route (decision D1).     |
+|             | OpenAI, Anthropic, Google (paid), OpenRouter  [Add key...]     |
+|             |   Your own key. The vendor's terms are shown before you agree. |
+|             | Gemini CLI, Codex CLI (optional)            [Review...]        |
+|             |   Uses the installed CLI's sign-in. Unavailable if not found.  |
 |             +----------------------------------------------------------------+
 |             | Not available                                                  |
-|             |  OpenAI API key       unknown  The terms cover businesses.     |
-|             |                       Waiting for OpenAI to say whether a      |
-|             |                       person's key may be used here.           |
-|             |  Anthropic API key    unknown  Same: "not for consumer use".   |
-|             |  Google Gemini key    unknown (paid), blocked (free key:       |
-|             |                       no personal data allowed).               |
-|             |  OpenRouter           account allowed, but no model qualifies  |
-|             |                       yet. Each model's own terms apply.       |
-|             |  Claude Code          Claude sign-in is not offered. API-key   |
-|             |                       mode unknown. Run it yourself in your    |
-|             |                       own terminal; JobPilot sends it nothing. |
-|             |  Gemini CLI           Consumer sign-in no longer exists.       |
-|             |  Codex CLI            Run it yourself; API-key mode unknown.   |
-|             |  Web endpoints (not   unknown. Only localhost is supported.    |
+|             |  Google Gemini key    free key: no personal data allowed.      |
+|             |  Antigravity CLI      No launcher. Run it in your own terminal.|
+|             |  Web endpoints (not   Not supported. Only localhost works.     |
 |             |  on your computer)                                             |
 +-------------+----------------------------------------------------------------+
 ```
@@ -622,7 +617,7 @@ Consent dialog (opened by Review on an eligible, non-local provider). Nothing is
 - Consent is per provider, per sign-in method, and per category. [Allow selected] stays disabled until at least one category is ticked. No category is ticked by default.
 - A verdict change in a release suspends the affected consent until the user confirms again, and the list row says "Suspended: terms changed".
 - Consent records, timestamps, and revocations are listed under the provider and shown in audit entries (FR-12.7).
-- **Release:** 0.4. Subscription rows depend on decision D1, and hosted API rows on decision D4. Both are open.
+- **Release:** 0.4. Subscription rows follow decision D1 and hosted API rows decision D4, both decided 2026-11-01.
 - **Keyboard:** the provider list is one tab stop with arrows. Enter on a row opens its detail. Ineligible rows are focusable so their reason is read. In the dialog, the checkboxes take Space, the focus stays inside, and Esc cancels.
 - **Focus order:** Ollama toggle, Add endpoint, Review, then the Not available list (read-only rows, in order). Dialog: Cancel, category checkboxes, Show exactly what will be sent, Allow selected.
 - **Empty state:** no provider enabled other than No-AI: "JobPilot works without one. Tasks that need AI end with a manual path." This is a normal state, not an error.
@@ -692,4 +687,4 @@ Model rows and the status line change with what JobPilot finds:
 | AI provider consent | Screen 13 |
 | Local AI setup | Screen 14 |
 
-Open items for the owner: the pause-panel `{timeout}` (proposed as 30 minutes in [agents](agents.md#4-the-nine-agents)) and the Ctrl+` and F6 keys are proposals; the Sign in with ChatGPT row exists only if decision D1 adopts it.
+Open items for the owner: the pause-panel `{timeout}` (proposed as 30 minutes in [agents](agents.md#4-the-nine-agents)) and the Ctrl+` and F6 keys are proposals; the Sign in with ChatGPT row is optional under decision D1.

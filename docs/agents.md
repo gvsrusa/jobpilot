@@ -73,7 +73,7 @@ Timeouts exclude time waiting for a person. "Router policy" means the [retry rul
 
 Notes that bind the table:
 
-- **Discovery.** Today's `allowed` read rows are Lever, RemoteOK, and We Work Remotely (RSS only). Every other source enters through user-assisted import. `unknown` behaves as `blocked`, and the agent cannot run a connector for it.
+- **Discovery.** Today's `allowed` read rows are Lever, RemoteOK, and We Work Remotely (RSS only). Every other source enters through user-assisted import. A site read row that is `unknown` behaves as `blocked`, and the agent cannot run a connector for it.
 - **Matching.** Stated authorization values are compared deterministically and only per country. A missing value is reported as "not stated", never as eligible or ineligible (FR-4.10).
 - **Resume and cover letter.** Only user-entered or user-approved material counts as evidence. A draft does not become evidence by being saved. Neither agent holds `read:sensitive`. `read:resume_text` withholds user-marked documents and lines. Unmarked text can still state visa status, citizenship, or salary ([threat model](security/threat-model.md#11-residual-risks)).
 - **Career memory.** Only the user approves an answer or lowers a class (FR-8.4). Sensitive answers are not embedded. Work-authorization answers are found by exact country key, not by similarity.
@@ -83,15 +83,15 @@ Notes that bind the table:
 
 ## 5. Automation modes
 
-The browser application agent runs in one of three modes. The mode must be earned by a register row. A user cannot override `blocked` or `unknown`.
+The browser application agent runs in one of three modes. The mode must be earned by a register row, or under owner decision D2 for Copilot, by a row recording "no clause found". A user cannot override a site row that is `blocked`.
 
 | Mode | Needs | Agent does | Today |
 |---|---|---|---|
 | Manual | A `user-assisted` apply row | Opens the link in the user's default browser, supplies files and text, records the outcome. No request to the site and no browser driven there. The user fills and submits. | Available on every `user-assisted` apply row in the register. |
-| Copilot | The site's own `allowed` Copilot row | Drives an isolated browser, fills, uploads, stops. The user reviews and clicks submit. A human click does not substitute for the row. | **No site is eligible.** Greenhouse, Lever, Ashby, Workday, and LinkedIn are `unknown`, and Indeed is `blocked`. Tested on local fixture forms only. |
+| Copilot | The site's own `allowed` Copilot row, or a Copilot row recording "no clause found" (D2) | Drives an isolated browser, fills, uploads, stops. The user reviews and clicks submit. A human click does not substitute for the row. Eligible on Greenhouse, Lever, and Ashby hosted forms, recorded as "no clause found". Workday (a clause may reach it) and LinkedIn (not read) stay refused, and Indeed is `blocked`. Pauses for CAPTCHA, MFA, identity verification, and legal declarations always apply. |
 | Autonomous | The site's own `allowed` row, verified connector permission, and explicit user authorization (FR-9.6) | Also submits, in one attempt. Stops at every mandatory pause. | **Default off. Zero eligible connectors.** Every hosted-form row for this step is `unknown` or `blocked`. |
 
-Autonomous steps are `unreviewed`, so the router's [mode check](ai-providers.md#routing) refuses every OpenAI-origin model on any step of a submission, and any provider that cannot leave human confirmation in place. A site's row applies whichever model runs. Decision D2 in Task A6 sets what happens to this mode next, and this document does not assume its outcome.
+Autonomous steps are `unreviewed`, so the router's [mode check](ai-providers.md#routing) refuses every OpenAI-origin model on any step of a submission, and any provider that cannot leave human confirmation in place. A site's row applies whichever model runs. Decision D2 (2026-11-01) keeps Autonomous default-off.
 
 ## 6. Mandatory pauses
 

@@ -93,18 +93,19 @@ Exit tests:
 Gates: all five apply. Build includes the workflow runner; migrations add memory, tracking, and execution-log tables and upgrade a 0.2 database; Windows and macOS means pause and cancellation work on both.
 ## Release 0.4: External AI backends
 
-Scope: external AI backends, API providers, consent UI. The design of the subscription-CLI integration depends on Decision D1, made in Task A6. This plan does not assume D1's outcome, and 0.4 scope for the subscription backends stays conditional on it. Hosted API providers likewise depend on Decision D4.
+Scope: external AI backends, API providers, consent UI. Per the owner's decisions of 2026-11-01: Claude Code through the official `claude` CLI and its own login, as a headless backend (`claude -p` style) the task router may call and as a user-driven terminal session (D1); optional Gemini CLI and Codex CLI adapters on whatever sign-in the installed CLI supports; direct API providers under standard BYOK (D4). Security controls stay: `no_tools` for job and company text, and consent records.
 
-Requirements: FR-3.9 to FR-3.19 (subscription items conditional on D1, hosted API items on D4), FR-3.30.
+Requirements: FR-3.9 to FR-3.19, FR-3.30.
 
 Exit tests:
-- Each API provider in FR-3.15 to FR-3.19 whose [policy register](policy-register.md) verdict permits the operation runs through the task router with capability declarations, schema validation, timeouts, retries, and fallback. A provider or model whose verdict is `unknown` or `blocked` is refused, and a test proves it.
+- Each direct API provider in FR-3.15 to FR-3.19 that the register's [owner decisions](policy-register.md#owner-decisions-2026-11-01) make eligible (OpenAI, Anthropic, Google paid key, OpenRouter, loopback endpoints) runs through the task router with capability declarations, schema validation, timeouts, retries, and fallback. A provider the decisions leave out (free Gemini key, non-loopback endpoints, Vertex AI, Ollama cloud models) is refused, and a test proves it.
 - Consent UI blocks any external call until the user gives explicit data-sharing consent, and shows what will be sent.
 - Prompt-injection tests pass for untrusted text sent to external backends. FR-12.3 lands in 0.2; this test extends it to hosted backends.
-- Subscription backends: scope and tests defined after D1; the terms review for each CLI is recorded before any of them ships.
+- Claude Code headless backend: the router calls the user's installed `claude` CLI on its own login, passes job text only with tools disabled (an adapter test proves no tool is available), and the app reads or stores no CLI token. The terminal session starts `claude` for the user and the router never sends it work. An absent CLI shows as unavailable.
+- Optional Gemini CLI and Codex CLI adapters: run on the installed CLI's sign-in when present, show unavailable when absent, and are skipped for tasks that need `no_tools` unless a no-tools configuration is proven.
 - No mandatory key: the app still works end to end with no provider configured.
 
-Gates: all five apply. Build includes the provider and consent code; migrations add provider settings and consent records; Windows and macOS means keychain-stored keys and CLI detection work on both.
+Gates: all five apply. Build includes the provider and consent code; migrations add provider settings and consent records; Windows and macOS means keychain-stored keys, Claude Code headless and terminal, and CLI detection work on both.
 ## Release 0.5: International job discovery and intelligence
 
 Scope: connector SDK, read-only discovery, job intelligence (spec section 6).
@@ -123,13 +124,13 @@ Exit tests:
 Gates: all five apply. Build includes the connector SDK; migrations add jobs, companies, and match tables; Windows and macOS means connector tests and the job CLI commands pass on both.
 ## Release 0.6: Browser automation
 
-Scope: Playwright runtime, permissions engine, Manual and Copilot modes. Copilot runs only on sites with an `allowed` register row. Autonomous mode ships only for connectors that pass policy review.
+Scope: Playwright runtime, permissions engine, Manual and Copilot modes. Per D2, Copilot runs on a site where no clause forbids it, recorded as "no clause found" (Greenhouse, Lever, Ashby); a site row that is `blocked` stays blocked. Autonomous mode is default-off and ships only for connectors that pass policy review.
 
 Requirements: FR-3.22, FR-9.1 to FR-9.21, FR-11.6, FR-12.4.
 
 Exit tests:
 - Manual mode supplies documents and retrieved answers for the user to apply in their own browser, and records the outcome.
-- Copilot mode detects forms, extracts questions, retrieves answers, fills forms, uploads resume and cover letter, and captures confirmations on sites whose register verdict for Copilot fill is `allowed`. All other sites are refused, and a test proves it. Where no site is eligible, these behaviours are tested against local fixture forms only.
+- Copilot mode detects forms, extracts questions, retrieves answers, fills forms, uploads resume and cover letter, and captures confirmations on sites whose register row for Copilot fill is `allowed` or records "no clause found". Sites whose row is `blocked`, quotes a clause that may reach them (Workday), or was not read (LinkedIn) are refused, and a test proves it. Each Copilot run records "no clause found". Tests run against local fixture forms for each eligible site.
 - The permissions engine allows Autonomous submission only for connectors with verified permission and explicit user authorization; all other connectors are refused.
 - The runtime pauses for legal declarations, unverified sensitive information, identity verification, CAPTCHA, MFA, and other human-only steps.
 - Browser processes are isolated; emergency pause halts them.
