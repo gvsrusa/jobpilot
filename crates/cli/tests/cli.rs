@@ -2080,3 +2080,78 @@ async fn ai_index_while_paused_says_paused() {
     let text = stderr_text(&refused);
     assert!(text.starts_with("error[paused]"), "{text}");
 }
+
+/// A run with `input` piped in, as a script would give a key.
+fn run_with_stdin(home: &Path, args: &[&str], input: &str) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jobpilot"))
+        .args(args)
+        .env("JOBPILOT_HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // A command that refuses before reading closes the pipe, which is no failure here.
+    let _ = child.stdin.take().unwrap().write_all(input.as_bytes());
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn key_set_refuses_argv_by_shape() {
+    let (_dir, home) = fresh_home();
+    let refused = run(&home, &["ai", "key", "set", "openai", "sk-abcdefgh"]);
+    assert_eq!(refused.status.code(), Some(2), "clap's usage error");
+    assert!(refused.stdout.is_empty());
+    let flag = run(&home, &["ai", "key", "set", "openai", "--key=sk-abcdefgh"]);
+    assert_eq!(flag.status.code(), Some(2));
+    assert!(
+        !home.exists(),
+        "refused while parsing, before any data opened"
+    );
+}
+
+#[test]
+fn key_set_with_a_bad_key_echoes_nothing() {
+    let (_dir, home) = fresh_home();
+    let refused = run_with_stdin(&home, &["ai", "key", "set", "openai"], "two words here\n");
+    assert_eq!(refused.status.code(), Some(1));
+    let text = stderr_text(&refused);
+    assert!(text.starts_with("error[validation]"), "{text}");
+    assert!(!text.contains("two words here"), "{text}");
+    assert!(refused.stdout.is_empty());
+    let secrets = run(&home, &["ai", "status", "--json"]);
+    let status = stdout_json(&secrets);
+    assert_eq!(status["external"][0]["key_stored"], false);
+}
+
+#[test]
+fn key_set_with_nothing_piped_is_not_a_key() {
+    let (_dir, home) = fresh_home();
+    let refused = run_with_stdin(&home, &["ai", "key", "set", "openai"], "");
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(stderr_text(&refused).starts_with("error[validation]"));
+}
+
+#[test]
+fn key_set_refuses_a_provider_that_takes_no_key() {
+    let (_dir, home) = fresh_home();
+    for provider in ["ollama", "claude_code", "gemini_cli", "codex_cli"] {
+        let refused = run_with_stdin(&home, &["ai", "key", "set", provider], "sk-abcdefgh\n");
+        assert_eq!(refused.status.code(), Some(1), "{provider}");
+        let text = stderr_text(&refused);
+        assert!(text.starts_with("error[refused]"), "{provider}: {text}");
+        assert!(!text.contains("sk-abcdefgh"), "{text}");
+    }
+}
+
+#[test]
+fn key_remove_with_no_key_is_not_found() {
+    let (_dir, home) = fresh_home();
+    let refused = run(&home, &["ai", "key", "remove", "openai"]);
+    assert_eq!(refused.status.code(), Some(1));
+    let text = stderr_text(&refused);
+    assert!(text.starts_with("error[not_found]"), "{text}");
+}

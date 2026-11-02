@@ -12,8 +12,9 @@
 // writers from two processes; hold the row in a transaction if that ever happens.
 
 use serde_json::json;
-use zeroize::Zeroizing;
+pub use zeroize::Zeroizing;
 
+use crate::ai::register::{self, ProviderInfo, ProviderKind};
 use crate::audit;
 use crate::crypto::KEY_ACCOUNT_PREFIX;
 use crate::db::Db;
@@ -21,13 +22,67 @@ use crate::error::{Error, Result};
 
 const SERVICE: &str = "io.github.gvsrusa.jobpilot";
 
+pub const API_KEY_PREFIX: &str = "ai-key-";
+
+/// The longest key taken. It keeps an entry under Credential Manager's 2,560-byte blob limit.
+const MAX_API_KEY: usize = 512;
+
+/// The keychain entry and `secret_index` name of a provider's key.
+pub fn api_key_name(provider: &str) -> String {
+    format!("{API_KEY_PREFIX}{provider}")
+}
+
+/// Trims, then 8 to 512 visible ASCII characters with no space. Pasted text may be anything
+/// at all, so the one error never holds it.
+pub fn check_api_key(raw: &str) -> Result<Zeroizing<String>> {
+    let key = raw.trim();
+    let shaped =
+        (8..=MAX_API_KEY).contains(&key.len()) && key.bytes().all(|b| b.is_ascii_graphic());
+    if !shaped {
+        return Err(Error::Validation("that is not an API key".into()));
+    }
+    Ok(Zeroizing::new(key.to_owned()))
+}
+
+/// The provider, if it is one that takes a key. Adapters ask this first, so nobody types or
+/// confirms a key that cannot be stored.
+pub fn key_provider(provider: &str) -> Result<&'static ProviderInfo> {
+    register::info(provider)
+        .filter(|info| matches!(info.kind, ProviderKind::Api | ProviderKind::Endpoint))
+        .ok_or_else(|| Error::Refused("this provider takes no key".into()))
+}
+
+/// Stores a provider's key under its reserved name, replacing any earlier one.
+pub async fn set_api_key(db: &Db, provider: &str, key: &str, actor: &str) -> Result<()> {
+    key_provider(provider)?;
+    let key = check_api_key(key)?;
+    store(db, &api_key_name(provider), &key, actor).await
+}
+
+/// `NotFound` when no key is stored.
+pub async fn delete_api_key(db: &Db, provider: &str, actor: &str) -> Result<()> {
+    key_provider(provider)?;
+    erase(db, &api_key_name(provider), actor).await
+}
+
+/// Off the runtime. `None` when no entry.
+// Task 4's `KeySource::Keychain` is the first caller.
+#[allow(dead_code)]
+pub(crate) async fn read_api_key(provider: &str) -> Result<Option<Zeroizing<String>>> {
+    let name = api_key_name(provider);
+    keychain(move || Ok(get(&name)?.map(Zeroizing::new))).await
+}
+
 /// Stores `value` under `name`, replacing any earlier value.
-///
-/// The index row goes first: a crash between the two steps must leave a name that
-/// `delete_all` can find, never a keychain entry it cannot.
 pub async fn set(db: &Db, name: &str, value: &str, actor: &str) -> Result<()> {
     check_name(name)?;
-    refuse_data_key(name)?;
+    refuse_reserved(name)?;
+    store(db, name, value, actor).await
+}
+
+/// The index row goes first: a crash between the two steps must leave a name that
+/// `delete_all` can find, never a keychain entry it cannot.
+async fn store(db: &Db, name: &str, value: &str, actor: &str) -> Result<()> {
     let added = sqlx::query(
         "INSERT INTO secret_index (name, created_at) \
          VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
@@ -39,7 +94,7 @@ pub async fn set(db: &Db, name: &str, value: &str, actor: &str) -> Result<()> {
     .rows_affected()
         == 1;
 
-    let (entry_name, entry_value) = (name.to_owned(), value.to_owned());
+    let (entry_name, entry_value) = (name.to_owned(), Zeroizing::new(value.to_owned()));
     if let Err(error) = keychain(move || {
         entry(&entry_name)?
             .set_password(&entry_value)
@@ -71,7 +126,11 @@ pub fn get(name: &str) -> Result<Option<String>> {
 /// `NotFound` when this root does not list `name`: the entry could belong to another
 /// root. The row outlives the keychain entry, so a failure here can be retried.
 pub async fn delete(db: &Db, name: &str, actor: &str) -> Result<()> {
-    refuse_data_key(name)?;
+    refuse_reserved(name)?;
+    erase(db, name, actor).await
+}
+
+async fn erase(db: &Db, name: &str, actor: &str) -> Result<()> {
     let listed: Option<i64> = sqlx::query_scalar("SELECT 1 FROM secret_index WHERE name = ?")
         .bind(name)
         .fetch_optional(&db.pool)
@@ -166,12 +225,21 @@ fn check_name(name: &str) -> Result<()> {
 
 /// `set` and `delete` are open to the webview, and a key id is not secret: the audit log
 /// shows it. Replacing or removing that entry would destroy the only copy of the data
-/// key. Windows matches credential names without regard to case, so this does too.
-fn refuse_data_key(name: &str) -> Result<()> {
-    let prefix = name.get(..KEY_ACCOUNT_PREFIX.len());
-    if prefix.is_some_and(|prefix| prefix.eq_ignore_ascii_case(KEY_ACCOUNT_PREFIX)) {
+/// key. Swapping a provider key for one of its own would route the user's data to another
+/// account. Windows matches credential names without regard to case, so this does too.
+fn refuse_reserved(name: &str) -> Result<()> {
+    let starts_with = |prefix: &str| {
+        name.get(..prefix.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+    };
+    if starts_with(KEY_ACCOUNT_PREFIX) {
         return Err(Error::Refused(
             "this name is reserved for the data key".into(),
+        ));
+    }
+    if starts_with(API_KEY_PREFIX) {
+        return Err(Error::Refused(
+            "this name is reserved for a provider key".into(),
         ));
     }
     Ok(())
@@ -240,13 +308,92 @@ mod tests {
     fn only_data_key_names_are_reserved() {
         for name in ["data-key-00112233aabbccdd", "DATA-KEY-x", "Data-Key-"] {
             assert!(
-                matches!(refuse_data_key(name), Err(Error::Refused(_))),
+                matches!(refuse_reserved(name), Err(Error::Refused(_))),
                 "{name}"
             );
         }
-        for name in ["data-key", "openai", "my-data-key-1", "é"] {
-            assert!(refuse_data_key(name).is_ok(), "{name}");
+        for name in ["data-key", "ai-key", "openai", "my-data-key-1", "é"] {
+            assert!(refuse_reserved(name).is_ok(), "{name}");
         }
+    }
+
+    #[test]
+    fn api_key_names_are_reserved_from_the_generic_commands() {
+        for name in ["ai-key-openai", "AI-KEY-x"] {
+            assert!(
+                matches!(refuse_reserved(name), Err(Error::Refused(_))),
+                "{name}"
+            );
+        }
+        assert_eq!(api_key_name("openai"), "ai-key-openai");
+    }
+
+    #[test]
+    fn check_api_key_trims_and_never_quotes() {
+        assert_eq!(
+            check_api_key("  sk-abcdefgh\n").unwrap().as_str(),
+            "sk-abcdefgh"
+        );
+        let long = "x".repeat(513);
+        for bad in [
+            "",
+            "short",
+            "two words here",
+            "has\ttab1",
+            long.as_str(),
+            "café-key-1234",
+        ] {
+            let error = check_api_key(bad).unwrap_err();
+            assert!(matches!(error, Error::Validation(_)), "{error:?}");
+            let message = error.to_string();
+            assert!(bad.is_empty() || !message.contains(bad), "{message}");
+        }
+    }
+
+    #[test]
+    fn check_api_key_takes_the_limits_exactly() {
+        assert!(check_api_key(&"x".repeat(8)).is_ok());
+        assert!(check_api_key(&"x".repeat(7)).is_err());
+        assert!(check_api_key(&"x".repeat(512)).is_ok());
+        assert!(check_api_key("\u{7f}xxxxxxxx").is_err());
+    }
+
+    /// Refused before the index or the keychain, so it needs neither.
+    #[tokio::test]
+    async fn only_api_and_endpoint_providers_take_a_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&crate::AppPaths::new(tmp.path().join("data")))
+            .await
+            .unwrap();
+        for provider in ["ollama", "claude_code", "gemini_cli", "codex_cli", "x"] {
+            let set = set_api_key(&db, provider, "sk-abcdefgh", "test").await;
+            assert!(matches!(set, Err(Error::Refused(_))), "{provider}: {set:?}");
+            let gone = delete_api_key(&db, provider, "test").await;
+            assert!(
+                matches!(gone, Err(Error::Refused(_))),
+                "{provider}: {gone:?}"
+            );
+        }
+        for provider in ["openai", "anthropic", "google", "openrouter", "endpoint"] {
+            assert!(key_provider(provider).is_ok(), "{provider}");
+        }
+        assert!(names(&db).await.unwrap().is_empty());
+        db.close().await;
+    }
+
+    /// The row check runs first, so a name this root does not list asks no keychain.
+    #[tokio::test]
+    async fn a_bad_key_and_a_missing_key_touch_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&crate::AppPaths::new(tmp.path().join("data")))
+            .await
+            .unwrap();
+        let set = set_api_key(&db, "openai", "two words here", "test").await;
+        assert!(matches!(set, Err(Error::Validation(_))), "{set:?}");
+        let gone = delete_api_key(&db, "openai", "test").await;
+        assert!(matches!(gone, Err(Error::NotFound)), "{gone:?}");
+        assert!(names(&db).await.unwrap().is_empty());
+        db.close().await;
     }
 
     #[test]

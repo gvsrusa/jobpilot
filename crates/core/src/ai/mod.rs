@@ -485,7 +485,7 @@ async fn external_status(db: &Db) -> Result<Vec<ExternalStatus>> {
             available: false,
             reason: Some("not_built".into()),
             model: text_setting(db, &format!("ai.model.{}", info.name)).await?,
-            key_stored: stored.contains(&format!("ai-key-{}", info.name)),
+            key_stored: stored.contains(&secrets::api_key_name(info.name)),
             path: None,
             consent: state.allowed(),
             suspended,

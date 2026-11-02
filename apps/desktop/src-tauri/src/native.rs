@@ -1,10 +1,12 @@
 //! Dialogs Rust opens itself (M-13). The webview can ask for an action and can never answer
 //! for the user: what is confirmed or picked comes back here, not through IPC, so no webview
 //! capability is involved. Each dialog waits on a blocking thread, and no caller may hold a
-//! state lock while one is open.
+//! state lock while one is open. The clipboard is read here for the same reason: a key comes
+//! to Rust from the system, and the webview has no clipboard permission at all.
 
 use std::path::PathBuf;
 
+use jobpilot_core::secrets::Zeroizing;
 use jobpilot_core::{Error, Result};
 use tauri::{AppHandle, Runtime};
 
@@ -38,6 +40,41 @@ pub async fn open_file<R: Runtime>(app: &AppHandle<R>, dialog: FileDialog<'_>) -
 /// `Err(Cancelled)` when the user closes the picker.
 pub async fn save_file<R: Runtime>(app: &AppHandle<R>, dialog: FileDialog<'_>) -> Result<PathBuf> {
     pick(app, dialog, true).await?.ok_or(Error::Cancelled)
+}
+
+/// `None` when it holds no text.
+#[cfg(not(test))]
+pub async fn clipboard_text<R: Runtime>(app: &AppHandle<R>) -> Result<Option<String>> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+
+    // The plugin flattens every failure to a string, an image on the clipboard among them,
+    // so each reads as no text and the caller's own refusal covers it.
+    let app = app.clone();
+    off_the_main_thread(move || app.clipboard().read_text().ok()).await
+}
+
+/// Clears the clipboard only if it still holds `was`: what the user copied since is theirs.
+// ponytail: the check and the clear are two calls, as the system has no compare-and-clear.
+// A copy landing between them is lost.
+pub async fn clear_clipboard<R: Runtime>(app: &AppHandle<R>, was: &str) -> Result<()> {
+    let now = clipboard_text(app).await?;
+    match now.map(Zeroizing::new) {
+        Some(now) if now.as_str() == was => wipe_clipboard(app).await,
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(test))]
+async fn wipe_clipboard<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+
+    let app = app.clone();
+    off_the_main_thread(move || app.clipboard().clear().is_ok())
+        .await?
+        .then_some(())
+        .ok_or_else(|| {
+            Error::Failed("the key is stored, but the clipboard could not be cleared".into())
+        })
 }
 
 #[cfg(not(test))]
@@ -104,6 +141,8 @@ async fn pick<R: Runtime>(
 pub struct NativeHook {
     pub confirm: std::sync::atomic::AtomicBool,
     pub picked: std::sync::Mutex<Option<PathBuf>>,
+    /// What the system clipboard holds, as the mock runtime has none.
+    pub clipboard: std::sync::Mutex<Option<String>>,
     /// Every dialog opened, as title and message.
     pub asked: std::sync::Mutex<Vec<String>>,
     /// For each confirmation, whether a `Work` was open while it waited.
@@ -121,11 +160,30 @@ impl Default for NativeHook {
         Self {
             confirm: true.into(),
             picked: Default::default(),
+            clipboard: Default::default(),
             asked: Default::default(),
             work_at_dialog: Default::default(),
             on_ask: Default::default(),
         }
     }
+}
+
+#[cfg(test)]
+pub async fn clipboard_text<R: Runtime>(app: &AppHandle<R>) -> Result<Option<String>> {
+    use tauri::Manager;
+
+    let hook = app.state::<NativeHook>();
+    let text = hook.clipboard.lock().unwrap().clone();
+    Ok(text)
+}
+
+#[cfg(test)]
+async fn wipe_clipboard<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
+    use tauri::Manager;
+
+    let hook = app.state::<NativeHook>();
+    hook.clipboard.lock().unwrap().take();
+    Ok(())
 }
 
 #[cfg(test)]

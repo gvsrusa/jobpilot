@@ -103,6 +103,7 @@ impl Command {
                 | Command::Ai(
                     AiCommand::ClaudePath { .. }
                         | AiCommand::Consent(ConsentCommand::Give { .. })
+                        | AiCommand::Key(_)
                         | AiCommand::Enable { .. }
                         | AiCommand::Disable { .. }
                         | AiCommand::Order { .. }
@@ -422,6 +423,8 @@ mod tests {
         ("ai enable openai", true),
         ("ai disable openai", true),
         ("ai order openai", true),
+        ("ai key set openai", true),
+        ("ai key remove openai", true),
         ("ai consent give claude_code --categories job_text", true),
         ("ai consent give openai --categories job_text", true),
         ("ai consent revoke claude_code", false),

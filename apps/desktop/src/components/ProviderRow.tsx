@@ -1,12 +1,51 @@
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { labelOf } from "@/components/ConsentDialog";
+import { ErrorAlert } from "@/components/ErrorAlert";
 import { Button } from "@/components/ui/button";
-import type { ExternalStatus } from "@/lib/ipc";
+import { ipc, type ExternalStatus } from "@/lib/ipc";
 import { SUSPENDED } from "@/lib/reasons";
 
 /** A provider's reason code, in plain words. */
 const UNAVAILABLE: Record<string, string> = {
   not_built: "not built yet",
 };
+
+/** Stored or not, and the two actions. Rust does both: no key passes through this screen. */
+function KeyControls({ row }: { row: ExternalStatus }) {
+  const client = useQueryClient();
+  const changed = () => client.resetQueries({ queryKey: ["ai"] });
+  const paste = useMutation({ mutationFn: () => ipc.aiKeyFromClipboard(row.name), onSuccess: changed });
+  const remove = useMutation({ mutationFn: () => ipc.aiKeyRemove(row.name), onSuccess: changed });
+  return (
+    <div className="grid gap-2">
+      <div className="flex flex-wrap items-center gap-3">
+        <span>{row.key_stored ? "Key stored" : "No key"}</span>
+        <Button
+          size="sm"
+          variant="outline"
+          aria-label={`${row.label}: Paste key from clipboard...`}
+          disabled={paste.isPending}
+          onClick={() => paste.mutate()}
+        >
+          Paste key from clipboard...
+        </Button>
+        {row.key_stored && (
+          <Button
+            size="sm"
+            variant="outline"
+            aria-label={`${row.label}: Remove key`}
+            disabled={remove.isPending}
+            onClick={() => remove.mutate()}
+          >
+            Remove key
+          </Button>
+        )}
+      </div>
+      <p className="text-muted-foreground">Copy your key first. The key stays out of this window.</p>
+      <ErrorAlert error={paste.error ?? remove.error} />
+    </div>
+  );
+}
 
 /** One external provider. Using it needs a record and a provider that can run. */
 export function ProviderRow(props: {
@@ -26,6 +65,7 @@ export function ProviderRow(props: {
         {row.path && <span className="break-all">{row.path}</span>}
       </div>
       {row.suspended && <p role="alert">{SUSPENDED}</p>}
+      {row.kind === "api" && <KeyControls row={row} />}
       {row.consent && <p>Consent given for: {row.consent.map(labelOf).join(", ")}.</p>}
       <div className="flex flex-wrap items-center gap-3">
         {row.consent && (

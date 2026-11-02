@@ -38,6 +38,7 @@ use jobpilot_core::profile::{self, Profile, ProfileBasic, WorkAuthorization};
 use jobpilot_core::recovery::{self, RecoveryReceipt};
 use jobpilot_core::render::{ResumeDoc, Template};
 use jobpilot_core::runner::{self, ExportChoice, RunDetail, RunSummary};
+use jobpilot_core::secrets::Zeroizing;
 use jobpilot_core::{Db, Error, Result, agents, secrets, settings, transfer};
 use serde_json::{Value, json};
 use tauri::ipc::Invoke;
@@ -152,6 +153,8 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         ai_consent_revoke,
         ai_sharing,
         ai_preview,
+        ai_key_from_clipboard,
+        ai_key_remove,
         ai_index,
         ai_cancel,
         key_state,
@@ -1163,6 +1166,50 @@ pub async fn ai_preview(state: State<'_, AppState>, job_text_id: String) -> Resu
     generate::preview(&db, TaskType::DraftResume, &job_text_id).await
 }
 
+/// A key comes from the system clipboard, so it never enters the webview, which sends only a
+/// provider name. Script there cannot answer the dialog, and what it shows is what is stored:
+/// the clipboard is read once, before the dialog. No lock is held while it is open.
+#[tauri::command]
+pub async fn ai_key_from_clipboard<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    provider: String,
+) -> Result<()> {
+    let label = secrets::key_provider(&provider)?.label;
+    drop(state.work().await?);
+    let copied = native::clipboard_text(&app).await?.map(Zeroizing::new);
+    // Any other text is someone's posting or password, so it is not repeated back.
+    let not_a_key = || Error::Validation("the clipboard does not hold a key".into());
+    let copied = copied.ok_or_else(not_a_key)?;
+    let key = secrets::check_api_key(&copied).map_err(|_| not_a_key())?;
+    let last_four = &key[key.len() - 4..];
+    let message = format!(
+        "Store the key ending in {last_four} as your {label} key? It goes to the system \
+         keychain. The clipboard is cleared after."
+    );
+    native::confirmed(&app, &format!("{label} key"), message, "Store key").await?;
+    secrets::set_api_key(&*state.work().await?, &provider, &key, ACTOR).await?;
+    // The text as copied: a key with a line break after it is still that text.
+    native::clear_clipboard(&app, &copied).await
+}
+
+/// Confirmed outside the webview, as script there must not be able to end the user's access.
+#[tauri::command]
+pub async fn ai_key_remove<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    provider: String,
+) -> Result<()> {
+    let label = secrets::key_provider(&provider)?.label;
+    let stored = secrets::names(&*state.work().await?).await?;
+    if !stored.contains(&secrets::api_key_name(&provider)) {
+        return Err(Error::NotFound);
+    }
+    let message = format!("Remove your {label} key from the system keychain?");
+    native::confirmed(&app, &format!("{label} key"), message, "Remove key").await?;
+    secrets::delete_api_key(&*state.work().await?, &provider, ACTOR).await
+}
+
 #[tauri::command]
 pub async fn ai_index(state: State<'_, AppState>) -> Result<usize> {
     let running = state.ai.begin()?;
@@ -1373,7 +1420,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use jobpilot_core::recovery::RecoveryReceipt;
-    use jobpilot_core::{AppPaths, Db, Error, backup, crypto};
+    use jobpilot_core::{AppPaths, Db, Error, backup, crypto, secrets};
     use serde_json::{Value, json};
     use tauri::ipc::{CallbackFn, InvokeBody};
     use tauri::test::{
@@ -1384,7 +1431,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::handler;
-    use crate::native::NativeHook;
+    use crate::native::{self, NativeHook};
     use crate::pty::{self, MAX_WRITE_BYTES, PtyState};
     use crate::state::{AppState, StartupError};
 
@@ -1516,6 +1563,30 @@ mod tests {
         fn answer(&self, yes: bool) {
             let hook = self.app.state::<NativeHook>();
             hook.confirm.store(yes, Ordering::SeqCst);
+        }
+
+        /// What the system clipboard holds from here on.
+        fn copy(&self, text: &str) {
+            let hook = self.app.state::<NativeHook>();
+            *hook.clipboard.lock().unwrap() = Some(text.to_owned());
+        }
+
+        fn clipboard(&self) -> Option<String> {
+            let hook = self.app.state::<NativeHook>();
+            hook.clipboard.lock().unwrap().clone()
+        }
+
+        /// A `secret_index` row, as a stored key leaves, with no keychain entry behind it.
+        fn list_secret(&self, name: &str) {
+            let state = self.app.state::<AppState>();
+            block_on(async {
+                let db = state.work().await.unwrap();
+                sqlx::query("INSERT INTO secret_index (name, created_at) VALUES (?, 't')")
+                    .bind(name)
+                    .execute(&db.pool)
+                    .await
+                    .unwrap();
+            });
         }
 
         /// What the user picks in the next file dialog.
@@ -2542,6 +2613,8 @@ mod tests {
         "ai_consent_revoke",
         "ai_sharing",
         "ai_preview",
+        "ai_key_from_clipboard",
+        "ai_key_remove",
         "ai_index",
         "ai_cancel",
         "key_state",
@@ -2597,6 +2670,201 @@ mod tests {
             .filter(|name| name.starts_with("dialog:"))
             .collect();
         assert_eq!(dialogs, ["dialog:allow-open"]);
+    }
+
+    #[test]
+    fn the_webview_gains_no_clipboard_capability() {
+        let capability: Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        let clipboard: Vec<&str> = capability["permissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|name| name.contains("clipboard"))
+            .collect();
+        assert_eq!(clipboard, [] as [&str; 0]);
+    }
+
+    /// Fake, and the last four are what a dialog may show of it.
+    const SECRET_KEY: &str = "sk-ZXQ-sentinel-WXYZ";
+    const SECRET_LAST4: &str = "WXYZ";
+
+    #[test]
+    fn clipboard_that_is_not_a_key_stores_nothing_and_echoes_nothing() {
+        let h = ready();
+        let posting = "Senior Rust engineer wanted, remote, Zebra Labs, apply today";
+        let args = json!({ "provider": "openai" });
+        h.copy(posting);
+
+        let error = h.call("ai_key_from_clipboard", args.clone()).unwrap_err();
+
+        assert_eq!(error["code"], "validation");
+        let text = error.to_string();
+        assert!(text.contains("the clipboard does not hold a key"), "{text}");
+        for word in posting.split_whitespace() {
+            assert!(!text.contains(word), "{word}: {text}");
+        }
+        assert!(h.asked().is_empty());
+        assert_eq!(h.ok("secret_names", json!({})), json!([]));
+        assert_eq!(h.clipboard().as_deref(), Some(posting), "left alone");
+
+        *h.app.state::<NativeHook>().clipboard.lock().unwrap() = None;
+        assert_eq!(h.code("ai_key_from_clipboard", args), "validation");
+        assert!(h.asked().is_empty());
+    }
+
+    #[test]
+    fn the_dialog_shows_only_the_last_four() {
+        let h = ready();
+        // A key copied from a web page often brings its line break along.
+        let copied = format!("{SECRET_KEY}\n");
+        h.copy(&copied);
+        h.answer(false);
+
+        let code = h.code("ai_key_from_clipboard", json!({ "provider": "openai" }));
+
+        assert_eq!(code, "confirmation_required");
+        let asked = h.asked();
+        assert_eq!(
+            asked,
+            [format!(
+                "OpenAI key: Store the key ending in {SECRET_LAST4} as your OpenAI key? It goes \
+                 to the system keychain. The clipboard is cleared after."
+            )]
+        );
+        assert!(!asked[0].contains(&SECRET_KEY[..SECRET_KEY.len() - 4]));
+        assert_eq!(h.ok("secret_names", json!({})), json!([]));
+        assert_eq!(h.clipboard().as_deref(), Some(copied.as_str()));
+        let hook = h.app.state::<NativeHook>();
+        assert_eq!(*hook.work_at_dialog.lock().unwrap(), [false]);
+    }
+
+    #[test]
+    fn key_commands_take_no_value_argument() {
+        let source = include_str!("commands.rs");
+        for command in ["ai_key_from_clipboard", "ai_key_remove"] {
+            let (_, rest) = source
+                .split_once(&format!("pub async fn {command}<R: Runtime>("))
+                .unwrap();
+            let (arguments, _) = rest.split_once(") -> ").unwrap();
+            let names: Vec<&str> = arguments
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, _)| name.trim())
+                .collect();
+            assert_eq!(names, ["app", "state", "provider"], "{command}");
+        }
+    }
+
+    #[test]
+    fn secret_set_refuses_a_provider_key_name() {
+        let h = ready();
+        for name in ["ai-key-openai", "AI-KEY-openai"] {
+            let set = json!({ "name": name, "value": "sk-from-script" });
+            assert_eq!(h.code("secret_set", set), "refused", "{name}");
+            assert_eq!(
+                h.code("secret_delete", json!({ "name": name })),
+                "refused",
+                "{name}"
+            );
+        }
+        assert_eq!(h.ok("secret_names", json!({})), json!([]));
+    }
+
+    #[test]
+    fn a_provider_with_no_key_asks_and_reads_nothing() {
+        let h = ready();
+        h.copy(SECRET_KEY);
+        for provider in ["ollama", "claude_code", "gemini_cli", "codex_cli", "nope"] {
+            let args = json!({ "provider": provider });
+            assert_eq!(
+                h.code("ai_key_from_clipboard", args.clone()),
+                "refused",
+                "{provider}"
+            );
+            assert_eq!(h.code("ai_key_remove", args), "refused", "{provider}");
+        }
+        assert!(h.asked().is_empty());
+    }
+
+    #[test]
+    fn key_commands_are_unavailable_in_recovery() {
+        let h = recovery(OPENS);
+        h.copy(SECRET_KEY);
+        for command in ["ai_key_from_clipboard", "ai_key_remove"] {
+            let args = json!({ "provider": "openai" });
+            assert_eq!(h.code(command, args), "unavailable", "{command}");
+        }
+        assert!(h.asked().is_empty());
+    }
+
+    #[test]
+    fn key_remove_confirms_natively_and_a_no_keeps_the_key() {
+        let h = ready();
+        let args = json!({ "provider": "anthropic" });
+        assert_eq!(h.code("ai_key_remove", args.clone()), "not_found");
+        assert!(h.asked().is_empty(), "nothing to ask about");
+
+        h.list_secret("ai-key-anthropic");
+        h.answer(false);
+        assert_eq!(h.code("ai_key_remove", args), "confirmation_required");
+        assert!(h.asked()[0].contains("Anthropic"), "{:?}", h.asked());
+        assert_eq!(h.ok("secret_names", json!({})), json!(["ai-key-anthropic"]));
+        let hook = h.app.state::<NativeHook>();
+        assert_eq!(*hook.work_at_dialog.lock().unwrap(), [false]);
+    }
+
+    #[test]
+    fn clear_clipboard_clears_only_what_is_still_there() {
+        let h = ready();
+        h.copy("copied since");
+        let app = h.app.handle();
+        block_on(native::clear_clipboard(app, "the key")).unwrap();
+        assert_eq!(h.clipboard().as_deref(), Some("copied since"));
+
+        block_on(native::clear_clipboard(app, "copied since")).unwrap();
+        assert_eq!(h.clipboard(), None);
+
+        block_on(native::clear_clipboard(app, "copied since")).unwrap();
+    }
+
+    /// The whole path, so the keychain. `.cargo/config.toml` names the throwaway service.
+    #[test]
+    #[ignore = "touches the OS keychain"]
+    fn a_pasted_key_is_stored_and_the_clipboard_cleared() {
+        let service = std::env::var("JOBPILOT_SECRET_SERVICE").unwrap();
+        assert_eq!(service, "jobpilot-test");
+        let h = ready();
+        let args = json!({ "provider": "openai" });
+
+        h.copy(&format!("{SECRET_KEY}\n"));
+        h.ok("ai_key_from_clipboard", args.clone());
+        assert_eq!(h.ok("secret_names", json!({})), json!(["ai-key-openai"]));
+        assert_eq!(h.clipboard(), None, "cleared, line break and all");
+        assert_eq!(
+            secrets::get("ai-key-openai").unwrap().as_deref(),
+            Some(SECRET_KEY)
+        );
+
+        // Copied over while the dialog was open: stored as shown, and the new text stays.
+        h.copy(SECRET_KEY);
+        let hook = h.app.state::<NativeHook>();
+        let app = h.app.handle().clone();
+        *hook.on_ask.lock().unwrap() = Some(Box::new(move || {
+            let app = app.clone();
+            Box::pin(async move {
+                let hook = app.state::<NativeHook>();
+                *hook.clipboard.lock().unwrap() = Some("copied since".into());
+            })
+        }));
+        h.ok("ai_key_from_clipboard", args.clone());
+        assert_eq!(h.clipboard().as_deref(), Some("copied since"));
+
+        *hook.on_ask.lock().unwrap() = None;
+        h.ok("ai_key_remove", args);
+        assert_eq!(h.ok("secret_names", json!({})), json!([]));
+        assert_eq!(secrets::get("ai-key-openai").unwrap(), None);
     }
 
     #[test]

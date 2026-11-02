@@ -1,6 +1,7 @@
 //! AI providers: status, models, settings, consent, and indexing.
 
 use std::future::Future;
+use std::io::{BufRead, IsTerminal, Read};
 
 use clap::{Subcommand, ValueEnum};
 use jobpilot_core::ai::claude_code;
@@ -9,6 +10,7 @@ use jobpilot_core::ai::router::{Router, ollama_from_settings};
 use jobpilot_core::ai::{
     self, CancellationToken, DataCategory, Sharing, TaskType, consent, register,
 };
+use jobpilot_core::secrets::{self, Zeroizing};
 use jobpilot_core::{Db, Error, Result, embed, generate, pause};
 use serde_json::json;
 
@@ -80,8 +82,19 @@ pub enum AiCommand {
     },
     #[command(subcommand)]
     Consent(ConsentCommand),
+    /// Provider API keys, kept in the system keychain.
+    #[command(subcommand)]
+    Key(KeyCommand),
     /// Embed knowledge items that have no vector yet.
     Index,
+}
+
+#[derive(Subcommand)]
+pub enum KeyCommand {
+    /// Store a key, read from a hidden prompt or one line of piped input. Never an argument.
+    Set { provider: ProviderArg },
+    /// Remove a stored key.
+    Remove { provider: ProviderArg },
 }
 
 #[derive(Subcommand)]
@@ -150,6 +163,22 @@ where
         Err(Error::Cancelled) if paused => Err(Error::Paused),
         done => done,
     }
+}
+
+/// Past any key, so the buffer never grows and leaves a copy behind for `Zeroizing` to miss.
+const KEY_LINE_BYTES: usize = 1024;
+
+/// A hidden prompt at a terminal, one line of stdin otherwise. Argv would reach the process
+/// list and the shell history.
+fn read_key() -> Result<Zeroizing<String>> {
+    if std::io::stdin().is_terminal() {
+        let typed = rpassword::prompt_password("Key (not shown): ")?;
+        return Ok(Zeroizing::new(typed));
+    }
+    let mut line = Zeroizing::new(String::with_capacity(KEY_LINE_BYTES));
+    let mut input = std::io::stdin().lock().take(KEY_LINE_BYTES as u64);
+    input.read_line(&mut line)?;
+    Ok(line)
 }
 
 async fn ollama(db: &Db) -> Result<Ollama> {
@@ -323,6 +352,24 @@ pub async fn ai(db: &Db, command: AiCommand) -> Result<Output> {
                 "\n\nExactly what draft_resume would send:\n\nSYSTEM\n{system}\n\nUSER\n{user}"
             ));
             out(json!({ "sharing": sharing, "preview": preview }), text)
+        }
+        AiCommand::Key(KeyCommand::Set { provider }) => {
+            let name = provider.name();
+            secrets::key_provider(name)?;
+            let key = read_key()?;
+            secrets::set_api_key(db, name, &key, ACTOR).await?;
+            out(
+                json!({ "key_stored": name }),
+                format!("key stored for {name}"),
+            )
+        }
+        AiCommand::Key(KeyCommand::Remove { provider }) => {
+            let name = provider.name();
+            secrets::delete_api_key(db, name, ACTOR).await?;
+            out(
+                json!({ "key_removed": name }),
+                format!("key removed for {name}"),
+            )
         }
         AiCommand::Index => {
             let router = Router::from_settings(db).await?;

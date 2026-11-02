@@ -607,6 +607,10 @@ export const ipc = {
   aiConsentGive: (provider: Provider, categories: DataCategory[]) =>
     invoke<void>("ai_consent_give", { provider, categories }),
   aiConsentRevoke: (provider: Provider) => invoke<void>("ai_consent_revoke", { provider }),
+  /** Rust reads the clipboard and confirms in a native dialog. The key never comes here. */
+  aiKeyFromClipboard: (provider: Provider) => invoke<void>("ai_key_from_clipboard", { provider }),
+  /** Rust confirms in a native dialog. */
+  aiKeyRemove: (provider: Provider) => invoke<void>("ai_key_remove", { provider }),
   aiSharing: (provider: Provider) => invoke<Sharing>("ai_sharing", { provider }),
   /** Builds the prompt and sends nothing. */
   aiPreview: (jobTextId: string) => invoke<PromptPreview>("ai_preview", { jobTextId }),

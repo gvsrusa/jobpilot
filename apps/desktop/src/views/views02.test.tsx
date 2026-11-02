@@ -839,6 +839,72 @@ describe("ai", () => {
     expect(dialog.queryByText(/Job text goes to/)).toBeNull();
   });
 
+  const keyRow = async (user: ReturnType<typeof renderApp>["user"]) => {
+    await go(user, "AI", /AI/);
+    return within(await screen.findByRole("listitem", { name: "OpenAI" }));
+  };
+
+  it("paste_key_sends_only_the_provider_name", async () => {
+    const b = backend({
+      ai_status: () => aiWith({ external: [external({})] }),
+      ai_key_from_clipboard: () => null,
+    });
+    const { user } = renderApp();
+    const row = await keyRow(user);
+    expect(row.getByText("No key")).toBeInTheDocument();
+    expect(row.getByText("Copy your key first. The key stays out of this window.")).toBeInTheDocument();
+    expect(row.queryByRole("button", { name: /Remove key/ })).toBeNull();
+    await user.click(row.getByRole("button", { name: /Paste key from clipboard\.\.\./ }));
+    await waitFor(() => expect(count(b, "ai_key_from_clipboard")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_key_from_clipboard")?.args).toEqual({ provider: "openai" });
+  });
+
+  it("remove_key_sends_only_the_provider_name", async () => {
+    const b = backend({
+      ai_status: () => aiWith({ external: [external({ key_stored: true })] }),
+      ai_key_remove: () => null,
+    });
+    const { user } = renderApp();
+    const row = await keyRow(user);
+    expect(row.getByText("Key stored")).toBeInTheDocument();
+    await user.click(row.getByRole("button", { name: /Remove key/ }));
+    await waitFor(() => expect(count(b, "ai_key_remove")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_key_remove")?.args).toEqual({ provider: "openai" });
+  });
+
+  it("a_refused_paste_shows_its_code", async () => {
+    backend({
+      ai_status: () => aiWith({ external: [external({})] }),
+      ai_key_from_clipboard: () => {
+        throw { code: "validation", message: "invalid input: the clipboard does not hold a key" };
+      },
+    });
+    const { user } = renderApp();
+    const row = await keyRow(user);
+    await user.click(row.getByRole("button", { name: /Paste key from clipboard\.\.\./ }));
+    const alert = await row.findByRole("alert");
+    expect(alert).toHaveTextContent("the clipboard does not hold a key");
+    expect(alert).toHaveTextContent("code: validation");
+  });
+
+  it("a_cli_row_has_no_key_controls", async () => {
+    backend({
+      ai_status: () => aiWith({ external: [external({ name: "gemini_cli", label: "Gemini CLI", kind: "cli" })] }),
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "Gemini CLI" }));
+    expect(row.queryByRole("button", { name: /Paste key/ })).toBeNull();
+    expect(row.queryByText("No key")).toBeNull();
+  });
+
+  it("a_key_field_does_not_exist", async () => {
+    backend({ ai_status: () => aiWith({ external: [external({ key_stored: true })] }) });
+    const { user } = renderApp();
+    await keyRow(user);
+    expect(document.querySelector("input[type=password]")).toBeNull();
+  });
+
   it("consent_focus_starts_on_cancel", async () => {
     consentBackend(null);
     const { user } = renderApp();
