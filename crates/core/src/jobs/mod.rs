@@ -414,10 +414,12 @@ pub async fn list(db: &Db, filter: &JobFilter, limit: i64) -> Result<Vec<Job>> {
                 Some(true) => {}
             }
         }
-        if let (Some(wish), Some(pay)) = (&filter.min_pay, &job.pay)
-            && matches!(pay::compare(pay, wish), pay::PayCompare::Below { .. })
-        {
-            continue;
+        if let Some(wish) = &filter.min_pay {
+            match job.pay.as_ref().map(|pay| pay::compare(pay, wish)) {
+                Some(pay::PayCompare::Below { .. }) => continue,
+                Some(pay::PayCompare::Meets) => {}
+                _ => job.not_stated.push("pay"),
+            }
         }
         kept.push(job);
     }

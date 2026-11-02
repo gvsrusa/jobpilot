@@ -221,6 +221,130 @@ fn location_rows_hold_the_pinned_points() {
     assert_eq!(location_points("onsite", "Berlin, Germany", &lisbon()), 0);
 }
 
+fn loc_points(job: &Job, basic: ProfileBasic) -> Option<u32> {
+    let me = Candidate {
+        basic,
+        ..Default::default()
+    };
+    score(job, &me).rows[2].points
+}
+
+fn placed(mode: Option<&str>, location: &str, country: Option<&str>) -> Job {
+    Job {
+        work_mode: mode.map(str::to_owned),
+        location: location.into(),
+        country: country.map(str::to_owned),
+        ..blank_job()
+    }
+}
+
+fn basic(countries: &[&str], cities: &[&str], modes: Vec<WorkMode>) -> ProfileBasic {
+    ProfileBasic {
+        countries: countries.iter().map(|c| c.to_string()).collect(),
+        cities: cities.iter().map(|c| c.to_string()).collect(),
+        work_modes: modes,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn an_unstated_mode_is_not_made_up() {
+    let remote_only = basic(&["PT"], &[], vec![WorkMode::Remote]);
+    let got = loc_points(&placed(None, "Lisbon, Portugal", None), remote_only);
+    assert!(got.is_some_and(|p| p > 0), "{got:?}");
+    let got = loc_points(&placed(None, "Anywhere", None), basic(&["PT"], &[], vec![]));
+    assert_eq!(got, Some(20));
+}
+
+#[test]
+fn a_profile_with_no_place_cannot_judge_a_place() {
+    let modes = basic(&[], &[], vec![WorkMode::Remote]);
+    assert_eq!(location_points("remote", "", &modes), 15);
+    assert_eq!(
+        loc_points(&placed(Some("remote"), "United States", None), modes),
+        None
+    );
+    let cities = basic(&[], &["Lisbon"], vec![WorkMode::Onsite]);
+    assert_eq!(
+        loc_points(&placed(Some("onsite"), "Berlin", None), cities.clone()),
+        None
+    );
+    assert_eq!(
+        loc_points(&placed(Some("onsite"), "Lisbon", None), cities),
+        Some(20)
+    );
+}
+
+#[test]
+fn an_onsite_job_with_no_place_is_not_compared() {
+    let pt = basic(&["PT"], &[], vec![]);
+    assert_eq!(
+        loc_points(&placed(Some("onsite"), "", None), pt.clone()),
+        None
+    );
+    assert_eq!(loc_points(&placed(Some("onsite"), "Foo", None), pt), None);
+}
+
+#[test]
+fn the_stated_country_is_used() {
+    let pt = basic(&["PT"], &[], vec![]);
+    for code in ["DE", "CA", "IN", "NL"] {
+        assert_eq!(
+            loc_points(&placed(Some("onsite"), "Foo", Some(code)), pt.clone()),
+            Some(0),
+            "{code}"
+        );
+        assert_eq!(
+            loc_points(&placed(Some("remote"), "", Some(code)), pt.clone()),
+            Some(0),
+            "{code}"
+        );
+    }
+    assert_eq!(
+        loc_points(&placed(Some("remote"), "Foo", Some("PT")), pt.clone()),
+        Some(20)
+    );
+    assert_eq!(
+        loc_points(&placed(Some("onsite"), "", Some("PT")), pt),
+        Some(10)
+    );
+}
+
+#[test]
+fn a_city_matches_a_whole_part_of_the_place() {
+    let york = basic(&["US"], &["York"], vec![]);
+    assert_eq!(
+        loc_points(
+            &placed(Some("onsite"), "New York, United States", None),
+            york.clone()
+        ),
+        Some(10)
+    );
+    assert_eq!(
+        loc_points(&placed(Some("onsite"), "York, United States", None), york),
+        Some(20)
+    );
+}
+
+#[test]
+fn pay_with_no_period_is_not_compared_and_a_period_is_shown() {
+    let mut job = job_full();
+    job.pay = Some(PayRange {
+        min: Some(50),
+        max: None,
+        currency: Some("EUR".into()),
+        period: None,
+    });
+    let mut me = me_full();
+    me.prefs.min_pay = Some(eur(90_000));
+    let row = score(&job, &me).rows.remove(3);
+    assert_eq!(row.points, None, "{}", row.note);
+    job.pay.as_mut().unwrap().period = Some(PayPeriod::Hour);
+    let row = score(&job, &me).rows.remove(3);
+    assert_eq!(row.points, Some(20));
+    assert!(row.note.contains("hour"), "{}", row.note);
+}
+
 async fn job_in(db: &Db, title: &str, country: Option<&str>, mode: Option<&str>) -> Job {
     let job = import_pasted(
         db,
@@ -309,6 +433,12 @@ async fn a_min_pay_filter_keeps_unstated_pay() {
     .unwrap();
     assert!(kept.iter().any(|j| j.id == unstated.id));
     assert!(kept.iter().any(|j| j.id == usd_job.id));
+    for id in [&unstated.id, &usd_job.id] {
+        let job = kept.iter().find(|j| &j.id == id).unwrap();
+        assert!(job.not_stated.contains(&"pay"), "{:?}", job.not_stated);
+    }
+    let high = kept.iter().find(|j| j.id == high_eur.id).unwrap();
+    assert!(high.not_stated.is_empty());
     assert!(kept.iter().any(|j| j.id == high_eur.id));
     assert!(!kept.iter().any(|j| j.id == low_eur.id));
     db.close().await;
@@ -547,6 +677,13 @@ async fn a_locked_key_is_not_read_as_not_stated() {
             note: String::new(),
         },
     )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO data_keys (key_id, created_at, key_check, active) \
+         VALUES ('gone', 't', x'00', 0)",
+    )
+    .execute(&db.pool)
     .await
     .unwrap();
     sqlx::query("UPDATE work_authorization SET key_id = 'gone'")

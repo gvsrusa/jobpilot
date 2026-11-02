@@ -8,7 +8,7 @@ use super::geo::{self, Scope};
 use super::pay::{PayCompare, compare};
 use super::prefs::{self, MatchPrefs};
 use super::rules::{self, Seniority};
-use super::{Job, PayRange};
+use super::{Job, PayPeriod, PayRange};
 use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::knowledge;
@@ -175,23 +175,52 @@ fn seniority_row(job: &Job, me: &Candidate) -> Row {
     }
 }
 
-fn folded(text: &str) -> String {
-    text.to_lowercase()
+/// The parts of a place, folded: `New York, United States` is `new york` and `united states`.
+fn parts_of(place: &str) -> Vec<String> {
+    place
+        .split([',', ';', '/', '|', '(', ')'])
+        .map(|part| part.trim().to_lowercase())
+        .filter(|part| !part.is_empty())
+        .collect()
 }
 
-/// Location points for a mode and a place against the profile. `mode` is `remote`, `hybrid`,
-/// or `onsite` (anything else is read as on site); `place` is the posting's location text. A
-/// mode outside the profile's work modes is 0. When the profile names no country or region,
-/// only the mode is judged.
-pub fn location_points(mode: &str, place: &str, basic: &ProfileBasic) -> u32 {
+/// Where a posting is: the text's own reading, with the stored country standing in when the
+/// text names no place and over a country the text names.
+enum Place {
+    Anywhere,
+    Region(String),
+    Country(String),
+    Unknown,
+}
+
+fn place_of(place: &str, country: Option<&str>) -> Place {
+    match (geo::scope_of(place), country.map(str::trim)) {
+        (Scope::Anywhere, _) => Place::Anywhere,
+        (_, Some(code)) if !code.is_empty() => Place::Country(code.to_ascii_uppercase()),
+        (Scope::Country(code), _) => Place::Country(code.to_owned()),
+        (Scope::Region(region), _) => Place::Region(region.to_owned()),
+        (Scope::Unknown, _) => Place::Unknown,
+    }
+}
+
+/// Location points, or why the place and the profile cannot be compared. Unknown is never a
+/// mismatch: a mode the posting leaves out skips the mode check, a profile with no country or
+/// region cannot judge a country, and a place the table cannot read judges nothing.
+fn location_score(
+    mode: Option<&str>,
+    place: &str,
+    country: Option<&str>,
+    basic: &ProfileBasic,
+) -> std::result::Result<u32, &'static str> {
     let weight = weight_of(Criterion::Location);
-    if !basic.work_modes.is_empty() && !basic.work_modes.iter().any(|m| mode_name(m) == mode) {
-        return 0;
+    if let Some(mode) = mode
+        && !basic.work_modes.is_empty()
+        && !basic.work_modes.iter().any(|m| mode_name(m) == mode)
+    {
+        return Ok(0);
     }
-    if basic.countries.is_empty() && basic.regions.is_empty() {
-        return weight;
-    }
-    let scope = geo::scope_of(place);
+    let found = place_of(place, country);
+    let profile_places = !basic.countries.is_empty() || !basic.regions.is_empty();
     let in_country = |code: &str| {
         basic.countries.iter().any(|c| c.eq_ignore_ascii_case(code))
             || basic.regions.iter().any(|r| geo::in_region(r, code))
@@ -200,68 +229,80 @@ pub fn location_points(mode: &str, place: &str, basic: &ProfileBasic) -> u32 {
         basic.regions.iter().any(|r| r.eq_ignore_ascii_case(region))
             || basic.countries.iter().any(|c| geo::in_region(region, c))
     };
-    if mode == "remote" {
-        return match scope {
-            Scope::Anywhere => weight,
-            Scope::Country(code) if in_country(code) => weight,
-            Scope::Region(region) if region_fits(region) => weight,
-            Scope::Unknown => 15,
-            _ => 0,
+    if mode == Some("remote") {
+        return match found {
+            Place::Anywhere => Ok(weight),
+            Place::Unknown if place.trim().is_empty() => Ok(15),
+            Place::Unknown => Err("the posting's place is not recognised"),
+            _ if !profile_places => Err("you name no country or region"),
+            Place::Country(code) => Ok(if in_country(&code) { weight } else { 0 }),
+            Place::Region(region) => Ok(if region_fits(&region) { weight } else { 0 }),
         };
     }
-    let lower = folded(place);
-    if basic
-        .cities
-        .iter()
-        .any(|city| !city.trim().is_empty() && lower.contains(&folded(city.trim())))
-    {
-        return weight;
+    if matches!(found, Place::Anywhere) {
+        return Ok(weight);
     }
-    match scope {
-        Scope::Country(code) if in_country(code) => weight / 2,
-        Scope::Region(region) if region_fits(region) => weight / 2,
-        _ => 0,
+    let parts = parts_of(place);
+    if basic.cities.iter().any(|city| {
+        let city = city.trim().to_lowercase();
+        !city.is_empty() && parts.contains(&city)
+    }) {
+        return Ok(weight);
     }
+    if !profile_places {
+        return Err("you name no country or region");
+    }
+    match found {
+        Place::Country(code) if in_country(&code) => Ok(weight / 2),
+        Place::Region(region) if region_fits(&region) => Ok(weight / 2),
+        Place::Country(_) | Place::Region(_) => Ok(0),
+        _ if place.trim().is_empty() => Err("the posting states no place"),
+        _ => Err("the posting's place is not recognised"),
+    }
+}
+
+/// Location points for a mode and a place against the profile, where the two can be compared;
+/// `remote`, `hybrid`, or `onsite` are the modes.
+pub fn location_points(mode: &str, place: &str, basic: &ProfileBasic) -> u32 {
+    location_score(Some(mode), place, None, basic).unwrap_or(0)
 }
 
 fn location_row(job: &Job, me: &Candidate) -> Row {
     let weight = weight_of(Criterion::Location);
-    let place = match (&job.country, geo::scope_of(&job.location)) {
-        (Some(country), Scope::Unknown) if !job.location.trim().is_empty() => {
-            format!("{}, {country}", job.location)
-        }
-        (Some(country), Scope::Unknown) => country.clone(),
-        _ => job.location.clone(),
-    };
-    let place_known = geo::scope_of(&place) != Scope::Unknown;
-    let has_place = place_known || !job.location.trim().is_empty();
-    let profile_cares = !me.basic.work_modes.is_empty() || !me.basic.countries.is_empty();
-    if !profile_cares || (job.work_mode.is_none() && !has_place) {
-        let why = if profile_cares {
-            "the posting states no mode or place"
-        } else {
-            "you set no work mode or country"
-        };
-        return Row {
-            criterion: Criterion::Location,
-            weight,
-            points: None,
-            note: format!("not compared: {why}"),
-        };
-    }
-    let mode = job.work_mode.as_deref().unwrap_or("onsite");
-    let points = location_points(mode, &place, &me.basic);
-    let shown = if job.location.trim().is_empty() {
-        "no place stated"
-    } else {
-        job.location.trim()
-    };
-    let mode_note = job.work_mode.as_deref().unwrap_or("mode not stated");
-    Row {
+    let not = |why: &str| Row {
         criterion: Criterion::Location,
         weight,
-        points: Some(points),
-        note: format!("{mode_note}, {shown}"),
+        points: None,
+        note: format!("not compared: {why}"),
+    };
+    let has_place = !job.location.trim().is_empty() || job.country.is_some();
+    if me.basic.work_modes.is_empty() && me.basic.countries.is_empty() {
+        return not("you set no work mode or country");
+    }
+    if job.work_mode.is_none() && !has_place {
+        return not("the posting states no mode or place");
+    }
+    match location_score(
+        job.work_mode.as_deref(),
+        &job.location,
+        job.country.as_deref(),
+        &me.basic,
+    ) {
+        Ok(points) => {
+            let shown = match (job.location.trim(), &job.country) {
+                ("", Some(country)) => country.as_str(),
+                ("", None) => "no place stated",
+                (text, _) => text,
+            };
+            let mode_note = job.work_mode.as_deref().unwrap_or("mode not stated");
+            Row {
+                criterion: Criterion::Location,
+                weight,
+                points: Some(points),
+                note: format!("{mode_note}, {shown}"),
+            }
+        }
+        Err(why) => not(why),
     }
 }
 
@@ -286,6 +327,16 @@ fn pay_text(pay: &PayRange) -> String {
     format!("{figures} {currency}").trim().to_owned()
 }
 
+fn period_word(period: PayPeriod) -> &'static str {
+    match period {
+        PayPeriod::Hour => "hour",
+        PayPeriod::Day => "day",
+        PayPeriod::Week => "week",
+        PayPeriod::Month => "month",
+        PayPeriod::Year => "year",
+    }
+}
+
 fn pay_row(job: &Job, me: &Candidate) -> Row {
     let weight = weight_of(Criterion::Pay);
     let not = |why: String| Row {
@@ -300,11 +351,17 @@ fn pay_row(job: &Job, me: &Candidate) -> Row {
     let Some(pay) = &job.pay else {
         return not("the posting states no pay".into());
     };
+    let per = |period: Option<PayPeriod>| match period {
+        Some(PayPeriod::Year) | None => String::new(),
+        Some(other) => format!(" per {}", period_word(other)),
+    };
     let note = format!(
-        "posting {}, you want {}+ {}",
+        "posting {}{}, you want {}+ {}{}",
         pay_text(pay),
+        per(pay.period),
         thousands(wish.amount),
-        wish.currency
+        wish.currency,
+        per(Some(wish.period))
     );
     match compare(pay, wish) {
         PayCompare::Meets => Row {
