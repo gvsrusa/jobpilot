@@ -487,6 +487,28 @@ async fn a_fit_out_of_range_is_a_validation_failure() {
 // ---- the agent --------------------------------------------------------------------------
 
 #[tokio::test]
+async fn a_job_that_cannot_score_starts_no_second_run() {
+    let (_tmp, db) = open().await;
+    let job = paste(&db, "Engineer", POSTING).await;
+    let (provider, _handles) = script(ProviderId::Ollama, vec![]);
+    let router = router_of(provider);
+    for _ in 0..2 {
+        match_jobs(&db, &router, "cli", MatchRequest::default(), token())
+            .await
+            .unwrap();
+    }
+    assert_eq!(rules_score(&db, &job.id).await, None, "an empty profile has no score");
+    assert_eq!(runner::list(&db, 10).await.unwrap().len(), 1, "the second pass starts no run");
+    // Nothing to score, so a person asking for the same job by id still gets a run.
+    let by_id = MatchRequest {
+        job_ids: vec![job.id.clone()],
+        ..MatchRequest::default()
+    };
+    match_jobs(&db, &router, "cli", by_id, token()).await.unwrap();
+    assert_eq!(runner::list(&db, 10).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn a_rules_run_never_calls_a_model() {
     let w = world().await;
     let second = paste(&w.db, "Designer", "We need a Figma designer.").await;

@@ -200,16 +200,7 @@ impl<'r> MatchingWorkflow<'r> {
         if !self.job_ids.is_empty() {
             return Ok(self.job_ids.clone());
         }
-        let filter = JobFilter {
-            include_duplicates: true,
-            ..JobFilter::default()
-        };
-        let all = jobs::list(ctx.db, &filter, i64::MAX).await?;
-        Ok(all
-            .into_iter()
-            .filter(|job| job.score.is_none() || job.stale)
-            .map(|job| job.id)
-            .collect())
+        needing_a_score(ctx.db).await
     }
 
     async fn score(&self, ctx: &Ctx<'_>) -> Result<StepOutput> {
@@ -370,6 +361,24 @@ async fn checked_ids(db: &Db, ids: Vec<String>, ai: bool) -> Result<Vec<String>>
     Ok(ids)
 }
 
+/// The jobs with no stored result, or one made from other inputs. A job whose result is a null
+/// score (an empty profile) is done: it waits for its inputs to change, not for another pass.
+async fn needing_a_score(db: &Db) -> Result<Vec<String>> {
+    let filter = JobFilter {
+        include_duplicates: true,
+        ..JobFilter::default()
+    };
+    let done: Vec<String> = sqlx::query_scalar("SELECT job_id FROM match_results")
+        .fetch_all(&db.pool)
+        .await?;
+    Ok(jobs::list(db, &filter, i64::MAX)
+        .await?
+        .into_iter()
+        .filter(|job| job.stale || !done.contains(&job.id))
+        .map(|job| job.id)
+        .collect())
+}
+
 /// Scores the jobs, and with `ai` asks a model to fill blank fields and to write a separate
 /// evaluation. Only a person starts it. A model that cannot answer leaves the rules score and
 /// puts its reason in the report.
@@ -382,6 +391,10 @@ pub async fn match_jobs(
 ) -> Result<MatchReport> {
     runner::person(actor)?;
     let ids = checked_ids(db, req.job_ids, req.ai).await?;
+    // The pass a screen starts on load must not write a run when there is nothing to do.
+    if ids.is_empty() && !req.ai && needing_a_score(db).await?.is_empty() {
+        return Ok(MatchReport::default());
+    }
     let workflow = MatchingWorkflow::new(router, ids, req.ai, false);
     runner::start(db, actor, &workflow, cancel)
         .await?
