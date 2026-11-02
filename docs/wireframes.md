@@ -73,7 +73,7 @@ The shell is a title bar, a left navigation, and one main view. Zustand holds on
 |             |                                                                |
 |             |                                                                |
 +-------------+----------------------------------------------------------------+
-| Local only. No account. No network.                    Data: {data root}     |
+| Your data stays on this computer. No account.          Data: {data root}     |
 +------------------------------------------------------------------------------+
 ```
 

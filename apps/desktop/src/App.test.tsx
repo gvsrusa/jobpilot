@@ -11,7 +11,7 @@ describe("shell", () => {
     for (const name of ["Status", "Documents", "Data"]) {
       expect(within(nav).getByRole("button", { name })).toBeInTheDocument();
     }
-    expect(screen.getByText("Local only. No account. No network.")).toBeInTheDocument();
+    expect(screen.getByText("Your data stays on this computer. No account.")).toBeInTheDocument();
     expect(screen.getByText("v0.1.0")).toBeInTheDocument();
     expect(screen.getAllByText("/home/me/jobpilot").length).toBeGreaterThan(0);
   });

@@ -132,7 +132,7 @@ function Shell({ root }: { root: string }) {
       <TerminalPanel open={terminal} onClose={() => setTerminal(false)} />
       <footer className="flex items-center justify-between border-t px-4 py-2 text-sm text-muted-foreground">
         <span className="flex items-center gap-3">
-          Local only. No account. No network.
+          Your data stays on this computer. No account.
           <Button size="sm" variant="ghost" onClick={() => setTerminal((open) => !open)}>
             Terminal
           </Button>
