@@ -42,6 +42,16 @@ fn own_link(url: &str) -> Option<String> {
         .then(|| format!("https://remoteok.com/{path}"))
 }
 
+/// The feed's text is UTF-8 read once as Latin-1 and encoded again, so `\u{2019}` arrives as the
+/// three characters U+00E2 U+0080 U+0099. A field goes back only if all of it is such bytes and
+/// they form valid UTF-8; any other text is not double-encoded and stays as it came.
+fn mended(text: &str) -> String {
+    let bytes: Option<Vec<u8>> = text.chars().map(|c| u8::try_from(c).ok()).collect();
+    bytes
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_else(|| text.to_owned())
+}
+
 fn id(row: &Value) -> String {
     match row.get("id") {
         Some(Value::String(s)) => s.trim().to_string(),
@@ -90,7 +100,8 @@ impl Connector for RemoteOk {
         let mut postings = Vec::new();
         let mut skipped = 0;
         for (at, row) in rows.iter().enumerate() {
-            let (id, title) = (id(row), decode_entities(&text(row, "position")));
+            let field = |key| decode_entities(&mended(&text(row, key)));
+            let (id, title) = (id(row), field("position"));
             let url = own_link(&text(row, "url"));
             let (Some(url), false, false) = (url, id.is_empty(), title.is_empty()) else {
                 // Row 0 is the legal notice, not a job.
@@ -115,8 +126,8 @@ impl Connector for RemoteOk {
             postings.push(Posting {
                 external_id: id,
                 title,
-                company: decode_entities(&text(row, "company")),
-                location: decode_entities(&text(row, "location")),
+                company: field("company"),
+                location: field("location"),
                 country: None,
                 work_mode: Some("remote"),
                 employment_type: None,
@@ -125,7 +136,7 @@ impl Connector for RemoteOk {
                 posted_on: posted,
                 pay: pay(row),
                 tags,
-                raw: text(row, "description"),
+                raw: mended(&text(row, "description")),
             });
         }
         if postings.is_empty() && (skipped > 0 || rows.is_empty()) {

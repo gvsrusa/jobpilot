@@ -153,6 +153,26 @@ fn remoteok_carries_attribution_and_a_lower_case_link() {
     assert_eq!(refusal(RemoteOk.parse(&target(""), body)), "bad_feed");
 }
 
+// The live feed sends UTF-8 that was read as Latin-1 and encoded again: every non-ASCII run of
+// 99 stored rows round-trips. A text that does not is left as it came.
+#[test]
+fn remoteok_puts_back_text_the_feed_double_encoded() {
+    let page = RemoteOk
+        .parse(
+            &target(""),
+            include_bytes!("fixtures/connectors/remoteok_double_encoded.json"),
+        )
+        .unwrap();
+    let mended = &page.postings[0];
+    assert_eq!(mended.raw, "<p>We\u{2019}re building for München \u{1F680}</p>");
+    assert_eq!(mended.title, "Engineer \u{2014} Rust");
+    assert_eq!(mended.company, "Café Co");
+    assert_eq!(mended.location, "Zürich");
+    let plain = &page.postings[1];
+    assert_eq!(plain.raw, "<p>We\u{2019}re in Zürich Ã©</p>");
+    assert_eq!(plain.company, "Café Co");
+}
+
 #[test]
 fn wwr_splits_company_and_role_and_keeps_the_html() {
     let page = WeWorkRemotely.parse(&target(""), WWR).unwrap();
