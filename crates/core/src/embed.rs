@@ -28,7 +28,7 @@ fn no_model() -> Error {
     Error::ManualRequired("no_embedding_model".into())
 }
 
-async fn model_setting(db: &Db) -> Result<String> {
+pub(crate) async fn model_setting(db: &Db) -> Result<String> {
     settings::get(db, "ai.embedding_model")
         .await?
         .and_then(|value| value.as_str().map(str::to_string))
@@ -38,7 +38,7 @@ async fn model_setting(db: &Db) -> Result<String> {
 
 /// A reply the caller can trust to line up with its inputs. The router checks this too;
 /// a vector stored against the wrong item would poison every later search.
-fn check(vectors: &[Vec<f32>], inputs: usize) -> Result<usize> {
+pub(crate) fn check(vectors: &[Vec<f32>], inputs: usize) -> Result<usize> {
     let dims = vectors.first().map_or(0, Vec::len);
     let sound = vectors.len() == inputs
         && dims > 0
@@ -57,6 +57,7 @@ fn check(vectors: &[Vec<f32>], inputs: usize) -> Result<usize> {
 /// many. Marked items are never sent, and have no rows. `ManualRequired` when no local
 /// embedding model is set up. A batch is stored whole or not at all.
 pub async fn index_missing(db: &Db, router: &Router, cancel: CancellationToken) -> Result<usize> {
+    crate::pause::ensure_off(db).await?;
     let model = model_setting(db).await?;
     let done: Vec<String> = sqlx::query_scalar("SELECT item_id FROM embeddings WHERE model = ?")
         .bind(&model)
@@ -65,7 +66,7 @@ pub async fn index_missing(db: &Db, router: &Router, cancel: CancellationToken) 
     let pending: Vec<_> = knowledge::list(db)
         .await?
         .into_iter()
-        .filter(|item| !item.marked_sensitive && !item.locked && !item.body.is_empty())
+        .filter(|item| !item.marked_sensitive && !item.sealed && !item.body.is_empty())
         .filter(|item| !done.contains(&item.id))
         .collect();
 

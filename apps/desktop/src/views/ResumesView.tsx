@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CompareTable } from "@/components/CompareTable";
+import { CopyPath } from "@/components/CopyPath";
 import { DraftEditor } from "@/components/DraftEditor";
 import { ErrorAlert } from "@/components/ErrorAlert";
 import { KnowledgeSection } from "@/components/KnowledgeSection";
@@ -108,7 +109,7 @@ function ClaimEditor({
     onSuccess: onSaved,
   });
   // The core counts only approved, unmarked items as evidence, so only those are offered.
-  const usable = (knowledge.data ?? []).filter((k) => k.approved && !k.marked_sensitive && !k.locked);
+  const usable = (knowledge.data ?? []).filter((k) => k.approved && !k.marked_sensitive && !k.sealed);
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
       <DialogContent showCloseButton={false}>
@@ -169,6 +170,7 @@ export function ResumesView() {
   const [originalId, setOriginalId] = useState<string | null>(null);
   const [selected, setSelected] = useState(0);
   const [template, setTemplate] = useState<Template>("classic");
+  const [exportAs, setExportAs] = useState<"none" | ExportFormat>("none");
   const [editor, setEditor] = useState<{ note: string | null } | null>(null);
   const [claimEditing, setClaimEditing] = useState(false);
   const [pasting, setPasting] = useState(false);
@@ -205,7 +207,10 @@ export function ResumesView() {
   };
 
   const generate = useMutation({
-    mutationFn: () => (kind === "resume" ? ipc.resumeGenerate(job!.id) : ipc.letterGenerate(job!.id)),
+    mutationFn: () => {
+      const choice = exportAs === "none" ? undefined : { format: exportAs, template };
+      return kind === "resume" ? ipc.resumeGenerate(job!.id, choice) : ipc.letterGenerate(job!.id, choice);
+    },
     onSuccess: (generated) => show(generated.draft),
     onError: (error) => {
       if (toAppError(error).code === "manual_required") {
@@ -285,6 +290,19 @@ export function ResumesView() {
             ))}
           </select>
         </div>
+        <div className="grid gap-1">
+          <Label htmlFor="export-after">After drafting, export as</Label>
+          <select
+            id="export-after"
+            className="h-8 rounded-lg border bg-background px-2 text-sm"
+            value={exportAs}
+            onChange={(e) => setExportAs(e.target.value as "none" | ExportFormat)}
+          >
+            <option value="none">None</option>
+            <option value="pdf">PDF</option>
+            <option value="docx">DOCX</option>
+          </select>
+        </div>
         <Button variant="outline" size="sm" onClick={() => setPasting(true)}>
           Paste a job posting...
         </Button>
@@ -318,6 +336,20 @@ export function ResumesView() {
             Cancel generation
           </Button>
         </div>
+      )}
+      {generate.data?.exported && (
+        <p role="status" className="flex flex-wrap items-center gap-2 text-sm">
+          <span>
+            Exported to <code className="break-all select-text">{generate.data.exported}</code>
+          </span>
+          <CopyPath path={generate.data.exported} />
+        </p>
+      )}
+      {generate.data && generate.data.export_skipped && !generate.data.exported && (
+        <p role="status" className="text-sm font-medium text-destructive">
+          The draft is saved but was not exported: a line, the name, a contact, or a heading is
+          one an export refuses. Fix it in the editor, then export.
+        </p>
       )}
       {generationError && (
         <>

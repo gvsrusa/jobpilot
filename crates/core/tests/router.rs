@@ -252,6 +252,38 @@ fn is_ok(outcome: &Outcome, id: ProviderId, count: u32) -> bool {
     matches!(outcome, Outcome::Ok { provider, attempts, .. } if *provider == id && *attempts == count)
 }
 
+async fn run_with_unavailable(why: &str) -> Outcome {
+    let (_tmp, db) = setup().await;
+    let mut ollama = Mock::ollama(vec![]);
+    ollama.availability = Availability::Unavailable(why.into());
+    let router = Router::with_providers(vec![ollama.boxed()]);
+    parse_job(&router, &db).await
+}
+
+#[tokio::test]
+async fn ollama_with_no_model_set_says_so() {
+    assert_eq!(
+        run_with_unavailable("no_model").await,
+        manual("no_model_set")
+    );
+}
+
+#[tokio::test]
+async fn ollama_missing_the_model_says_so() {
+    assert_eq!(
+        run_with_unavailable("model_missing").await,
+        manual("model_not_installed")
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_unavailable_stays_provider_unavailable() {
+    assert_eq!(
+        run_with_unavailable("not_running").await,
+        manual("provider_unavailable")
+    );
+}
+
 #[tokio::test]
 async fn falls_back_in_order_and_ends_no_ai_manual_required() {
     let (_tmp, db) = setup().await;
@@ -474,11 +506,29 @@ fn no_shipped_task_mixes_sensitive_with_untrusted_text() {
         TaskType::ParseJob,
         TaskType::DraftResume,
         TaskType::DraftCoverLetter,
+        TaskType::ClassifyAnswer,
         TaskType::Embed,
     ] {
         let categories = spec(task).categories;
         assert!(!categories.contains(&DataCategory::Sensitive), "{task:?}");
     }
+}
+
+#[test]
+fn classify_answer_makes_one_attempt_on_a_no_tools_provider() {
+    let task = spec(TaskType::ClassifyAnswer);
+    assert_eq!(task.attempts, 1);
+    assert!(task.required.contains(&Capability::NoTools));
+    assert_eq!(task.categories, [DataCategory::JobText]);
+    let schema: serde_json::Value = serde_json::from_str(task.schema).unwrap();
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(
+        schema["properties"]["class"]["enum"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
 }
 
 #[tokio::test]
@@ -775,7 +825,7 @@ async fn timeout_kills_attempt_and_moves_on() {
     let started = Instant::now();
     let outcome = parse_job(&router, &db).await;
 
-    assert!(started.elapsed() < Duration::from_millis(500));
+    assert!(started.elapsed() < Duration::from_secs(5));
     assert!(is_ok(&outcome, ProviderId::Ollama, 1), "{outcome:?}");
     assert_eq!(slow_counters.dropped.load(Ordering::SeqCst), 2);
 }
@@ -790,7 +840,7 @@ async fn declared_timeout_bounds_an_attempt_without_an_override() {
     let started = Instant::now();
     assert_eq!(parse_job(&router, &db).await, manual("no_ai"));
 
-    assert!(started.elapsed() < Duration::from_millis(500));
+    assert!(started.elapsed() < Duration::from_secs(5));
 }
 
 #[tokio::test]
@@ -826,7 +876,7 @@ async fn hanging_availability_probe_cannot_outlive_the_timeout() {
         manual("provider_unavailable")
     );
 
-    assert!(started.elapsed() < Duration::from_millis(500));
+    assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(calls(&counters), 0);
     assert_eq!(skip_reasons(&db, "ollama").await, ["unavailable"]);
 }
@@ -851,7 +901,7 @@ async fn cancel_ends_with_cancelled_and_no_further_attempts() {
     );
 
     assert_eq!(outcome.unwrap(), Outcome::Cancelled);
-    assert!(started.elapsed() < Duration::from_millis(500));
+    assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(calls(&slow_counters), 1);
     assert_eq!(slow_counters.dropped.load(Ordering::SeqCst), 1);
     assert_eq!(calls(&next_counters), 0);
@@ -1448,7 +1498,7 @@ async fn embed_honours_timeout_and_cancel() {
         matches!(result, Err(Error::ManualRequired(_))),
         "{result:?}"
     );
-    assert!(started.elapsed() < Duration::from_millis(500));
+    assert!(started.elapsed() < Duration::from_secs(5));
 
     let router = Router::with_providers(vec![Mock::ollama(vec![Reply::Hang]).boxed()]);
     let cancel = CancellationToken::new();

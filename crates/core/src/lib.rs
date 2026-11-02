@@ -1,6 +1,9 @@
 //! JobPilot AI core library. All product behaviour lives here.
 
+pub mod agents;
 pub mod ai;
+pub mod analytics;
+pub mod applications;
 pub mod audit;
 pub mod backup;
 pub mod crypto;
@@ -12,11 +15,14 @@ pub mod error;
 pub mod generate;
 pub mod hardware;
 pub mod knowledge;
+pub mod memory;
 pub mod parse;
 pub mod paths;
+pub mod pause;
 pub mod profile;
 pub mod recovery;
 pub mod render;
+pub mod runner;
 pub mod secrets;
 pub mod settings;
 pub mod transfer;

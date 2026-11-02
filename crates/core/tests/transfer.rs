@@ -59,7 +59,7 @@ async fn export_covers_every_user_table() {
 
     let expected: BTreeSet<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_master WHERE type = 'table' \
-         AND name NOT GLOB '_sqlx_*' AND name NOT GLOB 'documents_fts*'",
+         AND name NOT GLOB '_sqlx_*' AND name NOT GLOB 'documents_fts*' AND name NOT GLOB 'memory_fts*'",
     )
     .fetch_all(&db.pool)
     .await
@@ -499,7 +499,7 @@ async fn keychain_round_trip() {
     assert_eq!(log[0].target.as_deref(), Some(name));
     for entry in &log {
         let expected = match entry.action.as_str() {
-            "export" => serde_json::json!({ "sensitive_plain": false }),
+            "export" => serde_json::json!({ "sensitive_plain": false, "withheld": 0 }),
             _ => serde_json::json!({}),
         };
         assert_eq!(entry.detail, expected);
@@ -725,4 +725,45 @@ async fn an_id_no_key_can_have_cannot_block_deletion() {
     transfer::delete_all(db, "DELETE", true).await.unwrap();
 
     assert!(!paths.db().exists());
+}
+
+#[tokio::test]
+async fn an_application_survives_backup_restore_and_export_and_dies_with_delete_all() {
+    use jobpilot_core::applications::{self, ApplicationInput};
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let input = ApplicationInput {
+        company: "Acme".into(),
+        role: "Engineer".into(),
+        ..ApplicationInput::default()
+    };
+    let app = applications::add(&db, "cli", input).await.unwrap();
+    applications::set_status(&db, "cli", &app.id, "applied", Some("2026-10-02"), "sent")
+        .await
+        .unwrap();
+    let snapshot = backup::create(&db, "cli").await.unwrap();
+    applications::remove(&db, "cli", &app.id).await.unwrap();
+
+    let db = backup::restore(db, &snapshot.path, "cli").await.unwrap().db;
+    let back = applications::get(&db, &app.id).await.unwrap();
+    assert_eq!(back.applied_on.as_deref(), Some("2026-10-02"));
+    assert_eq!(applications::history(&db, &app.id).await.unwrap().len(), 2);
+
+    let dir = transfer::export_all(&db, "cli").await.unwrap();
+    let (_, data) = read_export(&dir);
+    let apps = data["tables"]["applications"].as_array().unwrap();
+    assert_eq!(apps.len(), 1);
+    assert_eq!(apps[0]["company"], "Acme");
+    assert_eq!(
+        data["tables"]["application_events"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    transfer::delete_all(db, "DELETE", true).await.unwrap();
+    let db = Db::open(&paths).await.unwrap();
+    assert!(applications::list(&db, None).await.unwrap().is_empty());
+    db.close().await;
 }

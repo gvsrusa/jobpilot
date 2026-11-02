@@ -58,6 +58,8 @@ pub enum Error {
     /// The router tried every provider and ended `Outcome::Failed`.
     #[error("failed: {0}")]
     Failed(String),
+    #[error("emergency pause is on")]
+    Paused,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -90,6 +92,7 @@ impl Error {
             Error::Cancelled => "cancelled",
             Error::TooLarge { .. } => "too_large",
             Error::Failed(_) => "failed",
+            Error::Paused => "paused",
         }
     }
 }
@@ -137,6 +140,7 @@ mod tests {
             (Error::Cancelled, "cancelled"),
             (Error::TooLarge { limit: 1 }, "too_large"),
             (Error::Failed("x".into()), "failed"),
+            (Error::Paused, "paused"),
         ];
         for (error, code) in cases {
             assert_eq!(error.code(), code);

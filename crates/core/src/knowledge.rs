@@ -37,13 +37,14 @@ macro_rules! now {
 pub struct KnowledgeItem {
     pub id: String,
     pub kind: String,
-    /// Empty while `locked`, and for a marked item whose text was discarded.
+    /// Empty while `sealed`, and for a marked item whose text was discarded.
     pub body: String,
     pub source: String,
     pub source_ref: Option<String>,
     pub approved: bool,
     pub marked_sensitive: bool,
-    pub locked: bool,
+    /// The body is ciphertext. A list never opens it: [`reveal`] does, one item at a time.
+    pub sealed: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -75,7 +76,7 @@ impl Row {
             source_ref: self.source_ref,
             approved: self.approved,
             marked_sensitive: self.marked_sensitive,
-            locked: false,
+            sealed: self.body_enc.is_some(),
         }
     }
 }
@@ -126,8 +127,8 @@ pub async fn add(
     Ok(row.plain())
 }
 
-/// Newest first. A marked body is opened under the key its row names; when that key is
-/// not available the item is listed `locked` with an empty body, and the list still works.
+/// Newest first. A sealed body is listed empty and `sealed`: a list asks the keychain
+/// nothing, so it works with the key gone and never prompts. [`reveal`] opens one.
 pub async fn list(db: &Db) -> Result<Vec<KnowledgeItem>> {
     let rows: Vec<Row> = sqlx::query_as(concat!(
         "SELECT ",
@@ -136,47 +137,66 @@ pub async fn list(db: &Db) -> Result<Vec<KnowledgeItem>> {
     ))
     .fetch_all(&db.pool)
     .await?;
-    let mut keys: Vec<(String, Option<crypto::DataKey>)> = Vec::new();
-    let mut items = Vec::with_capacity(rows.len());
+    Ok(rows.into_iter().map(Row::plain).collect())
+}
+
+/// One item's text. A sealed body is opened under the key its row names; when that key
+/// cannot be had, the key's own error comes back. `NotFound` for an unknown id, and a
+/// marked item whose text was discarded is a validation error.
+pub async fn reveal(db: &Db, id: &str) -> Result<String> {
+    let row: Row = sqlx::query_as(concat!(
+        "SELECT ",
+        columns!(),
+        " FROM knowledge_items WHERE id = ?"
+    ))
+    .bind(id)
+    .fetch_optional(&db.pool)
+    .await?
+    .ok_or(Error::NotFound)?;
+    let (Some(sealed), Some(key_id)) = (row.body_enc, row.key_id) else {
+        if row.marked_sensitive {
+            return Err(bad(
+                "this text was cleared when its key was given up; remove the item",
+            ));
+        }
+        return Ok(row.body);
+    };
+    let key = crypto::key_by_id(db, &key_id).await?;
+    let (table, column) = crypto::KNOWLEDGE_AAD;
+    let plain = key.decrypt(table, column, &row.id, &sealed)?;
+    String::from_utf8(plain).map_err(|_| bad("the text is not valid UTF-8"))
+}
+
+/// Every marked body, opened, for a check that must not miss marked text. The first key
+/// error ends it, so a caller never works from some of the text. With nothing sealed the
+/// keychain is not asked. A body that will not open for another reason is `Locked`. A
+/// marked row still holding plain text (the app never writes one) counts as it is.
+pub(crate) async fn marked_bodies(db: &Db) -> Result<Vec<String>> {
+    let rows: Vec<Row> = sqlx::query_as(concat!(
+        "SELECT ",
+        columns!(),
+        " FROM knowledge_items WHERE body_enc IS NOT NULL OR marked_sensitive = 1 ORDER BY seq"
+    ))
+    .fetch_all(&db.pool)
+    .await?;
+    let (table, column) = crypto::KNOWLEDGE_AAD;
+    let mut keys: Vec<crypto::DataKey> = Vec::new();
+    let mut bodies = Vec::with_capacity(rows.len());
     for row in rows {
-        let (Some(sealed), Some(key_id)) = (row.body_enc.clone(), row.key_id.clone()) else {
-            items.push(row.plain());
+        let (Some(sealed), Some(key_id)) = (row.body_enc, row.key_id) else {
+            bodies.extend(Some(row.body).filter(|body| !body.is_empty()));
             continue;
         };
-        if !keys.iter().any(|(id, _)| *id == key_id) {
-            let key = key_or_none(crypto::key_by_id(db, &key_id).await)?;
-            keys.push((key_id.clone(), key));
+        if !keys.iter().any(|key| key.key_id() == key_id) {
+            keys.push(crypto::key_by_id(db, &key_id).await?);
         }
-        let key = keys
-            .iter()
-            .find(|(id, _)| *id == key_id)
-            .and_then(|k| k.1.as_ref());
-        let (table, column) = crypto::KNOWLEDGE_AAD;
-        // A body that will not open for any reason is shown locked, not as an error:
-        // one damaged row must not hide the rest.
+        let key = keys.iter().find(|key| key.key_id() == key_id);
         let opened = key
             .and_then(|key| key.decrypt(table, column, &row.id, &sealed).ok())
             .and_then(|plain| String::from_utf8(plain).ok());
-        let mut item = row.plain();
-        item.locked = opened.is_none();
-        item.body = opened.unwrap_or_default();
-        items.push(item);
+        bodies.push(opened.ok_or(Error::Locked)?);
     }
-    Ok(items)
-}
-
-/// A key the store cannot give is a locked item; any other error is real.
-fn key_or_none(found: Result<crypto::DataKey>) -> Result<Option<crypto::DataKey>> {
-    match found {
-        Ok(key) => Ok(Some(key)),
-        Err(
-            Error::KeyMissing { .. }
-            | Error::KeyMismatch { .. }
-            | Error::KeyUnavailable(_)
-            | Error::Locked,
-        ) => Ok(None),
-        Err(other) => Err(other),
-    }
+    Ok(bodies)
 }
 
 pub async fn approve(db: &Db, id: &str, approved: bool) -> Result<()> {

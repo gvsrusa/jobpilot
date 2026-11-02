@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 use crate::crypto::{self, DataKey, KeyState};
 use crate::db::{self, Db};
 use crate::error::{Error, Result};
-use crate::{audit, secrets, settings};
+use crate::{audit, memory, secrets, settings};
 
 pub const RECOVERY_FORMAT: u32 = 1;
 
@@ -331,9 +331,9 @@ pub async fn discard_locked(db: &Db, confirm_key_id: &str, actor: &str) -> Resul
         ));
     }
 
-    // ponytail: work_authorization and marked knowledge bodies hold ciphertext. A later
-    // ciphertext column is cleared here, and joins `crypto::held_key_ids` and
-    // `other_ciphertext`.
+    // ponytail: work_authorization, marked knowledge bodies, and sealed answers hold
+    // ciphertext. A later ciphertext column is cleared here, and joins
+    // `crypto::held_key_ids` and `other_ciphertext`.
     sqlx::query("DELETE FROM work_authorization WHERE key_id = ?")
         .bind(&old)
         .execute(&mut *write)
@@ -355,6 +355,7 @@ pub async fn discard_locked(db: &Db, confirm_key_id: &str, actor: &str) -> Resul
     .bind(&old)
     .execute(&mut *write)
     .await?;
+    memory::clear_sealed(&mut *write, &old).await?;
 
     let new_key_id = new.as_ref().map(|(key, _)| key.key_id().to_owned());
     match &new {
@@ -402,6 +403,8 @@ async fn other_ciphertext(executor: impl sqlx::SqliteExecutor<'_>, key_id: &str)
     Ok(sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM work_authorization WHERE key_id <> ?1) \
          OR EXISTS (SELECT 1 FROM knowledge_items \
+                    WHERE body_enc IS NOT NULL AND key_id <> ?1) \
+         OR EXISTS (SELECT 1 FROM memory_answers \
                     WHERE body_enc IS NOT NULL AND key_id <> ?1)",
     )
     .bind(key_id)
@@ -412,6 +415,39 @@ async fn other_ciphertext(executor: impl sqlx::SqliteExecutor<'_>, key_id: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::AppPaths;
+
+    // `discard_locked` needs a keychain: this is the check that keeps a key whose answers
+    // are the only ciphertext left, and `memory::tests` pins the clearing.
+    #[tokio::test]
+    async fn a_sealed_answer_is_other_ciphertext() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&AppPaths::new(tmp.path().join("data")))
+            .await
+            .unwrap();
+        let mut raw = db.pool.acquire().await.unwrap();
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut *raw)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO memory_answers (id, question_id, body, body_enc, key_id, source, \
+             reviewed_at, created_at, updated_at) \
+             VALUES ('a1', 'q1', '', x'00', 'other', 'user', 't', 't', 't')",
+        )
+        .execute(&mut *raw)
+        .await
+        .unwrap();
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&mut *raw)
+            .await
+            .unwrap();
+        drop(raw);
+
+        assert!(other_ciphertext(&db.pool, "named").await.unwrap());
+        assert!(!other_ciphertext(&db.pool, "other").await.unwrap());
+        db.close().await;
+    }
 
     fn refused(state: KeyState) -> bool {
         matches!(offered(&state), Err(Error::Refused(_)))

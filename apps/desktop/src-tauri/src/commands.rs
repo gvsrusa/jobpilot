@@ -10,23 +10,32 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use jobpilot_core::agents::MemoryRefreshed;
 use jobpilot_core::ai::claude_code::{self, TERMS_DATE};
 use jobpilot_core::ai::ollama::Ollama;
 use jobpilot_core::ai::router::{Router, ollama_from_settings};
-use jobpilot_core::ai::{self, AiStatus, DataCategory, ProviderId, consent};
+use jobpilot_core::ai::{self, AiStatus, CancellationToken, DataCategory, ProviderId, consent};
+use jobpilot_core::analytics::{self, Report};
+use jobpilot_core::applications::{self, Application, ApplicationEvent, ApplicationInput};
 use jobpilot_core::audit::{self, AuditEntry};
 use jobpilot_core::backup::{self, BackupInfo};
 use jobpilot_core::crypto::{self, KeyState};
 use jobpilot_core::documents::{self, Document, SearchHit};
 use jobpilot_core::drafts::{self, ClaimInput, Compare, Draft, ExportFormat};
 use jobpilot_core::embed::{self, Hit};
-use jobpilot_core::generate::{self, Generated};
+use jobpilot_core::generate::Generated;
 use jobpilot_core::knowledge::{self, JobText, KnowledgeItem};
+use jobpilot_core::memory::{
+    self, Answer, AppliedAnswer, AuthorizationAnswer, Class, MemoryHit, Question, QuestionRow,
+    RefreshPlan, UsedAnswer,
+};
 use jobpilot_core::parse::{self, Imported};
+use jobpilot_core::pause::{self, PauseState};
 use jobpilot_core::profile::{self, Profile, ProfileBasic, WorkAuthorization};
 use jobpilot_core::recovery::{self, RecoveryReceipt};
 use jobpilot_core::render::{ResumeDoc, Template};
-use jobpilot_core::{Db, Error, Result, secrets, settings, transfer};
+use jobpilot_core::runner::{self, ExportChoice, RunDetail, RunSummary};
+use jobpilot_core::{Db, Error, Result, agents, secrets, settings, transfer};
 use serde_json::{Value, json};
 use tauri::ipc::Invoke;
 use tauri::{AppHandle, Runtime, State};
@@ -35,6 +44,14 @@ use crate::native::{self, FileDialog};
 use crate::state::{AppState, StartupError, Status};
 
 const ACTOR: &str = "gui";
+
+/// `withheld` counts sealed answers left out, because no key could open them.
+#[derive(serde::Serialize)]
+pub struct Exported {
+    path: String,
+    withheld: usize,
+}
+
 /// Settings core keeps for itself: what the router runs, and the recovery reminder's mark.
 /// The first has a command for each key, and the second is only ever core's to write.
 const OWNED_SETTINGS: &[&str] = &["ai.", "recovery_key_exported_"];
@@ -71,10 +88,46 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         kb_approve,
         kb_mark_sensitive,
         kb_remove,
+        kb_reveal,
         kb_search,
         job_paste,
         job_list,
         job_get,
+        app_list,
+        app_get,
+        app_add,
+        app_update,
+        app_set_status,
+        app_note,
+        app_history,
+        agents_list,
+        agent_get,
+        agent_cancel,
+        agent_resume,
+        pause_status,
+        pause_set,
+        pause_clear,
+        analytics_run,
+        analytics_latest,
+        app_remove,
+        memory_list,
+        memory_get,
+        memory_add_question,
+        memory_add_answer,
+        memory_edit_answer,
+        memory_approve,
+        memory_mark_reviewed,
+        memory_set_class,
+        memory_reveal,
+        memory_confirm_use,
+        memory_use,
+        memory_application_answers,
+        memory_authorization,
+        memory_remove_question,
+        memory_remove_answer,
+        memory_search,
+        memory_refresh,
+        memory_refresh_plan,
         resume_import,
         resume_list,
         resume_versions,
@@ -301,9 +354,12 @@ pub async fn backup_restore<R: Runtime>(
 }
 
 #[tauri::command]
-pub async fn data_export(state: State<'_, AppState>) -> Result<String> {
-    let path = transfer::export_all(&*state.work().await?, ACTOR).await?;
-    Ok(path.to_string_lossy().into_owned())
+pub async fn data_export(state: State<'_, AppState>) -> Result<Exported> {
+    let report = transfer::export_report(&*state.work().await?, ACTOR).await?;
+    Ok(Exported {
+        path: report.path.to_string_lossy().into_owned(),
+        withheld: report.withheld,
+    })
 }
 
 #[tauri::command]
@@ -425,6 +481,33 @@ pub async fn kb_remove(state: State<'_, AppState>, id: String) -> Result<()> {
     knowledge::remove(&*state.work().await?, &id).await
 }
 
+/// The text of one item. A sealed body is shown only after a native confirmation, every
+/// time, so script in the webview cannot read marked text on its own: the dialog is Rust's
+/// and does not name the text. An unknown id answers `not_found` and an unsealed item
+/// answers at once, with no dialog, because neither holds anything to protect.
+#[tauri::command]
+pub async fn kb_reveal<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<String> {
+    let db = state.work().await?;
+    let items = knowledge::list(&db).await?;
+    let item = items
+        .iter()
+        .find(|item| item.id == id)
+        .ok_or(Error::NotFound)?;
+    if item.sealed {
+        let message = format!(
+            "Show the sealed {} item {}?\n\nIts text will appear on screen until you hide it \
+             or leave this screen.",
+            item.kind, item.id
+        );
+        native::confirmed(&app, "Show sealed text", message, "Show").await?;
+    }
+    knowledge::reveal(&db, &id).await
+}
+
 /// Embeddings when a local model is set up, else a plain text match.
 #[tauri::command]
 pub async fn kb_search(
@@ -453,6 +536,336 @@ pub async fn job_list(state: State<'_, AppState>) -> Result<Vec<JobText>> {
 #[tauri::command]
 pub async fn job_get(state: State<'_, AppState>, id: String) -> Result<JobText> {
     knowledge::get_job_text(&*state.work().await?, &id).await
+}
+
+#[tauri::command]
+pub async fn app_list(
+    state: State<'_, AppState>,
+    status: Option<String>,
+) -> Result<Vec<Application>> {
+    applications::list(&*state.work().await?, status.as_deref()).await
+}
+
+#[tauri::command]
+pub async fn app_get(state: State<'_, AppState>, id: String) -> Result<Application> {
+    applications::get(&*state.work().await?, &id).await
+}
+
+#[tauri::command]
+pub async fn app_add(state: State<'_, AppState>, input: ApplicationInput) -> Result<Application> {
+    applications::add(&*state.work().await?, ACTOR, input).await
+}
+
+#[tauri::command]
+pub async fn app_update(
+    state: State<'_, AppState>,
+    id: String,
+    input: ApplicationInput,
+) -> Result<Application> {
+    applications::update(&*state.work().await?, ACTOR, &id, input).await
+}
+
+#[tauri::command]
+pub async fn app_set_status(
+    state: State<'_, AppState>,
+    id: String,
+    status: String,
+    on: Option<String>,
+    note: String,
+) -> Result<Application> {
+    agents::set_status(
+        &*state.work().await?,
+        ACTOR,
+        &id,
+        &status,
+        on.as_deref(),
+        &note,
+        CancellationToken::new(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn app_note(state: State<'_, AppState>, id: String, note: String) -> Result<()> {
+    applications::add_note(&*state.work().await?, ACTOR, &id, &note).await
+}
+
+#[tauri::command]
+pub async fn app_history(state: State<'_, AppState>, id: String) -> Result<Vec<ApplicationEvent>> {
+    applications::history(&*state.work().await?, &id).await
+}
+
+#[tauri::command]
+pub async fn app_remove(state: State<'_, AppState>, id: String) -> Result<()> {
+    applications::remove(&*state.work().await?, ACTOR, &id).await
+}
+
+#[tauri::command]
+pub async fn memory_list(
+    state: State<'_, AppState>,
+    class: Option<Class>,
+) -> Result<Vec<QuestionRow>> {
+    memory::list(&*state.work().await?, class).await
+}
+
+#[tauri::command]
+pub async fn memory_get(state: State<'_, AppState>, question_id: String) -> Result<QuestionRow> {
+    memory::get(&*state.work().await?, &question_id).await
+}
+
+#[tauri::command]
+pub async fn memory_add_question(
+    state: State<'_, AppState>,
+    text: String,
+    country: Option<String>,
+) -> Result<Question> {
+    memory::add_question(&*state.work().await?, &text, country.as_deref()).await
+}
+
+#[tauri::command]
+pub async fn memory_add_answer(
+    state: State<'_, AppState>,
+    question_id: String,
+    text: String,
+    source_ref: Option<String>,
+) -> Result<Answer> {
+    let db = state.work().await?;
+    memory::add_answer(&db, &question_id, &text, source_ref.as_deref()).await
+}
+
+#[tauri::command]
+pub async fn memory_edit_answer(
+    state: State<'_, AppState>,
+    answer_id: String,
+    text: String,
+) -> Result<Answer> {
+    memory::edit_answer(&*state.work().await?, &answer_id, &text).await
+}
+
+// ponytail: the class is read before the dialog and not again after it, so a raise that lands
+// while the dialog is open is approved on the answer given. Core still refuses what the
+// class forbids then, and the audit row names who approved.
+/// Approving under a sealed class asks a native yes, so script in the webview cannot make a
+/// sensitive answer usable. Each `state.work()` here ends before any dialog.
+#[tauri::command]
+pub async fn memory_approve<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    answer_id: String,
+    approved: bool,
+) -> Result<()> {
+    if approved {
+        let (class, _) = memory::find_answer(&*state.work().await?, &answer_id).await?;
+        memory::refuse_authorization(class)?;
+        if class.sealed() {
+            let message = format!(
+                "Approve the {} answer {answer_id}?\n\nIt can then be offered for applications, \
+                 each use confirmed by you.",
+                class.as_str()
+            );
+            native::confirmed(&app, "Approve sealed answer", message, "Approve").await?;
+        }
+    }
+    memory::approve(&*state.work().await?, ACTOR, &answer_id, approved).await
+}
+
+/// See [`memory_approve`]: marking a sealed-class answer as still true is a person's word.
+#[tauri::command]
+pub async fn memory_mark_reviewed<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    answer_id: String,
+) -> Result<()> {
+    let (class, _) = memory::find_answer(&*state.work().await?, &answer_id).await?;
+    memory::refuse_authorization(class)?;
+    if class.sealed() {
+        let message = format!(
+            "Mark the {} answer {answer_id} as reviewed?\n\nThis says it is still true.",
+            class.as_str()
+        );
+        native::confirmed(&app, "Review sealed answer", message, "Mark reviewed").await?;
+    }
+    memory::mark_reviewed(&*state.work().await?, ACTOR, &answer_id).await
+}
+
+/// Lowering a class can open sealed bodies, so it asks a native yes. Raising only protects.
+#[tauri::command]
+pub async fn memory_set_class<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    question_id: String,
+    class: Class,
+) -> Result<Question> {
+    let question = memory::get(&*state.work().await?, &question_id)
+        .await?
+        .question;
+    memory::check_lowering(&question, class)?;
+    let from = question.class;
+    if class < from {
+        let takes_answers = match from {
+            Class::WorkAuthorization => "It can then take an answer here. ",
+            _ => "",
+        };
+        let message = format!(
+            "Lower question {question_id} from {} to {}?\n\n{takes_answers}A body in the \
+             normal class is stored as plain text.",
+            from.as_str(),
+            class.as_str()
+        );
+        native::confirmed(&app, "Lower class", message, "Lower").await?;
+    }
+    memory::set_class(&*state.work().await?, ACTOR, &question_id, class).await
+}
+
+/// The text of one answer. A sealed body is shown only after a native confirmation, every
+/// time, as in [`kb_reveal`]: the dialog is Rust's and does not name the text. An unknown id
+/// answers `not_found` and an unsealed answer answers at once, with no dialog.
+#[tauri::command]
+pub async fn memory_reveal<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    answer_id: String,
+) -> Result<String> {
+    let (class, answer) = memory::find_answer(&*state.work().await?, &answer_id).await?;
+    if answer.sealed {
+        let message = format!(
+            "Show the sealed {} answer {answer_id}?\n\nIts text will appear on screen until \
+             you hide it or leave this screen.",
+            class.as_str()
+        );
+        native::confirmed(&app, "Show sealed text", message, "Show").await?;
+    }
+    memory::reveal(&*state.work().await?, ACTOR, &answer_id).await
+}
+
+/// Confirming a use always asks a native yes, whatever the class, so script in the webview
+/// cannot make a sealed answer usable. The dialog names the class, the application, and the
+/// question, never the answer's value. Each `state.work()` here ends before the dialog.
+// ponytail: the version read before the dialog is not bound across it, so an edit that lands
+// while it is open is confirmed as the new version. Core still refuses an unapproved answer
+// then, and an edit unapproves, so the user must approve the new text before this counts.
+#[tauri::command]
+pub async fn memory_confirm_use<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    answer_id: String,
+    application_id: String,
+) -> Result<()> {
+    let message = {
+        let db = state.work().await?;
+        let (class, answer) = memory::find_answer(&db, &answer_id).await?;
+        let question = memory::get(&db, &answer.question_id).await?.question;
+        let application = applications::get(&db, &application_id).await?;
+        // The gates core would refuse on run first, so no one is asked for a doomed yes.
+        if class == Class::WorkAuthorization {
+            return Err(Error::Refused("use_profile_by_country".into()));
+        }
+        if !answer.approved {
+            return Err(Error::Refused("answer_not_approved".into()));
+        }
+        let stale = match answer.stale {
+            true => "\n\nThis answer has not been reviewed for over 180 days.",
+            false => "",
+        };
+        format!(
+            "Use the {} answer to \"{}\" for {} / {}?\n\nYou confirm this is true today.{stale}",
+            class.as_str(),
+            question.text.chars().take(300).collect::<String>(),
+            application.company,
+            application.role
+        )
+    };
+    native::confirmed(&app, "Confirm this answer", message, "Confirm").await?;
+    memory::confirm_use(&*state.work().await?, ACTOR, &answer_id, &application_id).await
+}
+
+/// The text of one answer for one application. Core refuses a sealed class with no current
+/// confirmation, so this opens no dialog of its own.
+#[tauri::command]
+pub async fn memory_use(
+    state: State<'_, AppState>,
+    answer_id: String,
+    application_id: String,
+) -> Result<UsedAnswer> {
+    memory::use_answer(&*state.work().await?, ACTOR, &answer_id, &application_id).await
+}
+
+#[tauri::command]
+pub async fn memory_application_answers(
+    state: State<'_, AppState>,
+    application_id: String,
+) -> Result<Vec<AppliedAnswer>> {
+    memory::application_answers(&*state.work().await?, &application_id).await
+}
+
+#[tauri::command]
+pub async fn memory_authorization(
+    state: State<'_, AppState>,
+    country: String,
+) -> Result<AuthorizationAnswer> {
+    memory::authorization_for(&*state.work().await?, &country).await
+}
+
+#[tauri::command]
+pub async fn memory_remove_question(state: State<'_, AppState>, id: String) -> Result<()> {
+    memory::remove_question(&*state.work().await?, &id).await
+}
+
+#[tauri::command]
+pub async fn memory_remove_answer(state: State<'_, AppState>, id: String) -> Result<()> {
+    memory::remove_answer(&*state.work().await?, &id).await
+}
+
+/// By meaning when a local model is set up, else by words. A sealed answer's text is never
+/// in a hit.
+#[tauri::command]
+pub async fn memory_search(
+    state: State<'_, AppState>,
+    query: String,
+    limit: usize,
+) -> Result<Vec<MemoryHit>> {
+    let db = state.work().await?;
+    let router = Router::from_settings(&db).await?;
+    memory::search(&db, &router, &query, limit).await
+}
+
+/// What a press of Refresh would spend. Reads only: it starts no provider and asks no key.
+#[tauri::command]
+pub async fn memory_refresh_plan(state: State<'_, AppState>) -> Result<RefreshPlan> {
+    let db = state.work().await?;
+    let router = Router::from_settings(&db).await?;
+    memory::refresh_plan(&db, &router).await
+}
+
+/// Only a person's press starts it. With Claude calls ahead, the count is named in a native
+/// dialog first, with no `work` held, and the plan is read again after the answer: a count
+/// that moved in between is refused, so the yes covers what ran.
+#[tauri::command]
+pub async fn memory_refresh<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+) -> Result<MemoryRefreshed> {
+    let asked = {
+        let db = state.work().await?;
+        let router = Router::from_settings(&db).await?;
+        memory::refresh_plan(&db, &router).await?.claude_calls
+    };
+    if asked > 0 {
+        let message = format!(
+            "This will make up to {asked} Claude calls, limit {}.",
+            memory::CLASSIFY_BATCH
+        );
+        native::confirmed(&app, "Refresh career memory", message, "Refresh").await?;
+    }
+    let running = state.ai.begin()?;
+    let db = state.work().await?;
+    let router = Router::from_settings(&db).await?;
+    if memory::refresh_plan(&db, &router).await?.claude_calls != asked {
+        return Err(Error::Validation(
+            "the number of Claude calls changed since you were asked; press Refresh again".into(),
+        ));
+    }
+    agents::memory_refresh(&db, &router, ACTOR, running.token.clone()).await
 }
 
 /// The path comes from the picker: the webview never names a file to read. Closing the
@@ -491,19 +904,29 @@ pub async fn resume_versions(state: State<'_, AppState>, lineage_id: String) -> 
 }
 
 #[tauri::command]
-pub async fn resume_generate(state: State<'_, AppState>, job_text_id: String) -> Result<Generated> {
+pub async fn resume_generate(
+    state: State<'_, AppState>,
+    job_text_id: String,
+    export: Option<ExportChoice>,
+) -> Result<Generated> {
     let running = state.ai.begin()?;
     let db = state.work().await?;
     let router = Router::from_settings(&db).await?;
-    generate::resume(&db, &router, ACTOR, &job_text_id, running.token.clone()).await
+    let token = running.token.clone();
+    agents::draft_resume(&db, &router, ACTOR, &job_text_id, export, token).await
 }
 
 #[tauri::command]
-pub async fn letter_generate(state: State<'_, AppState>, job_text_id: String) -> Result<Generated> {
+pub async fn letter_generate(
+    state: State<'_, AppState>,
+    job_text_id: String,
+    export: Option<ExportChoice>,
+) -> Result<Generated> {
     let running = state.ai.begin()?;
     let db = state.work().await?;
     let router = Router::from_settings(&db).await?;
-    generate::cover_letter(&db, &router, ACTOR, &job_text_id, running.token.clone()).await
+    let token = running.token.clone();
+    agents::draft_cover_letter(&db, &router, ACTOR, &job_text_id, export, token).await
 }
 
 #[tauri::command]
@@ -722,6 +1145,100 @@ pub async fn ai_index(state: State<'_, AppState>) -> Result<usize> {
 pub async fn ai_cancel(state: State<'_, AppState>) -> Result<()> {
     state.ai.cancel();
     Ok(())
+}
+
+/// What the command and the menu item both run. The tokens fire first, whatever comes
+/// after, so a running task stops even with no data open. The write goes through the `db`
+/// read lock and not [`AppState::work`]: it must not queue behind a task holding the gate.
+pub async fn pause_now(state: &AppState) -> Result<PauseState> {
+    // Before the tokens, so a run that ends on its token knows why while the row is pending.
+    pause::announce(&state.paths);
+    state.ai.cancel();
+    state.pull.cancel();
+    let slot = state.db.read().await;
+    pause::set(ready(&slot)?, ACTOR).await
+}
+
+/// For a pause set by another process, such as `jobpilot pause set`: its running tasks are
+/// not this app's to find, but a download or an index started here is. True when it is on.
+pub async fn stop_if_paused(state: &AppState) -> bool {
+    let on = match state.db.read().await.as_deref() {
+        Some(db) => pause::is_set(db).await.unwrap_or(false),
+        None => false,
+    };
+    if on {
+        state.ai.cancel();
+        state.pull.cancel();
+    }
+    on
+}
+
+#[tauri::command]
+pub async fn pause_status(state: State<'_, AppState>) -> Result<PauseState> {
+    let slot = state.db.read().await;
+    pause::state(ready(&slot)?).await
+}
+
+#[tauri::command]
+pub async fn pause_set(state: State<'_, AppState>) -> Result<PauseState> {
+    pause_now(&state).await
+}
+
+/// Only a dialog Rust opens clears it, with no lock held while it waits. The shortcut and
+/// the menu only ever set.
+#[tauri::command]
+pub async fn pause_clear<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+) -> Result<PauseState> {
+    ready(&*state.db.read().await)?;
+    native::confirmed(
+        &app,
+        "Clear emergency pause",
+        "Runs stay halted until you resume each one.".into(),
+        "Clear",
+    )
+    .await?;
+    let slot = state.db.read().await;
+    pause::clear(ready(&slot)?, ACTOR).await
+}
+
+#[tauri::command]
+pub async fn agents_list(state: State<'_, AppState>, limit: i64) -> Result<Vec<RunSummary>> {
+    runner::list(&*state.work().await?, limit).await
+}
+
+#[tauri::command]
+pub async fn agent_get(state: State<'_, AppState>, id: String) -> Result<RunDetail> {
+    runner::get(&*state.work().await?, &id).await
+}
+
+#[tauri::command]
+pub async fn agent_cancel(state: State<'_, AppState>, id: String) -> Result<()> {
+    agents::cancel_run(&*state.work().await?, ACTOR, &id).await
+}
+
+/// A run stopped short is the command's error, so the view shows its code.
+#[tauri::command]
+pub async fn agent_resume(state: State<'_, AppState>, id: String) -> Result<RunDetail> {
+    let running = state.ai.begin()?;
+    let db = state.work().await?;
+    let router = Router::from_settings(&db).await?;
+    agents::resume_run(&db, &router, ACTOR, &id, running.token.clone())
+        .await?
+        .into_result()?;
+    runner::get(&db, &id).await
+}
+
+/// Builds a report from the application store. No model, so no AI slot is taken.
+#[tauri::command]
+pub async fn analytics_run(state: State<'_, AppState>) -> Result<Report> {
+    agents::analytics_report(&*state.work().await?, ACTOR, CancellationToken::new()).await
+}
+
+#[tauri::command]
+pub async fn analytics_latest(state: State<'_, AppState>) -> Result<Option<Report>> {
+    analytics::latest(&*state.work().await?).await
 }
 
 /// `peek`: asks the store and never makes a key.
@@ -1149,10 +1666,11 @@ mod tests {
         assert_eq!(h.ok("backup_list", json!({}))[0]["path"], info["path"]);
         let export = h.ok("data_export", json!({}));
         assert!(
-            Path::new(export.as_str().unwrap())
+            Path::new(export["path"].as_str().unwrap())
                 .join("data.json")
                 .is_file()
         );
+        assert_eq!(export["withheld"], 0);
         assert_eq!(h.code("secret_delete", json!({ "name": "n" })), "not_found");
 
         let audit = h.ok("audit_recent", json!({ "limit": 2 }));
@@ -1931,10 +2449,46 @@ mod tests {
         "kb_approve",
         "kb_mark_sensitive",
         "kb_remove",
+        "kb_reveal",
         "kb_search",
         "job_paste",
         "job_list",
         "job_get",
+        "app_list",
+        "app_get",
+        "app_add",
+        "app_update",
+        "app_set_status",
+        "app_note",
+        "app_history",
+        "agents_list",
+        "agent_get",
+        "agent_cancel",
+        "agent_resume",
+        "pause_status",
+        "pause_set",
+        "pause_clear",
+        "analytics_run",
+        "analytics_latest",
+        "app_remove",
+        "memory_list",
+        "memory_get",
+        "memory_add_question",
+        "memory_add_answer",
+        "memory_edit_answer",
+        "memory_approve",
+        "memory_mark_reviewed",
+        "memory_set_class",
+        "memory_reveal",
+        "memory_confirm_use",
+        "memory_use",
+        "memory_application_answers",
+        "memory_authorization",
+        "memory_remove_question",
+        "memory_remove_answer",
+        "memory_search",
+        "memory_refresh",
+        "memory_refresh_plan",
         "resume_import",
         "resume_list",
         "resume_versions",
@@ -2090,6 +2644,80 @@ mod tests {
         h.ok("kb_remove", json!({ "id": id }));
 
         assert_eq!(h.ok("kb_list", json!({})), json!([]));
+    }
+
+    /// A marked row naming a key this keychain never held, so nothing here asks a keychain.
+    fn seal_without_a_key(h: &Harness, id: &str) {
+        block_on(async {
+            let slot = h.app.state::<AppState>();
+            let slot = slot.db.read().await;
+            let mut connection = slot.as_ref().unwrap().pool.acquire().await.unwrap();
+            sqlx::query("PRAGMA foreign_keys = OFF")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO knowledge_items (id, kind, body, body_enc, key_id, source, \
+                 approved, marked_sensitive, created_at, updated_at) \
+                 VALUES (?, 'note', '', x'00', 'gone', 'user', 0, 1, 't', 't')",
+            )
+            .bind(id)
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn kb_reveal_of_a_sealed_item_needs_a_native_yes_every_time() {
+        let h = ready();
+        seal_without_a_key(&h, "s1");
+        assert_eq!(h.ok("kb_list", json!({}))[0]["sealed"], true);
+
+        h.answer(false);
+        assert_eq!(
+            h.code("kb_reveal", json!({ "id": "s1" })),
+            "confirmation_required"
+        );
+        assert_eq!(h.asked().len(), 1);
+        assert!(h.asked()[0].contains("s1"), "{:?}", h.asked());
+
+        // A yes opens the dialog again and reaches the key, which this keychain lacks.
+        h.answer(true);
+        assert_eq!(h.code("kb_reveal", json!({ "id": "s1" })), "key_missing");
+        assert_eq!(h.asked().len(), 2, "one dialog per reveal");
+    }
+
+    #[test]
+    fn kb_reveal_of_a_plain_item_or_an_unknown_id_asks_nothing() {
+        let h = ready();
+        let item = h.ok("kb_add", json!({ "kind": "note", "body": "Shipped it" }));
+
+        let body = h.ok("kb_reveal", json!({ "id": item["id"] }));
+
+        assert_eq!(body, "Shipped it");
+        assert_eq!(h.code("kb_reveal", json!({ "id": "nope" })), "not_found");
+        assert!(h.asked().is_empty());
+    }
+
+    #[test]
+    #[ignore = "uses the test keychain"]
+    fn kb_reveal_shows_a_sealed_body_after_a_yes() {
+        let h = ready();
+        let item = h.ok("kb_add", json!({ "kind": "note", "body": "ZXQ-SEALED" }));
+        let id = item["id"].as_str().unwrap();
+        h.ok("kb_mark_sensitive", json!({ "id": id, "marked": true }));
+        assert_eq!(h.ok("kb_list", json!({}))[0]["body"], "");
+
+        h.answer(false);
+        assert_eq!(
+            h.code("kb_reveal", json!({ "id": id })),
+            "confirmation_required"
+        );
+        h.answer(true);
+        assert_eq!(h.ok("kb_reveal", json!({ "id": id })), "ZXQ-SEALED");
+        assert!(!h.asked().iter().any(|m| m.contains("ZXQ-SEALED")));
+        h.ok("data_delete", delete("DELETE", true));
     }
 
     #[test]
@@ -2807,6 +3435,992 @@ mod tests {
             assert!(Instant::now() < until, "timed out");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn app_commands_reach_core() {
+        let h = ready();
+        let added = h.ok(
+            "app_add",
+            json!({ "input": { "company": "Acme", "role": "Engineer", "country": "pt" } }),
+        );
+        let id = added["id"].as_str().unwrap().to_owned();
+        assert_eq!(added["status"], "saved");
+        assert_eq!(added["country"], "PT");
+        let moved = h.ok(
+            "app_set_status",
+            json!({ "id": id, "status": "applied", "on": "2026-10-02", "note": "sent" }),
+        );
+        assert_eq!(moved["applied_on"], "2026-10-02");
+        let history = h.ok("app_history", json!({ "id": id }));
+        assert_eq!(history.as_array().unwrap().len(), 2);
+        h.ok("app_note", json!({ "id": id, "note": "called" }));
+        assert_eq!(
+            h.ok("app_history", json!({ "id": id }))
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        let edited = h.ok(
+            "app_update",
+            json!({ "id": id, "input": { "company": "Acme", "role": "Staff" } }),
+        );
+        assert_eq!(edited["role"], "Staff");
+        assert_eq!(h.ok("app_get", json!({ "id": id }))["status"], "applied");
+        assert_eq!(
+            h.ok("app_list", json!({ "status": "applied" }))
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            h.ok("app_list", json!({ "status": null }))
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let refused = h.call(
+            "app_set_status",
+            json!({ "id": id, "status": "ghosted", "on": null, "note": "" }),
+        );
+        assert_eq!(code_of(refused), "validation");
+        h.ok("app_remove", json!({ "id": id }));
+        assert_eq!(code_of(h.call("app_get", json!({ "id": id }))), "not_found");
+    }
+
+    #[test]
+    fn agents_commands_reach_core() {
+        let h = ready();
+        assert_eq!(
+            h.ok("agents_list", json!({ "limit": 10 })),
+            json!([]),
+            "no run yet"
+        );
+        let added = h.ok(
+            "app_add",
+            json!({ "input": { "company": "Acme", "role": "Engineer" } }),
+        );
+        let id = added["id"].as_str().unwrap().to_owned();
+        h.ok(
+            "app_set_status",
+            json!({ "id": id, "status": "applied", "on": null, "note": "sent" }),
+        );
+
+        let runs = h.ok("agents_list", json!({ "limit": 10 }));
+        assert_eq!(runs[0]["agent"], "tracking");
+        assert_eq!(runs[0]["state"], "completed");
+        assert_eq!(runs[0]["actor"], "gui");
+        let run = runs[0]["id"].as_str().unwrap().to_owned();
+        let detail = h.ok("agent_get", json!({ "id": run }));
+        assert_eq!(detail["run"]["id"], run.as_str());
+        assert_eq!(detail["log"].as_array().unwrap().len(), 5);
+
+        for command in ["agent_cancel", "agent_resume"] {
+            let refused = h.call(command, json!({ "id": run }));
+            assert_eq!(code_of(refused), "validation", "{command}");
+        }
+        assert_eq!(
+            code_of(h.call("agent_get", json!({ "id": "x" }))),
+            "not_found"
+        );
+
+        with_db(&h, |db| {
+            let run = run.clone();
+            async move {
+                sqlx::query("UPDATE agent_runs SET state = 'halted', step = 0 WHERE id = ?")
+                    .bind(run)
+                    .execute(&db.pool)
+                    .await
+                    .unwrap();
+            }
+        });
+        let resumed = h.ok("agent_resume", json!({ "id": run }));
+        assert_eq!(resumed["run"]["state"], "completed");
+
+        with_db(&h, |db| {
+            let run = run.clone();
+            async move {
+                sqlx::query("UPDATE agent_runs SET state = 'halted' WHERE id = ?")
+                    .bind(run)
+                    .execute(&db.pool)
+                    .await
+                    .unwrap();
+            }
+        });
+        h.ok("agent_cancel", json!({ "id": run }));
+        let detail = h.ok("agent_get", json!({ "id": run }));
+        assert_eq!(detail["run"]["state"], "cancelled");
+    }
+
+    #[test]
+    fn analytics_commands_reach_core() {
+        let h = ready();
+        assert_eq!(h.ok("analytics_latest", json!({})), Value::Null);
+        let added = h.ok(
+            "app_add",
+            json!({ "input": { "company": "Acme", "role": "Engineer" } }),
+        );
+        let id = added["id"].as_str().unwrap().to_owned();
+        h.ok(
+            "app_set_status",
+            json!({ "id": id, "status": "applied", "on": null, "note": "" }),
+        );
+        let report = h.ok("analytics_run", json!({}));
+        assert_eq!(report["volume"]["total"], 1);
+        assert_eq!(report["funnel"]["applied"], 1);
+        assert_eq!(report["funnel"]["response_rate"], 0.0);
+        let latest = h.ok("analytics_latest", json!({}));
+        assert_eq!(latest["id"], report["id"]);
+        let runs = h.ok("agents_list", json!({ "limit": 10 }));
+        assert_eq!(runs[0]["agent"], "analytics");
+        assert_eq!(runs[0]["actor"], "gui");
+    }
+
+    /// A sealed row naming a key this keychain never held, under a question of `class`.
+    fn seal_answer_without_a_key(h: &Harness, class: &str, id: &str) -> String {
+        let text = format!("Question for {id}");
+        let question = h.ok(
+            "memory_add_question",
+            json!({ "text": text, "country": null }),
+        );
+        let question = question["id"].as_str().unwrap().to_owned();
+        with_db(h, |db| async move {
+            let mut connection = db.pool.acquire().await.unwrap();
+            sqlx::query("PRAGMA foreign_keys = OFF")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE memory_questions SET class = ? WHERE id = ?")
+                .bind(class)
+                .bind(&question)
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO memory_answers (id, question_id, body, body_enc, key_id, source, \
+                 reviewed_at, created_at, updated_at) \
+                 VALUES (?, ?, '', x'00', 'gone', 'user', 't', 't', 't')",
+            )
+            .bind(id)
+            .bind(&question)
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+            sqlx::query("PRAGMA foreign_keys = ON")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            question
+        })
+    }
+
+    fn with_db<T, F: Future<Output = T>>(h: &Harness, work: impl FnOnce(Arc<Db>) -> F) -> T {
+        block_on(async {
+            let slot = h.app.state::<AppState>();
+            let db = slot.db.read().await.as_ref().unwrap().clone();
+            work(db).await
+        })
+    }
+
+    fn approved(h: &Harness, question: &str) -> Value {
+        h.ok("memory_get", json!({ "questionId": question }))["answers"][0]["approved"].clone()
+    }
+
+    #[test]
+    fn memory_commands_reach_core() {
+        let h = ready();
+        let added = h.ok(
+            "memory_add_question",
+            json!({ "text": "Why this job?", "country": "pt" }),
+        );
+        let question = added["id"].as_str().unwrap().to_owned();
+        assert_eq!(added["class"], "normal");
+        assert_eq!(added["country"], "PT");
+        let item = h.ok("kb_add", json!({ "kind": "note", "body": "A note" }));
+
+        let answer = h.ok(
+            "memory_add_answer",
+            json!({ "questionId": question, "text": "Because", "sourceRef": item["id"] }),
+        );
+        let id = answer["id"].as_str().unwrap().to_owned();
+        assert_eq!(answer["source"], "knowledge");
+        assert_eq!(answer["approved"], false);
+
+        let edited = h.ok(
+            "memory_edit_answer",
+            json!({ "answerId": id, "text": "Since then" }),
+        );
+        assert_eq!(edited["version"], 2);
+        h.ok(
+            "memory_approve",
+            json!({ "answerId": id, "approved": true }),
+        );
+        h.ok("memory_mark_reviewed", json!({ "answerId": id }));
+        assert!(h.asked().is_empty(), "a normal answer asks nothing");
+
+        let row = h.ok("memory_get", json!({ "questionId": question }));
+        assert_eq!(row["answers"][0]["approved"], true);
+        assert_eq!(row["answers"][0]["body"], "Since then");
+        assert_eq!(
+            h.ok("memory_reveal", json!({ "answerId": id })),
+            "Since then"
+        );
+        h.ok(
+            "memory_approve",
+            json!({ "answerId": id, "approved": false }),
+        );
+
+        let raised = h.ok(
+            "memory_add_question",
+            json!({ "text": "A question with no answers", "country": null }),
+        );
+        let raised = raised["id"].as_str().unwrap().to_owned();
+        let saved = h.ok(
+            "memory_set_class",
+            json!({ "questionId": raised, "class": "legal" }),
+        );
+        assert_eq!(saved["class"], "legal");
+        assert_eq!(saved["class_source"], "user");
+        let legal = h.ok("memory_list", json!({ "class": "legal" }));
+        assert_eq!(legal.as_array().unwrap().len(), 1);
+        let all = h.ok("memory_list", json!({ "class": null }));
+        assert_eq!(all.as_array().unwrap().len(), 2);
+
+        h.ok("memory_remove_answer", json!({ "id": id }));
+        h.ok("memory_remove_question", json!({ "id": question }));
+        let gone = h.call("memory_get", json!({ "questionId": question }));
+        assert_eq!(code_of(gone), "not_found");
+    }
+
+    #[test]
+    fn memory_search_reaches_core() {
+        let h = ready();
+        let found = h.ok(
+            "memory_add_question",
+            json!({ "text": "Describe your leadership style", "country": null }),
+        );
+        let found = found["id"].as_str().unwrap().to_owned();
+        let answer = h.ok(
+            "memory_add_answer",
+            json!({ "questionId": found, "text": "I mentor", "sourceRef": null }),
+        );
+        h.ok(
+            "memory_approve",
+            json!({ "answerId": answer["id"], "approved": true }),
+        );
+        let authorization = h.ok(
+            "memory_add_question",
+            json!({ "text": "Are you authorized to work in the US?", "country": "US" }),
+        );
+        assert_eq!(authorization["class"], "work_authorization");
+
+        let hits = h.ok(
+            "memory_search",
+            json!({ "query": "leadership", "limit": 5 }),
+        );
+        assert_eq!(hits.as_array().unwrap().len(), 1);
+        assert_eq!(hits[0]["question_id"], found.as_str());
+        assert_eq!(hits[0]["via"], "text");
+        assert_eq!(hits[0]["answer"], "I mentor");
+        let none = h.ok(
+            "memory_search",
+            json!({ "query": "authorized", "limit": 5 }),
+        );
+        assert!(none.as_array().unwrap().is_empty());
+
+        // With no embedding model the refresh embeds nothing and is not an error.
+        let refreshed = h.ok("memory_refresh", json!({}));
+        assert_eq!(refreshed["embedded"], 0);
+        assert_eq!(refreshed["classified"]["skipped"], true);
+    }
+
+    #[test]
+    fn approving_a_sealed_class_answer_asks_natively() {
+        let h = ready();
+        let question = seal_answer_without_a_key(&h, "sensitive", "s1");
+
+        h.answer(false);
+        let refused = h.call(
+            "memory_approve",
+            json!({ "answerId": "s1", "approved": true }),
+        );
+        assert_eq!(code_of(refused), "confirmation_required");
+        assert_eq!(approved(&h, &question), false);
+        assert_eq!(h.asked().len(), 1);
+        assert!(h.asked()[0].contains("s1"), "{:?}", h.asked());
+
+        h.answer(true);
+        h.ok(
+            "memory_approve",
+            json!({ "answerId": "s1", "approved": true }),
+        );
+        assert_eq!(approved(&h, &question), true);
+        assert_eq!(h.asked().len(), 2);
+
+        // Taking it back asks no one.
+        h.answer(false);
+        h.ok(
+            "memory_approve",
+            json!({ "answerId": "s1", "approved": false }),
+        );
+        assert_eq!(approved(&h, &question), false);
+        assert_eq!(h.asked().len(), 2);
+    }
+
+    #[test]
+    fn reviewing_a_sealed_class_answer_asks_natively() {
+        let h = ready();
+        let question = seal_answer_without_a_key(&h, "legal", "s1");
+
+        h.answer(false);
+        let refused = h.call("memory_mark_reviewed", json!({ "answerId": "s1" }));
+        assert_eq!(code_of(refused), "confirmation_required");
+        let row = h.ok("memory_get", json!({ "questionId": question }));
+        assert_eq!(row["answers"][0]["reviewed_at"], "t");
+
+        h.answer(true);
+        h.ok("memory_mark_reviewed", json!({ "answerId": "s1" }));
+        let row = h.ok("memory_get", json!({ "questionId": question }));
+        assert_ne!(row["answers"][0]["reviewed_at"], "t");
+    }
+
+    #[test]
+    fn lowering_a_class_asks_natively_and_raising_does_not() {
+        let h = ready();
+        let added = h.ok(
+            "memory_add_question",
+            json!({ "text": "What is your salary?", "country": null }),
+        );
+        let question = added["id"].as_str().unwrap().to_owned();
+        assert_eq!(added["class"], "sensitive");
+
+        h.answer(false);
+        let saved = h.ok(
+            "memory_set_class",
+            json!({ "questionId": question, "class": "legal" }),
+        );
+        assert_eq!(saved["class"], "legal");
+        assert!(h.asked().is_empty());
+
+        let refused = h.call(
+            "memory_set_class",
+            json!({ "questionId": question, "class": "normal" }),
+        );
+        assert_eq!(code_of(refused), "confirmation_required");
+        let row = h.ok("memory_get", json!({ "questionId": question }));
+        assert_eq!(row["question"]["class"], "legal");
+        assert_eq!(h.asked().len(), 1);
+
+        h.answer(true);
+        let saved = h.ok(
+            "memory_set_class",
+            json!({ "questionId": question, "class": "normal" }),
+        );
+        assert_eq!(saved["class"], "normal");
+    }
+
+    #[test]
+    fn memory_reveal_of_a_sealed_answer_needs_a_native_yes_every_time() {
+        let h = ready();
+        // A body raised and not yet sealed needs no key, so a yes reaches the text here.
+        let added = h.ok(
+            "memory_add_question",
+            json!({ "text": "Why this job?", "country": null }),
+        );
+        let question = added["id"].as_str().unwrap().to_owned();
+        let answer = h.ok(
+            "memory_add_answer",
+            json!({ "questionId": question, "text": "ZXQ-SEALED", "sourceRef": null }),
+        );
+        let id = answer["id"].as_str().unwrap().to_owned();
+        with_db(&h, |db| async move {
+            sqlx::query("UPDATE memory_questions SET class = 'sensitive'")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        });
+        let row = h.ok("memory_get", json!({ "questionId": question }));
+        assert_eq!(row["answers"][0]["sealed"], true);
+        assert_eq!(row["answers"][0]["body"], "");
+
+        h.answer(false);
+        let refused = h.call("memory_reveal", json!({ "answerId": id }));
+        assert_eq!(code_of(refused), "confirmation_required");
+        assert_eq!(h.asked().len(), 1);
+        assert!(h.asked()[0].contains(&id), "{:?}", h.asked());
+        let log = h.ok("audit_recent", json!({ "limit": 10 }));
+        assert!(!log.to_string().contains("answer_revealed"), "{log}");
+
+        h.answer(true);
+        assert_eq!(
+            h.ok("memory_reveal", json!({ "answerId": id })),
+            "ZXQ-SEALED"
+        );
+        assert_eq!(
+            h.ok("memory_reveal", json!({ "answerId": id })),
+            "ZXQ-SEALED"
+        );
+        assert_eq!(h.asked().len(), 3, "one dialog per reveal");
+        assert!(!h.asked().iter().any(|m| m.contains("ZXQ-SEALED")));
+        let log = h.ok("audit_recent", json!({ "limit": 10 }));
+        assert!(log.to_string().contains("answer_revealed"), "{log}");
+        assert!(!log.to_string().contains("ZXQ-SEALED"), "{log}");
+    }
+
+    /// A Sensitive-class answer whose approved body waits to be sealed, so no key is needed,
+    /// and an application to use it for.
+    fn waiting_sensitive_answer(h: &Harness) -> (String, String) {
+        let added = h.ok(
+            "memory_add_question",
+            json!({ "text": "Why this job?", "country": null }),
+        );
+        let answer = h.ok(
+            "memory_add_answer",
+            json!({ "questionId": added["id"], "text": "ZXQ-CANARY", "sourceRef": null }),
+        );
+        let id = answer["id"].as_str().unwrap().to_owned();
+        with_db(h, |db| async move {
+            sqlx::query("UPDATE memory_questions SET class = 'sensitive'")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE memory_answers SET approved = 1")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        });
+        let application = h.ok(
+            "app_add",
+            json!({ "input": {
+                "company": "Acme", "role": "Engineer", "job_text_id": null,
+                "resume_draft_id": null, "letter_draft_id": null, "link": "",
+                "country": "", "notes": ""
+            } }),
+        );
+        (id, application["id"].as_str().unwrap().to_owned())
+    }
+
+    #[test]
+    fn confirm_use_opens_a_native_dialog_without_the_value() {
+        let h = ready();
+        let (id, app) = waiting_sensitive_answer(&h);
+        let args = json!({ "answerId": id, "applicationId": app });
+
+        let refused = h.call("memory_use", args.clone());
+        assert_eq!(code_of(refused), "confirmation_required");
+        assert!(h.asked().is_empty(), "use opens no dialog of its own");
+
+        h.answer(true);
+        h.ok("memory_confirm_use", args.clone());
+        let asked = h.asked();
+        assert_eq!(asked.len(), 1);
+        assert!(!asked[0].contains("ZXQ-CANARY"), "{asked:?}");
+        for part in [
+            "Confirm this answer",
+            "sensitive",
+            "Why this job?",
+            "Acme / Engineer",
+            "You confirm this is true today",
+        ] {
+            assert!(asked[0].contains(part), "{part}: {asked:?}");
+        }
+        assert!(!asked[0].contains("180 days"), "{asked:?}");
+
+        let used = h.ok("memory_use", args);
+        assert_eq!(used["text"], "ZXQ-CANARY");
+        let listed = h.ok(
+            "memory_application_answers",
+            json!({ "applicationId": app }),
+        );
+        assert_eq!(listed[0]["current"], true);
+        assert!(!listed.to_string().contains("ZXQ-CANARY"));
+        let log = h.ok("audit_recent", json!({ "limit": 20 }));
+        assert!(log.to_string().contains("answer_confirmed"), "{log}");
+        assert!(log.to_string().contains("answer_used"), "{log}");
+        assert!(!log.to_string().contains("ZXQ-CANARY"), "{log}");
+    }
+
+    #[test]
+    fn a_refused_dialog_records_no_confirmation() {
+        let h = ready();
+        let (id, app) = waiting_sensitive_answer(&h);
+        let args = json!({ "answerId": id, "applicationId": app });
+
+        h.answer(false);
+        let refused = h.call("memory_confirm_use", args.clone());
+
+        assert_eq!(code_of(refused), "confirmation_required");
+        assert_eq!(h.asked().len(), 1);
+        let listed = h.ok(
+            "memory_application_answers",
+            json!({ "applicationId": app }),
+        );
+        assert_eq!(listed.as_array().unwrap().len(), 0);
+        assert_eq!(code_of(h.call("memory_use", args)), "confirmation_required");
+        let log = h.ok("audit_recent", json!({ "limit": 20 }));
+        assert!(!log.to_string().contains("answer_confirmed"), "{log}");
+    }
+
+    #[test]
+    fn confirm_use_refuses_an_unapproved_answer_before_any_dialog() {
+        let h = ready();
+        let (id, app) = waiting_sensitive_answer(&h);
+        with_db(&h, |db| async move {
+            sqlx::query("UPDATE memory_answers SET approved = 0")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        });
+
+        let refused = h.call(
+            "memory_confirm_use",
+            json!({ "answerId": id, "applicationId": app }),
+        );
+
+        assert_eq!(code_of(refused), "refused");
+        assert!(h.asked().is_empty());
+    }
+
+    #[test]
+    fn memory_authorization_reads_the_profile_by_country() {
+        let h = ready();
+        let none = h.ok("memory_authorization", json!({ "country": "ca" }));
+        assert_eq!(none["stated"], false);
+        assert_eq!(none["country"], "CA");
+        assert_eq!(none["authorized"], "not_stated");
+        let bad = h.call("memory_authorization", json!({ "country": "canada" }));
+        assert_eq!(code_of(bad), "validation");
+    }
+
+    #[test]
+    fn memory_reveal_of_a_plain_answer_or_an_unknown_id_asks_nothing() {
+        let h = ready();
+        let added = h.ok(
+            "memory_add_question",
+            json!({ "text": "Why this job?", "country": null }),
+        );
+        let answer = h.ok(
+            "memory_add_answer",
+            json!({ "questionId": added["id"], "text": "Because", "sourceRef": null }),
+        );
+
+        assert_eq!(
+            h.ok("memory_reveal", json!({ "answerId": answer["id"] })),
+            "Because"
+        );
+        let unknown = h.call("memory_reveal", json!({ "answerId": "nope" }));
+        assert_eq!(code_of(unknown), "not_found");
+        assert!(h.asked().is_empty());
+    }
+
+    // A dialog that can only end in a refusal asks the user for nothing.
+    #[test]
+    fn a_work_authorization_refusal_opens_no_dialog() {
+        let h = ready();
+        seal_answer_without_a_key(&h, "work_authorization", "s1");
+        let added = h.ok(
+            "memory_add_question",
+            json!({ "text": "Are you authorized to work in Canada?", "country": null }),
+        );
+
+        for result in [
+            h.call(
+                "memory_approve",
+                json!({ "answerId": "s1", "approved": true }),
+            ),
+            h.call("memory_mark_reviewed", json!({ "answerId": "s1" })),
+            h.call(
+                "memory_set_class",
+                json!({ "questionId": added["id"], "class": "normal" }),
+            ),
+        ] {
+            let error = result.unwrap_err();
+            assert_eq!(error["code"], "refused");
+            assert!(
+                error["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("use_profile_by_country")
+            );
+        }
+        assert!(h.asked().is_empty(), "{:?}", h.asked());
+    }
+
+    #[test]
+    fn lowering_from_work_authorization_says_what_it_allows() {
+        let h = ready();
+        let question = seal_answer_without_a_key(&h, "work_authorization", "s1");
+        h.answer(false);
+        let refused = h.call(
+            "memory_set_class",
+            json!({ "questionId": question, "class": "sensitive" }),
+        );
+        assert_eq!(code_of(refused), "confirmation_required");
+        assert!(
+            h.asked()[0].contains("can then take an answer"),
+            "{:?}",
+            h.asked()
+        );
+    }
+
+    #[test]
+    fn data_export_says_how_many_answers_it_left_out() {
+        let h = ready();
+        let added = h.ok(
+            "memory_add_question",
+            json!({ "text": "Why this job?", "country": null }),
+        );
+        h.ok(
+            "memory_add_answer",
+            json!({ "questionId": added["id"], "text": "Because", "sourceRef": null }),
+        );
+        with_db(&h, |db| async move {
+            sqlx::query("UPDATE memory_questions SET class = 'sensitive'")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        });
+
+        assert_eq!(h.ok("data_export", json!({}))["withheld"], 1);
+    }
+
+    #[test]
+    fn no_memory_dialog_holds_the_handle() {
+        let h = ready();
+        let question = seal_answer_without_a_key(&h, "sensitive", "s1");
+        with_db(&h, |db| async move {
+            sqlx::query("UPDATE memory_answers SET approved = 1")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        });
+        let app = h.ok(
+            "app_add",
+            json!({ "input": {
+                "company": "Acme", "role": "Engineer", "job_text_id": null,
+                "resume_draft_id": null, "letter_draft_id": null, "link": "",
+                "country": "", "notes": ""
+            } }),
+        );
+        h.answer(false);
+        for result in [
+            h.call(
+                "memory_confirm_use",
+                json!({ "answerId": "s1", "applicationId": app["id"] }),
+            ),
+            h.call(
+                "memory_approve",
+                json!({ "answerId": "s1", "approved": true }),
+            ),
+            h.call("memory_mark_reviewed", json!({ "answerId": "s1" })),
+            h.call("memory_reveal", json!({ "answerId": "s1" })),
+            h.call(
+                "memory_set_class",
+                json!({ "questionId": question, "class": "normal" }),
+            ),
+        ] {
+            assert_eq!(code_of(result), "confirmation_required");
+        }
+        let hook = h.app.state::<NativeHook>();
+        assert_eq!(*hook.work_at_dialog.lock().unwrap(), [false; 5]);
+    }
+
+    /// A posting, evidence it can cite, and a `claude` that cites it.
+    #[cfg(unix)]
+    fn drafting_with_claude(h: &Harness) -> Value {
+        let item = h.ok("kb_add", json!({ "kind": "skill", "body": "Rust" }));
+        let doc = json!({ "name": "", "contact": [], "summary": ["Rust"], "sections": [] });
+        let claims = json!([{ "text": "Rust", "evidence_ids": [item["id"]] }]);
+        let reply = json!({ "type": "result", "subtype": "success", "is_error": false,
+            "permission_denials": [], "structured_output": { "doc": doc, "claims": claims } });
+        fake_claude(
+            h,
+            &format!("[ \"$1\" = --version ] && exit 0\ncat > /dev/null\nprintf '%s' '{reply}'"),
+        );
+        h.ok(
+            "ai_enable",
+            json!({ "provider": "claude_code", "enabled": true }),
+        );
+        let categories = ["job_text", "profile_basic", "resume_text"];
+        h.ok(
+            "ai_consent_give",
+            json!({ "provider": "claude_code", "categories": categories }),
+        );
+        h.ok("job_paste", json!({ "title": "Role", "raw": "Build" }))["id"].clone()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_generate_runs_through_the_agent() {
+        let h = ready();
+        let job = drafting_with_claude(&h);
+        let export = json!({ "format": "pdf", "template": "compact" });
+        let made = h.ok(
+            "resume_generate",
+            json!({ "jobTextId": job, "export": export }),
+        );
+        assert_eq!(made["provider"], "claude_code");
+        let path = PathBuf::from(made["exported"].as_str().expect("a path"));
+        assert!(path.starts_with(h.paths.exports()), "{path:?}");
+        assert!(path.is_file());
+
+        let runs = h.ok("agents_list", json!({ "limit": 10 }));
+        assert_eq!(runs[0]["agent"], "resume");
+        assert_eq!(runs[0]["state"], "completed");
+        assert_eq!(runs[0]["actor"], "gui");
+
+        let made = h.ok(
+            "resume_generate",
+            json!({ "jobTextId": job, "export": null }),
+        );
+        assert_eq!(made["exported"], Value::Null);
+    }
+
+    /// Two questions waiting, and Claude on with consent: a press names the count first.
+    fn claude_on_with_questions(h: &Harness) {
+        h.ok(
+            "ai_enable",
+            json!({ "provider": "claude_code", "enabled": true }),
+        );
+        h.ok(
+            "ai_consent_give",
+            json!({ "provider": "claude_code", "categories": ["job_text"] }),
+        );
+        for text in ["Describe project one", "Describe project two"] {
+            h.ok(
+                "memory_add_question",
+                json!({ "text": text, "country": null }),
+            );
+        }
+    }
+
+    #[test]
+    fn memory_refresh_names_the_count_natively() {
+        let h = ready();
+        claude_on_with_questions(&h);
+        let plan = h.ok("memory_refresh_plan", json!({}));
+        assert_eq!(
+            (plan["pending"].clone(), plan["claude_calls"].clone()),
+            (json!(2), json!(2))
+        );
+
+        h.answer(false);
+        assert_eq!(h.code("memory_refresh", json!({})), "confirmation_required");
+        let asked = h.asked();
+        let dialog = asked.last().unwrap();
+        assert!(
+            dialog.contains("Refresh career memory")
+                && dialog.contains("This will make up to 2 Claude calls, limit 20."),
+            "{asked:?}"
+        );
+        assert_eq!(
+            h.ok("agents_list", json!({ "limit": 10 })),
+            json!([]),
+            "no run row"
+        );
+        let hook = h.app.state::<NativeHook>();
+        assert_eq!(hook.work_at_dialog.lock().unwrap().last(), Some(&false));
+    }
+
+    /// The yes covers the count it was asked with: a question that arrives while the dialog
+    /// is open changes the plan, and the press is refused before anything runs.
+    #[test]
+    fn a_count_that_moves_after_the_dialog_is_refused() {
+        let h = ready();
+        claude_on_with_questions(&h);
+        let db = with_db(&h, |db| async move { db });
+        let hook = h.app.state::<NativeHook>();
+        *hook.on_ask.lock().unwrap() = Some(Box::new(move || {
+            let db = db.clone();
+            Box::pin(async move {
+                jobpilot_core::memory::add_question(&db, "Describe project three", None)
+                    .await
+                    .unwrap();
+            })
+        }));
+        h.answer(true);
+        let refused = h.call("memory_refresh", json!({}));
+        assert_eq!(code_of(refused), "validation");
+        assert!(h.asked().last().unwrap().contains("up to 2 Claude calls"));
+        assert_eq!(h.ok("agents_list", json!({ "limit": 10 })), json!([]));
+        let plan = h.ok("memory_refresh_plan", json!({}));
+        assert_eq!(plan["claude_calls"], 3, "the new question is counted now");
+    }
+
+    #[test]
+    fn memory_refresh_asks_nothing_when_no_claude_call_is_ahead() {
+        let h = ready();
+        h.ok(
+            "memory_add_question",
+            json!({ "text": "Describe project one", "country": null }),
+        );
+        let plan = h.ok("memory_refresh_plan", json!({}));
+        assert_eq!(plan["claude_calls"], 0);
+        h.answer(false);
+        let done = h.ok("memory_refresh", json!({}));
+        assert_eq!(done["classified"]["skipped"], true);
+        assert!(h.asked().is_empty());
+        let runs = h.ok("agents_list", json!({ "limit": 10 }));
+        assert_eq!(runs[0]["agent"], "career_memory");
+    }
+
+    fn audited(h: &Harness, action: &str) -> Vec<String> {
+        let rows = h.ok("audit_recent", json!({ "limit": 50 }));
+        let rows = rows.as_array().unwrap();
+        rows.iter()
+            .filter(|row| row["action"] == action)
+            .map(|row| row["actor"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn pause_set_fires_the_running_tokens_and_is_audited_as_gui() {
+        let h = ready();
+        let state = h.app.state::<AppState>();
+        let ai = state.ai.begin().unwrap();
+        let pull = state.pull.begin().unwrap();
+        assert_eq!(h.ok("pause_status", json!({}))["paused"], false);
+
+        let before = jobpilot_core::pause::epoch(&h.paths);
+        let on = h.ok("pause_set", json!({}));
+
+        assert_eq!(
+            jobpilot_core::pause::epoch(&h.paths),
+            before + 1,
+            "announced first"
+        );
+        assert_eq!(on["paused"], true);
+        assert_eq!(on["set_by"], "gui");
+        assert!(ai.token.is_cancelled() && pull.token.is_cancelled());
+        assert_eq!(audited(&h, "emergency_pause_set"), ["gui"]);
+        assert_eq!(h.ok("pause_status", json!({}))["paused"], true);
+        // Again: nothing more is written.
+        h.ok("pause_set", json!({}));
+        assert_eq!(audited(&h, "emergency_pause_set"), ["gui"]);
+    }
+
+    #[test]
+    fn pause_set_in_recovery_fires_tokens_and_reports_unavailable() {
+        let h = recovery(OPENS);
+        let state = h.app.state::<AppState>();
+        let ai = state.ai.begin().unwrap();
+        let pull = state.pull.begin().unwrap();
+
+        assert_eq!(h.code("pause_set", json!({})), "unavailable");
+
+        assert!(ai.token.is_cancelled() && pull.token.is_cancelled());
+        assert_eq!(h.code("pause_status", json!({})), "unavailable");
+    }
+
+    #[test]
+    fn pause_clear_asks_natively_and_stays_set_when_refused() {
+        let h = ready();
+        h.ok("pause_set", json!({}));
+
+        h.answer(false);
+        assert_eq!(h.code("pause_clear", json!({})), "confirmation_required");
+        assert_eq!(h.ok("pause_status", json!({}))["paused"], true);
+        let asked = h.asked();
+        assert!(
+            asked.last().unwrap().contains("Clear emergency pause"),
+            "{asked:?}"
+        );
+        let hook = h.app.state::<NativeHook>();
+        assert_eq!(hook.work_at_dialog.lock().unwrap().last(), Some(&false));
+        assert!(audited(&h, "emergency_pause_cleared").is_empty());
+
+        h.answer(true);
+        let off = h.ok("pause_clear", json!({}));
+        assert_eq!(off["paused"], false);
+        assert_eq!(audited(&h, "emergency_pause_cleared"), ["gui"]);
+    }
+
+    #[test]
+    fn pause_clear_in_recovery_asks_nothing() {
+        let h = recovery(OPENS);
+        assert_eq!(h.code("pause_clear", json!({})), "unavailable");
+        assert!(h.asked().is_empty());
+    }
+
+    #[test]
+    fn the_menu_item_uses_the_shared_pause_path() {
+        use crate::menu::{self, PAUSE_ID};
+        let h = ready();
+        let state = h.app.state::<AppState>();
+        let ai = state.ai.begin().unwrap();
+        let event = |id: &str| tauri::menu::MenuEvent { id: id.into() };
+
+        menu::on_event(h.app.handle(), event("something_else"));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(h.ok("pause_status", json!({}))["paused"], false);
+
+        menu::on_event(h.app.handle(), event(PAUSE_ID));
+        wait_until(|| h.ok("pause_status", json!({}))["paused"] == true);
+        assert!(ai.token.is_cancelled());
+        assert_eq!(audited(&h, "emergency_pause_set"), ["gui"]);
+    }
+
+    /// macOS makes a submenu only on the main thread, and a test never runs there, so the
+    /// whole menu is built where it can be: the item is checked on every system.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn menu_has_the_pause_item_and_accelerator() {
+        use crate::menu::{self, PAUSE_ACCELERATOR, PAUSE_ID, SAFETY};
+        let h = ready();
+
+        let menu = menu::build(h.app.handle()).unwrap();
+
+        let items = menu.items().unwrap();
+        let names: Vec<String> = items
+            .iter()
+            .filter_map(|item| item.as_submenu()?.text().ok())
+            .collect();
+        assert!(
+            names.contains(&"Edit".to_owned()),
+            "copy and paste stay: {names:?}"
+        );
+        let safety = items
+            .iter()
+            .filter_map(|item| item.as_submenu())
+            .find(|submenu| submenu.text().is_ok_and(|text| text == SAFETY))
+            .expect("a Safety submenu");
+        assert!(safety.get(PAUSE_ID).is_some());
+        assert_eq!(PAUSE_ACCELERATOR, "CmdOrCtrl+Shift+H");
+    }
+
+    #[test]
+    fn the_pause_item_has_its_id_label_and_a_valid_accelerator() {
+        use crate::menu::{self, PAUSE_ACCELERATOR, PAUSE_ID};
+        let h = ready();
+
+        let item = menu::pause_item(h.app.handle()).unwrap();
+
+        assert_eq!(item.id().0, PAUSE_ID);
+        assert_eq!(item.text().unwrap(), "Emergency pause");
+        assert_eq!(PAUSE_ACCELERATOR, "CmdOrCtrl+Shift+H");
+        assert!(item.is_enabled().unwrap());
+    }
+
+    #[test]
+    fn a_pause_set_by_another_process_fires_the_tokens() {
+        let h = ready();
+        let state = h.app.state::<AppState>();
+        let (ai, pull) = (state.ai.begin().unwrap(), state.pull.begin().unwrap());
+        assert!(!block_on(super::stop_if_paused(&state)));
+        assert!(!ai.token.is_cancelled());
+
+        // A second handle stands for the CLI.
+        block_on(async {
+            let other = Db::open(&h.paths).await.unwrap();
+            jobpilot_core::pause::set(&other, "cli").await.unwrap();
+            other.close().await;
+        });
+
+        assert!(block_on(super::stop_if_paused(&state)));
+        assert!(ai.token.is_cancelled() && pull.token.is_cancelled());
     }
 
     fn code_of(result: Result<Value, Value>) -> String {

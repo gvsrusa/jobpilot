@@ -1,6 +1,6 @@
 # JobPilot AI: Architecture
 
-Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md), [PRD](prd.md), and [milestone plan](milestones.md). Requirement IDs (`FR-<section>.<n>`) come from the PRD. Nothing here is implemented yet. This document describes release 0.1 in detail and names later pieces only as extension points.
+Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md), [PRD](prd.md), and [milestone plan](milestones.md). Requirement IDs (`FR-<section>.<n>`) come from the PRD. Releases 0.1 to 0.3 are built; this document describes 0.1 in detail, adds the 0.2 and 0.3 modules, and names later pieces only as extension points.
 
 Related documents: [AI providers](ai-providers.md), [policy register](policy-register.md), [threat model](security/threat-model.md), [agents](agents.md). They own connector, AI, security, and agent design. This document does not specify those designs. The database is described in [database-schema.md](database-schema.md).
 
@@ -166,11 +166,24 @@ A root must be proven to be JobPilot's before anything touches it, because `JOBP
 
 Backup layout: `backups/<label>-<UTC stamp>/` holds `jobpilot.db` (written with `VACUUM INTO`), a copy of `documents/`, and `manifest.json` with `{format: 1, schema_version, created_at, wal}`. Restore validates the backup before touching live data, writes a `pre-restore` snapshot, closes the handle, and takes the exclusive lock. It then builds the new database as a temporary copy inside the root: it merges a WAL only if the manifest claims one, migrates an older backup forward, checks the schema, puts back the live `secret_index` names because secret values are never in a backup, writes the audit row, and checks the copy again. Next it renames the documents into place, clears the live `-wal` and `-shm`, renames the database into place, and reopens. A failure before the database rename leaves live data unchanged. Once that rename succeeds the restore has happened, so a failed reopen returns `restored_not_opened` rather than an error that reads as nothing changed. If step 2 fails on a corrupt database that still opens, restore falls through to the offline path, which copies the files instead of reading rows. Nothing deletes snapshots automatically.
 
-Planned later modules (connector SDK, workflow runner, permissions engine) will be added to this crate in later releases. Their designs belong to the documents listed at the top and are not decided here.
+Modules added in 0.3:
+
+| Module | Responsibility | Requirements |
+|---|---|---|
+| `applications` | Application records and their history, with `check_change` validation shared with the tracking agent. A status change goes through `agents::set_status`. | FR-2.12 |
+| `memory` | Career memory: questions, answers, sensitivity rules and classes (`rules`, `classify`), search (`search`, FTS5 and local embeddings), and the use gate (`usage`) that returns a sealed answer only after a person confirms it. Work authorization is read from the profile by exact country. | FR-8.1 to FR-8.8 |
+| `runner` | The deterministic workflow runner: `Workflow`, `Agent`, the static permission sets (`perms`), run rows, heartbeats, checkpoints, retries, timeouts, and cancellation (`store`). | FR-11.10 to FR-11.16 |
+| `agents` | The workflows on the runner: `tracking`, `analytics`, `draft` (resume and cover letter), and `memory` (refresh), plus `set_status`, `resume_run`, and `cancel_run`. | FR-11.3, FR-11.4, FR-11.5, FR-11.7, FR-11.9 |
+| `analytics` | Aggregate queries over the application store, with no model and no network. | FR-10.11 |
+| `pause` | The emergency pause flag in the database, the 250 ms watch, and the gates. | FR-12.8 |
+
+Planned later modules (connector SDK, permissions engine) will be added to this crate in later releases. Their designs belong to the documents listed at the top and are not decided here.
 
 ### 6.2 `crates/cli` (`jobpilot`)
 
 A binary crate that depends on `jobpilot-core`. It parses arguments, calls core with actor `"cli"`, and prints text or, with `--json`, JSON. Errors go to standard error as `error[<code>]: <message>` with exit code 1. The 0.1 surface is `status`, `doc`, `backup`, and `data`. It contains no business logic. Later releases add the commands in FR-10.3 to FR-10.12. This is the 0.1 slice of FR-10.13.
+
+The 0.3 CLI adds `app` (add, list, show, history, edit, status, note, answers, remove), `memory` (add-question, add-answer, list, show, edit-answer, approve, unapprove, reviewed, set-class, reveal, confirm, use, authorization, remove-question, remove-answer, search, refresh), `agents` (list, show, log, cancel, resume), `analytics` (report, show), and `pause` (set, status, clear). Each has a row in the `PANEL` table, and what its GUI twin confirms natively (for example `pause clear`) is refused in the terminal panel.
 
 The 0.2 CLI adds `profile`, `prefs`, `kb`, `job`, `resume`, `letter`, `ai`, and the `data recovery-key` commands, plus `jobpilot shell`, the restricted line interpreter the terminal panel runs. The desktop bundles this binary as a sidecar (`externalBin: binaries/jobpilot`). `apps/desktop/scripts/sidecar.mjs` builds it and copies it to `binaries/jobpilot-<target triple>`; `beforeBuildCommand` runs it, with `TAURI_ENV_TARGET_TRIPLE` set under `tauri build --target`, and CI runs it as its own step. Under `tauri dev` the script is not run, so build the CLI first.
 
@@ -181,6 +194,8 @@ Holds `AppState`, which contains the `AppPaths`, an `RwLock<Option<Db>>` slot, a
 `backup_restore` and `data_delete` take the write lock, take the `Db` out of its slot, call core, and always reopen before returning. There is deliberately no `secret_get` command, so secret values never cross IPC. The adapter uses the single-instance plugin so a second launch focuses the existing window, and the dialog plugin with only `dialog:allow-open` permission to pick a backup folder. The webview Content Security Policy and capabilities are locked down in plan Task B1.
 
 In 0.2 the adapter also holds `pty.rs`, which runs the sidecar in a PTY (`portable-pty`) for the panel with a marker in its environment so core can refuse the commands M-14 lists; `native.rs`, which owns the native dialogs for recovery files and destructive confirmations so those paths never cross the webview; and the AI commands. The webview cannot set `ai.claude_path`, give consent, or enable a provider through the panel. Exit cancels in-flight tasks and waits up to 5 seconds before leaving.
+
+In 0.3 the adapter adds `menu.rs`, which builds the native menu with a `Safety` submenu whose Emergency pause item carries the `CmdOrCtrl+Shift+H` accelerator, and the pause watcher, which polls the stored flag and fires the in-flight tokens. Commands for applications, memory, agents, analytics, and pause go in `handler()` and in the `ALLOWED_COMMANDS` list the tests compare, and the destructive ones (confirming a sensitive use, clearing the pause) ask through `native.rs`.
 
 ### 6.4 `apps/desktop/src` (React frontend)
 
@@ -198,6 +213,10 @@ Built with Vite, Tailwind CSS, shadcn/ui, Zustand for client state, and TanStack
 | Resumes view | `src/views/ResumesView.tsx` | Resume import, knowledge items, job texts, drafts, comparison, and export (0.2). |
 | AI view | `src/views/AiView.tsx` | Providers, order, consent, Ollama models and downloads, and the Claude path (0.2). |
 | Terminal panel | `src/components/TerminalPanel.tsx` | xterm.js on the PTY. Ctrl+` shows or hides it, F6 leaves it (0.2). |
+| Applications view | `src/views/ApplicationsView.tsx` | Add, filter, edit, and change the status of applications, their history, the answers an application used, and the analytics summary (0.3). |
+| Memory view | `src/views/MemoryView.tsx` | Questions, answers, classes, approval, search, and the refresh with its call count (0.3). |
+| Agents view | `src/views/AgentsView.tsx` | Runs and their logs, with resume and cancel (0.3). |
+| Title bar | `src/components/TitleBar.tsx` | First in the page on every screen: the Emergency pause button, the paused notice, and Clear pause (0.3). |
 
 Screen layouts are in the UI wireframes (plan Task A5) and are not repeated here.
 

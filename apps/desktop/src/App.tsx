@@ -1,13 +1,18 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { ErrorAlert } from "@/components/ErrorAlert";
 import { TerminalPanel } from "@/components/TerminalPanel";
+import { TitleBar } from "@/components/TitleBar";
 import { Button } from "@/components/ui/button";
+import { isPauseKey, usePause } from "@/lib/pause";
 import { useUiStore, type View } from "@/lib/store";
 import { useStatus } from "@/lib/status";
 import { cn } from "@/lib/utils";
 import { DataView } from "@/views/DataView";
+import { AgentsView } from "@/views/AgentsView";
 import { AiView } from "@/views/AiView";
+import { ApplicationsView } from "@/views/ApplicationsView";
 import { DocumentsView } from "@/views/DocumentsView";
+import { MemoryView } from "@/views/MemoryView";
 import { ProfileView } from "@/views/ProfileView";
 import { ResumesView } from "@/views/ResumesView";
 import { RecoveryView } from "@/views/RecoveryView";
@@ -20,16 +25,25 @@ const NAV: { view: View; label: string }[] = [
   { view: "profile", label: "Profile" },
   { view: "resumes", label: "Resumes" },
   { view: "ai", label: "AI" },
+  { view: "applications", label: "Applications" },
+  { view: "memory", label: "Memory" },
+  { view: "agents", label: "Agents" },
 ];
 
-function Shell({ version, root }: { version: string; root: string }) {
+function Shell({ root }: { root: string }) {
   const { view, setView } = useUiStore();
   const nav = useRef<HTMLElement>(null);
   const main = useRef<HTMLElement>(null);
   const [terminal, setTerminal] = useState(false);
 
-  // On a view change, focus moves to the main view heading.
-  useEffect(() => main.current?.querySelector("h1")?.focus(), [view]);
+  // On a view change, focus moves to the main view heading. Not on launch: that would put
+  // the first tab stop past Emergency pause.
+  const shown = useRef(view);
+  useEffect(() => {
+    if (shown.current === view) return;
+    shown.current = view;
+    main.current?.querySelector("h1")?.focus();
+  }, [view]);
 
   useEffect(() => {
     const onKey = (e: globalThis.KeyboardEvent) => {
@@ -85,11 +99,7 @@ function Shell({ version, root }: { version: string; root: string }) {
   };
 
   return (
-    <div className="flex min-h-screen flex-col">
-      <header className="flex items-center justify-between border-b px-4 py-2">
-        <span className="font-semibold">JobPilot AI</span>
-        <span className="text-sm text-muted-foreground">v{version}</span>
-      </header>
+    <div className="flex flex-1 flex-col">
       <div className="flex flex-1">
         <nav ref={nav} aria-label="Main" onKeyDown={onNavKey} className="flex w-44 flex-col gap-1 border-r p-3">
           {NAV.map((item) => (
@@ -111,6 +121,9 @@ function Shell({ version, root }: { version: string; root: string }) {
           {view === "profile" && <ProfileView />}
           {view === "resumes" && <ResumesView />}
           {view === "ai" && <AiView />}
+          {view === "applications" && <ApplicationsView />}
+          {view === "memory" && <MemoryView />}
+          {view === "agents" && <AgentsView />}
         </main>
       </div>
       <TerminalPanel open={terminal} onClose={() => setTerminal(false)} />
@@ -131,11 +144,28 @@ function Shell({ version, root }: { version: string; root: string }) {
 
 export default function App() {
   const status = useStatus();
+  const pause = usePause();
+
+  // Here, not in `Shell`, so a focused terminal, an open dialog, the recovery screen, and the
+  // loading state are all covered. Capture, so nothing in the page takes the key first. It
+  // only ever sets: clearing is the title bar's button and a native dialog.
+  const set = pause.set.mutate;
+  useEffect(() => {
+    const onPause = (e: globalThis.KeyboardEvent) => {
+      if (!isPauseKey(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      set();
+    };
+    window.addEventListener("keydown", onPause, true);
+    return () => window.removeEventListener("keydown", onPause, true);
+  }, [set]);
+
+  let body;
   if (status.isPending) {
-    return <p className="p-6 text-sm text-muted-foreground">Opening your data...</p>;
-  }
-  if (status.isError) {
-    return (
+    body = <p className="p-6 text-sm text-muted-foreground">Opening your data...</p>;
+  } else if (status.isError) {
+    body = (
       <main className="grid max-w-xl gap-3 p-6">
         <ErrorAlert error={status.error} />
         <div>
@@ -143,8 +173,16 @@ export default function App() {
         </div>
       </main>
     );
+  } else if (status.data.state === "recovery") {
+    // `Ok` is not enough: "recovery" replaces the shell and hides the navigation.
+    body = <RecoveryView status={status.data} />;
+  } else {
+    body = <Shell root={status.data.data_root} />;
   }
-  // `Ok` is not enough: "recovery" replaces the shell and hides the navigation.
-  if (status.data.state === "recovery") return <RecoveryView status={status.data} />;
-  return <Shell version={status.data.app_version} root={status.data.data_root} />;
+  return (
+    <div className="flex min-h-screen flex-col">
+      <TitleBar version={status.data?.app_version} pause={pause} />
+      {body}
+    </div>
+  );
 }

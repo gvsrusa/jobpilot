@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use clap::Subcommand;
 use jobpilot_core::crypto::{self, KeyState};
 use jobpilot_core::{
-    AppPaths, Db, Error, Result, app_schema_version, backup, documents, profile, recovery, transfer,
+    AppPaths, Db, Error, Result, app_schema_version, backup, documents, memory, pause, profile,
+    recovery, transfer,
 };
 use serde_json::json;
 
@@ -86,8 +87,9 @@ pub async fn status(db: &Db) -> Result<Output> {
     let ollama =
         serde_json::to_value(&ai.ollama).map_err(|e| Error::Io(std::io::Error::other(e)))?;
     let swap = db.swap_interrupted();
+    let paused = pause::state(db).await?;
     let mut text = format!(
-        "jobpilot {}\nschema {schema}\ndata {}\n{}\nollama: {}\nclaude code: {}",
+        "jobpilot {}\nschema {schema}\ndata {}\n{}\nollama: {}\nclaude code: {}\n{}",
         jobpilot_core::VERSION,
         db.paths().root().display(),
         describe_key(&key_state),
@@ -97,6 +99,7 @@ pub async fn status(db: &Db) -> Result<Output> {
         } else {
             "not found"
         },
+        crate::pause::describe(&paused),
     );
     if swap {
         text.push_str("\nwarning: a restore was interrupted; check your documents");
@@ -109,6 +112,9 @@ pub async fn status(db: &Db) -> Result<Output> {
             "root": db.paths().root(),
             "key_state": key_state,
             "swap_interrupted": swap,
+            "paused": paused.paused,
+            "paused_at": paused.set_at,
+            "paused_by": paused.set_by,
             "ai": {
                 "ollama": ollama,
                 "claude_code": { "available": ai.claude_code.available },
@@ -213,17 +219,31 @@ pub async fn restore(paths: &AppPaths, source: &Path) -> Result<Output> {
 pub async fn data(db: &Db, command: DataCommand) -> Result<Output> {
     match command {
         DataCommand::Export => {
-            // Before writing: the export holds work authorization in plain text when unlocked.
-            let (_, sensitive_plain) = profile::export_authorization(db).await?;
+            // Before writing: the export holds these in plain text when unlocked.
+            let (_, authorization) = profile::export_authorization(db).await?;
+            let (_, answers, _) = memory::export_sealed(db).await?;
+            let sensitive_plain = authorization || answers;
             if sensitive_plain {
                 eprintln!(
-                    "warning: this export holds your work authorization answers as plain text. \
-                     Keep the folder private."
+                    "warning: this export holds your work authorization answers and sealed \
+                     career answers as plain text. Keep the folder private."
                 );
             }
-            let path = transfer::export_all(db, ACTOR).await?;
+            let report = transfer::export_report(db, ACTOR).await?;
+            let (path, withheld) = (report.path, report.withheld);
+            if withheld > 0 {
+                let plural = if withheld == 1 { "" } else { "s" };
+                eprintln!(
+                    "warning: {withheld} sealed career answer{plural} left out of this export, \
+                     as no key could open them. They are still in JobPilot."
+                );
+            }
             out(
-                json!({ "path": path, "sensitive_plain": sensitive_plain }),
+                json!({
+                    "path": path,
+                    "sensitive_plain": sensitive_plain,
+                    "withheld": withheld,
+                }),
                 format!("exported to {}", path.display()),
             )
         }

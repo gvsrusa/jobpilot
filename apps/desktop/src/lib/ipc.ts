@@ -33,8 +33,6 @@ export type KeyState =
 export type RecoveryReceipt = { key_id: string; path: string };
 
 export type WorkMode = "remote" | "hybrid" | "onsite";
-export type Stated = "not_stated" | "yes" | "no";
-
 export type ProfileBasic = {
   name: string;
   email: string;
@@ -65,13 +63,14 @@ export type Profile = {
 export type KnowledgeItem = {
   id: string;
   kind: string;
-  /** Empty while `locked`. Render it as text only. */
+  /** Empty while `sealed`: `kbReveal` fetches it. Render it as text only. */
   body: string;
   source: string;
   source_ref: string | null;
   approved: boolean;
   marked_sensitive: boolean;
-  locked: boolean;
+  /** The body is ciphertext. A list never opens it. */
+  sealed: boolean;
 };
 
 export type Hit = { item_id: string; score: number; body: string };
@@ -95,6 +94,205 @@ export type ResumeDoc = {
   contact: string[];
   summary: string[];
   sections: Section[];
+};
+
+export const STATUSES = [
+  "saved",
+  "applied",
+  "screening",
+  "interviewing",
+  "offer",
+  "accepted",
+  "rejected",
+  "withdrawn",
+] as const;
+export type ApplicationStatus = (typeof STATUSES)[number];
+
+/** What the form sends. Optional ids are null when nothing is linked. */
+export type ApplicationInput = {
+  company: string;
+  role: string;
+  job_text_id: string | null;
+  resume_draft_id: string | null;
+  letter_draft_id: string | null;
+  link: string;
+  country: string;
+  notes: string;
+};
+
+/** Core's `memory::Class`, lowest first. */
+export const CLASSES = ["normal", "sensitive", "legal", "work_authorization"] as const;
+export type MemoryClass = (typeof CLASSES)[number];
+
+/** Render `text` as text only. It may come from outside the app. */
+export type Question = {
+  id: string;
+  text: string;
+  class: MemoryClass;
+  class_source: string;
+  country: string | null;
+  source: string;
+  source_ref: string | null;
+  findings: Finding[];
+  classified_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type Answer = {
+  id: string;
+  question_id: string;
+  /** Empty under a sealed class: `memoryReveal` fetches it. Render it as text only. */
+  body: string;
+  /** There is text to show on request. False on a body cleared with its key. */
+  sealed: boolean;
+  approved: boolean;
+  version: number;
+  source: string;
+  source_ref: string | null;
+  reviewed_at: string;
+  stale: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type QuestionRow = { question: Question; answers: Answer[] };
+
+/** At most 20 questions go to a model per press, and Claude is asked about each. */
+export type RefreshPlan = { pending: number; claude_calls: number };
+
+/** `skipped`: no AI took the classifying, so classes are the rules'. */
+export type MemoryRefreshed = {
+  sealed: number;
+  /** The error code that left answers hidden; they seal at the next refresh with a key. */
+  seal_blocked: string | null;
+  classified: { checked: number; raised: number; skipped: boolean };
+  embedded: number;
+};
+
+/** One search hit. `answer` is set only for an approved answer of the normal class; a sealed
+ * class has none and needs a confirmation on an application. Render text only. */
+export type MemoryHit = {
+  question_id: string;
+  question: string;
+  class: MemoryClass;
+  answer_id: string | null;
+  answer: string | null;
+  stale: boolean;
+  needs_confirmation: boolean;
+  source: string | null;
+  score: number;
+  via: "semantic" | "text";
+};
+
+/** What `memoryUse` returns. The only place an answer's text reaches the screen for an
+ * application. Render it as text only. */
+export type UsedAnswer = {
+  application_id: string;
+  answer_id: string;
+  class: MemoryClass;
+  text: string;
+  stale: boolean;
+};
+
+/** An answer an application has used or confirmed. It never holds the answer's text. */
+export type AppliedAnswer = {
+  answer_id: string;
+  question: string;
+  class: MemoryClass;
+  confirmed_at: string | null;
+  used_at: string | null;
+  /** The confirmation matches the answer's version and the answer is not stale. */
+  current: boolean;
+};
+
+export type Stated = "not_stated" | "yes" | "no";
+
+/** Work authorization for one exact country, from the profile. `stated` is false when the
+ * profile has no row for it. */
+export type AuthorizationAnswer = {
+  country: string;
+  authorized: Stated;
+  needs_sponsorship: Stated;
+  note: string;
+  stated: boolean;
+};
+
+export type Application = ApplicationInput & {
+  id: string;
+  status: ApplicationStatus;
+  applied_on: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ApplicationEvent = {
+  id: number;
+  at: string;
+  actor: string;
+  kind: "created" | "status" | "note" | "edited";
+  from_status: ApplicationStatus | null;
+  to_status: ApplicationStatus | null;
+  note: string;
+};
+
+/** The emergency pause. `set_by` is `gui` or `cli`. */
+export type PauseState = { paused: boolean; set_at: string | null; set_by: string | null };
+
+export type Agent = "resume" | "cover_letter" | "career_memory" | "tracking" | "analytics";
+
+export type RunState =
+  | "queued"
+  | "checking"
+  | "running"
+  | "checkpointed"
+  | "retrying"
+  | "waiting_for_human"
+  | "halted"
+  | "completed"
+  | "manual_required"
+  | "refused"
+  | "failed"
+  | "cancelled";
+
+export type RunSummary = {
+  id: string;
+  agent: Agent;
+  state: RunState;
+  step: number;
+  steps: number;
+  reason: string | null;
+  actor: string;
+  created_at: string;
+  finished_at: string | null;
+};
+
+export type LogRow = {
+  at: string;
+  step: string;
+  state: RunState;
+  duration_ms: number;
+  provider: string | null;
+  data_categories: DataCategory[];
+  outcome: string;
+};
+
+export type RunDetail = { run: RunSummary; log: LogRow[] };
+
+/** Counts and rates only. A rate with no applications behind it is null. */
+export type Report = {
+  id: string;
+  created_at: string;
+  volume: { total: number; by_status: Record<string, number>; applied_last_30_days: number };
+  funnel: {
+    applied: number;
+    responded: number;
+    interviews: number;
+    offers: number;
+    response_rate: number | null;
+    offer_rate: number | null;
+  };
+  timing: { median_days_to_response: number | null; responses_counted: number };
 };
 
 export type DraftKind = "resume" | "cover_letter";
@@ -136,7 +334,14 @@ export type Generated = {
   draft: Draft;
   blocked: number;
   provider: "ollama" | "claude_code" | "no_ai";
+  /** Where the file went, when an export was asked for and no claim was blocked. */
+  exported: string | null;
+  /** Set when an export was asked for and refused: a line, the name, a contact, or a heading. */
+  export_skipped: string | null;
 };
+
+/** What to render right after drafting. Rust writes it to the exports folder only. */
+export type ExportChoice = { format: ExportFormat; template: Template };
 
 export type Fit = "fits" | "may_slow" | "too_large";
 
@@ -191,6 +396,9 @@ export type BackupInfo = {
   schema_version: number | null;
 };
 
+/** `withheld` counts sealed answers left out, because no key could open them. */
+export type Exported = { path: string; withheld: number };
+
 export type AuditEntry = {
   id: number;
   at: string;
@@ -215,7 +423,7 @@ export const ipc = {
   backupCreate: () => invoke<BackupInfo>("backup_create"),
   backupList: () => invoke<BackupInfo[]>("backup_list"),
   backupRestore: (source: string) => invoke<Status>("backup_restore", { source }),
-  dataExport: () => invoke<string>("data_export"),
+  dataExport: () => invoke<Exported>("data_export"),
   dataDelete: (confirm: string, includeBackups: boolean) =>
     invoke<Status>("data_delete", { confirm, includeBackups }),
   secretSet: (name: string, value: string) => invoke<void>("secret_set", { name, value }),
@@ -237,19 +445,87 @@ export const ipc = {
   kbMarkSensitive: (id: string, marked: boolean) =>
     invoke<void>("kb_mark_sensitive", { id, marked }),
   kbRemove: (id: string) => invoke<void>("kb_remove", { id }),
+  /** Rust asks the user in a native dialog each time; script cannot answer it. */
+  kbReveal: (id: string) => invoke<string>("kb_reveal", { id }),
   kbSearch: (query: string, limit: number) => invoke<Hit[]>("kb_search", { query, limit }),
 
   jobPaste: (title: string, raw: string) => invoke<JobText>("job_paste", { title, raw }),
   jobList: () => invoke<JobText[]>("job_list"),
   jobGet: (id: string) => invoke<JobText>("job_get", { id }),
 
+  appList: (status: ApplicationStatus | null) =>
+    invoke<Application[]>("app_list", { status }),
+  appGet: (id: string) => invoke<Application>("app_get", { id }),
+  appAdd: (input: ApplicationInput) => invoke<Application>("app_add", { input }),
+  appUpdate: (id: string, input: ApplicationInput) =>
+    invoke<Application>("app_update", { id, input }),
+  /** `on` is YYYY-MM-DD and only matters for the first move to applied. */
+  appSetStatus: (id: string, status: ApplicationStatus, on: string | null, note: string) =>
+    invoke<Application>("app_set_status", { id, status, on, note }),
+  appNote: (id: string, note: string) => invoke<void>("app_note", { id, note }),
+  appHistory: (id: string) => invoke<ApplicationEvent[]>("app_history", { id }),
+
+  agentsList: (limit: number) => invoke<RunSummary[]>("agents_list", { limit }),
+  agentGet: (id: string) => invoke<RunDetail>("agent_get", { id }),
+  /** An active run stops at its next poll; a halted run ends now. */
+  agentCancel: (id: string) => invoke<void>("agent_cancel", { id }),
+  agentResume: (id: string) => invoke<RunDetail>("agent_resume", { id }),
+
+  pauseStatus: () => invoke<PauseState>("pause_status"),
+  /** Stops everything automated now. Idempotent, and never clears. */
+  pauseSet: () => invoke<PauseState>("pause_set"),
+  /** Rust asks in a native dialog; only this button reaches it. */
+  pauseClear: () => invoke<PauseState>("pause_clear"),
+  /** Builds a new report from the application store. No model is involved. */
+  analyticsRun: () => invoke<Report>("analytics_run"),
+  analyticsLatest: () => invoke<Report | null>("analytics_latest"),
+  appRemove: (id: string) => invoke<void>("app_remove", { id }),
+
+  memoryList: (cls: MemoryClass | null) => invoke<QuestionRow[]>("memory_list", { class: cls }),
+  memoryGet: (questionId: string) => invoke<QuestionRow>("memory_get", { questionId }),
+  memoryAddQuestion: (text: string, country: string | null) =>
+    invoke<Question>("memory_add_question", { text, country }),
+  memoryAddAnswer: (questionId: string, text: string, sourceRef: string | null) =>
+    invoke<Answer>("memory_add_answer", { questionId, text, sourceRef }),
+  memoryEditAnswer: (answerId: string, text: string) =>
+    invoke<Answer>("memory_edit_answer", { answerId, text }),
+  /** Under a sealed class, Rust confirms an approval in a native dialog. */
+  memoryApprove: (answerId: string, approved: boolean) =>
+    invoke<void>("memory_approve", { answerId, approved }),
+  /** Under a sealed class, Rust confirms in a native dialog. */
+  memoryMarkReviewed: (answerId: string) => invoke<void>("memory_mark_reviewed", { answerId }),
+  /** Rust confirms lowering in a native dialog. */
+  memorySetClass: (questionId: string, cls: MemoryClass) =>
+    invoke<Question>("memory_set_class", { questionId, class: cls }),
+  /** Rust asks the user in a native dialog each time; script cannot answer it. */
+  memoryReveal: (answerId: string) => invoke<string>("memory_reveal", { answerId }),
+  /** Rust always asks the user in a native dialog; the dialog never holds the answer. */
+  memoryConfirmUse: (answerId: string, applicationId: string) =>
+    invoke<void>("memory_confirm_use", { answerId, applicationId }),
+  memoryUse: (answerId: string, applicationId: string) =>
+    invoke<UsedAnswer>("memory_use", { answerId, applicationId }),
+  memoryApplicationAnswers: (applicationId: string) =>
+    invoke<AppliedAnswer[]>("memory_application_answers", { applicationId }),
+  memoryAuthorization: (country: string) =>
+    invoke<AuthorizationAnswer>("memory_authorization", { country }),
+  memoryRemoveQuestion: (id: string) => invoke<void>("memory_remove_question", { id }),
+  memoryRemoveAnswer: (id: string) => invoke<void>("memory_remove_answer", { id }),
+  memorySearch: (query: string, limit: number) =>
+    invoke<MemoryHit[]>("memory_search", { query, limit }),
+  /** What a press of Refresh would spend. Reads only. */
+  memoryRefreshPlan: () => invoke<RefreshPlan>("memory_refresh_plan"),
+  /** Rust names the Claude count in its own dialog first, when any call is ahead. */
+  memoryRefresh: () => invoke<MemoryRefreshed>("memory_refresh"),
+
   /** Rust opens the picker. Rejects with `cancelled` when the user closes it. */
   resumeImport: () => invoke<Imported>("resume_import"),
   resumeList: (kind: DraftKind | null) => invoke<Draft[]>("resume_list", { kind }),
   resumeVersions: (lineageId: string) => invoke<Draft[]>("resume_versions", { lineageId }),
   /** `manual_required` opens the editor; its message ends with the reason. */
-  resumeGenerate: (jobTextId: string) => invoke<Generated>("resume_generate", { jobTextId }),
-  letterGenerate: (jobTextId: string) => invoke<Generated>("letter_generate", { jobTextId }),
+  resumeGenerate: (jobTextId: string, exportAs?: ExportChoice) =>
+    invoke<Generated>("resume_generate", { jobTextId, export: exportAs }),
+  letterGenerate: (jobTextId: string, exportAs?: ExportChoice) =>
+    invoke<Generated>("letter_generate", { jobTextId, export: exportAs }),
   resumeCompare: (generatedId: string, originalId: string | null) =>
     invoke<Compare>("resume_compare", { generatedId, originalId }),
   claimEdit: (claimId: string, input: ClaimInput) =>

@@ -1,6 +1,6 @@
 # JobPilot AI: UI Wireframes
 
-Status: draft for owner approval. Date: 2026-11-01. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) section 9 (UI wireframes), [PRD](prd.md), [milestones](milestones.md), [architecture](architecture.md#64-appsdesktopsrc-react-frontend), [policy register](policy-register.md), [AI providers](ai-providers.md), [agents](agents.md), and [threat model](security/threat-model.md). Requirement IDs (`FR-<section>.<n>`) come from the PRD. Nothing here is implemented yet.
+Status: draft for owner approval. Date: 2026-11-01. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) section 9 (UI wireframes), [PRD](prd.md), [milestones](milestones.md), [architecture](architecture.md#64-appsdesktopsrc-react-frontend), [policy register](policy-register.md), [AI providers](ai-providers.md), [agents](agents.md), and [threat model](security/threat-model.md). Requirement IDs (`FR-<section>.<n>`) come from the PRD. Screens 2 to 7, 10, 12 to 14, and 16 to 18 are built (through release 0.3). Screens 8, 9, and 11 are proposals for 0.5 and 0.6.
 
 These are layout sketches, not visual design. They fix what each screen shows, what it refuses to show, and how a keyboard user moves through it. Colours, type, and spacing belong to the shadcn/ui theme.
 
@@ -8,7 +8,7 @@ These are layout sketches, not visual design. They fix what each screen shows, w
 
 ### Release map
 
-Only the first five screens (shell, recovery, status, documents, data) belong to release 0.1. They match plan Task B8: three views (`status`, `documents`, `data`) plus the recovery screen. Every later screen is a proposal for the release named, and a release plan may change it.
+Only the first five screens (shell, recovery, status, documents, data) belong to release 0.1, and screens 16 to 18 belong to 0.3. They match plan Task B8: three views (`status`, `documents`, `data`) plus the recovery screen. Every later screen is a proposal for the release named, and a release plan may change it.
 
 | # | Screen | Release | Requirements |
 |---|---|---|---|
@@ -25,6 +25,9 @@ Only the first five screens (shell, recovery, status, documents, data) belong to
 | 12 | Terminal panel | 0.2 | FR-10.1, FR-10.2, FR-12.5 |
 | 13 | AI provider consent | 0.2 (Claude Code row), 0.4 (other providers) | FR-3.12, FR-3.30 |
 | 14 | AI: Ollama and models | 0.2 | FR-2.13, FR-3.2 to FR-3.8 |
+| 16 | Applications | 0.3 | FR-2.12, FR-8.8, FR-10.9, FR-10.11 |
+| 17 | Career memory | 0.3 | FR-8.1 to FR-8.8, FR-10.10 |
+| 18 | Agents | 0.3 | FR-11.12, FR-11.15, FR-11.16, FR-10.12, FR-12.8 |
 
 ### Rules every screen follows
 
@@ -42,7 +45,8 @@ Only the first five screens (shell, recovery, status, documents, data) belong to
 |---|---|
 | Tab, Shift+Tab | Next, previous control in the focus order listed per screen |
 | F6, Shift+F6 | Cycle regions: navigation, main view, bottom panel (when open) |
-| Ctrl+1 to Ctrl+3 (Cmd on macOS) | Open Status, Documents, Data. Later releases append numbers. |
+| Ctrl+1 to Ctrl+9 (Cmd on macOS) | Open Status, Documents, Data, Profile, Resumes, AI, Applications, Memory, Agents, in that order. Ctrl+0 is the last free number: Jobs takes it in 0.5. |
+| Ctrl+Shift+H (Cmd+Shift+H on macOS) | Emergency pause, on every screen. It only turns the pause on. See the note under screen 2. |
 | Esc | Close the open dialog and return focus to the control that opened it |
 | Enter, Space | Activate the focused button or toggle |
 | Arrow keys | Move within a list, table, or radio group; Tab leaves the group |
@@ -55,14 +59,14 @@ Dialogs trap focus, open with focus on the least destructive control, and restor
 
 ## 2. App shell and navigation (release 0.1)
 
-The shell is a left navigation and one main view. Zustand holds only the current view (`status`, `documents`, `data`). TanStack Query holds all server state. In recovery state the navigation is hidden (see screen 3).
+The shell is a title bar, a left navigation, and one main view. Zustand holds only the current view (`status`, `documents`, `data`, and the later entries below). TanStack Query holds all server state. In recovery state the navigation is hidden (see screen 3).
 
 ```text
 +------------------------------------------------------------------------------+
-| JobPilot AI                                                           v0.1.0 |
+| JobPilot AI                                    [Emergency pause]      v0.3.0 |
 +-------------+----------------------------------------------------------------+
 | Status      |                                                                |
-| Documents   |   Main view: one of Status, Documents, Data                    |
+| Documents   |   Main view: one of the entries listed below                   |
 | Data        |                                                                |
 |             |   Errors from IPC appear here, in an alert, above the view.    |
 |             |                                                                |
@@ -84,17 +88,20 @@ Later releases extend the navigation. Each entry appears only in the release tha
  Profile            0.2       7
  Resumes            0.2       10 (resume compare)
  AI                 0.2       14 (Ollama, models, Claude Code consent); 13 grows in 0.4
- Applications       0.3       history; review screen 11 joins in 0.6
- Jobs               0.5       8, 9
+ Applications       0.3       16 (history and summary); review screen 11 joins in 0.6
+ Memory             0.3       17 (career memory)
+ Agents             0.3       18 (runs and logs)
+ Jobs               0.5       8, 9 (Ctrl+0)
 
  Bottom panel: Terminal 0.2 (screen 12)
  Title bar: Emergency pause 0.3, visible on every screen
 ```
 
-- **Release:** 0.1 for three entries and the footer. The other entries are marked above.
-- **Keyboard:** Ctrl/Cmd+1 to 3 switch views. Up and Down move within the navigation list. Enter opens the entry. F6 moves between navigation and main view.
-- **Focus order:** navigation list, main view in its own order, footer text (not focusable). On view change, focus moves to the main view heading.
-- **Empty state:** not applicable. The shell always has at least three entries.
+- **Release:** 0.1 for three entries and the footer. The other entries are marked above. The title bar and its pause button arrive in 0.3.
+- **Keyboard:** Ctrl/Cmd+1 to 9 switch views (Ctrl+0 is the last free number, for Jobs in 0.5). Up and Down move within the navigation list. Enter opens the entry. F6 moves between navigation and main view. Ctrl/Cmd+Shift+H turns the emergency pause on from any screen, including with focus in the terminal panel.
+- **Title bar (0.3):** `[Emergency pause]` is a red button. Once the pause is on it reads "Paused. Nothing automated runs." beside `[Clear pause]`, which asks through a native dialog. With no data open the bar says "No data is open, so nothing is running." The native `Safety` menu holds the same item. On macOS the shortcut may not fire while the web view is hung (a `wry` limit, see [agents](agents.md#8-emergency-pause)); the menu item and `jobpilot pause set` are the reliable paths.
+- **Focus order:** Emergency pause (the first tab stop on every screen), navigation list, main view in its own order, footer text (not focusable). On view change, focus moves to the main view heading.
+- **Empty state:** not applicable. The shell always has at least three entries, and the pause button.
 - **Error state:** IPC errors that are not tied to one control show in a page-level alert at the top of the main view. A second app launch focuses this window (single-instance plugin) and shows no error.
 
 ## 3. Recovery screen (release 0.1)
@@ -689,5 +696,115 @@ Model rows and the status line change with what JobPilot finds:
 | Terminal panel | Screen 12 |
 | AI provider consent | Screen 13 |
 | Local AI setup | Screen 14 |
+| Applications | Screen 16 |
+| Career memory | Screen 17 |
+| Agents | Screen 18 |
 
 Open items for the owner: the pause-panel `{timeout}` (proposed as 30 minutes in [agents](agents.md#4-the-nine-agents)) and the Ctrl+` and F6 keys are proposals; the Sign in with ChatGPT row is optional under decision D1.
+
+## 16. Applications (release 0.3)
+
+Track applications by hand and offline (FR-2.12). A status change runs through the tracking agent, so it shows in Agents (screen 18). A summary of counts and rates is built on request by the analytics agent and holds no company, role, or note. Link text is untrusted and is shown as inert text, never as an anchor.
+
+```text
++-------------+----------------------------------------------------------------+
+| ...         | Applications                              [Add application]    |
+| Applications+----------------------------------------------------------------+
+|             | Summary                                            [Refresh]   |
+|             |  Total {n}   Applied in the last 30 days {n}                   |
+|             |  Response rate {percent or "not enough data yet"}              |
+|             |  Median days to a response {n days (from n responses)}         |
+|             |  By status: {saved 2} {applied 5} {screening 1}                |
+|             +----------------------------------------------------------------+
+|             | Filter by status [ All statuses  v ]                           |
+|             | Company     Role         Status      Applied     Updated       |
+|             | > Beta      Platform Dev screening   2026-10-01  Nov 01        |
+|             |   Acme      Engineer     applied     2026-10-12  Oct 12        |
+|             +----------------------------------------------------------------+
+|             | Company [        ] Role [        ]                             |
+|             | Link (untrusted text, not clickable) [                       ] |
+|             | Country (two letters) [  ]    Notes [                        ] |
+|             | [Save]                                                         |
+|             | Change status: New status [ v ] Applied on (optional)[YYYY-MM-DD]
+|             |   Status note (optional) [               ]  [Change status]    |
+|             | Add note [                          ] [Add note]               |
+|             | History: {at} {actor} {from -> to} {note}                      |
+|             | Answers for this application:                                  |
+|             |  Answer to use [ Choose an answer v ]                          |
+|             |  [Copy] or [Confirm and copy] (native dialog), then the text   |
+|             |  Authorization country [  ] [Show what I stated] [Open Profile]|
+|             |   -> {stated value, or "Not stated"}                           |
+|             | [Remove...]                                                    |
++-------------+----------------------------------------------------------------+
+```
+
+- A sensitive or legal answer shows its text only after a person confirms it for this application, through a native dialog the web page cannot answer. Editing the answer voids the confirmation. A work-authorization question has no stored answer: the screen shows the value from Profile for the country asked, or "Not stated".
+- While the emergency pause is on, `[Change status]` is refused with `paused` and says to clear the pause. Editing fields and adding notes still work.
+- **Release:** 0.3.
+- **Keyboard:** Ctrl/Cmd+7 opens it. Tab moves through filter, list, then the open application's forms. Enter on a row opens it. Esc closes the remove dialog.
+- **Focus order:** Emergency pause, navigation, heading, Refresh, Add application, Filter, list, then the form in the order shown.
+- **Empty state:** "No summary yet. Press Refresh to build one." A rate with nothing behind it reads "not enough data yet", never 0. No applications: "Select an application, or add one."
+- **Error state:** an alert with the code above the part that failed. `paused`, `confirmation_required`, `refused`, and a stale-answer message each name what to do.
+
+## 17. Career memory (release 0.3)
+
+Questions you are asked again and again, with answers you approve (FR-8.1 to FR-8.8). Text is inert. Search is by meaning when a local embedding model is set, else by words. A sensitive or legal answer is never shown in search, and work-authorization answers are never found by search.
+
+```text
++-------------+----------------------------------------------------------------+
+| ...         | Career memory                                                  |
+| Memory      +----------------------------------------------------------------+
+|             | Search memory [                    ] [Search] [Refresh index]  |
+|             |   Up to {n} Claude calls, limit 20 / No Claude calls           |
+|             |   {Checked n, raised n, indexed n}                             |
+|             +----------------------------------------------------------------+
+|             | Filter by class [ All v ]                                      |
+|             | Question {Why this company?}      [ normal              ]      |
+|             |   Noticed ({kind}): {excerpt}                                  |
+|             |   Class [ normal v ]   [Remove question...]                   |
+|             |   Answers: {text or "Sealed"}  v{n}  approved/not  fresh/stale |
+|             |     [Approve] [Mark reviewed] [Edit] [Remove...]               |
+|             |   Add an answer: Answer [          ] Source (optional) [ v ]   |
+|             |     [Add answer]                                               |
+|             |   (work authorization) "Answered from your profile, for one    |
+|             |    country at a time."                                         |
+|             +----------------------------------------------------------------+
+|             | Add a question: Question [          ] Country (optional) [  ]  |
+|             |   [Add question]                                               |
++-------------+----------------------------------------------------------------+
+```
+
+- Refresh index is the only thing that spends your Claude usage. Nothing refreshes by itself. It shows how many calls it will make before it makes any, at most 20 per press.
+- Approval is yours. A class you set is final: a model may raise a class and never changes one you set.
+- **Release:** 0.3.
+- **Keyboard:** Ctrl/Cmd+8 opens it. Tab moves through search, filter, then each question card.
+- **Focus order:** Emergency pause, navigation, heading, Search, Search, Refresh index, Filter, questions top to bottom (class, Remove, answers, add answer), Add a question.
+- **Empty state:** "No questions yet. Add one you are often asked." A filter with no match: "No questions in this class." Search: "Nothing matches."
+- **Error state:** an alert with the code. A sealed answer while the key is unavailable lists with an empty body and says why.
+
+## 18. Agents (release 0.3)
+
+Every run of the resume, cover letter, career memory, tracking, and analytics agents, with its log (FR-11.12). The log has ids, states, codes, and counts, never prompts, outputs, or text.
+
+```text
++-------------+----------------------------------------------------------------+
+| ...         | Agents                                                         |
+| Agents      +----------------------------------------------------------------+
+|             | Agent        State      Step   Started       Reason            |
+|             | > resume     halted     2/3    Nov 01 10:04  paused            |
+|             |   tracking   completed  1/1    Nov 01 09:58                    |
+|             |   analytics  completed  3/3    Nov 01 09:50                    |
+|             +----------------------------------------------------------------+
+|             | Selected run                  [Resume] [Cancel run]            |
+|             | Time   Step   State   Duration  Provider  Categories  Outcome  |
+|             | {log rows, oldest first}                                       |
++-------------+----------------------------------------------------------------+
+```
+
+- `[Resume]` shows only for a halted run and passes through Checking again. `[Cancel run]` shows for a halted or active run. A cancelled run cannot resume. The list refreshes every 2 seconds.
+- A halted run stays halted after the pause is cleared until you resume or cancel it. A run whose process died reads `halted` with the reason `interrupted`.
+- **Release:** 0.3.
+- **Keyboard:** Ctrl/Cmd+9 opens it. Tab reaches each row's open button, then Resume and Cancel run.
+- **Focus order:** Emergency pause, navigation, heading, the run list, then the selected run's buttons and log table.
+- **Empty state:** "No agent has run yet."
+- **Error state:** an alert with the code, such as `paused` on a resume while the pause is on.

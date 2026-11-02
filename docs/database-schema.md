@@ -1,6 +1,6 @@
 # JobPilot AI: Database Schema
 
-Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md), [PRD](prd.md), [architecture](architecture.md). Requirement IDs (`FR-<section>.<n>`) come from the PRD. Section 1 (release 0.1) and section 2 (release 0.2) are implemented; section 4 is still a proposal.
+Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md), [PRD](prd.md), [architecture](architecture.md). Requirement IDs (`FR-<section>.<n>`) come from the PRD. Sections 1 (release 0.1), 2 (release 0.2), and 3 (release 0.3) are implemented; section 5 is still a proposal. `schema_version` is 11 on a fresh database, and migration `0011` is the last.
 
 The database is SQLite accessed through SQLx (FR-2.1) and managed by versioned migrations (FR-2.5). It lives at `<data root>/jobpilot.db`, in WAL mode with foreign keys on. Full-text search uses FTS5 (FR-2.2).
 
@@ -226,7 +226,22 @@ ALTER TABLE embeddings_new RENAME TO embeddings;
 
 Snapshots: `pre-migrate-<from>-<stamp>` is written before any migration on a database that holds data, and `pre-discard-<stamp>` before locked fields are discarded. Neither is pruned.
 
-## 3. Migration rules
+## 3. Release 0.3 tables (decided, shipped)
+
+Migrations `0006` to `0011` add the tables below, on top of the 0.2 tables. Each file opens with its rule 7 note, which says how backup, export, and delete-all treat the data. `schema_version` is 11 on a fresh database, and a 0.2 database (version 5) opens at 11 after a `pre-migrate-5-*` snapshot, with every earlier row intact and the new tables empty (`a_0_2_database_upgrades_to_0_3`).
+
+| Migration | Tables | Class and handling |
+|---|---|---|
+| `0006_applications.sql` | `applications`, `application_events` | Personal, plain. Backup copies them with the database, export writes both, delete-all removes them with the root. Holds no work authorization. `application_events` is the history: created, status, note, and edited, with the actor. |
+| `0007_career_memory.sql` | `memory_questions`, `memory_answers`, `application_answers` | Questions and unsealed answers are Personal, plain. A body in a class above `normal` is Sensitive: `body = ''` and `body_enc` holds JPK1 ciphertext (a new ciphertext column, so it joins the key checks in `crypto.rs` and `recovery.rs`). Backup copies the ciphertext with the database. `data.json` drops BLOB columns and blanks a plain body under a sealed class, and `memory_sealed_answers.json` holds the plain text, private on Unix, only when the key is unlocked and after the export warning. `memory_questions.class_source` is `rules`, `model`, or `user`, and `user` is final. `application_answers` holds ids, versions, and times for confirmations, never answer text. Delete-all removes all three with the root. |
+| `0008_memory_search.sql` | `memory_fts`, `memory_embeddings` | Derived, and rebuilt from the questions and plain answers. A work-authorization question has no row in either table, and a sealed class indexes the question only. Export skips them. Backup copies them, delete-all removes them. The migration backfills `memory_fts` for questions that exist already. |
+| `0009_agent_runs.sql` | `agent_runs`, `agent_run_log` | Ids, enum choices, codes, and durations, never a prompt, an output, posting text, an answer, or a secret (M-26). `input` keeps what a resume needs (for a status update the application id, status, and date, never its note). `generation` counts resumes, and `cancel_actor` is who asked first. `waiting_for_human` is in the state `CHECK` and is never entered in 0.3. Backup copies them, export writes them, delete-all removes them. |
+| `0010_reports.sql` | `reports` | Counts and rates only, no company, role, or note. `complete = 0` marks a report still being built. Backup copies it, export writes it, delete-all removes it. |
+| `0011_emergency_pause.sql` | `emergency_pause`, and `drafts.run_id` | `emergency_pause` has one row while the pause is on: who set it and when, no personal data. A restore never clears it. `drafts.run_id` is the id of the run that made a generated version, so a run that repeats its draft step after a failed checkpoint write finds its version and calls no model again. |
+
+Other rules the migrations follow: runtime SQL only, LF line endings, and no file edited after it shipped.
+
+## 4. Migration rules
 
 1. Forward only. There are no down migrations. Recovery from a bad migration is a restore from the snapshot.
 2. Snapshot before migrating. When pending migrations exist and the database already holds data, core writes `backups/pre-migrate-<from>-<stamp>/` before applying anything. A failed migration leaves the snapshot and the previous data in place.
@@ -236,9 +251,9 @@ Snapshots: `pre-migrate-<from>-<stamp>` is written before any migration on a dat
 6. Every release must apply cleanly to a fresh database and upgrade the previous release's database (milestone gate 3). Restoring an older backup migrates it forward.
 7. A migration that creates a table holding personal data must say how backup, export, and delete-all handle it.
 
-## 4. Proposed later entities (not decided)
+## 5. Proposed later entities (not decided)
 
-This diagram is a proposal only, and it predates the 0.2 design: the candidate and resume entities shipped under the names in section 2. It shows how later releases might extend the schema. Table names, columns, and relationships are not decided and will be fixed in the release that adds them, each with its own migration. Connector, AI, and agent details are owned by [policy-register.md](policy-register.md), [ai-providers.md](ai-providers.md), and [agents.md](agents.md). Release targets come from the [milestone plan](milestones.md).
+This diagram is a proposal only, and it predates the 0.2 and 0.3 designs: the candidate and resume entities shipped under the names in section 2, and the application, answer, and agent run entities under the names in section 3. It shows how later releases might extend the schema. Table names, columns, and relationships are not decided and will be fixed in the release that adds them, each with its own migration. Connector, AI, and agent details are owned by [policy-register.md](policy-register.md), [ai-providers.md](ai-providers.md), and [agents.md](agents.md). Release targets come from the [milestone plan](milestones.md).
 
 ```mermaid
 erDiagram
@@ -256,25 +271,8 @@ erDiagram
         text id PK
         text connector_id FK
     }
-    application {
-        text id PK
-        text job_id FK
-        text resume_id FK
-    }
-    answer {
-        text id PK
-        text candidate_id FK
-    }
-    agent_run {
-        text id PK
-        text application_id FK "optional"
-    }
     candidate ||--o{ resume : "has (0.2)"
-    candidate ||--o{ answer : "has (0.3)"
     connector ||--o{ job : "supplies (0.5)"
-    job ||--o{ application : "applied to (0.3)"
-    resume ||--o{ application : "used in (0.3)"
-    application ||--o{ agent_run : "worked by (0.3)"
 ```
 
 Proposed entities and their planned release:
@@ -283,7 +281,5 @@ Proposed entities and their planned release:
 |---|---|---|
 | candidate | 0.2, built | Shipped as `profile` and `work_authorization` (section 2). |
 | resume | 0.2, built | Shipped as `knowledge_items`, `drafts`, and `claims` (section 2). |
-| application | 0.3 | Tracking history, viewable and editable offline (FR-2.12). |
-| answer | 0.3 | Career memory with approval, provenance, freshness, sensitivity (FR-8). |
-| agent_run | 0.3 | Execution logs, checkpoints (FR-11.12, FR-11.15). |
+| application, answer, agent_run | 0.3, built | Shipped as `applications` and `application_events`, `memory_questions` and `memory_answers`, and `agent_runs` and `agent_run_log` (section 3). |
 | job, connector | 0.5 | Connector declarations and discovered jobs (FR-5, FR-6). |

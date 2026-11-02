@@ -3,9 +3,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use jobpilot_core::ai::{DataCategory, consent};
+use jobpilot_core::ai::{self, DataCategory, consent};
 use jobpilot_core::crypto::{self, KEY_ACCOUNT_PREFIX, KeyState};
-use jobpilot_core::{AppPaths, Db, Error, MIGRATOR, app_schema_version, audit, backup, documents};
+use jobpilot_core::{
+    AppPaths, Db, Error, MIGRATOR, app_schema_version, audit, backup, documents, pause, settings,
+};
 use serde_json::{Value, json};
 use sqlx::SqlSafeStr;
 use sqlx::migrate::{Migration, MigrationType, Migrator};
@@ -271,6 +273,51 @@ async fn restore_revokes_external_consent_and_says_so_in_the_audit_log() {
         .unwrap();
     assert_eq!(rows, 1);
     db.close().await;
+}
+
+/// A restore that closes Claude Code's consent switches it off too, as the AI screen's own
+/// Revoke does, so the screen never shows it on and failing every task.
+#[tokio::test]
+async fn restore_turns_claude_off_with_its_consent() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    consent::give(&db, CLAUDE, &[DataCategory::JobText], "2026-11-01", "gui")
+        .await
+        .unwrap();
+    ai::set_enabled(&db, "claude_code", true).await.unwrap();
+    ai::set_enabled(&db, "ollama", true).await.unwrap();
+    let info = backup::create(&db, "test").await.unwrap();
+
+    let restored = backup::restore(db, &info.path, "test").await.unwrap().db;
+
+    let enabled = settings::get(&restored, "ai.enabled")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(enabled["claude_code"], false);
+    assert_eq!(
+        enabled["ollama"], true,
+        "only the revoked provider is turned off"
+    );
+    restored.close().await;
+}
+
+/// With no consent to revoke the switch is left as it was.
+#[tokio::test]
+async fn restore_with_no_consent_leaves_the_claude_switch_alone() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    ai::set_enabled(&db, "claude_code", true).await.unwrap();
+    let info = backup::create(&db, "test").await.unwrap();
+
+    let restored = backup::restore(db, &info.path, "test").await.unwrap().db;
+
+    let enabled = settings::get(&restored, "ai.enabled")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(enabled["claude_code"], true);
+    restored.close().await;
 }
 
 /// The recovery screen's restore goes through the same temporary copy.
@@ -1863,4 +1910,175 @@ async fn a_readable_outgoing_key_stands_in_for_a_lost_backup_key_with_no_ciphert
     rows.sort_by_key(|(_, active)| *active);
     assert_eq!(rows, [(KEY_ID.to_owned(), 0), (key_id, 1)]);
     report.db.close().await;
+}
+
+/// A restore must never be the way out of an emergency pause: only a person clears it.
+#[tokio::test]
+async fn restore_keeps_a_set_pause() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let earlier = backup::create(&db, "cli").await.unwrap().path;
+    pause::set(&db, "cli").await.unwrap();
+
+    let restored = backup::restore(db, &earlier, "cli").await.unwrap().db;
+
+    assert!(pause::is_set(&restored).await.unwrap());
+    let kept: Vec<_> = audit::recent(&restored, 20)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.action == "emergency_pause_kept_by_restore")
+        .collect();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].actor, "cli");
+    restored.close().await;
+}
+
+#[tokio::test]
+async fn restoring_a_paused_backup_stays_paused() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    pause::set(&db, "cli").await.unwrap();
+    let during = backup::create(&db, "cli").await.unwrap().path;
+    pause::clear(&db, "cli").await.unwrap();
+
+    let restored = backup::restore(db, &during, "cli").await.unwrap().db;
+
+    assert!(pause::is_set(&restored).await.unwrap());
+    restored.close().await;
+}
+
+/// A restore with no pause on either side leaves none, and a restore under an actor the
+/// pause table does not take still completes.
+#[tokio::test]
+async fn restore_adds_no_pause_when_none_was_set() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let earlier = backup::create(&db, "cli").await.unwrap().path;
+    let restored = backup::restore(db, &earlier, "test").await.unwrap().db;
+    assert!(!pause::is_set(&restored).await.unwrap());
+    pause::set(&restored, "gui").await.unwrap();
+    let again = backup::restore(restored, &earlier, "test")
+        .await
+        .unwrap()
+        .db;
+    assert!(pause::is_set(&again).await.unwrap());
+    // The table takes a person only, so an actor outside it is recorded as the CLI.
+    assert_eq!(
+        pause::state(&again).await.unwrap().set_by.as_deref(),
+        Some("cli")
+    );
+    again.close().await;
+}
+
+fn audit_actions(entries: &[audit::AuditEntry], action: &str) -> usize {
+    entries.iter().filter(|e| e.action == action).count()
+}
+
+/// A live database that cannot be read cannot say whether the pause was on, so the restored
+/// data comes up paused and the audit log says why.
+#[tokio::test]
+async fn offline_restore_over_an_unreadable_database_comes_up_paused() {
+    let (_tmp, paths) = temp_root();
+    let source = backup_with_doc(&paths, "alpha").await;
+    let db = Db::open(&paths).await.unwrap();
+    db.close().await;
+    for suffix in ["-wal", "-shm"] {
+        let _ = fs::remove_file(sidecar(&paths.db(), suffix));
+    }
+    fs::write(paths.db(), b"this is not a database at all, just bytes").unwrap();
+
+    let db = backup::restore_offline(&paths, &source, "gui")
+        .await
+        .unwrap()
+        .db;
+
+    assert!(pause::is_set(&db).await.unwrap());
+    let entries = audit::recent(&db, 20).await.unwrap();
+    assert_eq!(audit_actions(&entries, "emergency_pause_set_by_restore"), 1);
+    let row = entries
+        .iter()
+        .find(|e| e.action == "emergency_pause_set_by_restore")
+        .unwrap();
+    assert_eq!(row.detail, json!({ "why": "live_state_unreadable" }));
+    db.close().await;
+}
+
+/// An older schema has no pause table, which is a pause that was never on.
+#[tokio::test]
+async fn offline_restore_over_a_database_with_no_pause_table_stays_unpaused() {
+    let (_tmp, paths) = temp_root();
+    let source = backup_with_doc(&paths, "alpha").await;
+    let db = Db::open(&paths).await.unwrap();
+    sqlx::query("DROP TABLE emergency_pause")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    plant_future_version(&db.pool).await;
+    db.close().await;
+
+    let db = backup::restore_offline(&paths, &source, "gui")
+        .await
+        .unwrap()
+        .db;
+
+    assert!(!pause::is_set(&db).await.unwrap());
+    let entries = audit::recent(&db, 20).await.unwrap();
+    assert_eq!(audit_actions(&entries, "emergency_pause_set_by_restore"), 0);
+    db.close().await;
+}
+
+/// No database file is no live data, and no pause.
+#[tokio::test]
+async fn offline_restore_with_no_live_database_stays_unpaused() {
+    let (_tmp, paths) = temp_root();
+    let source = backup_with_doc(&paths, "alpha").await;
+    let db = Db::open(&paths).await.unwrap();
+    db.close().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = fs::remove_file(sidecar(&paths.db(), suffix));
+    }
+
+    let db = backup::restore_offline(&paths, &source, "gui")
+        .await
+        .unwrap()
+        .db;
+
+    assert!(!pause::is_set(&db).await.unwrap());
+    db.close().await;
+}
+
+/// A restore whose live pause was readable keeps the backup's own row and audits once.
+#[tokio::test]
+async fn a_kept_pause_is_audited_once_and_not_when_the_backup_already_had_it() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let plain = backup::create(&db, "cli").await.unwrap().path;
+    pause::set(&db, "gui").await.unwrap();
+    let paused_backup = backup::create(&db, "cli").await.unwrap().path;
+
+    let db = backup::restore(db, &plain, "cli").await.unwrap().db;
+    let entries = audit::recent(&db, 50).await.unwrap();
+    assert_eq!(
+        audit_actions(&entries, "emergency_pause_kept_by_restore"),
+        1
+    );
+    assert_eq!(
+        pause::state(&db).await.unwrap().set_by.as_deref(),
+        Some("cli")
+    );
+
+    let db = backup::restore(db, &paused_backup, "cli").await.unwrap().db;
+    let entries = audit::recent(&db, 50).await.unwrap();
+    // The backup carried the row, so this restore adds none and audits none (the log is the
+    // backup's own, which never saw the first restore).
+    assert_eq!(
+        audit_actions(&entries, "emergency_pause_kept_by_restore"),
+        0
+    );
+    assert_eq!(
+        pause::state(&db).await.unwrap().set_by.as_deref(),
+        Some("gui")
+    );
+    db.close().await;
 }

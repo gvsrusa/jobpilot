@@ -117,7 +117,7 @@ pub async fn show(db: &Db) -> Result<Profile> {
 
 /// A key error while reading rows (a row sealed under a key this machine lost) leaves the
 /// profile locked instead of failing it. Any other error is real.
-fn degraded(error: Error) -> Result<KeyState> {
+pub(crate) fn degraded(error: Error) -> Result<KeyState> {
     match error {
         Error::KeyMissing { key_id } => Ok(KeyState::KeyMissing { key_id }),
         Error::KeyMismatch { key_id } => Ok(KeyState::KeyMismatch { key_id }),
@@ -260,6 +260,24 @@ pub(crate) async fn authorization_notes(db: &Db) -> Result<Vec<String>> {
     }
     let rows = read_authorization(db).await?;
     Ok(rows.into_iter().map(|row| row.note).collect())
+}
+
+/// One country's row, by the exact code. With no row it returns `None` before any key call,
+/// so "not stated" asks the keychain nothing. With one, only the key that sealed it is read.
+pub(crate) async fn authorization_row(db: &Db, country: &str) -> Result<Option<WorkAuthorization>> {
+    let stored: Option<(Vec<u8>, String)> =
+        sqlx::query_as("SELECT ciphertext, key_id FROM work_authorization WHERE country = ?")
+            .bind(country)
+            .fetch_optional(&db.pool)
+            .await?;
+    let Some((ciphertext, key_id)) = stored else {
+        return Ok(None);
+    };
+    let key = crypto::key_by_id(db, &key_id).await?;
+    let plain = key.decrypt(TABLE, COLUMN, country, &ciphertext)?;
+    serde_json::from_slice(&plain)
+        .map(Some)
+        .map_err(|e| Error::Validation(e.to_string()))
 }
 
 async fn read_authorization(db: &Db) -> Result<Vec<WorkAuthorization>> {

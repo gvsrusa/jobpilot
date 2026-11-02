@@ -38,6 +38,7 @@ use crate::db::{
 };
 use crate::error::{Error, Result};
 use crate::paths::AppPaths;
+use crate::pause;
 use crate::{audit, secrets};
 
 const DB_FILE: &str = "jobpilot.db";
@@ -77,6 +78,8 @@ type KeyRow = (String, String, Vec<u8>);
 struct LiveRows {
     secrets: Option<Vec<SecretRow>>,
     keys: Option<Vec<KeyRow>>,
+    /// Whether the emergency pause was on. A restore is never the way out of it.
+    paused: Option<bool>,
 }
 
 /// What step 1 found in the source.
@@ -169,6 +172,10 @@ pub async fn restore_with(
     };
 
     let lock = lock_exclusive(&paths)?;
+    // A `pause set` from another process can land between the read in `prepare` and the lock.
+    // No handle is open now and nothing can write, so one more read closes that gap.
+    let mut live = live;
+    live.paused = merge_pause(live.paused, read_live(&paths).await.1.paused);
     let plan = Plan {
         source,
         actor,
@@ -231,6 +238,7 @@ async fn prepare(db: &Db, source: &Path, migrator: &Migrator) -> Result<(Validat
     let live = LiveRows {
         secrets: Some(read_secrets(&db.pool).await?),
         keys: Some(read_keys(&db.pool).await?),
+        paused: Some(pause::is_set(db).await?),
     };
     Ok((validated, live))
 }
@@ -441,9 +449,12 @@ async fn read_live(paths: &AppPaths) -> (Option<i64>, LiveRows) {
         .filename(paths.db())
         .read_only(true);
     let Ok(pool) = SqlitePool::connect_with(options).await else {
+        // No file is no live data, and so no pause. A file that will not open is unknown.
+        let paused = (!paths.db().exists()).then_some(false);
         let live = LiveRows {
             secrets: None,
             keys: None,
+            paused,
         };
         return (None, live);
     };
@@ -451,6 +462,7 @@ async fn read_live(paths: &AppPaths) -> (Option<i64>, LiveRows) {
     let live = LiveRows {
         secrets: read_secrets(&pool).await.ok(),
         keys: read_keys(&pool).await.ok(),
+        paused: read_paused(&pool).await.ok(),
     };
     pool.close().await;
     (version, live)
@@ -558,6 +570,7 @@ async fn migrate_and_fill(pool: &SqlitePool, plan: &Plan<'_>) -> Result<()> {
     }
 
     revoke_external_consent(pool, plan.actor).await?;
+    keep_pause(pool, plan).await?;
 
     let target = plan.source.to_string_lossy();
     let mut detail = json!({});
@@ -570,15 +583,90 @@ async fn migrate_and_fill(pool: &SqlitePool, plan: &Plan<'_>) -> Result<()> {
     audit::record_to(pool, plan.actor, "restore", Some(&target), detail).await
 }
 
+/// A pause that was on stays on, whatever the backup says. The backup's own row, if it has
+/// one, is kept as it is. Only a person clears it, so a restore cannot be the way out.
+async fn keep_pause(pool: &SqlitePool, plan: &Plan<'_>) -> Result<()> {
+    let unknown = plan.live.paused.is_none();
+    if plan.live.paused == Some(false) {
+        return Ok(());
+    }
+    // The table takes a person only. An actor outside it still keeps the pause, as the CLI's.
+    let by = if matches!(plan.actor, "gui" | "cli") {
+        plan.actor
+    } else {
+        "cli"
+    };
+    let added = sqlx::query(
+        "INSERT OR IGNORE INTO emergency_pause (id, set_at, set_by) \
+         VALUES ('me', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?)",
+    )
+    .bind(by)
+    .execute(pool)
+    .await?;
+    if added.rows_affected() == 1 {
+        // Fail closed: when the live pause could not be read, the data comes up paused.
+        let (action, detail) = if unknown {
+            (
+                "emergency_pause_set_by_restore",
+                json!({ "why": "live_state_unreadable" }),
+            )
+        } else {
+            ("emergency_pause_kept_by_restore", json!({}))
+        };
+        audit::record_to(pool, plan.actor, action, None, detail).await?;
+    }
+    Ok(())
+}
+
+/// A schema older than the pause has no such table, which is a pause that was never on. Any
+/// other failure is an unknown, and the caller treats it as on.
+async fn read_paused(pool: &SqlitePool) -> Result<bool> {
+    let found: std::result::Result<Option<i64>, sqlx::Error> =
+        sqlx::query_scalar("SELECT 1 FROM emergency_pause WHERE id = 'me'")
+            .fetch_optional(pool)
+            .await;
+    match found {
+        Ok(found) => Ok(found.is_some()),
+        Err(sqlx::Error::Database(error)) if error.message().contains("no such table") => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// What a pause read before the lock and one read under it say together. Either one on
+/// means on, and an unreadable one with no "on" is unknown.
+fn merge_pause(before: Option<bool>, under_lock: Option<bool>) -> Option<bool> {
+    if before == Some(true) || under_lock == Some(true) {
+        Some(true)
+    } else if before.is_none() || under_lock.is_none() {
+        None
+    } else {
+        Some(false)
+    }
+}
+
 /// Consent is a decision made now, and a backup is an old one, or someone else's copy, so a
 /// restore never brings one back (FR-3.30). Fails closed as the router does: anything but
-/// Ollama is external. The row stays as the record, closed by the restore.
+/// Ollama is external. The row stays as the record, closed by the restore. When one was
+/// closed, Claude Code is also switched off, as the AI screen's own Revoke does, so the
+/// screen shows it off with no consent rather than on and failing every task. With no
+/// consent to close, the switch is left as it was.
 async fn revoke_external_consent(pool: &SqlitePool, actor: &str) -> Result<()> {
     let revoked: Vec<String> = sqlx::query_scalar(
         "UPDATE consent SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
          WHERE revoked_at IS NULL AND provider <> 'ollama' RETURNING provider",
     )
     .fetch_all(pool)
+    .await?;
+    if revoked.is_empty() {
+        return Ok(());
+    }
+    // A missing or non-object setting has nothing to switch off: the default is off.
+    sqlx::query(
+        "UPDATE settings SET value = json_set(value, '$.claude_code', json('false')), \
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE key = 'ai.enabled' AND json_type(value) = 'object'",
+    )
+    .execute(pool)
     .await?;
     for provider in revoked {
         let action = "consent_revoked_by_restore";
@@ -799,6 +887,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pause set between the first read and the lock must not be lost.
+    #[test]
+    fn a_pause_set_in_the_gap_before_the_lock_is_kept() {
+        assert_eq!(merge_pause(Some(false), Some(true)), Some(true));
+        assert_eq!(merge_pause(Some(true), Some(false)), Some(true));
+        assert_eq!(merge_pause(Some(false), Some(false)), Some(false));
+        assert_eq!(merge_pause(Some(false), None), None);
+        assert_eq!(merge_pause(None, Some(false)), None);
+        assert_eq!(merge_pause(None, Some(true)), Some(true));
+    }
 
     fn staged_root() -> (tempfile::TempDir, AppPaths) {
         let tmp = tempfile::tempdir().unwrap();

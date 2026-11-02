@@ -3,13 +3,16 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Subcommand, ValueEnum};
+use jobpilot_core::agents;
 use jobpilot_core::ai::router::Router;
 use jobpilot_core::drafts::{self, ClaimInput, Draft, ExportFormat};
+use jobpilot_core::generate::Generated;
 use jobpilot_core::render::Template;
-use jobpilot_core::{Db, Result, generate, parse};
+use jobpilot_core::runner::ExportChoice;
+use jobpilot_core::{Db, Result, parse};
 use serde_json::json;
 
-use crate::ai::with_ctrl_c;
+use crate::ai::with_interrupts;
 use crate::{ACTOR, Output, out};
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -38,9 +41,7 @@ pub enum ResumeCommand {
         lineage: String,
     },
     /// Draft a resume for a stored job posting.
-    Generate {
-        job_id: String,
-    },
+    Generate(GenerateArgs),
     /// A draft beside the original text it came from.
     Compare {
         draft: String,
@@ -63,8 +64,28 @@ pub enum ResumeCommand {
 
 #[derive(Subcommand)]
 pub enum LetterCommand {
-    Generate { job_id: String },
+    /// Draft a cover letter for a stored job posting.
+    Generate(GenerateArgs),
     Export(ExportArgs),
+}
+
+#[derive(clap::Args)]
+pub struct GenerateArgs {
+    job_id: String,
+    /// Also render the draft into the exports folder, when no line is blocked.
+    #[arg(long, value_enum)]
+    export: Option<FormatArg>,
+    #[arg(long, value_enum, default_value = "classic")]
+    template: TemplateArg,
+}
+
+impl GenerateArgs {
+    fn choice(&self) -> Option<ExportChoice> {
+        self.export.map(|format| ExportChoice {
+            format: format_of(format),
+            template: template_of(self.template),
+        })
+    }
 }
 
 #[derive(clap::Args)]
@@ -130,15 +151,14 @@ pub async fn resume(db: &Db, command: ResumeCommand) -> Result<Output> {
                 .join("\n");
             out(versions, text)
         }
-        ResumeCommand::Generate { job_id } => {
+        ResumeCommand::Generate(args) => {
             let router = Router::from_settings(db).await?;
-            let made =
-                with_ctrl_c(|cancel| generate::resume(db, &router, ACTOR, &job_id, cancel)).await?;
-            let text = format!(
-                "draft {} (v{}) from {}; {} line(s) need evidence before export",
-                made.draft.id, made.draft.version, made.provider, made.blocked
-            );
-            out(made, text)
+            let choice = args.choice();
+            let made = with_interrupts(db, |cancel| {
+                agents::draft_resume(db, &router, ACTOR, &args.job_id, choice, cancel)
+            })
+            .await?;
+            generated(made)
         }
         ResumeCommand::Compare { draft, original } => {
             let compared = drafts::compare(db, &draft, original.as_deref()).await?;
@@ -183,30 +203,53 @@ pub async fn resume(db: &Db, command: ResumeCommand) -> Result<Output> {
 
 pub async fn letter(db: &Db, command: LetterCommand) -> Result<Output> {
     match command {
-        LetterCommand::Generate { job_id } => {
+        LetterCommand::Generate(args) => {
             let router = Router::from_settings(db).await?;
-            let made =
-                with_ctrl_c(|cancel| generate::cover_letter(db, &router, ACTOR, &job_id, cancel))
-                    .await?;
-            let text = format!(
-                "draft {} (v{}) from {}; {} line(s) need evidence before export",
-                made.draft.id, made.draft.version, made.provider, made.blocked
-            );
-            out(made, text)
+            let choice = args.choice();
+            let made = with_interrupts(db, |cancel| {
+                agents::draft_cover_letter(db, &router, ACTOR, &args.job_id, choice, cancel)
+            })
+            .await?;
+            generated(made)
         }
         LetterCommand::Export(args) => export(db, args).await,
     }
 }
 
-async fn export(db: &Db, args: ExportArgs) -> Result<Output> {
-    let template = match args.template {
+fn template_of(arg: TemplateArg) -> Template {
+    match arg {
         TemplateArg::Classic => Template::Classic,
         TemplateArg::Compact => Template::Compact,
-    };
-    let format = match args.format {
+    }
+}
+
+fn format_of(arg: FormatArg) -> ExportFormat {
+    match arg {
         FormatArg::Docx => ExportFormat::Docx,
         FormatArg::Pdf => ExportFormat::Pdf,
-    };
+    }
+}
+
+fn generated(made: Generated) -> Result<Output> {
+    let mut text = format!(
+        "draft {} (v{}) from {}; {} line(s) need evidence before export",
+        made.draft.id, made.draft.version, made.provider, made.blocked
+    );
+    if let Some(path) = &made.exported {
+        text.push_str(&format!("\nexported to {path}"));
+    }
+    if made.export_skipped.is_some() {
+        text.push_str(
+            "\nnot exported: a line, the name, a contact, or a heading is one an export refuses; \
+             see `jobpilot resume compare`",
+        );
+    }
+    out(made, text)
+}
+
+async fn export(db: &Db, args: ExportArgs) -> Result<Output> {
+    let template = template_of(args.template);
+    let format = format_of(args.format);
     let dir = args.out.unwrap_or_else(|| db.paths().exports());
     let path = drafts::export(db, &args.draft, template, format, &dir, ACTOR).await?;
     out(

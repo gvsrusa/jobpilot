@@ -98,7 +98,15 @@ function ExportSection({ root }: { root: string }) {
       <ErrorAlert error={exported.error} />
       {exported.data && (
         <p className="text-sm">
-          Exported to <code className="break-all select-text">{exported.data}</code>
+          Exported to <code className="break-all select-text">{exported.data.path}</code>
+        </p>
+      )}
+      {exported.data && exported.data.withheld > 0 && (
+        <p className="text-sm">
+          {exported.data.withheld === 1
+            ? "1 sealed career answer was left out"
+            : `${exported.data.withheld} sealed career answers were left out`}
+          , as no key could open them. They are still in JobPilot.
         </p>
       )}
       <div>
@@ -117,9 +125,9 @@ function ExportSection({ root }: { root: string }) {
           onConfirm={() => exported.mutate()}
         >
           <p>
-            JobPilot keeps some fields encrypted: work authorization, notes, and knowledge you
-            marked sensitive. The export writes them as plain text. Anyone who can read the
-            exports folder can read them, and a cloud-synced or shared folder would copy them.
+            JobPilot keeps some fields encrypted: work authorization, notes, knowledge you marked
+            sensitive, and sealed career answers. With your key unlocked, the export writes them as
+            plain text, and it says if any were left out. Anyone who can read the exports folder can read them, and a cloud-synced or shared folder would copy them.
           </p>
           <p>Delete the file when you no longer need it.</p>
         </ConfirmDialog>

@@ -130,6 +130,7 @@ pub const AUTHORIZATION_PATTERNS: &[&str] = &[
     "allowed to work",
     "permitted to work",
     "entitled to work",
+    "immigration",
     "legally authorized",
     "legally authorised",
     "legally allowed",
@@ -144,6 +145,81 @@ pub const AUTHORIZATION_PATTERNS: &[&str] = &[
     "h 1 b",
     "ead",
     "opt",
+];
+
+/// After "able to work in", in lower case. A name not here still counts when capitalized.
+// ponytail: the countries job applications name most, not all of them. A lower-case or
+// all-caps "able to work in chile" passes; add a name when one is missed.
+const COUNTRIES: &[&str] = &[
+    "argentina",
+    "australia",
+    "austria",
+    "belgium",
+    "brazil",
+    "bulgaria",
+    "canada",
+    "china",
+    "croatia",
+    "cyprus",
+    "czechia",
+    "czech republic",
+    "denmark",
+    "egypt",
+    "england",
+    "estonia",
+    "finland",
+    "france",
+    "germany",
+    "greece",
+    "hong kong",
+    "hungary",
+    "iceland",
+    "india",
+    "indonesia",
+    "ireland",
+    "israel",
+    "italy",
+    "japan",
+    "latvia",
+    "lithuania",
+    "luxembourg",
+    "malaysia",
+    "malta",
+    "mexico",
+    "netherlands",
+    "new zealand",
+    "nigeria",
+    "norway",
+    "pakistan",
+    "philippines",
+    "poland",
+    "portugal",
+    "romania",
+    "scotland",
+    "singapore",
+    "slovakia",
+    "slovenia",
+    "south africa",
+    "south korea",
+    "spain",
+    "sweden",
+    "switzerland",
+    "taiwan",
+    "thailand",
+    "turkey",
+    "ukraine",
+    "united arab emirates",
+    "united kingdom",
+    "united states",
+    "uk",
+    "usa",
+    "vietnam",
+    "wales",
+];
+/// Capitalized at the start of a heading or a title, and no place.
+const NOT_PLACES: &[&str] = &[
+    "a", "an", "fast", "remote", "remotely", "shift", "shifts", "team", "teams", "weekend",
+    "weekends",
 ];
 
 /// In [`AUTHORIZATION_PATTERNS`]: short enough to begin other words (`visage`, `option`).
@@ -214,7 +290,7 @@ fn hides(c: char) -> bool {
 
 /// Lower-case words split at anything that is not a letter or digit, after compatibility
 /// decomposition with marks dropped: what a reader sees, not how it was typed.
-fn fold(text: &str) -> String {
+pub(crate) fn fold(text: &str) -> String {
     let words: String = text
         .nfkd()
         .filter(|c| !is_combining_mark(*c) && !hides(*c))
@@ -224,15 +300,61 @@ fn fold(text: &str) -> String {
     words.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn states_authorization(text: &str) -> bool {
+pub(crate) fn states_authorization(text: &str) -> bool {
     let folded = format!(" {} ", fold(text));
-    AUTHORIZATION_PATTERNS.iter().any(|pattern| {
+    let listed = AUTHORIZATION_PATTERNS.iter().any(|pattern| {
         if WHOLE_WORD_PATTERNS.contains(pattern) {
             folded.contains(&format!(" {pattern} "))
         } else {
             folded.contains(&format!(" {pattern}"))
         }
+    });
+    listed || able_to_work_in_a_place(text)
+}
+
+/// "Able to work in a team" is an honest line on a resume, so this phrase needs a place
+/// after it. The text keeps its case here, as [`fold`] would lose a capitalized place.
+// ponytail: a capital is all that marks an unlisted place, so "Able to work in Python" is
+// flagged until it is reworded, and all-caps text counts only [`COUNTRIES`].
+fn able_to_work_in_a_place(text: &str) -> bool {
+    let spaced: String = text
+        .nfkd()
+        .filter(|c| !is_combining_mark(*c) && !hides(*c))
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect();
+    let words: Vec<&str> = spaced.split_whitespace().collect();
+    let lower: Vec<String> = words.iter().map(|word| word.to_lowercase()).collect();
+    let cased = text.chars().any(char::is_lowercase);
+    lower.windows(4).enumerate().any(|(at, phrase)| {
+        phrase == ["able", "to", "work", "in"]
+            && names_a_place(&words[at + 4..], &lower[at + 4..], cased)
     })
+}
+
+fn names_a_place(words: &[&str], lower: &[String], cased: bool) -> bool {
+    let Some(first) = lower.first() else {
+        return false;
+    };
+    let the = first == "the";
+    let name = if the { &lower[1..] } else { lower };
+    if the
+        && name
+            .first()
+            .is_some_and(|word| matches!(word.as_str(), "us" | "eu"))
+    {
+        return true;
+    }
+    if COUNTRIES.iter().any(|country| {
+        let parts = country.split(' ').count();
+        name.len() >= parts
+            && country
+                .split(' ')
+                .eq(name[..parts].iter().map(String::as_str))
+    }) {
+        return true;
+    }
+    let capitalized = words[0].chars().next().is_some_and(char::is_uppercase);
+    !the && cased && capitalized && !NOT_PLACES.contains(&first.as_str())
 }
 
 /// For each line, whether `hit` holds for it, or for it and its neighbour read as one line,
@@ -251,7 +373,7 @@ fn hits_by_line(texts: &[&str], hit: impl Fn(&str) -> bool) -> Vec<bool> {
 }
 
 pub(crate) fn usable(item: &KnowledgeItem) -> bool {
-    item.approved && !item.marked_sensitive && !item.locked
+    item.approved && !item.marked_sensitive && !item.sealed
 }
 
 /// The claim is, whole, the body of something the user typed in.
@@ -326,19 +448,11 @@ fn fragments<'a>(texts: impl Iterator<Item = &'a str>) -> Vec<String> {
 /// `Err` with a key error, or `Err(Locked)`, when a sealed text exists and cannot be opened.
 /// With nothing sealed, the keychain is not touched.
 async fn sealed_text(db: &Db) -> Result<Sealed> {
-    let items = knowledge::list(db).await?;
-    if items.iter().any(|item| item.locked) {
-        return Err(Error::Locked);
-    }
+    let marked = knowledge::marked_bodies(db).await?;
     let notes = profile::authorization_notes(db).await?;
     Ok(Sealed {
         notes: fragments(notes.iter().map(String::as_str)),
-        marked: fragments(
-            items
-                .iter()
-                .filter(|item| item.marked_sensitive)
-                .map(|item| item.body.as_str()),
-        ),
+        marked: fragments(marked.iter().map(String::as_str)),
     })
 }
 
@@ -517,6 +631,8 @@ struct NewDraft<'a> {
     title: &'a str,
     job_text_id: Option<&'a str>,
     provider: Option<&'a str>,
+    /// The agent run that made a generated version, written with the row.
+    run_id: Option<&'a str>,
 }
 
 /// One statement picks the version and inserts it, so two writers cannot pick the same one.
@@ -525,10 +641,11 @@ async fn store(db: &Db, new: NewDraft<'_>, doc: &ResumeDoc, claims: &[Claim]) ->
     let mut tx = db.pool.begin().await?;
     let row: DraftRow = sqlx::query_as(concat!(
         "INSERT INTO drafts \
-         (id, kind, lineage_id, version, origin, title, job_text_id, provider, body, created_at) \
+         (id, kind, lineage_id, version, origin, title, job_text_id, provider, body, created_at, \
+         run_id) \
          SELECT lower(hex(randomblob(16))), ?1, coalesce(?2, lower(hex(randomblob(16)))), \
          coalesce(max(version), 0) + 1, ?3, ?4, ?5, ?6, ?7, \
-         strftime('%Y-%m-%dT%H:%M:%fZ', 'now') FROM drafts WHERE lineage_id = ?2 RETURNING ",
+         strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?8 FROM drafts WHERE lineage_id = ?2 RETURNING ",
         columns!()
     ))
     .bind(new.kind)
@@ -538,6 +655,7 @@ async fn store(db: &Db, new: NewDraft<'_>, doc: &ResumeDoc, claims: &[Claim]) ->
     .bind(new.job_text_id)
     .bind(new.provider)
     .bind(&body)
+    .bind(new.run_id)
     .fetch_one(&mut *tx)
     .await?;
     for claim in claims {
@@ -557,6 +675,16 @@ async fn store(db: &Db, new: NewDraft<'_>, doc: &ResumeDoc, claims: &[Claim]) ->
     }
     tx.commit().await?;
     row.into_draft()
+}
+
+/// The version a run already made, if any.
+pub(crate) async fn of_run(db: &Db, run_id: &str) -> Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar("SELECT id FROM drafts WHERE run_id = ? ORDER BY version DESC")
+            .bind(run_id)
+            .fetch_optional(&db.pool)
+            .await?,
+    )
 }
 
 /// Whether a lineage has a generated version, after checking it exists and is of `kind`.
@@ -601,6 +729,45 @@ pub async fn create_version(
     doc: ResumeDoc,
     claims: Vec<ClaimInput>,
 ) -> Result<Draft> {
+    let made = Made {
+        kind,
+        lineage_id,
+        origin,
+        title,
+        job_text_id,
+        provider,
+        run_id: None,
+    };
+    create_version_for(db, made, doc, claims).await
+}
+
+/// What [`create_version`] takes besides the document and its claims, and the run that asked.
+pub(crate) struct Made<'a> {
+    pub kind: &'a str,
+    pub lineage_id: Option<&'a str>,
+    pub origin: &'a str,
+    pub title: &'a str,
+    pub job_text_id: Option<&'a str>,
+    pub provider: Option<&'a str>,
+    pub run_id: Option<&'a str>,
+}
+
+/// As [`create_version`], with the run's id written in the same transaction as the version.
+pub(crate) async fn create_version_for(
+    db: &Db,
+    made: Made<'_>,
+    doc: ResumeDoc,
+    claims: Vec<ClaimInput>,
+) -> Result<Draft> {
+    let Made {
+        kind,
+        lineage_id,
+        origin,
+        title,
+        job_text_id,
+        provider,
+        run_id,
+    } = made;
     check_kind(kind)?;
     let title = title.trim();
     if title.is_empty() || title.chars().count() > TITLE_LIMIT {
@@ -643,6 +810,7 @@ pub async fn create_version(
         title,
         job_text_id,
         provider,
+        run_id,
     };
     store(db, new, &doc, &checked).await
 }
@@ -874,6 +1042,7 @@ pub async fn save_manual(
         title,
         job_text_id: latest.as_ref().and_then(|l| l.job_text_id.as_deref()),
         provider: latest.as_ref().and_then(|l| l.provider.as_deref()),
+        run_id: None,
     };
     store(db, new, &doc, &claims).await
 }
@@ -977,6 +1146,21 @@ pub async fn export(
     out_dir: &Path,
     actor: &str,
 ) -> Result<PathBuf> {
+    export_signalling(db, draft_id, template, format, out_dir, actor, None).await
+}
+
+/// `export`, sending on `started` once the render is under way, so a test can drop the
+/// future at that exact point. `export` is the only production caller.
+#[doc(hidden)]
+pub async fn export_signalling(
+    db: &Db,
+    draft_id: &str,
+    template: Template,
+    format: ExportFormat,
+    out_dir: &Path,
+    actor: &str,
+    started: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<PathBuf> {
     let draft = get(db, draft_id).await?;
     if holds_generated_text(db, &draft).await? {
         // First, so sealed text that cannot be read refuses before `claims` looks past it.
@@ -988,21 +1172,45 @@ pub async fn export(
             return Err(Error::Refused("claims_blocked".into()));
         }
     }
-    let bytes = match format {
-        ExportFormat::Docx => to_docx(&draft.doc, template)?,
-        ExportFormat::Pdf => to_pdf(&draft.doc, template)?,
-    };
     let name = format!(
         "{}-v{}.{}",
         slug(&draft.title),
         draft.version,
         format.extension()
     );
-    std::fs::create_dir_all(out_dir)?;
     let path = out_dir.join(name);
-    write_file(&path, &bytes)?;
+    // Rendering and the file write run off the async threads: a runner step shares its
+    // overseer's task, and a stretch that never yields would stall its timeout and heartbeat.
+    // The audit row is written by a task of its own, so a cancel that drops this future past
+    // its grace cannot leave a file with no row: the thread finishes, and the row follows.
+    let (doc, out_dir, target) = (draft.doc.clone(), out_dir.to_owned(), path.clone());
+    let work = tokio::task::spawn_blocking(move || -> Result<()> {
+        let bytes = match format {
+            ExportFormat::Docx => to_docx(&doc, template)?,
+            ExportFormat::Pdf => to_pdf(&doc, template)?,
+        };
+        std::fs::create_dir_all(&out_dir)?;
+        write_file(&target, &bytes)
+    });
+    if let Some(started) = started {
+        started.send(()).ok();
+    }
     let detail = json!({ "version": draft.version, "format": format, "template": template });
-    audit::record(db, actor, "export", Some(&draft.id), detail).await?;
+    let (pool, who, id) = (db.pool.clone(), actor.to_owned(), draft.id.clone());
+    let landed = tokio::spawn(async move {
+        work.await
+            .map_err(|_| Error::Failed("export_interrupted".into()))??;
+        let mut conn = pool.acquire().await?;
+        let row = audit::record_to(&mut *conn, &who, "export", Some(&id), detail).await;
+        if let Err(error) = &row {
+            // Nobody may be waiting on this any more, so say it here: the file is on disk.
+            eprintln!("export: the file was written but its audit row was not: {error}");
+        }
+        row
+    });
+    landed
+        .await
+        .map_err(|_| Error::Failed("export_interrupted".into()))??;
     Ok(path)
 }
 
@@ -1030,7 +1238,7 @@ mod tests {
             source_ref: None,
             approved: true,
             marked_sensitive: false,
-            locked: false,
+            sealed: false,
         }
     }
 
@@ -1045,6 +1253,40 @@ mod tests {
         let mut claims = [claim(text, status)];
         flag_sealed(&mut claims, evidence, s);
         claims[0].status.clone()
+    }
+
+    #[test]
+    fn able_to_work_in_counts_only_before_a_place() {
+        for text in [
+            "Are you able to work in Germany?",
+            "able to work in germany",
+            "ABLE TO WORK IN GERMANY",
+            "able to work in new zealand",
+            "Able to work in the US",
+            "able to work in the uk",
+            "Able to work in the EU",
+            "Able to work in Lisbon",
+            "able to w\u{200b}ork in Germany",
+            "Legally able to work",
+        ] {
+            assert!(states_authorization(text), "{text}");
+        }
+        for text in [
+            "Able to work in a team",
+            "Able to work in teams",
+            "Able To Work In Teams",
+            "Able to work in remote teams",
+            "Able to work in Remote settings",
+            "Are you able to work weekends?",
+            "Able to work in shifts",
+            "Able to work in fast-paced settings",
+            "Able to work in Fast-paced settings",
+            "Able to work in the office",
+            "ABLE TO WORK IN AGILE TEAMS",
+            "Able to work in",
+        ] {
+            assert!(!states_authorization(text), "{text}");
+        }
     }
 
     #[test]

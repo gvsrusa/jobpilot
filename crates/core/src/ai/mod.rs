@@ -37,6 +37,8 @@ pub const RUN_REASONS: &[&str] = &[
     "error_max_structured_output_retries",
     "consent_needed",
     "provider_unavailable",
+    "no_model_set",
+    "model_not_installed",
 ];
 
 /// Absent capabilities are false: a declaration lists only what the provider proves.
@@ -70,6 +72,7 @@ pub enum TaskType {
     ParseJob,
     DraftResume,
     DraftCoverLetter,
+    ClassifyAnswer,
     Embed,
 }
 
@@ -111,6 +114,14 @@ static DRAFT_COVER_LETTER: TaskSpec = TaskSpec {
     categories: DRAFT_DATA,
     attempts: 2,
 };
+/// One attempt: a validation failure must not spend a second Claude call past the cap.
+static CLASSIFY_ANSWER: TaskSpec = TaskSpec {
+    task: TaskType::ClassifyAnswer,
+    schema: include_str!("../../schemas/classify_answer.json"),
+    required: DRAFTING,
+    categories: &[DataCategory::JobText],
+    attempts: 1,
+};
 static EMBED: TaskSpec = TaskSpec {
     task: TaskType::Embed,
     schema: "",
@@ -125,6 +136,7 @@ pub fn spec(task: TaskType) -> &'static TaskSpec {
         TaskType::ParseJob => &PARSE_JOB,
         TaskType::DraftResume => &DRAFT_RESUME,
         TaskType::DraftCoverLetter => &DRAFT_COVER_LETTER,
+        TaskType::ClassifyAnswer => &CLASSIFY_ANSWER,
         TaskType::Embed => &EMBED,
     }
 }

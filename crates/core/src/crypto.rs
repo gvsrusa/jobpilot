@@ -207,6 +207,8 @@ impl DataKey {
 pub(crate) const AUTHORIZATION_AAD: (&str, &str) = ("work_authorization", "row");
 /// The table and column in the associated data of a marked knowledge body.
 pub(crate) const KNOWLEDGE_AAD: (&str, &str) = ("knowledge_items", "body_enc");
+/// The table and column in the associated data of a sealed answer.
+pub(crate) const MEMORY_AAD: (&str, &str) = ("memory_answers", "body_enc");
 
 /// What shows that a stored value is a key id's key.
 pub(crate) enum Proof {
@@ -379,13 +381,15 @@ async fn existing_key(db: &Db) -> Result<Option<Found>> {
 }
 
 /// The key ids that hold ciphertext.
-// ponytail: work_authorization and marked knowledge bodies hold ciphertext. Every later
-// ciphertext column joins this query, `sample_of`, the check in `add_first_key` and
-// `reactivate`, and the delete and check in `recovery::discard_locked`.
+// ponytail: work_authorization, marked knowledge bodies, and sealed answers hold ciphertext.
+// Every later ciphertext column joins this query, `sample_of`, the check in
+// `insert_first_key` and `reactivate`, and the clearing and check in
+// `recovery::discard_locked`.
 pub(crate) async fn held_key_ids(db: &Db) -> Result<Vec<String>> {
     Ok(sqlx::query_scalar(
         "SELECT key_id FROM work_authorization \
          UNION SELECT key_id FROM knowledge_items WHERE body_enc IS NOT NULL \
+         UNION SELECT key_id FROM memory_answers WHERE body_enc IS NOT NULL \
          ORDER BY key_id",
     )
     .fetch_all(&db.pool)
@@ -429,7 +433,23 @@ async fn sample_of(db: &Db, key_id: &str) -> Result<Option<Proof>> {
     .bind(key_id)
     .fetch_optional(&db.pool)
     .await?;
-    let (table, column) = KNOWLEDGE_AAD;
+    if let Some((row_id, ciphertext)) = row {
+        let (table, column) = KNOWLEDGE_AAD;
+        return Ok(Some(Proof::Sealed {
+            table,
+            column,
+            row_id,
+            ciphertext,
+        }));
+    }
+    let row: Option<(String, Vec<u8>)> = sqlx::query_as(
+        "SELECT id, body_enc FROM memory_answers \
+         WHERE key_id = ? AND body_enc IS NOT NULL LIMIT 1",
+    )
+    .bind(key_id)
+    .fetch_optional(&db.pool)
+    .await?;
+    let (table, column) = MEMORY_AAD;
     Ok(row.map(|(row_id, ciphertext)| Proof::Sealed {
         table,
         column,
@@ -593,6 +613,8 @@ async fn reactivate(db: &Db, key: DataKey, active: Option<&str>, held: &[String]
          AND NOT EXISTS (SELECT 1 FROM work_authorization \
                          WHERE key_id NOT IN (SELECT value FROM json_each(?3))) \
          AND NOT EXISTS (SELECT 1 FROM knowledge_items WHERE body_enc IS NOT NULL \
+                         AND key_id NOT IN (SELECT value FROM json_each(?3))) \
+         AND NOT EXISTS (SELECT 1 FROM memory_answers WHERE body_enc IS NOT NULL \
                          AND key_id NOT IN (SELECT value FROM json_each(?3)))",
     )
     .bind(key.key_id())
@@ -681,20 +703,7 @@ async fn add_first_key(
     store.await?;
 
     let mut write = db.pool.begin().await?;
-    let inserted = sqlx::query(
-        "INSERT INTO data_keys (key_id, created_at, key_check, active) \
-         SELECT ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, 1 \
-         WHERE NOT EXISTS (SELECT 1 FROM data_keys) \
-         AND NOT EXISTS (SELECT 1 FROM work_authorization) \
-         AND NOT EXISTS (SELECT 1 FROM knowledge_items WHERE body_enc IS NOT NULL)",
-    )
-    .bind(key.key_id())
-    .bind(key_check)
-    .execute(&mut *write)
-    .await?
-    .rows_affected()
-        == 1;
-    if !inserted {
+    if !insert_first_key(&mut write, key.key_id(), &key_check).await? {
         write.rollback().await?;
         // An entry left behind is unused, so its removal must not hide the winner's key.
         let _ = secrets::remove_all(vec![account(key.key_id())]).await;
@@ -711,6 +720,28 @@ async fn add_first_key(
     .await?;
     write.commit().await?;
     Ok(Some(key))
+}
+
+/// The row, if this root still holds no key row and no ciphertext.
+async fn insert_first_key(
+    write: &mut sqlx::SqliteConnection,
+    key_id: &str,
+    key_check: &[u8],
+) -> Result<bool> {
+    let inserted = sqlx::query(
+        "INSERT INTO data_keys (key_id, created_at, key_check, active) \
+         SELECT ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, 1 \
+         WHERE NOT EXISTS (SELECT 1 FROM data_keys) \
+         AND NOT EXISTS (SELECT 1 FROM work_authorization) \
+         AND NOT EXISTS (SELECT 1 FROM knowledge_items WHERE body_enc IS NOT NULL) \
+         AND NOT EXISTS (SELECT 1 FROM memory_answers WHERE body_enc IS NOT NULL)",
+    )
+    .bind(key_id)
+    .bind(key_check)
+    .execute(write)
+    .await?
+    .rows_affected();
+    Ok(inserted == 1)
 }
 
 /// A key for a root that gives up its old one, stored under a new id, so the write
@@ -787,7 +818,7 @@ mod tests {
 
     use super::*;
     use crate::paths::AppPaths;
-    use crate::{backup, documents, settings, transfer};
+    use crate::{backup, documents, memory, settings, transfer};
 
     #[test]
     fn hex_round_trips_and_refuses_what_is_not_hex() {
@@ -1028,6 +1059,95 @@ mod tests {
         db.close().await;
     }
 
+    /// A sealed answer under `key`, with no `data_keys` row: the foreign key refuses this, so
+    /// it takes a damaged file. It holds real ciphertext, so a trial decrypt can prove `key`.
+    async fn add_orphan_answer(db: &Db, key: &DataKey) {
+        let sealed = key
+            .encrypt("memory_answers", "body_enc", "a1", b"sealed")
+            .unwrap();
+        let mut raw = db.pool.acquire().await.unwrap();
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut *raw)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO memory_questions (id, key, text, class, class_source, source, \
+             created_at, updated_at) VALUES ('q1', 'q', 'q', 'sensitive', 'user', 'user', 't', 't')",
+        )
+        .execute(&mut *raw)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO memory_answers (id, question_id, body, body_enc, key_id, source, \
+             reviewed_at, created_at, updated_at) \
+             VALUES ('a1', 'q1', '', ?, ?, 'user', 't', 't', 't')",
+        )
+        .bind(sealed)
+        .bind(key.key_id())
+        .execute(&mut *raw)
+        .await
+        .unwrap();
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&mut *raw)
+            .await
+            .unwrap();
+    }
+
+    async fn open_root() -> (tempfile::TempDir, Db) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&AppPaths::new(tmp.path().join("data")))
+            .await
+            .unwrap();
+        (tmp, db)
+    }
+
+    #[tokio::test]
+    async fn a_sealed_answer_is_held_and_proves_its_key() {
+        let (_tmp, db) = open_root().await;
+        let key = DataKey::from_bytes(KEY_ID, [7; 32]);
+        add_orphan_answer(&db, &key).await;
+
+        assert_eq!(held_key_ids(&db).await.unwrap(), [KEY_ID]);
+        let proof = proof_of(&db, KEY_ID).await.unwrap().unwrap();
+        assert!(matches!(proof, Proof::Sealed { .. }));
+        assert!(proof.holds(&key));
+        assert!(!proof.holds(&DataKey::from_bytes(KEY_ID, [8; 32])));
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_sealed_answer_blocks_a_first_key() {
+        let (_tmp, db) = open_root().await;
+        let key = DataKey::from_bytes(KEY_ID, [7; 32]);
+        add_orphan_answer(&db, &key).await;
+
+        let mut write = db.pool.begin().await.unwrap();
+        let inserted = insert_first_key(&mut write, OTHER_KEY_ID, &key_check(&key)).await;
+
+        assert!(!inserted.unwrap());
+        drop(write);
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM data_keys")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_sealed_answer_under_an_unlisted_id_blocks_a_reactivation() {
+        let (_tmp, db) = open_root().await;
+        add_orphan_answer(&db, &DataKey::from_bytes(OTHER_KEY_ID, [8; 32])).await;
+
+        let key = DataKey::from_bytes(KEY_ID, [7; 32]);
+        let held = [KEY_ID.to_owned()];
+        let found = reactivate(&db, key, None, &held).await.unwrap();
+
+        assert!(found.is_err());
+        assert_eq!(active_key_id(&db.pool).await.unwrap(), None);
+        db.close().await;
+    }
+
     /// Counts every route to the keychain, so it needs no keychain to run. No other test
     /// in this binary may reach `secrets::entry`: this one reads a process-wide count.
     #[tokio::test]
@@ -1050,6 +1170,22 @@ mod tests {
         db.close().await;
         let db = Db::open(&paths).await.unwrap();
 
+        // A body raised on a root with no key: nothing is sealed yet, so nothing is asked,
+        // and an export cannot make a key.
+        let question = memory::add_question(&db, "Why this job?", None)
+            .await
+            .unwrap();
+        memory::add_answer(&db, &question.id, "Because", None)
+            .await
+            .unwrap();
+        memory::raise_class(&db, &question.id, memory::Class::Sensitive, "model")
+            .await
+            .unwrap();
+        memory::list(&db, None).await.unwrap();
+        memory::export_sealed(&db).await.unwrap();
+        transfer::export_all(&db, "cli").await.unwrap();
+        memory::remove_question(&db, &question.id).await.unwrap();
+
         assert_eq!(calls(), before);
         assert_eq!(db.key_state(), KeyState::NotLoaded);
         let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM data_keys")
@@ -1057,6 +1193,117 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, 0);
+
+        // Reads that name "asks the keychain nothing". With nothing sealed, the check text
+        // is read without a key; with a sealed row seeded, a list still asks no one.
+        crate::knowledge::marked_bodies(&db).await.unwrap();
+        let key = DataKey::from_bytes("c0de000000000001", [3; 32]);
+        let check = key
+            .encrypt(
+                "data_keys",
+                "key_check",
+                "c0de000000000001",
+                key_check_text(),
+            )
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO data_keys (key_id, created_at, key_check, active) VALUES (?, 't', ?, 0)",
+        )
+        .bind("c0de000000000001")
+        .bind(check)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let sealed = key
+            .encrypt("knowledge_items", "body_enc", "m", b"sealed")
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO knowledge_items (id, kind, body, body_enc, key_id, source, approved, \
+             marked_sensitive, created_at, updated_at) \
+             VALUES ('m', 'note', '', ?, 'c0de000000000001', 'user', 0, 1, 't', 't')",
+        )
+        .bind(sealed)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let listed = crate::knowledge::list(&db).await.unwrap();
+        assert!(listed[0].sealed && listed[0].body.is_empty());
+
+        let question = memory::add_question(&db, "Your salary?", None)
+            .await
+            .unwrap();
+        let sealed = key
+            .encrypt("memory_answers", "body_enc", "s1", b"sealed")
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO memory_answers (id, question_id, body, body_enc, key_id, source, \
+             reviewed_at, created_at, updated_at) \
+             VALUES ('s1', ?, '', ?, 'c0de000000000001', 'user', 't', 't', 't')",
+        )
+        .bind(&question.id)
+        .bind(sealed)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let listed = memory::list(&db, None).await.unwrap();
+        assert!(listed[0].answers[0].sealed && listed[0].answers[0].body.is_empty());
+        memory::get(&db, &question.id).await.unwrap();
+        memory::find_answer(&db, "s1").await.unwrap();
+        assert_eq!(memory::seal_pending(&db).await.unwrap(), 0);
+        memory::mark_reviewed(&db, "cli", "s1").await.unwrap();
+        memory::approve(&db, "cli", "s1", true).await.unwrap();
+        memory::approve(&db, "cli", "s1", false).await.unwrap();
+        memory::set_class(&db, "cli", &question.id, memory::Class::Legal)
+            .await
+            .unwrap();
+        assert_eq!(known_state(&db).await.unwrap(), KeyState::NotLoaded);
+        assert_eq!(calls(), before);
+
+        // Tracking reads and writes ask no one, with a sealed row in the database.
+        let app = crate::applications::add(
+            &db,
+            "cli",
+            crate::applications::ApplicationInput {
+                company: "Acme".into(),
+                role: "Engineer".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        crate::applications::get(&db, &app.id).await.unwrap();
+        crate::applications::list(&db, None).await.unwrap();
+        crate::applications::set_status(&db, "cli", &app.id, "applied", None, "n")
+            .await
+            .unwrap();
+        crate::applications::add_note(&db, "cli", &app.id, "n")
+            .await
+            .unwrap();
+        crate::applications::history(&db, &app.id).await.unwrap();
+        crate::applications::remove(&db, "cli", &app.id)
+            .await
+            .unwrap();
+        assert_eq!(calls(), before);
+
+        // Confirming a sealed answer, listing its use, and a country with no row ask no one.
+        let app = crate::applications::add(
+            &db,
+            "cli",
+            crate::applications::ApplicationInput {
+                company: "Acme".into(),
+                role: "Engineer".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        memory::approve(&db, "cli", "s1", true).await.unwrap();
+        memory::confirm_use(&db, "cli", "s1", &app.id)
+            .await
+            .unwrap();
+        memory::application_answers(&db, &app.id).await.unwrap();
+        assert!(!memory::authorization_for(&db, "CA").await.unwrap().stated);
+        assert_eq!(calls(), before);
         db.close().await;
 
         // The seam itself: an empty name stops before the OS, but it passed through.

@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-import { ipc, type KnowledgeItem } from "@/lib/ipc";
+import { ipc, toAppError, type KnowledgeItem } from "@/lib/ipc";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { ErrorAlert } from "./ErrorAlert";
 
@@ -44,8 +44,44 @@ const stateOf = (item: KnowledgeItem) => {
   return item.approved ? "Approved" : "Not approved";
 };
 
-/** What Approve all acts on: a marked or locked item could not be cited anyway. */
-const waiting = (item: KnowledgeItem) => !item.approved && !item.marked_sensitive && !item.locked;
+/** What Approve all acts on: a marked or sealed item could not be cited anyway. */
+const waiting = (item: KnowledgeItem) => !item.approved && !item.marked_sensitive && !item.sealed;
+
+/** A key problem is not the item's fault: point at the screen that can fix it. */
+const KEY_CODES = ["key_missing", "key_mismatch", "key_unavailable", "locked"];
+
+/**
+ * A sealed body lists with no text. Show asks Rust, which asks the user in a native dialog
+ * and then the keychain; the text lives only here and goes when hidden or unmounted.
+ */
+export function SealedText({ reveal: open }: { reveal: () => Promise<string> }) {
+  const [text, setText] = useState<string | null>(null);
+  const reveal = useMutation({ mutationFn: open, onSuccess: setText });
+  const code = reveal.error ? toAppError(reveal.error).code : null;
+  return (
+    <div className="grid gap-1">
+      {text === null ? (
+        <span className="flex flex-wrap items-center gap-2">
+          <span>Sealed</span>
+          <Button size="sm" variant="outline" disabled={reveal.isPending} onClick={() => reveal.mutate()}>
+            Show
+          </Button>
+        </span>
+      ) : (
+        <>
+          <span className="whitespace-pre-wrap">{text}</span>
+          <Button size="sm" variant="outline" className="w-fit" onClick={() => setText(null)}>
+            Hide
+          </Button>
+        </>
+      )}
+      <ErrorAlert error={reveal.error} />
+      {code && KEY_CODES.includes(code) && (
+        <p className="text-xs text-muted-foreground">Locked, see Recovery on the Data screen.</p>
+      )}
+    </div>
+  );
+}
 
 /** What drafts are written from. Item text comes from a parsed file: render it as text only. */
 export function KnowledgeSection() {
@@ -127,14 +163,18 @@ export function KnowledgeSection() {
           <ul className="grid max-h-80 gap-2 overflow-y-auto text-sm">
             {group.items.map((item) => (
               <li key={item.id} className="grid gap-1 rounded border p-2">
-                <span className="whitespace-pre-wrap">{item.locked ? "Locked, see Recovery" : item.body}</span>
+                {item.sealed ? (
+                  <SealedText reveal={() => ipc.kbReveal(item.id)} />
+                ) : (
+                  <span className="whitespace-pre-wrap">{item.body}</span>
+                )}
                 <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                   <span>{item.kind}</span>
                   <span>{stateOf(item)}</span>
                   <Button
                     size="sm"
                     variant="outline"
-                    disabled={busy || item.locked}
+                    disabled={busy || item.sealed}
                     onClick={() => approve.mutate({ id: item.id, approved: !item.approved })}
                   >
                     {item.approved ? "Unapprove" : "Approve"}
@@ -142,7 +182,7 @@ export function KnowledgeSection() {
                   <Button
                     size="sm"
                     variant="outline"
-                    disabled={busy || item.locked}
+                    disabled={busy || item.sealed}
                     onClick={() => mark.mutate({ id: item.id, marked: !item.marked_sensitive })}
                   >
                     {item.marked_sensitive ? "Unmark sensitive" : "Mark sensitive"}
@@ -197,7 +237,7 @@ export function KnowledgeSection() {
           onCancel={() => setRemoving(null)}
           onConfirm={() => remove.mutate(removing.id)}
         >
-          <p>{removing.locked ? "This item is locked, so its text cannot be shown." : removing.body}</p>
+          <p>{removing.sealed ? "This item is sealed, so its text is not shown here." : removing.body}</p>
           <p>This cannot be undone. A draft that cites it no longer counts it as evidence.</p>
         </ConfirmDialog>
       )}

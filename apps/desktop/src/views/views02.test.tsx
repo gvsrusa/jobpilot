@@ -71,7 +71,7 @@ const item = (id: string, body: string): KnowledgeItem => ({
   source_ref: null,
   approved: true,
   marked_sensitive: false,
-  locked: false,
+  sealed: false,
 });
 
 const COMPARE: Compare = {
@@ -312,6 +312,8 @@ describe("resumes", () => {
   it.each([
     ["consent_needed", /does not cover this task/],
     ["provider_unavailable", /cannot be reached/],
+    ["no_model_set", /No local model is chosen/],
+    ["model_not_installed", /not installed in Ollama/],
   ])("manual_required_%s_is_not_called_switched_off", async (reason, text) => {
     resumeBackend({
       resume_list: () => [],
@@ -448,12 +450,60 @@ describe("knowledge", () => {
     expect(screen.queryByText(/Nothing was generated/)).toBeNull();
   });
 
+  it("export_choice_reaches_resume_generate", async () => {
+    const generated = draft({ id: "g1", lineage_id: "G" });
+    const b = resumeBackend({
+      resume_list: () => [],
+      ai_status: () => CLAUDE_READY,
+      resume_compare: () => ({ ...COMPARE, generated: [], blocked: 0 }),
+      resume_generate: () => ({
+        draft: generated,
+        blocked: 0,
+        provider: "claude_code",
+        exported: "/data/exports/backend-engineer-v1.pdf",
+        export_skipped: null,
+      }),
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    await user.selectOptions(await screen.findByLabelText("After drafting, export as"), "pdf");
+    await user.click(await screen.findByRole("button", { name: "Generate" }));
+    await waitFor(() => expect(count(b, "resume_generate")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "resume_generate")?.args).toEqual({
+      jobTextId: "j1",
+      export: { format: "pdf", template: "classic" },
+    });
+    expect(await screen.findByText("/data/exports/backend-engineer-v1.pdf")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy path" })).toBeInTheDocument();
+  });
+
+  it("a_refused_export_after_drafting_is_said_aloud", async () => {
+    const generated = draft({ id: "g1", lineage_id: "G" });
+    resumeBackend({
+      resume_list: () => [],
+      ai_status: () => CLAUDE_READY,
+      resume_compare: () => ({ ...COMPARE, generated: [], blocked: 0 }),
+      resume_generate: () => ({
+        draft: generated,
+        blocked: 0,
+        provider: "claude_code",
+        exported: null,
+        export_skipped: "claims_blocked",
+      }),
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    await user.selectOptions(await screen.findByLabelText("After drafting, export as"), "pdf");
+    await user.click(await screen.findByRole("button", { name: "Generate" }));
+    expect(await screen.findByText(/was not exported/)).toBeInTheDocument();
+  });
+
   it("approve_all_skips_what_a_draft_could_not_cite_anyway", async () => {
     const kb = store([
       parsed("p1", "Open line"),
       parsed("p2", "Already fine", { approved: true }),
       parsed("p3", "Marked", { marked_sensitive: true }),
-      parsed("p4", "", { locked: true, marked_sensitive: true }),
+      parsed("p4", "", { sealed: true, marked_sensitive: true }),
     ]);
     const b = resumeBackend({ ...kb, resume_list: () => [CV] });
     const { user } = renderApp();
@@ -506,16 +556,56 @@ describe("knowledge", () => {
     expect(await screen.findByText("Added by you")).toBeInTheDocument();
   });
 
-  it("a_locked_item_shows_no_text_and_cannot_be_marked", async () => {
+  it("a_sealed_item_shows_no_text_and_cannot_be_marked", async () => {
     resumeBackend({
-      kb_list: () => [parsed("p1", "", { locked: true, marked_sensitive: true })],
+      kb_list: () => [parsed("p1", "", { sealed: true, marked_sensitive: true })],
       resume_list: () => [CV],
     });
     const { user } = renderApp();
     await go(user, "Resumes", "Resumes");
-    const row = (await screen.findByText("Locked, see Recovery")).closest("li")!;
+    const row = (await screen.findByText("Sealed")).closest("li")!;
     expect(within(row).getByRole("button", { name: "Unmark sensitive" })).toBeDisabled();
     expect(within(row).getByRole("button", { name: "Approve" })).toBeDisabled();
+  });
+
+  it("kb_show_reveals_a_sealed_item_on_request", async () => {
+    const b = resumeBackend({
+      kb_list: () => [parsed("p1", "", { sealed: true, marked_sensitive: true })],
+      kb_reveal: () => "Treated for a rare condition",
+      resume_list: () => [CV],
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    const row = (await screen.findByText("Sealed")).closest("li")!;
+    // Listing never opens the body: nothing asked Rust to reveal until the press.
+    expect(count(b, "kb_reveal")).toBe(0);
+    expect(screen.queryByText("Treated for a rare condition")).toBeNull();
+
+    await user.click(within(row).getByRole("button", { name: "Show" }));
+
+    expect(await screen.findByText("Treated for a rare condition")).toBeInTheDocument();
+    expect(count(b, "kb_reveal")).toBe(1);
+    expect(b.calls.find((c) => c.cmd === "kb_reveal")?.args).toEqual({ id: "p1" });
+    await user.click(within(row).getByRole("button", { name: "Hide" }));
+    expect(screen.queryByText("Treated for a rare condition")).toBeNull();
+    expect(within(row).getByRole("button", { name: "Show" })).toBeInTheDocument();
+  });
+
+  it("kb_show_with_no_key_shows_the_error_and_points_to_recovery", async () => {
+    resumeBackend({
+      kb_list: () => [parsed("p1", "", { sealed: true, marked_sensitive: true })],
+      kb_reveal: () => {
+        throw { code: "key_missing", message: "the key for this data is not on this computer" };
+      },
+      resume_list: () => [CV],
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    await user.click(await screen.findByRole("button", { name: "Show" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("key_missing");
+    expect(screen.getByText(/see Recovery/)).toBeInTheDocument();
+    expect(screen.getByText("Sealed")).toBeInTheDocument();
   });
 
   it("item_text_is_shown_as_text", async () => {
@@ -830,6 +920,44 @@ describe("data", () => {
     await go(user, "Data", "Data and privacy");
     await user.click((await screen.findAllByRole("button", { name: /^Restore/ }))[0]);
     expect(await screen.findByText(/consent you gave to Claude Code is revoked/i)).toBeInTheDocument();
+  });
+
+  it("ai_view_after_restore_shows_claude_off_and_asks_for_consent", async () => {
+    const info = { path: "/home/me/jobpilot/backups/manual-1", created_at: "2026-11-01T10:00:00Z", schema_version: 5 };
+    let restored = false;
+    const on = aiWith({
+      claude_code: { available: true, path: "/opt/claude", consent: ["job_text", "profile_basic", "resume_text"] },
+      enabled: { ollama: true, claude_code: true },
+      order: ["ollama", "claude_code"],
+    });
+    // As core leaves it: consent revoked, and Claude Code switched off with it.
+    const off = aiWith({
+      claude_code: { available: true, path: "/opt/claude", consent: null },
+      enabled: { ollama: true, claude_code: false },
+      order: ["ollama", "claude_code"],
+    });
+    backend({
+      backup_list: () => [info],
+      backup_restore: () => {
+        restored = true;
+        return READY;
+      },
+      ai_status: () => (restored ? off : on),
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    expect(await screen.findByLabelText("Use Claude Code")).toBeChecked();
+
+    await go(user, "Data", "Data and privacy");
+    await user.click((await screen.findAllByRole("button", { name: /^Restore/ }))[0]);
+    await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Replace my data" }));
+    await waitFor(() => expect(restored).toBe(true));
+
+    await go(user, "AI", /AI/);
+    expect(await screen.findByText("Off. Claude Code is used only after you consent below.")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Use Claude Code")).toBeNull();
+    expect(screen.getByRole("button", { name: "Review consent..." })).toBeEnabled();
+    expect(screen.getByText("Claude Code is off")).toBeInTheDocument();
   });
 
   it("data_export_warns_before_writing_sensitive_fields", async () => {

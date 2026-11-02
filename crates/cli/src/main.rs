@@ -1,7 +1,12 @@
 //! JobPilot CLI: a thin adapter over `jobpilot-core`. Parse, call core, print.
 
+mod agents;
 mod ai;
+mod analytics;
+mod apps;
 mod data;
+mod memory;
+mod pause;
 mod profile;
 mod resume;
 mod shell;
@@ -57,9 +62,24 @@ pub enum Command {
     /// Cover letter drafts.
     #[command(subcommand)]
     Letter(resume::LetterCommand),
+    /// Applications you are tracking.
+    #[command(subcommand)]
+    App(apps::AppCommand),
+    /// Questions and answers you reuse.
+    #[command(subcommand)]
+    Memory(memory::MemoryCommand),
+    /// Agent runs and their logs.
+    #[command(subcommand)]
+    Agents(agents::AgentsCommand),
+    /// Counts and rates over your applications.
+    #[command(subcommand)]
+    Analytics(analytics::AnalyticsCommand),
     /// AI providers, models, and consent.
     #[command(subcommand)]
     Ai(ai::AiCommand),
+    /// Stop all automation.
+    #[command(subcommand)]
+    Pause(pause::PauseCommand),
     /// Restricted prompt used by the app's terminal panel.
     Shell,
 }
@@ -73,7 +93,9 @@ impl Command {
     pub fn refused_in_panel(&self) -> bool {
         use ai::{AiCommand, ConsentCommand};
         use data::{BackupCommand, DataCommand};
-        use profile::JobCommand;
+        use memory::MemoryCommand;
+        use pause::PauseCommand;
+        use profile::{JobCommand, KbCommand};
         use resume::{ExportArgs, LetterCommand, ResumeCommand};
         matches!(
             self,
@@ -91,6 +113,18 @@ impl Command {
                     DataCommand::Delete { .. }
                         | DataCommand::RecoveryKey(_)
                         | DataCommand::DiscardLocked { .. }
+                )
+                | Command::Pause(PauseCommand::Clear)
+                | Command::Kb(KbCommand::Reveal { .. })
+                | Command::Memory(
+                    MemoryCommand::Approve { .. }
+                        | MemoryCommand::Reviewed { .. }
+                        | MemoryCommand::SetClass { .. }
+                        | MemoryCommand::Reveal { .. }
+                        | MemoryCommand::Confirm { .. }
+                        | MemoryCommand::Use { .. }
+                        | MemoryCommand::Authorization { .. }
+                        | MemoryCommand::Refresh { yes: true }
                 )
                 | Command::Job(JobCommand::Paste { file: Some(_), .. })
                 | Command::Resume(
@@ -174,17 +208,34 @@ pub fn error_line(error: &Error) -> String {
 fn message(error: &Error) -> String {
     match error {
         Error::PanelRefused => shell::REFUSAL.into(),
+        Error::Paused => "Emergency pause is on, so nothing automated runs. Clear it with \
+                          `jobpilot pause clear` in an ordinary terminal, or from the title bar."
+            .into(),
         Error::ManualRequired(reason) if reason == "not_logged_in" => {
             "Claude Code is not signed in. Run `claude` once to log in, then try again.".into()
         }
         Error::ManualRequired(reason) if reason == "consent_needed" => {
             "Claude Code is on, but your consent does not cover this task. Give consent with \
-             `jobpilot ai consent give` in an ordinary terminal, or on the AI screen."
+             `jobpilot ai consent give claude_code --categories \
+             job_text,profile_basic,resume_text` in an ordinary terminal, or on the AI screen."
                 .into()
         }
         Error::ManualRequired(reason) if reason == "provider_unavailable" => {
             "An AI provider is on but cannot be reached. Check `jobpilot ai status`, or write \
              this one yourself."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "no_model_set" => {
+            "No local model is chosen. Set one with `jobpilot ai set-model --drafting <name>` \
+             in an ordinary terminal, or write this one yourself."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "model_not_installed" => {
+            "The chosen model is not installed in Ollama. Check `jobpilot ai models`.".into()
+        }
+        Error::Refused(reason) if reason == "use_profile_by_country" => {
+            "Work authorization is answered from your profile, for one country at a time. If \
+             this question asks something else, remove it and add it in other words."
                 .into()
         }
         other => other.to_string(),
@@ -226,7 +277,12 @@ async fn with_db(db: &Db, command: Command) -> Result<Output> {
         Command::Job(command) => profile::job(db, command).await,
         Command::Resume(command) => resume::resume(db, command).await,
         Command::Letter(command) => resume::letter(db, command).await,
+        Command::App(command) => apps::app(db, command).await,
+        Command::Memory(command) => memory::memory(db, command).await,
+        Command::Agents(command) => agents::agents(db, command).await,
+        Command::Analytics(command) => analytics::analytics(db, command).await,
         Command::Ai(command) => ai::ai(db, command).await,
+        Command::Pause(command) => pause::pause(db, command).await,
         // `main` and the shell handle this before any command runs.
         Command::Shell => Err(Error::PanelRefused),
     }
@@ -236,7 +292,8 @@ async fn with_db(db: &Db, command: Command) -> Result<Output> {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{Cli, Command};
+    use super::{Cli, Command, message};
+    use jobpilot_core::Error;
 
     /// Every leaf command, with whether the panel refuses it. Script in the webview can type
     /// into the panel, so a command whose GUI twin needs a native dialog, or that changes
@@ -271,6 +328,7 @@ mod tests {
         ("kb unapprove i", false),
         ("kb mark-sensitive i", false),
         ("kb unmark i", false),
+        ("kb reveal i", true),
         ("kb search q", false),
         ("job paste t", false),
         ("job paste t --file /f", true),
@@ -280,14 +338,54 @@ mod tests {
         ("resume list", false),
         ("resume versions l", false),
         ("resume generate j", false),
+        ("resume generate j --export pdf", false),
         ("resume compare d", false),
         ("resume export d --format pdf", false),
         ("resume export d --format pdf --out /o", true),
         ("resume edit-claim c --text t", false),
         ("resume remove-claim c", false),
         ("letter generate j", false),
+        ("letter generate j --export pdf", false),
         ("letter export d --format pdf", false),
         ("letter export d --format pdf --out /o", true),
+        ("app add --company c --role r", false),
+        ("app list", false),
+        ("app show i", false),
+        ("app history i", false),
+        ("app edit i --role r", false),
+        ("app status i applied", false),
+        ("app note i n", false),
+        ("app remove i", false),
+        ("memory add-question q", false),
+        ("memory add-answer q a", false),
+        ("memory list", false),
+        ("memory show q", false),
+        ("memory edit-answer a t", false),
+        ("memory unapprove a", false),
+        ("memory remove-question q", false),
+        ("memory remove-answer a", false),
+        ("memory approve a", true),
+        ("memory reviewed a", true),
+        ("memory set-class q normal", true),
+        ("memory reveal a", true),
+        ("memory confirm a --application x", true),
+        ("memory use a --application x", true),
+        ("memory authorization PT", true),
+        ("memory search q", false),
+        ("memory refresh", false),
+        ("memory refresh --yes", true),
+        ("app answers i", false),
+        ("agents list", false),
+        ("agents list --limit 5", false),
+        ("agents show r", false),
+        ("agents log r", false),
+        ("agents cancel r", false),
+        ("agents resume r", false),
+        ("analytics report", false),
+        ("analytics show", false),
+        ("pause set", false),
+        ("pause status", false),
+        ("pause clear", true),
         ("ai status", false),
         ("ai models", false),
         ("ai pull m", true),
@@ -328,6 +426,28 @@ mod tests {
             line.strip_prefix(path)
                 .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
         })
+    }
+
+    #[test]
+    fn consent_hint_names_the_whole_command() {
+        let text = message(&Error::ManualRequired("consent_needed".into()));
+        assert!(
+            text.contains(
+                "jobpilot ai consent give claude_code --categories job_text,profile_basic,resume_text"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn model_reasons_say_what_to_do() {
+        let none = message(&Error::ManualRequired("no_model_set".into()));
+        assert!(
+            none.contains("jobpilot ai set-model --drafting <name>"),
+            "{none}"
+        );
+        let gone = message(&Error::ManualRequired("model_not_installed".into()));
+        assert!(gone.contains("jobpilot ai models"), "{gone}");
     }
 
     #[test]

@@ -5,7 +5,7 @@ import userEvent from "@testing-library/user-event";
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import App from "./App";
 import { useUiStore } from "./lib/store";
-import type { BackupInfo, Document, Status } from "./lib/ipc";
+import type { BackupInfo, Document, PauseState, Status } from "./lib/ipc";
 
 export const READY: Status = {
   state: "ready",
@@ -42,6 +42,7 @@ export function backend(overrides: Record<string, Handler> = {}): Backend {
   const docs: Document[] = [];
   const secrets: string[] = [];
   const backups: BackupInfo[] = [];
+  let pause: PauseState = { paused: false, set_at: null, set_by: null };
   const defaults: Record<string, Handler> = {
     status: () => READY,
     retry_open: () => READY,
@@ -80,7 +81,7 @@ export function backend(overrides: Record<string, Handler> = {}): Backend {
       return info;
     },
     backup_restore: () => READY,
-    data_export: () => "/home/me/jobpilot/exports/export-1",
+    data_export: () => ({ path: "/home/me/jobpilot/exports/export-1", withheld: 0 }),
     data_delete: () => READY,
     secret_names: () => secrets,
     secret_set: ({ name }) => {
@@ -89,7 +90,32 @@ export function backend(overrides: Record<string, Handler> = {}): Backend {
     secret_delete: ({ name }) => {
       secrets.splice(secrets.indexOf(String(name)), 1);
     },
+    pause_status: () => pause,
+    pause_set: () => {
+      pause = { paused: true, set_at: "2026-11-01T10:00:00.000Z", set_by: "gui" };
+      return pause;
+    },
+    pause_clear: () => {
+      pause = { paused: false, set_at: null, set_by: null };
+      return pause;
+    },
     audit_recent: () => [],
+    app_list: () => [],
+    app_history: () => [],
+    analytics_latest: () => null,
+    job_list: () => [],
+    kb_list: () => [],
+    memory_list: () => [],
+    memory_application_answers: () => [],
+    memory_search: () => [],
+    memory_refresh_plan: () => ({ pending: 0, claude_calls: 0 }),
+    memory_refresh: () => ({
+      sealed: 0,
+      seal_blocked: null,
+      classified: { checked: 0, raised: 0, skipped: true },
+      embedded: 0,
+    }),
+    resume_list: () => [],
     key_state: () => ({ state: "key_not_loaded" }),
     settings_get: () => null,
     settings_set: () => undefined,
