@@ -58,7 +58,7 @@ static INDEED: ConnectorDecl = decl(
 static LINKEDIN: ConnectorDecl = decl(
     "linkedin",
     "LinkedIn",
-    PolicyStatus::Unknown,
+    PolicyStatus::Blocked,
     ("LinkedIn", "Automated read or logged-in automation"),
     (
         "LinkedIn",

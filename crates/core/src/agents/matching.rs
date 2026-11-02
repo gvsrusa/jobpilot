@@ -368,9 +368,12 @@ async fn needing_a_score(db: &Db) -> Result<Vec<String>> {
         include_duplicates: true,
         ..JobFilter::default()
     };
-    let done: Vec<String> = sqlx::query_scalar("SELECT job_id FROM match_results")
-        .fetch_all(&db.pool)
-        .await?;
+    let done: std::collections::HashSet<String> =
+        sqlx::query_scalar("SELECT job_id FROM match_results")
+            .fetch_all(&db.pool)
+            .await?
+            .into_iter()
+            .collect();
     Ok(jobs::list(db, &filter, i64::MAX)
         .await?
         .into_iter()

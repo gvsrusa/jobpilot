@@ -40,7 +40,7 @@ const SOURCES: SourceStatus[] = [
   status({ name: "ashby", label: "Ashby", read: "silent_read", note: R1 }),
   status({ name: "workday", label: "Workday", read: "unknown", can_fetch: false, operations: ["import_pasted"], target: "none" }),
   status({ name: "indeed", label: "Indeed", read: "blocked", can_fetch: false, operations: ["import_pasted"], target: "none" }),
-  status({ name: "linkedin", label: "LinkedIn", read: "user_assisted", can_fetch: false, operations: ["import_pasted"], target: "none" }),
+  status({ name: "linkedin", label: "LinkedIn", read: "blocked", can_fetch: false, operations: ["import_pasted"], target: "none" }),
 ];
 
 const job = (over: Partial<Job> = {}): Job => ({
@@ -126,7 +126,7 @@ describe("Jobs screen", () => {
     for (const [name, read, note] of [
       ["Workday", "read: unknown", "No connector. Import instead."],
       ["Indeed", "read: blocked", "No connector. Import instead."],
-      ["LinkedIn", "read: unknown", "User-assisted only."],
+      ["LinkedIn", "read: blocked", "No connector. Import instead."],
     ]) {
       const row = within(sources).getByRole("listitem", { name });
       expect(within(row).getByText(read)).toBeInTheDocument();
@@ -148,7 +148,7 @@ describe("Jobs screen", () => {
     const sources = await screen.findByRole("region", { name: "Sources" });
     for (const name of ["Greenhouse", "Ashby"]) {
       const row = within(sources).getByRole("listitem", { name });
-      expect(within(row).getByText("read: owner decision")).toBeInTheDocument();
+      expect(within(row).getByText("read: ruling R1")).toBeInTheDocument();
       expect(within(row).getByText(R1)).toBeInTheDocument();
       expect(within(row).getByRole("button", { name: `Fetch ${name}` })).toBeInTheDocument();
     }

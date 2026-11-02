@@ -334,7 +334,7 @@ fn every_assisted_src_can_only_import() {
     }
     let unknown = |name: &str| read_status(find(name).unwrap().decl());
     assert_eq!(unknown("workday"), PolicyStatus::Unknown);
-    assert_eq!(unknown("linkedin"), PolicyStatus::Unknown);
+    assert_eq!(unknown("linkedin"), PolicyStatus::Blocked);
     assert_eq!(unknown("company_page"), PolicyStatus::Unknown);
 }
 

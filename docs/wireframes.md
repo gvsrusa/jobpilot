@@ -363,19 +363,19 @@ Built. Ctrl+0 opens it. Jobs come from connectors whose register read verdict is
 |             |  Lever       read: allowed       [Board] [Fetch]               |
 |             |  RemoteOK    read: allowed       [Fetch]  attribution shown    |
 |             |  We Work Remotely  read: allowed [Fetch]  attribution shown    |
-|             |  Greenhouse  read: owner decision [Board] [Fetch]              |
+|             |  Greenhouse  read: ruling R1 [Board] [Fetch]              |
 |             |    Vendor is silent on third-party readers. Read under         |
 |             |    ruling R1.                                                  |
-|             |  Ashby       read: owner decision [Board] [Fetch]  (same note) |
+|             |  Ashby       read: ruling R1 [Board] [Fetch]  (same note) |
 |             |  Workday     read: unknown   No connector. Import instead.     |
 |             |  Indeed      read: blocked   No connector. Import instead.     |
-|             |  LinkedIn    read: unknown   No connector. Import instead.     |
+|             |  LinkedIn    read: blocked   No connector. Import instead.     |
 |             |  Company career page  read: unknown  No connector. ...         |
 +-------------+----------------------------------------------------------------+
 ```
 
 - A source that cannot fetch has no Fetch button, only the import route. A board source (Lever, Greenhouse, Ashby) asks for the board name first. Attribution ("Remote OK", "We Work Remotely") shows on every card from those sources. Job text is labelled as outside text and renders as plain text: no links, no images, no logos.
-- The fixed R1 note is "Vendor is silent on third-party readers. Read under ruling R1." **R1 is a controller ruling, not an owner decision.** The GUI label for these two rows still reads `read: owner decision`. That wording is wrong and is listed as a known issue in the [0.5 release note](releases/0.5.0.md#known-issues).
+- The fixed R1 note is "Vendor is silent on third-party readers. Read under ruling R1." **R1 is a controller ruling, not an owner decision.** The GUI label for these two rows still reads `read: ruling R1`. That wording is wrong and is listed as a known issue in the [0.5 release note](releases/0.5.0.md#known-issues).
 - A score shows `--` with "no score: nothing in your profile to compare" when nothing could be compared. The rules score runs when the screen opens and after a fetch or an import, for every job with no score or a stale one.
 - A duplicate shows under its first source as "+{n} other sources". The list hides duplicates.
 - **Release:** 0.5.
@@ -502,7 +502,7 @@ Why a mode is unavailable comes from the site's register row and the mode rules.
 | Register verdict for that mode and site | Text under the disabled mode |
 |---|---|
 | `unknown` with "no clause found" (Copilot, D2) | Copilot is selectable. Text beside it: "No clause found for this site. You review and submit." |
-| `unknown` otherwise | "The site has not said whether tools may do this. Treated as blocked until it answers." (Workday, LinkedIn) |
+| `unknown` otherwise | "The site has not said whether tools may do this. Treated as blocked until it answers." (Workday) |
 | `blocked` | "The site's terms forbid this. JobPilot will not do it, even if you ask." (Indeed) |
 | Autonomous with no eligible connector | "No site or connector qualifies today. Needs a site rule of allowed, verified permission, and your explicit authorization." |
 | Autonomous with an OpenAI-origin model | "Not allowed with OpenAI models for submissions with no human review." |

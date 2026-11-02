@@ -320,7 +320,7 @@ function SourceItem({ status, existing, onFetched }: { status: SourceStatus; exi
       onFetched();
     },
   });
-  const read = { allowed: "allowed", silent_read: "owner decision", blocked: "blocked", user_assisted: "unknown", unknown: "unknown" }[status.read];
+  const read = { allowed: "allowed", silent_read: "ruling R1", blocked: "blocked", user_assisted: "unknown", unknown: "unknown" }[status.read];
   const closed = status.read === "user_assisted" ? "User-assisted only." : "No connector. Import instead.";
   const stop = outcome.result?.reason ?? null;
   const thrown = outcome.error ? toAppError(outcome.error) : null;
