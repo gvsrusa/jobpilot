@@ -1,7 +1,9 @@
 //! The job store and user-assisted import. No network: a pasted link is routed, never fetched.
 
 use jobpilot_core::jobs::link::{LinkRoute, connector_of, route};
-use jobpilot_core::jobs::{JobFilter, PastedJob, get, import_pasted, list, remove, text_id};
+use jobpilot_core::jobs::{
+    JobFilter, PastedJob, dedupe, detail, get, import_pasted, list, remove, split, text_id,
+};
 use jobpilot_core::{AppPaths, Db, knowledge, pause};
 use tempfile::TempDir;
 
@@ -455,4 +457,33 @@ async fn a_link_with_a_user_name_or_plain_http_is_refused_at_import() {
     .await
     .unwrap();
     assert_eq!(ok.url.as_deref(), Some("https://example.com/jobs/1"));
+}
+
+// A leader's split must not leave its followers hidden until a fetch: a paste-only person has none.
+#[tokio::test]
+async fn splitting_a_leader_regroups_its_followers_at_once() {
+    let (_tmp, db) = open().await;
+    let link = Some("https://example.com/job");
+    let mut ids = Vec::new();
+    for text in ["First text", "Second text", "Third text"] {
+        let job = import_pasted(&db, pasted("Dev", "Acme", link, text))
+            .await
+            .unwrap();
+        ids.push(job.id);
+    }
+    dedupe::run(&db).await.unwrap();
+    let shown = |db| async move { list(db, &JobFilter::default(), 50).await.unwrap().len() };
+    assert_eq!(shown(&db).await, 1);
+
+    split(&db, "cli", &ids[0]).await.unwrap();
+
+    assert_eq!(shown(&db).await, 2, "the leader, and a new leader for the rest");
+    let left = detail(&db, &ids[0]).await.unwrap();
+    assert!(left.group.is_empty(), "it claims nobody");
+    assert_eq!(left.job.duplicates, 0);
+    assert_eq!(get(&db, &ids[1]).await.unwrap().duplicate_of, None);
+    assert_eq!(
+        get(&db, &ids[2]).await.unwrap().duplicate_of.as_deref(),
+        Some(ids[1].as_str())
+    );
 }

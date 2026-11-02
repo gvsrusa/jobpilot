@@ -879,7 +879,7 @@ pub async fn remove_source(db: &Db, id: &str) -> Result<()> {
 }
 
 /// A person says this job is not a duplicate: it leaves its group and no later pass puts it
-/// back. Jobs that were grouped under it regroup among themselves on the next pass.
+/// back. Jobs that were grouped under it regroup among themselves at once.
 pub async fn split(db: &Db, actor: &str, id: &str) -> Result<()> {
     runner::person(actor)?;
     let mut tx = db.pool.begin().await?;
@@ -899,6 +899,7 @@ pub async fn split(db: &Db, actor: &str, id: &str) -> Result<()> {
     )
     .await?;
     tx.commit().await?;
+    dedupe::run(db).await?;
     Ok(())
 }
 
