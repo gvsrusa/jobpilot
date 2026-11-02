@@ -3429,6 +3429,16 @@ mod tests {
         assert_eq!(h.ok("settings_get", key), "anthropic/claude-x");
         let cli = json!({ "provider": "gemini_cli", "model": "m" });
         assert_eq!(h.code("ai_set_api_model", cli), "validation");
+        for provider in ["anthropic", "google"] {
+            h.ok(
+                "ai_set_api_model",
+                json!({ "provider": provider, "model": "m-1" }),
+            );
+            let key = json!({ "key": format!("ai.model.{provider}") });
+            assert_eq!(h.ok("settings_get", key), "m-1");
+        }
+        let path = json!({ "provider": "google", "model": "models/x" });
+        assert_eq!(h.code("ai_set_api_model", path), "validation");
     }
 
     #[test]

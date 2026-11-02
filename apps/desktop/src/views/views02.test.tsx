@@ -857,6 +857,23 @@ describe("ai", () => {
     for (const box of dialog.getAllByRole("checkbox")) expect(box).not.toBeChecked();
   });
 
+  it("google_consent_shows_the_paid_key_line", async () => {
+    backend({
+      ai_status: () => aiWith({ external: [external({ name: "google", label: "Google Gemini" }), external({})] }),
+      ai_sharing: () => GOOGLE,
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "Google Gemini" }));
+    expect(row.getByText("Free keys are not supported.")).toBeInTheDocument();
+    const other = within(screen.getByRole("listitem", { name: "OpenAI" }));
+    expect(other.queryByText("Free keys are not supported.")).toBeNull();
+    await user.click(row.getByRole("button", { name: "Review Google Gemini..." }));
+    const dialog = within(await screen.findByRole("dialog"));
+    expect(dialog.getByRole("heading", { name: "Share data with Google Gemini (your own paid key)" })).toBeInTheDocument();
+    expect(dialog.getByText(GOOGLE.attestation!)).toBeInTheDocument();
+  });
+
   it("consent_dialog_says_why_a_task_is_skipped", async () => {
     backend({
       ai_status: () => aiWith({ external: [external({ name: "codex_cli", label: "Codex CLI", runs_job_text: false })] }),

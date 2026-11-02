@@ -43,6 +43,8 @@ const MODEL_NOT_INSTALLED: &str = "model_not_installed";
 const OLLAMA: &str = "ollama";
 const CLAUDE_CODE: &str = "claude_code";
 const OPENAI: &str = "openai";
+const ANTHROPIC: &str = "anthropic";
+const GOOGLE: &str = "google";
 const OPENROUTER: &str = "openrouter";
 const ENDPOINT: &str = "endpoint";
 
@@ -110,7 +112,7 @@ impl Router {
                         .unwrap_or_else(|_| ClaudeCode::with_binary(PathBuf::new(), None));
                     providers.push(Box::new(claude));
                 }
-                OPENAI | OPENROUTER | ENDPOINT => {
+                OPENAI | ANTHROPIC | GOOGLE | OPENROUTER | ENDPOINT => {
                     match ApiProvider::from_settings(db, name).await? {
                         Some(provider) => providers.push(Box::new(provider)),
                         None => eprintln!("{name}: no usable address, provider left out"),

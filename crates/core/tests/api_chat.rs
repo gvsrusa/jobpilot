@@ -979,7 +979,7 @@ async fn availability_comes_from_settings_and_the_index_alone() {
     let row = |name: &str| status.external.iter().find(|row| row.name == name).unwrap();
     assert_eq!(row("openrouter").reason.as_deref(), Some("no_api_model"));
     assert_eq!(row("endpoint").reason.as_deref(), Some("no_endpoint"));
-    assert_eq!(row("anthropic").reason.as_deref(), Some("not_built"));
+    assert_eq!(row("anthropic").reason.as_deref(), Some("no_api_model"));
     assert_eq!(row("gemini_cli").reason.as_deref(), Some("not_built"));
 }
 

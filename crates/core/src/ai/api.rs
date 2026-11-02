@@ -1,12 +1,12 @@
-//! Providers reached by HTTP with a chat wire: OpenAI, OpenRouter, and a server the user runs
-//! on loopback. Everything a vendor sends is untrusted: reply text goes back to the router for
-//! its schema check, an error body is read only to match fixed words, and no error holds a
-//! vendor's text. No request names a tool, so the model has none.
+//! Providers reached by HTTP: OpenAI, OpenRouter, and a server the user runs on loopback on the
+//! chat wire, Anthropic and Google on their own. Everything a vendor sends is untrusted: reply
+//! text goes back to the router for its schema check, an error body is read only to match fixed
+//! words, and no error holds a vendor's text. No request names a tool, so the model has none.
 
 use std::time::Duration;
 
-use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, HeaderValue, RETRY_AFTER};
+use reqwest::{Client, RequestBuilder};
 use serde_json::{Value, json};
 
 use super::net::{
@@ -24,6 +24,19 @@ use crate::settings;
 
 const OPENAI_BASE: &str = "https://api.openai.com/v1";
 const OPENROUTER_BASE: &str = "https://openrouter.ai/api/v1";
+const ANTHROPIC_BASE: &str = "https://api.anthropic.com";
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+/// The API requires a limit. The chat wire sends none.
+const ANTHROPIC_MAX_TOKENS: u32 = 16_000;
+const GOOGLE_BASE: &str = "https://generativelanguage.googleapis.com";
+/// `SAFETY` and its kin: each ends a reply because a filter did, whatever text came before it.
+const GOOGLE_REFUSED: [&str; 5] = [
+    "SAFETY",
+    "RECITATION",
+    "BLOCKLIST",
+    "PROHIBITED_CONTENT",
+    "SPII",
+];
 const ENDPOINT_URL: &str = "ai.endpoint.url";
 const ENDPOINT_MODEL: &str = "ai.model.endpoint";
 const MAX_MODEL: usize = 200;
@@ -56,6 +69,8 @@ enum Wire {
     OpenAi,
     OpenRouter,
     Endpoint,
+    Anthropic,
+    Google,
 }
 
 pub struct ApiProvider {
@@ -75,6 +90,8 @@ fn wire_of(name: &str) -> Option<Wire> {
         "openai" => Some(Wire::OpenAi),
         "openrouter" => Some(Wire::OpenRouter),
         "endpoint" => Some(Wire::Endpoint),
+        "anthropic" => Some(Wire::Anthropic),
+        "google" => Some(Wire::Google),
         _ => None,
     }
 }
@@ -89,6 +106,8 @@ impl ApiProvider {
         let (base, client) = match wire {
             Wire::OpenAi => (OPENAI_BASE.to_string(), hosted_client()?),
             Wire::OpenRouter => (OPENROUTER_BASE.to_string(), hosted_client()?),
+            Wire::Anthropic => (ANTHROPIC_BASE.to_string(), hosted_client()?),
+            Wire::Google => (GOOGLE_BASE.to_string(), hosted_client()?),
             Wire::Endpoint => match stored_endpoint(db).await? {
                 Some(endpoint) => endpoint,
                 None => return Ok(None),
@@ -148,6 +167,28 @@ impl ApiProvider {
     }
 
     fn body(&self, prompt: &Prompt) -> Result<Value> {
+        let schema = provider_schema(prompt.schema)?;
+        Ok(match self.wire {
+            Wire::OpenAi | Wire::OpenRouter | Wire::Endpoint => self.chat_body(prompt, schema),
+            Wire::Anthropic => json!({
+                "model": self.model,
+                "max_tokens": ANTHROPIC_MAX_TOKENS,
+                "system": prompt.system,
+                "messages": [{"role": "user", "content": prompt.user}],
+                "output_config": {"format": {"type": "json_schema", "schema": schema}},
+            }),
+            Wire::Google => json!({
+                "systemInstruction": {"parts": [{"text": prompt.system}]},
+                "contents": [{"role": "user", "parts": [{"text": prompt.user}]}],
+                "generationConfig": {
+                    "responseMimeType": "application/json",
+                    "responseJsonSchema": schema,
+                },
+            }),
+        })
+    }
+
+    fn chat_body(&self, prompt: &Prompt, schema: Value) -> Value {
         let mut body = json!({
             "model": self.model,
             "messages": [
@@ -159,27 +200,53 @@ impl ApiProvider {
                 "json_schema": {
                     "name": "jobpilot_output",
                     "strict": true,
-                    "schema": provider_schema(prompt.schema)?,
+                    "schema": schema,
                 },
             },
         });
-        match self.wire {
-            Wire::OpenAi => body["store"] = json!(false),
-            Wire::OpenRouter => {
-                body["provider"] = json!({"data_collection": "deny", "require_parameters": true});
-            }
-            Wire::Endpoint => {}
+        if self.wire == Wire::OpenAi {
+            body["store"] = json!(false);
         }
-        Ok(body)
+        if self.wire == Wire::OpenRouter {
+            body["provider"] = json!({"data_collection": "deny", "require_parameters": true});
+        }
+        body
+    }
+
+    /// Google's model is in the path. `complete` runs `check_model` first, so it cannot leave
+    /// the segment.
+    fn url(&self) -> String {
+        match self.wire {
+            Wire::OpenAi | Wire::OpenRouter | Wire::Endpoint => {
+                format!("{}/chat/completions", self.base)
+            }
+            Wire::Anthropic => format!("{}/v1/messages", self.base),
+            Wire::Google => {
+                format!("{}/v1beta/models/{}:generateContent", self.base, self.model)
+            }
+        }
+    }
+
+    /// The key goes in this header and nowhere else. Never in a URL: errors and proxies log those.
+    fn with_key(&self, request: RequestBuilder, key: &str) -> Result<RequestBuilder> {
+        Ok(match self.wire {
+            Wire::OpenAi | Wire::OpenRouter | Wire::Endpoint => {
+                let bearer = Zeroizing::new(format!("Bearer {key}"));
+                request.header(AUTHORIZATION, sensitive(&bearer)?)
+            }
+            Wire::Anthropic => request
+                .header("x-api-key", sensitive(key)?)
+                .header("anthropic-version", ANTHROPIC_VERSION),
+            Wire::Google => request.header("x-goog-api-key", sensitive(key)?),
+        })
     }
 
     /// One POST and its capped read. Both stay inside the router's `bounded`, the only deadline
     /// a hosted call has, so a server that drips bytes is cut off at the attempt's limit.
     async fn send(&self, body: &Value) -> Result<Vec<u8>> {
-        let url = format!("{}/chat/completions", self.base);
-        let mut request = self.client.post(url).json(body);
+        let mut request = self.client.post(self.url()).json(body);
         if let Some(key) = self.read_key().await? {
-            request = request.header(AUTHORIZATION, bearer(&key)?);
+            request = self.with_key(request, &key)?;
         }
         let response = request.send().await.map_err(net)?;
         let status = response.status();
@@ -199,10 +266,9 @@ impl ApiProvider {
 }
 
 /// `set_sensitive` keeps the value out of `Debug` output. reqwest's copy of it is not zeroed.
-fn bearer(key: &str) -> Result<HeaderValue> {
-    let text = Zeroizing::new(format!("Bearer {key}"));
+fn sensitive(text: &str) -> Result<HeaderValue> {
     let mut value =
-        HeaderValue::from_str(&text).map_err(|_| Error::Refused("auth_failed".into()))?;
+        HeaderValue::from_str(text).map_err(|_| Error::Refused("auth_failed".into()))?;
     value.set_sensitive(true);
     Ok(value)
 }
@@ -248,7 +314,7 @@ impl Provider for ApiProvider {
             // Again here: a restored backup puts a model in settings past `set_model`.
             check_model(self.info.name, &self.model)?;
             let reply = self.send(&self.body(prompt)?).await?;
-            read_reply(&reply)
+            read_reply(self.wire, &reply)
         })
     }
 
@@ -262,35 +328,95 @@ impl Provider for ApiProvider {
     }
 }
 
+/// What a reply holds, whichever wire it came by.
+struct Reading {
+    tool_call: bool,
+    refused: bool,
+    truncated: bool,
+    text: Option<String>,
+}
+
 /// The text a model answered, or why it did not. A reply can hold usable text and still fail
 /// here: a refusal or a tool call is never read as an answer. What comes back is untrusted, and
 /// the router's validation is its only way in.
-fn read_reply(body: &[u8]) -> Result<String> {
+fn read_reply(wire: Wire, body: &[u8]) -> Result<String> {
     let bad_reply = || Error::Failed("bad_reply".into());
     let reply: Value = serde_json::from_slice(body).map_err(|_| bad_reply())?;
-    let choice = &reply["choices"][0];
-    let message = &choice["message"];
-    let finish = choice["finish_reason"].as_str();
-    let called = message["tool_calls"]
-        .as_array()
-        .is_some_and(|calls| !calls.is_empty());
-    if called || !message["function_call"].is_null() {
+    let reading = match wire {
+        Wire::OpenAi | Wire::OpenRouter | Wire::Endpoint => read_chat(&reply),
+        Wire::Anthropic => read_anthropic(&reply),
+        Wire::Google => read_google(&reply),
+    };
+    if reading.tool_call {
         return Err(Error::Refused("permission_denied".into()));
     }
-    let refused = message["refusal"]
-        .as_str()
-        .is_some_and(|text| !text.is_empty());
-    if refused || finish == Some("content_filter") {
+    if reading.refused {
         return Err(Error::Refused("model_refused".into()));
     }
-    if finish == Some("length") {
+    if reading.truncated {
         return Err(Error::Failed("output_truncated".into()));
     }
     if !reply["error"].is_null() {
         return Err(bad_reply());
     }
-    let text = message["content"].as_str().ok_or_else(bad_reply)?;
-    Ok(text.to_string())
+    reading.text.ok_or_else(bad_reply)
+}
+
+fn read_chat(reply: &Value) -> Reading {
+    let choice = &reply["choices"][0];
+    let message = &choice["message"];
+    let finish = choice["finish_reason"].as_str();
+    let refusal = message["refusal"].as_str();
+    Reading {
+        tool_call: !items(&message["tool_calls"]).is_empty() || !message["function_call"].is_null(),
+        refused: refusal.is_some_and(|text| !text.is_empty()) || finish == Some("content_filter"),
+        truncated: finish == Some("length"),
+        text: message["content"].as_str().map(str::to_string),
+    }
+}
+
+/// `ends_with`: server and MCP tool blocks count too, and no request here asked for any.
+/// Thinking blocks are neither a tool nor the answer.
+fn read_anthropic(reply: &Value) -> Reading {
+    let blocks = items(&reply["content"]);
+    let stop = reply["stop_reason"].as_str();
+    Reading {
+        tool_call: blocks.iter().any(|b| kind(b).ends_with("tool_use")),
+        refused: stop == Some("refusal"),
+        truncated: stop == Some("max_tokens"),
+        text: joined(blocks.iter().filter(|b| kind(b) == "text")),
+    }
+}
+
+/// `executableCode` is Google's code tool, called as `functionCall` is. A thought is not the
+/// answer.
+fn read_google(reply: &Value) -> Reading {
+    let candidate = &reply["candidates"][0];
+    let parts = items(&candidate["content"]["parts"]);
+    let finish = candidate["finishReason"].as_str().unwrap_or_default();
+    let blocked = !reply["promptFeedback"]["blockReason"].is_null();
+    Reading {
+        tool_call: parts
+            .iter()
+            .any(|p| !p["functionCall"].is_null() || !p["executableCode"].is_null()),
+        refused: blocked || GOOGLE_REFUSED.contains(&finish),
+        truncated: finish == "MAX_TOKENS",
+        text: joined(parts.iter().filter(|p| p["thought"] != true)),
+    }
+}
+
+fn kind(block: &Value) -> &str {
+    block["type"].as_str().unwrap_or_default()
+}
+
+fn items(value: &Value) -> &[Value] {
+    value.as_array().map_or(&[], Vec::as_slice)
+}
+
+/// `None` when nothing holds text: an empty join is no answer.
+fn joined<'a>(parts: impl Iterator<Item = &'a Value>) -> Option<String> {
+    let text: String = parts.filter_map(|part| part["text"].as_str()).collect();
+    (!text.is_empty()).then_some(text)
 }
 
 /// Refused before anything is sent. `Ok(())` means eligible.

@@ -786,6 +786,45 @@ async fn consent_give_needs_attest_for_google() {
 }
 
 #[test]
+fn anthropic_and_google_take_a_model_and_consent() {
+    let (_dir, home) = fresh_home();
+    let env = [("JOBPILOT_CLAUDE_BIN", "not-a-path")];
+    let row = |home: &Path, name: &str| {
+        let shown = stdout_json(&run_env(home, &["ai", "status", "--json"], &env));
+        let rows = shown["external"].as_array().unwrap().clone();
+        rows.into_iter().find(|row| row["name"] == name).unwrap()
+    };
+    for name in ["anthropic", "google"] {
+        assert_eq!(row(&home, name)["reason"], "no_api_model");
+        ok(&home, &["ai", "model", name, "vendor-model-1"]);
+        ok(&home, &["ai", "enable", name]);
+        let give = ["ai", "consent", "give", name, "--categories", DRAFT_CONSENT];
+        if name == "google" {
+            let refused = run(&home, &give);
+            assert_eq!(refused.status.code(), Some(1));
+            assert!(stderr_text(&refused).contains("--attest"));
+            assert!(
+                row(&home, name)["consent"].is_null(),
+                "no attestation, no record"
+            );
+            let mut attested = give.to_vec();
+            attested.push("--attest");
+            ok(&home, &attested);
+        } else {
+            ok(&home, &give);
+        }
+        let shown = row(&home, name);
+        assert_eq!(shown["model"], "vendor-model-1");
+        assert_eq!(shown["reason"], "no_key");
+        assert_eq!(shown["consent"].as_array().unwrap().len(), 3);
+    }
+
+    let refused = run(&home, &["ai", "model", "google", "models/x"]);
+    assert!(stderr_text(&refused).contains("validation"));
+    assert_eq!(row(&home, "google")["model"], "vendor-model-1");
+}
+
+#[test]
 fn panel_refuses_new_ai_commands() {
     let (_dir, home) = fresh_home();
     let panel = [("JOBPILOT_PANEL", "1")];

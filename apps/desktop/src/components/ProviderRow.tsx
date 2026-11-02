@@ -171,6 +171,7 @@ export function ProviderRow(props: {
       {row.kind === "endpoint" && <EndpointControls row={row} />}
       {row.kind !== "cli" && <ModelControls row={row} />}
       {row.kind !== "cli" && <KeyControls row={row} />}
+      {row.name === "google" && <p className="text-muted-foreground">Free keys are not supported.</p>}
       {row.consent && <p>Consent given for: {row.consent.map(labelOf).join(", ")}.</p>}
       <div className="flex flex-wrap items-center gap-3">
         {row.consent && (

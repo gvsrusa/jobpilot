@@ -471,7 +471,7 @@ pub(crate) async fn provider_settings(db: &Db) -> Result<(Vec<String>, serde_jso
 }
 
 /// A provider row's availability, by the same checks routing uses. Opens no socket.
-// ponytail: a row reads `not_built` until its adapter lands, Tasks 5 to 8.
+// ponytail: a row reads `not_built` until its adapter lands, Tasks 6 to 8.
 async fn row_availability(
     db: &Db,
     info: &register::ProviderInfo,
