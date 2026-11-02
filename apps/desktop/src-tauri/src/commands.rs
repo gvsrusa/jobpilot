@@ -4223,6 +4223,31 @@ mod tests {
         assert_eq!(hook.work_at_dialog.lock().unwrap().last(), Some(&false));
     }
 
+    /// The yes covers the count it was asked with: a question that arrives while the dialog
+    /// is open changes the plan, and the press is refused before anything runs.
+    #[test]
+    fn a_count_that_moves_after_the_dialog_is_refused() {
+        let h = ready();
+        claude_on_with_questions(&h);
+        let db = with_db(&h, |db| async move { db });
+        let hook = h.app.state::<NativeHook>();
+        *hook.on_ask.lock().unwrap() = Some(Box::new(move || {
+            let db = db.clone();
+            Box::pin(async move {
+                jobpilot_core::memory::add_question(&db, "Describe project three", None)
+                    .await
+                    .unwrap();
+            })
+        }));
+        h.answer(true);
+        let refused = h.call("memory_refresh", json!({}));
+        assert_eq!(code_of(refused), "validation");
+        assert!(h.asked().last().unwrap().contains("up to 2 Claude calls"));
+        assert_eq!(h.ok("agents_list", json!({ "limit": 10 })), json!([]));
+        let plan = h.ok("memory_refresh_plan", json!({}));
+        assert_eq!(plan["claude_calls"], 3, "the new question is counted now");
+    }
+
     #[test]
     fn memory_refresh_asks_nothing_when_no_claude_call_is_ahead() {
         let h = ready();

@@ -296,17 +296,32 @@ pub async fn memory(db: &Db, command: MemoryCommand) -> Result<Output> {
                 agents::memory_refresh(db, &router, ACTOR, cancel)
             })
             .await?;
-            let mut text = format!(
+            let mut text = String::new();
+            if plan.claude_calls > 0 {
+                text.push_str(&format!(
+                    "Making up to {} Claude calls, limit {}.\n",
+                    plan.claude_calls,
+                    memory::CLASSIFY_BATCH
+                ));
+            }
+            text.push_str(&format!(
                 "Checked {}, raised {}, indexed {}",
                 done.classified.checked, done.classified.raised, done.embedded
-            );
+            ));
             if done.classified.skipped {
                 text.push_str("\nNo AI took this; classes come from the rules.");
+            }
+            if let Some(code) = &done.seal_blocked {
+                text.push_str(&format!(
+                    "\nSome answers stay hidden until they can be sealed: error[{code}]."
+                ));
             }
             if done.embedded == 0 && !embedding_model_set(db).await? {
                 text.push_str("\nNo embedding model is set; search uses text.");
             }
-            out(&done, text)
+            let mut shown = serde_json::to_value(&done).unwrap_or_default();
+            shown["claude_calls"] = json!(plan.claude_calls);
+            out(shown, text)
         }
     }
 }

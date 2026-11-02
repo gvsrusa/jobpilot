@@ -111,6 +111,7 @@ export function backend(overrides: Record<string, Handler> = {}): Backend {
     memory_refresh_plan: () => ({ pending: 0, claude_calls: 0 }),
     memory_refresh: () => ({
       sealed: 0,
+      seal_blocked: null,
       classified: { checked: 0, raised: 0, skipped: true },
       embedded: 0,
     }),

@@ -701,6 +701,7 @@ describe("career memory", () => {
       memory_search: ({ query }: Args) => (query === "none" ? [] : hits),
       memory_refresh: () => ({
         sealed: 0,
+        seal_blocked: null,
         classified: { checked: 3, raised: 1, skipped: false },
         embedded: 2,
       }),
@@ -738,6 +739,7 @@ describe("career memory", () => {
     bank([], {
       memory_refresh: () => ({
         sealed: 0,
+        seal_blocked: null,
         classified: { checked: 0, raised: 0, skipped: true },
         embedded: 0,
       }),
@@ -747,6 +749,21 @@ describe("career memory", () => {
     await user.click(screen.getByRole("button", { name: "Refresh index" }));
     expect(await screen.findByText("Checked 0, raised 0, indexed 0")).toBeInTheDocument();
     expect(screen.getByText("No AI took this; classes come from the rules.")).toBeInTheDocument();
+  });
+
+  it("refresh_says_when_a_key_left_answers_hidden", async () => {
+    bank([], {
+      memory_refresh: () => ({
+        sealed: 0,
+        seal_blocked: "key_unavailable",
+        classified: { checked: 1, raised: 1, skipped: false },
+        embedded: 0,
+      }),
+    });
+    const { user } = renderApp();
+    await openMemory(user);
+    await user.click(screen.getByRole("button", { name: "Refresh index" }));
+    expect(await screen.findByText(/stay hidden until they can be sealed \(key_unavailable\)/)).toBeInTheDocument();
   });
 
   it("refresh_shows_the_claude_count_before_the_press", async () => {

@@ -6,11 +6,12 @@ use std::sync::{Mutex, PoisonError};
 use serde::Serialize;
 
 use crate::ai::router::Router;
-use crate::ai::{BoxFuture, TaskType, spec};
+use crate::ai::{BoxFuture, DataCategory, ProviderId, TaskType, spec};
+use crate::crypto::DataKey;
 use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::memory::classify::{Classified, classify_pending};
-use crate::memory::{index_missing, seal_pending};
+use crate::memory::{index_missing, seal_pending, seal_pending_with};
 use crate::runner::{Agent, Ctx, Permission, RunInput, StepDef, StepOutput, Workflow};
 
 use Permission::*;
@@ -42,6 +43,9 @@ pub static STEPS: &[StepDef] = &[
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MemoryRefreshed {
     pub sealed: usize,
+    /// The code of the key error that left bodies hidden. They are sealed at the next refresh
+    /// with the key available.
+    pub seal_blocked: Option<String>,
     pub classified: Classified,
     pub embedded: usize,
 }
@@ -53,6 +57,7 @@ pub struct MemoryRefreshed {
 pub struct MemoryWorkflow<'r> {
     pub router: &'r Router,
     pub resumed: bool,
+    key: Option<DataKey>,
     done: Mutex<MemoryRefreshed>,
 }
 
@@ -61,8 +66,15 @@ impl<'r> MemoryWorkflow<'r> {
         MemoryWorkflow {
             router,
             resumed,
+            key: None,
             done: Mutex::new(MemoryRefreshed::default()),
         }
+    }
+
+    /// A key to seal with, in place of the keychain's. For tests, which never touch it.
+    pub fn with_key(mut self, key: DataKey) -> Self {
+        self.key = Some(key);
+        self
     }
 
     pub fn done(&self) -> MemoryRefreshed {
@@ -81,35 +93,31 @@ impl<'r> MemoryWorkflow<'r> {
             self.note(|done| done.classified.skipped = true);
             return Ok(StepOutput::default());
         }
-        let classified =
-            classify_pending(ctx.db, self.router, ctx.actor, ctx.cancel.clone()).await?;
-        let categories = if classified.checked > 0 {
-            spec(TaskType::ClassifyAnswer).categories
-        } else {
-            &[]
-        };
+        let since = now(ctx.db).await?;
+        let result = classify_pending(ctx.db, self.router, ctx.actor, ctx.cancel.clone()).await;
+        // What left the machine is read from the router's own log, so a call that came back
+        // unusable still counts: the text was sent.
+        let (provider, categories) = asked_since(ctx.db, &since).await?;
+        let classified = result?;
         self.note(|done| done.classified = classified);
         Ok(StepOutput {
-            provider: None,
+            provider,
             categories,
         })
     }
 
     /// A key that cannot be had leaves the bodies hidden, as every read already shows them,
-    /// and the run goes on.
+    /// and the run goes on. The code is kept for the person.
     async fn seal(&self, ctx: &Ctx<'_>) -> Result<StepOutput> {
-        let sealed = match seal_pending(ctx.db).await {
-            Ok(sealed) => sealed,
-            Err(
-                Error::Locked
-                | Error::KeyUnavailable(_)
-                | Error::KeyMissing { .. }
-                | Error::KeyMismatch { .. }
-                | Error::Secret(_),
-            ) => 0,
-            Err(error) => return Err(error),
+        let result = match &self.key {
+            Some(key) => seal_pending_with(ctx.db, key).await,
+            None => seal_pending(ctx.db).await,
         };
-        self.note(|done| done.sealed = sealed);
+        let (sealed, blocked) = sealed(result)?;
+        self.note(|done| {
+            done.sealed = sealed;
+            done.seal_blocked = blocked;
+        });
         Ok(StepOutput::default())
     }
 
@@ -167,4 +175,50 @@ pub async fn memory_refresh(
         .await?
         .into_result()?;
     Ok(workflow.done())
+}
+
+/// A key error is noted as its code and counts nothing sealed; any other error stands.
+pub fn sealed(result: Result<usize>) -> Result<(usize, Option<String>)> {
+    match result {
+        Ok(sealed) => Ok((sealed, None)),
+        Err(
+            error @ (Error::Locked
+            | Error::KeyUnavailable(_)
+            | Error::KeyMissing { .. }
+            | Error::KeyMismatch { .. }
+            | Error::Secret(_)),
+        ) => Ok((0, Some(error.code().to_owned()))),
+        Err(error) => Err(error),
+    }
+}
+
+async fn now(db: &Db) -> Result<String> {
+    Ok(
+        sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
+            .fetch_one(&db.pool)
+            .await?,
+    )
+}
+
+/// The provider a classify call went to since `since`, and the data it carried. An external
+/// one wins over a local one, since that is what left the machine. `NoAi` is no provider.
+async fn asked_since(
+    db: &Db,
+    since: &str,
+) -> Result<(Option<ProviderId>, &'static [DataCategory])> {
+    let used: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT provider FROM task_runs WHERE task_type = 'classify_answer' \
+         AND attempt >= 1 AND provider <> 'no_ai' AND started_at >= ?",
+    )
+    .bind(since)
+    .fetch_all(&db.pool)
+    .await?;
+    let named = |id: ProviderId| used.contains(&id.to_string()).then_some(id);
+    let provider = named(ProviderId::ClaudeCode).or_else(|| named(ProviderId::Ollama));
+    let categories = if provider.is_some() {
+        spec(TaskType::ClassifyAnswer).categories
+    } else {
+        &[]
+    };
+    Ok((provider, categories))
 }

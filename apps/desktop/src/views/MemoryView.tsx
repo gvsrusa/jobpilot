@@ -310,6 +310,9 @@ function SearchSection() {
             {refresh.data.embedded}
           </p>
           {refresh.data.classified.skipped && <p>No AI took this; classes come from the rules.</p>}
+          {refresh.data.seal_blocked && (
+            <p>Some answers stay hidden until they can be sealed ({refresh.data.seal_blocked}).</p>
+          )}
         </div>
       )}
       {asked !== null && hits.length === 0 && (

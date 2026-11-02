@@ -96,8 +96,10 @@ impl<'r> DraftWorkflow<'r> {
     }
 
     async fn draft(&self, ctx: &Ctx<'_>) -> Result<StepOutput> {
-        if ctx.saved("draft").is_some() {
-            // Made already: a second pass must not ask a model again or add a version.
+        // A version this run already made, whose checkpoint did not land: the model is not
+        // asked again and no second version is added.
+        if let Some(id) = drafts::of_run(ctx.db, ctx.run_id()).await? {
+            ctx.save("draft", &id)?;
             return Ok(StepOutput::default());
         }
         let (db, router, actor, job) = (ctx.db, self.router, ctx.actor, &self.job_text_id);
@@ -107,6 +109,7 @@ impl<'r> DraftWorkflow<'r> {
         } else {
             generate::resume(db, router, actor, job, cancel).await?
         };
+        drafts::tag_run(db, &made.draft.id, ctx.run_id()).await?;
         ctx.save("draft", &made.draft.id)?;
         let output = StepOutput {
             provider: Some(made.provider.clone()),
@@ -130,7 +133,9 @@ impl<'r> DraftWorkflow<'r> {
             Some(generated) => generated,
             None => rebuild(db, Some(&id)).await?,
         };
-        if generated.blocked == 0 {
+        if generated.blocked > 0 {
+            generated.export_skipped = Some(NOT_EXPORTED.into());
+        } else {
             let exported = drafts::export(
                 db,
                 &id,
@@ -143,7 +148,9 @@ impl<'r> DraftWorkflow<'r> {
             match exported {
                 Ok(path) => generated.exported = Some(path.to_string_lossy().into_owned()),
                 // The draft states what a claim may not. It is stored, and not rendered.
-                Err(Error::Refused(why)) if why == "claims_blocked" => {}
+                Err(Error::Refused(why)) if why == NOT_EXPORTED => {
+                    generated.export_skipped = Some(NOT_EXPORTED.into());
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -151,6 +158,10 @@ impl<'r> DraftWorkflow<'r> {
         Ok(StepOutput::default())
     }
 }
+
+/// Why a draft that was asked to export did not: a line of it, or its name, contact, or
+/// heading, is one an export refuses.
+const NOT_EXPORTED: &str = "claims_blocked";
 
 /// `provider` is matched on its stored text, since a checkpoint holds ids only.
 async fn rebuild(db: &Db, id: Option<&str>) -> Result<Generated> {
@@ -168,6 +179,7 @@ async fn rebuild(db: &Db, id: Option<&str>) -> Result<Generated> {
         blocked,
         provider,
         exported: None,
+        export_skipped: None,
     })
 }
 

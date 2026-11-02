@@ -673,6 +673,26 @@ async fn store(db: &Db, new: NewDraft<'_>, doc: &ResumeDoc, claims: &[Claim]) ->
     row.into_draft()
 }
 
+/// Ties a version to the run that made it, so a repeated step can find it.
+pub(crate) async fn tag_run(db: &Db, draft_id: &str, run_id: &str) -> Result<()> {
+    sqlx::query("UPDATE drafts SET run_id = ? WHERE id = ?")
+        .bind(run_id)
+        .bind(draft_id)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+/// The version a run already made, if any.
+pub(crate) async fn of_run(db: &Db, run_id: &str) -> Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar("SELECT id FROM drafts WHERE run_id = ? ORDER BY version DESC")
+            .bind(run_id)
+            .fetch_optional(&db.pool)
+            .await?,
+    )
+}
+
 /// Whether a lineage has a generated version, after checking it exists and is of `kind`.
 async fn lineage_is_generated(db: &Db, lineage_id: &str, kind: &str) -> Result<bool> {
     let (found, generated): (Option<String>, Option<bool>) = sqlx::query_as(
@@ -1111,19 +1131,28 @@ pub async fn export(
     let path = out_dir.join(name);
     // Rendering and the file write run off the async threads: a runner step shares its
     // overseer's task, and a stretch that never yields would stall its timeout and heartbeat.
+    // The audit row is written by a task of its own, so a cancel that drops this future past
+    // its grace cannot leave a file with no row: the thread finishes, and the row follows.
     let (doc, out_dir, target) = (draft.doc.clone(), out_dir.to_owned(), path.clone());
-    tokio::task::spawn_blocking(move || -> Result<()> {
+    let work = tokio::task::spawn_blocking(move || -> Result<()> {
         let bytes = match format {
             ExportFormat::Docx => to_docx(&doc, template)?,
             ExportFormat::Pdf => to_pdf(&doc, template)?,
         };
         std::fs::create_dir_all(&out_dir)?;
         write_file(&target, &bytes)
-    })
-    .await
-    .map_err(|_| Error::Failed("export_interrupted".into()))??;
+    });
     let detail = json!({ "version": draft.version, "format": format, "template": template });
-    audit::record(db, actor, "export", Some(&draft.id), detail).await?;
+    let (pool, who, id) = (db.pool.clone(), actor.to_owned(), draft.id.clone());
+    let landed = tokio::spawn(async move {
+        work.await
+            .map_err(|_| Error::Failed("export_interrupted".into()))??;
+        let mut conn = pool.acquire().await?;
+        audit::record_to(&mut *conn, &who, "export", Some(&id), detail).await
+    });
+    landed
+        .await
+        .map_err(|_| Error::Failed("export_interrupted".into()))??;
     Ok(path)
 }
 

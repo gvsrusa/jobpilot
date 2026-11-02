@@ -498,6 +498,7 @@ fn resume_generate_appears_in_agents_list() {
     assert_eq!(made["provider"], "claude_code");
     assert_eq!(made["blocked"], 0);
     assert!(made["exported"].is_null());
+    assert!(made["export_skipped"].is_null());
     let runs = stdout_json(&run(&home, &["agents", "list", "--json"]));
     assert_eq!(runs.as_array().unwrap().len(), 1);
     assert_eq!(runs[0]["agent"], "resume");
@@ -597,6 +598,10 @@ fn memory_refresh_prints_the_count_and_waits_for_yes() {
     ));
     assert_eq!(done["classified"]["checked"], 3);
     assert_eq!(done["classified"]["raised"], 3);
+    assert_eq!(done["claude_calls"], 3, "the count it acted on");
+    let text = run_env(&home, &["memory", "refresh", "--yes"], &env);
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(text.contains("Checked 0, raised 0, indexed 0"), "{text}");
     let runs = stdout_json(&run(&home, &["agents", "list", "--json"]));
     assert_eq!(runs[0]["agent"], "career_memory");
 }

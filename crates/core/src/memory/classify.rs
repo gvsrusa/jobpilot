@@ -52,11 +52,13 @@ pub fn classify_prompt(question: &str) -> Prompt {
     }
 }
 
-/// Oldest first, as `classify_pending` takes them.
+/// Oldest first, as `classify_pending` takes them. A class a person set is final: the model
+/// is not asked about it, so it cannot override that choice or unapprove their answers.
 async fn pending(db: &Db) -> Result<Vec<(String, String)>> {
     Ok(sqlx::query_as(
         "SELECT id, text FROM memory_questions \
-         WHERE classified_at IS NULL AND class <> 'work_authorization' ORDER BY seq LIMIT ?",
+         WHERE classified_at IS NULL AND class <> 'work_authorization' \
+         AND class_source <> 'user' ORDER BY seq LIMIT ?",
     )
     .bind(i64::try_from(CLASSIFY_BATCH).unwrap_or(i64::MAX))
     .fetch_all(&db.pool)

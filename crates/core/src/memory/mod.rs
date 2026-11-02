@@ -876,8 +876,22 @@ pub async fn seal_pending(db: &Db) -> Result<usize> {
         return Ok(0);
     }
     let key = crypto::unlocked(db).await?;
+    seal_rows_of(db, &key, rows).await
+}
+
+/// As [`seal_pending`], under a key the caller holds. The career memory agent's tests pass
+/// one made of bytes, so none of them reaches the keychain.
+pub async fn seal_pending_with(db: &Db, key: &DataKey) -> Result<usize> {
+    let rows = pending(db).await?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    seal_rows_of(db, key, rows).await
+}
+
+async fn seal_rows_of(db: &Db, key: &DataKey, rows: Vec<StoredAnswer>) -> Result<usize> {
     let mut write = db.pool.begin().await?;
-    let sealed = seal_rows(&mut write, &key, &rows).await?;
+    let sealed = seal_rows(&mut write, key, &rows).await?;
     let mut questions: Vec<&str> = rows.iter().map(|row| row.question_id.as_str()).collect();
     questions.dedup();
     for question in questions {

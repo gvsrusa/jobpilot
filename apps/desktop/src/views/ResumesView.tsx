@@ -345,6 +345,12 @@ export function ResumesView() {
           <CopyPath path={generate.data.exported} />
         </p>
       )}
+      {generate.data && generate.data.export_skipped && !generate.data.exported && (
+        <p role="status" className="text-sm font-medium text-destructive">
+          The draft is saved but was not exported: a line, the name, a contact, or a heading is
+          one an export refuses. Fix it in the editor, then export.
+        </p>
+      )}
       {generationError && (
         <>
           <ErrorAlert error={cancelled(generationError)} />

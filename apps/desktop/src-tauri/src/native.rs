@@ -108,6 +108,11 @@ pub struct NativeHook {
     pub asked: std::sync::Mutex<Vec<String>>,
     /// For each confirmation, whether a `Work` was open while it waited.
     pub work_at_dialog: std::sync::Mutex<Vec<bool>>,
+    /// Runs while a confirmation is open, as the world moving under the person's feet.
+    #[allow(clippy::type_complexity)]
+    pub on_ask: std::sync::Mutex<
+        Option<Box<dyn Fn() -> jobpilot_core::ai::BoxFuture<'static, ()> + Send + Sync>>,
+    >,
 }
 
 #[cfg(test)]
@@ -118,6 +123,7 @@ impl Default for NativeHook {
             picked: Default::default(),
             asked: Default::default(),
             work_at_dialog: Default::default(),
+            on_ask: Default::default(),
         }
     }
 }
@@ -139,6 +145,10 @@ async fn ask<R: Runtime>(
         .push(format!("{title}: {message}"));
     let work = app.state::<crate::state::AppState>().work_is_open();
     hook.work_at_dialog.lock().unwrap().push(work);
+    let moving = hook.on_ask.lock().unwrap().as_ref().map(|change| change());
+    if let Some(moving) = moving {
+        moving.await;
+    }
     Ok(hook.confirm.load(Ordering::SeqCst))
 }
 

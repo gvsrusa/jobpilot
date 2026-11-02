@@ -152,11 +152,17 @@ pub struct Ctx<'a> {
     pub db: &'a Db,
     pub actor: &'a str,
     pub cancel: CancellationToken,
+    run_id: String,
     agent: Agent,
     checkpoint: Mutex<Checkpoint>,
 }
 
 impl Ctx<'_> {
+    /// The row this step belongs to, so a result can be tied to its run.
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
     pub fn check(&self, permission: Permission) -> Result<()> {
         if spec_of(self.agent).permissions.contains(&permission) {
             Ok(())
@@ -610,6 +616,7 @@ async fn execute(
         db,
         actor,
         cancel,
+        run_id: id.clone(),
         agent: run.agent,
         checkpoint: Mutex::new(saved),
     };

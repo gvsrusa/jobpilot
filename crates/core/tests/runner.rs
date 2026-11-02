@@ -279,6 +279,67 @@ fn every_agent_step_stays_in_its_set() {
     }
 }
 
+/// Each step's needs, exactly: a step that asks for less than it does, or more than it needs,
+/// is a change someone should see.
+#[test]
+fn each_step_names_exactly_what_it_needs() {
+    use Permission::*;
+    let resume = [
+        ReadResumeText,
+        ReadProfileBasic,
+        ReadJobText,
+        Model(TaskType::DraftResume),
+        WriteDrafts,
+    ];
+    let letter = [
+        ReadResumeText,
+        ReadProfileBasic,
+        ReadJobText,
+        ReadCompanyText,
+        Model(TaskType::DraftCoverLetter),
+        WriteDrafts,
+    ];
+    let render = [ReadResumeText, WriteDrafts];
+    type Wanted<'a> = &'a [(&'a str, &'a [Permission])];
+    let table: &[(&[StepDef], Wanted)] = &[
+        (
+            draft::RESUME_STEPS,
+            &[("draft", &resume), ("render", &render)],
+        ),
+        (
+            draft::LETTER_STEPS,
+            &[("draft", &letter), ("render", &render)],
+        ),
+        (
+            memory::STEPS,
+            &[
+                (
+                    "classify",
+                    &[
+                        ReadCareerMemory,
+                        ReadJobText,
+                        Model(TaskType::ClassifyAnswer),
+                        WriteCareerMemory,
+                    ],
+                ),
+                (
+                    "seal",
+                    &[ReadCareerMemory, ReadSensitive, WriteCareerMemory],
+                ),
+                ("embed", &[ReadCareerMemory, EmbedLocal, WriteCareerMemory]),
+            ],
+        ),
+    ];
+    for (steps, wanted) in table {
+        assert_eq!(steps.len(), wanted.len());
+        for (step, (name, needs)) in steps.iter().zip(*wanted) {
+            assert_eq!(step.name, *name);
+            assert_eq!(step.needs, *needs, "{name}");
+            assert_eq!(step.attempts, 1, "{name}");
+        }
+    }
+}
+
 #[test]
 fn permission_sets_match_the_spec_table() {
     use Permission::*;

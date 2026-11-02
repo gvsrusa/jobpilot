@@ -461,6 +461,7 @@ describe("knowledge", () => {
         blocked: 0,
         provider: "claude_code",
         exported: "/data/exports/backend-engineer-v1.pdf",
+        export_skipped: null,
       }),
     });
     const { user } = renderApp();
@@ -474,6 +475,27 @@ describe("knowledge", () => {
     });
     expect(await screen.findByText("/data/exports/backend-engineer-v1.pdf")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Copy path" })).toBeInTheDocument();
+  });
+
+  it("a_refused_export_after_drafting_is_said_aloud", async () => {
+    const generated = draft({ id: "g1", lineage_id: "G" });
+    resumeBackend({
+      resume_list: () => [],
+      ai_status: () => CLAUDE_READY,
+      resume_compare: () => ({ ...COMPARE, generated: [], blocked: 0 }),
+      resume_generate: () => ({
+        draft: generated,
+        blocked: 0,
+        provider: "claude_code",
+        exported: null,
+        export_skipped: "claims_blocked",
+      }),
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    await user.selectOptions(await screen.findByLabelText("After drafting, export as"), "pdf");
+    await user.click(await screen.findByRole("button", { name: "Generate" }));
+    expect(await screen.findByText(/was not exported/)).toBeInTheDocument();
   });
 
   it("approve_all_skips_what_a_draft_could_not_cite_anyway", async () => {

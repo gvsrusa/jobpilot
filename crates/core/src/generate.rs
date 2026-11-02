@@ -40,6 +40,7 @@ pub struct Generated {
     /// Where the file went, when the draft agent was asked to export. Never set by
     /// [`resume`] or [`cover_letter`].
     pub exported: Option<String>,
+    pub export_skipped: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -313,5 +314,6 @@ async fn store(
         blocked,
         provider,
         exported: None,
+        export_skipped: None,
     })
 }

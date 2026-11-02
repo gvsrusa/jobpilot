@@ -238,6 +238,12 @@ fn generated(made: Generated) -> Result<Output> {
     if let Some(path) = &made.exported {
         text.push_str(&format!("\nexported to {path}"));
     }
+    if made.export_skipped.is_some() {
+        text.push_str(
+            "\nnot exported: a line, the name, a contact, or a heading is one an export refuses; \
+             see `jobpilot resume compare`",
+        );
+    }
     out(made, text)
 }
 

@@ -164,6 +164,8 @@ export type RefreshPlan = { pending: number; claude_calls: number };
 /** `skipped`: no AI took the classifying, so classes are the rules'. */
 export type MemoryRefreshed = {
   sealed: number;
+  /** The error code that left answers hidden; they seal at the next refresh with a key. */
+  seal_blocked: string | null;
   classified: { checked: number; raised: number; skipped: boolean };
   embedded: number;
 };
@@ -334,6 +336,8 @@ export type Generated = {
   provider: "ollama" | "claude_code" | "no_ai";
   /** Where the file went, when an export was asked for and no claim was blocked. */
   exported: string | null;
+  /** Set when an export was asked for and refused: a line, the name, a contact, or a heading. */
+  export_skipped: string | null;
 };
 
 /** What to render right after drafting. Rust writes it to the exports folder only. */

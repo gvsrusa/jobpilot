@@ -1135,13 +1135,14 @@ async fn refresh_plan_counts_claude_calls_and_calls_no_provider() {
     );
 }
 
-/// Classify, then a halt the first time, as a refresh stopped in the middle.
-struct HaltAfterClassify<'r> {
+/// A halt the first time classify is asked, before it does anything: a refresh stopped at
+/// the start of its first step.
+struct HaltBeforeClassify<'r> {
     inner: MemoryWorkflow<'r>,
     tripped: AtomicBool,
 }
 
-impl Workflow for HaltAfterClassify<'_> {
+impl Workflow for HaltBeforeClassify<'_> {
     fn agent(&self) -> Agent {
         self.inner.agent()
     }
@@ -1156,11 +1157,10 @@ impl Workflow for HaltAfterClassify<'_> {
 
     fn step<'a>(&'a self, ctx: &'a Ctx<'a>, index: usize) -> BoxFuture<'a, Result<StepOutput>> {
         Box::pin(async move {
-            let output = self.inner.step(ctx, index).await?;
             if index == 0 && !self.tripped.swap(true, Ordering::SeqCst) {
                 return Err(Error::Paused);
             }
-            Ok(output)
+            self.inner.step(ctx, index).await
         })
     }
 }
@@ -1176,20 +1176,22 @@ async fn resuming_a_refresh_makes_no_claude_call() {
     );
     provider.embeds = true;
     let router = router_of(provider);
-    let workflow = HaltAfterClassify {
+    let workflow = HaltBeforeClassify {
         inner: MemoryWorkflow::new(&router, false),
         tripped: AtomicBool::new(false),
     };
     let halted = runner::start(&db, "cli", &workflow, token()).await.unwrap();
     assert_eq!(halted.state, RunState::Halted);
-    assert_eq!(handles.calls(), 2);
+    assert_eq!(handles.calls(), 0);
     assert_eq!(handles.embed_calls.load(Ordering::SeqCst), 0);
 
+    // Two questions wait and replies are ready: only the rebuilt workflow's own rule keeps
+    // the resume from spending them.
     let done = agents::resume_run(&db, &router, "cli", &halted.run_id, token())
         .await
         .unwrap();
     assert_eq!(done.state, RunState::Completed);
-    assert_eq!(handles.calls(), 2, "classify was not asked again");
+    assert_eq!(handles.calls(), 0, "a resume makes no model call");
     assert!(
         handles.embed_calls.load(Ordering::SeqCst) > 0,
         "embed still ran"
@@ -1289,4 +1291,531 @@ async fn an_export_does_not_stall_the_overseer() {
         worst < took / 3,
         "the export held the thread: {worst:?} of {took:?}"
     );
+}
+
+// ---- fix round 1 ------------------------------------------------------------------------
+
+async fn wait_for(what: &str, mut done: impl AsyncFnMut() -> bool) {
+    let clock = std::time::Instant::now();
+    while !done().await {
+        assert!(clock.elapsed() < Duration::from_secs(5), "never: {what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_persons_class_is_final() {
+    let (_tmp, db) = open().await;
+    let lowered = memory::add_question(&db, "Please certify this is true", None)
+        .await
+        .unwrap();
+    assert_eq!(lowered.class, Class::Legal);
+    let answer = memory::add_answer(&db, &lowered.id, "Yes", None)
+        .await
+        .unwrap();
+    memory::set_class(&db, "cli", &lowered.id, Class::Normal)
+        .await
+        .unwrap();
+    let answer = memory::get(&db, &lowered.id)
+        .await
+        .unwrap()
+        .answers
+        .into_iter()
+        .find(|a| a.id == answer.id)
+        .unwrap();
+    memory::approve(&db, "cli", &answer.id, true).await.unwrap();
+    let raised = memory::add_question(&db, "Why this company?", None)
+        .await
+        .unwrap();
+    memory::set_class(&db, "cli", &raised.id, Class::Sensitive)
+        .await
+        .unwrap();
+
+    let plan_router = router_of(script(ProviderId::Ollama, vec![]).0);
+    assert_eq!(refresh_plan(&db, &plan_router).await.unwrap().pending, 0);
+    let (provider, handles) = script(
+        ProviderId::Ollama,
+        vec![class_reply("legal"), class_reply("legal")],
+    );
+    let done = classify_pending(&db, &router_of(provider), "cli", token())
+        .await
+        .unwrap();
+    assert_eq!((done.checked, done.raised, done.skipped), (0, 0, false));
+    assert_eq!(handles.calls(), 0);
+    let kept = memory::get(&db, &lowered.id).await.unwrap();
+    assert_eq!(kept.question.class, Class::Normal);
+    assert!(kept.answers[0].approved, "their approval stands");
+    assert_eq!(
+        memory::get(&db, &raised.id).await.unwrap().question.class,
+        Class::Sensitive
+    );
+}
+
+#[tokio::test]
+async fn work_authorization_questions_are_never_sent() {
+    let (_tmp, db) = open().await;
+    let q = memory::add_question(&db, "Are you authorized to work in the US?", Some("US"))
+        .await
+        .unwrap();
+    assert_eq!(q.class, Class::WorkAuthorization);
+    let (provider, handles) = script(ProviderId::Ollama, vec![class_reply("normal")]);
+    let done = classify_pending(&db, &router_of(provider), "cli", token())
+        .await
+        .unwrap();
+    assert_eq!((done.checked, done.skipped), (0, false));
+    assert_eq!(handles.calls(), 0);
+}
+
+#[tokio::test]
+async fn a_cancel_is_an_error_not_a_skip() {
+    let (_tmp, db) = open().await;
+    questions(&db, 2).await;
+    // Already fired: nothing is asked, and the router is not even entered.
+    let fired = token();
+    fired.cancel();
+    let (provider, handles) = script(ProviderId::Ollama, vec![class_reply("normal")]);
+    let error = classify_pending(&db, &router_of(provider), "cli", fired)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "cancelled");
+    assert_eq!(handles.calls(), 0);
+    assert_eq!(count(&db, "SELECT count(*) FROM task_runs").await, 0);
+
+    // Fired while the model works.
+    let cancel = token();
+    let (mut provider, _) = script(ProviderId::Ollama, vec![class_reply("normal")]);
+    provider.cancel_in_call = Some(cancel.clone());
+    let error = classify_pending(&db, &router_of(provider), "cli", cancel)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "cancelled");
+}
+
+/// The row of the classify step in a run's log.
+async fn classify_row(db: &Db) -> runner::LogRow {
+    let run = runner::list(db, 1).await.unwrap().remove(0);
+    let detail = runner::get(db, &run.id).await.unwrap();
+    detail
+        .log
+        .into_iter()
+        .find(|row| row.step == "classify" && row.state == RunState::Checkpointed)
+        .expect("classify was checkpointed")
+}
+
+#[tokio::test]
+async fn the_log_names_the_claude_call_that_succeeded() {
+    let (_tmp, db) = open().await;
+    consent_to(&db, &[DataCategory::JobText]).await;
+    questions(&db, 1).await;
+    let (provider, _) = script(ProviderId::ClaudeCode, vec![class_reply("normal")]);
+    agents::memory_refresh(&db, &router_of(provider), "cli", token())
+        .await
+        .unwrap();
+    let row = classify_row(&db).await;
+    assert_eq!(row.provider.as_deref(), Some(CLAUDE));
+    assert_eq!(row.data_categories, [DataCategory::JobText]);
+}
+
+#[tokio::test]
+async fn the_log_names_a_claude_call_that_came_back_as_bad_json() {
+    let (_tmp, db) = open().await;
+    consent_to(&db, &[DataCategory::JobText]).await;
+    questions(&db, 1).await;
+    let (provider, handles) = script(ProviderId::ClaudeCode, vec!["not json".into()]);
+    let done = agents::memory_refresh(&db, &router_of(provider), "cli", token())
+        .await
+        .unwrap();
+    assert!(done.classified.skipped);
+    assert_eq!(handles.calls(), 1);
+    let row = classify_row(&db).await;
+    assert_eq!(row.provider.as_deref(), Some(CLAUDE), "the text did leave");
+    assert_eq!(row.data_categories, [DataCategory::JobText]);
+}
+
+#[tokio::test]
+async fn the_log_names_no_provider_when_none_was_asked() {
+    let (_tmp, db) = open().await;
+    questions(&db, 1).await;
+    agents::memory_refresh(&db, &Router::with_providers(vec![]), "cli", token())
+        .await
+        .unwrap();
+    let row = classify_row(&db).await;
+    assert_eq!(row.provider, None);
+    assert!(row.data_categories.is_empty());
+}
+
+/// A plain answer under a normal question, and a key made of sevens.
+async fn plain_answer(db: &Db) -> (String, String) {
+    let key = DataKey::from_bytes(KEY_ID, [7; 32]);
+    let check = key
+        .encrypt("data_keys", "key_check", KEY_ID, crypto::key_check_text())
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO data_keys (key_id, created_at, key_check, active) VALUES (?, 't', ?, 0)",
+    )
+    .bind(KEY_ID)
+    .bind(check)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let question = memory::add_question(db, "Why this company?", None)
+        .await
+        .unwrap();
+    let answer = memory::add_answer(db, &question.id, "Because", None)
+        .await
+        .unwrap();
+    (question.id, answer.id)
+}
+
+#[tokio::test]
+async fn a_raise_seals_in_the_same_run() {
+    let (_tmp, db) = open().await;
+    let (_, answer) = plain_answer(&db).await;
+    let (provider, _) = script(ProviderId::Ollama, vec![class_reply("sensitive")]);
+    let router = router_of(provider);
+    let workflow =
+        MemoryWorkflow::new(&router, false).with_key(DataKey::from_bytes(KEY_ID, [7; 32]));
+    let done = runner::start(&db, "cli", &workflow, token()).await.unwrap();
+    assert_eq!(done.state, RunState::Completed);
+    assert_eq!(workflow.done().sealed, 1);
+    let (body, enc): (String, Option<Vec<u8>>) =
+        sqlx::query_as("SELECT body, body_enc FROM memory_answers WHERE id = ?")
+            .bind(&answer)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(body, "");
+    assert!(enc.is_some());
+}
+
+#[test]
+fn a_seal_key_error_is_noted_and_nothing_else_is() {
+    use jobpilot_core::agents::memory::sealed;
+    for error in [
+        Error::Locked,
+        Error::KeyUnavailable("x".into()),
+        Error::KeyMissing { key_id: "k".into() },
+        Error::KeyMismatch { key_id: "k".into() },
+        Error::Secret("x".into()),
+    ] {
+        let code = error.code();
+        assert_eq!(sealed(Err(error)).unwrap(), (0, Some(code.to_owned())));
+    }
+    assert_eq!(sealed(Ok(3)).unwrap(), (3, None));
+    assert!(sealed(Err(Error::Validation("x".into()))).is_err());
+}
+
+fn letter_reply(text: &str, ids: &[&str]) -> String {
+    json!({ "paragraphs": [{ "text": text, "evidence_ids": ids }] }).to_string()
+}
+
+#[tokio::test]
+async fn a_cover_letter_is_drafted_by_its_own_agent() {
+    let w = world().await;
+    let (provider, _) = script(
+        ProviderId::Ollama,
+        vec![letter_reply(BULLET, &[&w.item.id])],
+    );
+    let made = agents::draft_cover_letter(
+        &w.db,
+        &router_of(provider),
+        "cli",
+        &w.job.id,
+        pdf(),
+        token(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(made.draft.kind, "cover_letter");
+    assert!(made.exported.is_some());
+    let run = runner::list(&w.db, 1).await.unwrap().remove(0);
+    assert_eq!(
+        (run.agent, run.state),
+        (Agent::CoverLetter, RunState::Completed)
+    );
+    let detail = runner::get(&w.db, &run.id).await.unwrap();
+    assert!(detail.log.iter().any(|r| r.provider.is_some()));
+}
+
+#[tokio::test]
+async fn a_halted_letter_resumes_as_a_letter() {
+    let w = world().await;
+    let (provider, handles) = script(
+        ProviderId::Ollama,
+        vec![letter_reply(BULLET, &[&w.item.id])],
+    );
+    let router = router_of(provider);
+    let workflow = HaltAtRender {
+        inner: DraftWorkflow::new(TaskType::DraftCoverLetter, &w.job.id, pdf(), &router),
+        tripped: AtomicBool::new(false),
+    };
+    let halted = runner::start(&w.db, "cli", &workflow, token())
+        .await
+        .unwrap();
+    assert_eq!(halted.state, RunState::Halted);
+    let done = agents::resume_run(&w.db, &router, "cli", &halted.run_id, token())
+        .await
+        .unwrap();
+    assert_eq!(done.state, RunState::Completed);
+    assert_eq!(handles.calls(), 1);
+    assert_eq!(
+        count(
+            &w.db,
+            "SELECT count(*) FROM drafts WHERE kind = 'cover_letter'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        std::fs::read_dir(w.db.paths().exports()).unwrap().count(),
+        1
+    );
+}
+
+/// A step run under an agent that does not hold its needs, with the step table narrowed so the
+/// runner lets it in: the step's own check is what stops it.
+struct Narrowed<W> {
+    inner: W,
+    agent: Agent,
+}
+
+static NARROW: &[StepDef] = &[
+    StepDef {
+        name: "a",
+        needs: &[Permission::ReadApplications],
+        attempts: 1,
+    },
+    StepDef {
+        name: "b",
+        needs: &[Permission::ReadApplications],
+        attempts: 1,
+    },
+    StepDef {
+        name: "c",
+        needs: &[Permission::ReadApplications],
+        attempts: 1,
+    },
+];
+
+impl<W: Workflow> Workflow for Narrowed<W> {
+    fn agent(&self) -> Agent {
+        self.agent
+    }
+
+    fn input(&self) -> RunInput {
+        self.inner.input()
+    }
+
+    fn steps(&self) -> &'static [StepDef] {
+        &NARROW[..self.inner.steps().len()]
+    }
+
+    fn step<'a>(&'a self, ctx: &'a Ctx<'a>, index: usize) -> BoxFuture<'a, Result<StepOutput>> {
+        self.inner.step(ctx, index)
+    }
+}
+
+#[tokio::test]
+async fn the_draft_and_memory_steps_check_their_own_permissions() {
+    let w = world().await;
+    let (provider, handles) = script(
+        ProviderId::Ollama,
+        vec![resume_reply(BULLET, &[&w.item.id])],
+    );
+    let router = router_of(provider);
+    let draft = Narrowed {
+        inner: DraftWorkflow::new(TaskType::DraftResume, &w.job.id, None, &router),
+        agent: Agent::Analytics,
+    };
+    let done = runner::start(&w.db, "cli", &draft, token()).await.unwrap();
+    assert_eq!(done.state, RunState::Refused);
+    assert_eq!(done.reason.as_deref(), Some("permission_denied"));
+    assert_eq!(handles.calls(), 0);
+    assert_eq!(count(&w.db, "SELECT count(*) FROM drafts").await, 0);
+
+    questions(&w.db, 1).await;
+    let (provider, handles) = script(ProviderId::Ollama, vec![class_reply("legal")]);
+    let router = router_of(provider);
+    let memory = Narrowed {
+        inner: MemoryWorkflow::new(&router, false),
+        agent: Agent::Analytics,
+    };
+    let done = runner::start(&w.db, "cli", &memory, token()).await.unwrap();
+    assert_eq!(done.state, RunState::Refused);
+    assert_eq!(handles.calls(), 0);
+}
+
+#[tokio::test]
+async fn a_failed_checkpoint_write_does_not_draft_twice() {
+    let w = world().await;
+    let reply = resume_reply(BULLET, &[&w.item.id]);
+    let (provider, handles) = script(ProviderId::Ollama, vec![reply.clone(), reply]);
+    let router = router_of(provider);
+    sqlx::query(
+        "CREATE TRIGGER stop_checkpoint BEFORE UPDATE ON agent_runs \
+         WHEN NEW.state = 'checkpointed' BEGIN SELECT RAISE(ABORT, 'no'); END",
+    )
+    .execute(&w.db.pool)
+    .await
+    .unwrap();
+    let error = agents::draft_resume(&w.db, &router, "cli", &w.job.id, pdf(), token())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "db");
+    assert_eq!(handles.calls(), 1);
+    assert_eq!(count(&w.db, "SELECT count(*) FROM drafts").await, 1);
+
+    sqlx::query("DROP TRIGGER stop_checkpoint")
+        .execute(&w.db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE agent_runs SET heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-60 seconds')",
+    )
+    .execute(&w.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(runner::reap_stale(&w.db).await.unwrap(), 1);
+    let run = runner::list(&w.db, 1).await.unwrap().remove(0);
+    assert_eq!(run.state, RunState::Halted);
+    let done = agents::resume_run(&w.db, &router, "cli", &run.id, token())
+        .await
+        .unwrap();
+    assert_eq!(done.state, RunState::Completed);
+    assert_eq!(handles.calls(), 1, "no second model call");
+    assert_eq!(count(&w.db, "SELECT count(*) FROM drafts").await, 1);
+    assert_eq!(
+        std::fs::read_dir(w.db.paths().exports()).unwrap().count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_name_that_states_authorization_is_stored_and_the_export_is_skipped_aloud() {
+    let w = world().await;
+    let (provider, _) = script(
+        ProviderId::Ollama,
+        vec![resume_reply(BULLET, &[&w.item.id])],
+    );
+    let router = router_of(provider);
+    let workflow = HaltAtRender {
+        inner: DraftWorkflow::new(TaskType::DraftResume, &w.job.id, pdf(), &router),
+        tripped: AtomicBool::new(false),
+    };
+    let halted = runner::start(&w.db, "cli", &workflow, token())
+        .await
+        .unwrap();
+    // Edited under the run, as the name of a stored draft can be: no claim is blocked, and
+    // the export still refuses.
+    sqlx::query(
+        "UPDATE drafts SET body = json_set(body, '$.name', 'Authorized to work in the US')",
+    )
+    .execute(&w.db.pool)
+    .await
+    .unwrap();
+    let again = DraftWorkflow::new(TaskType::DraftResume, &w.job.id, pdf(), &router);
+    let done = runner::resume(&w.db, "cli", &halted.run_id, &again, token())
+        .await
+        .unwrap();
+    assert_eq!(done.state, RunState::Completed);
+    let made = again.into_generated(&w.db, &done.saved).await.unwrap();
+    assert_eq!(made.blocked, 0);
+    assert_eq!(made.exported, None);
+    assert_eq!(made.export_skipped.as_deref(), Some("claims_blocked"));
+    assert!(
+        !w.db.paths().exports().exists()
+            || std::fs::read_dir(w.db.paths().exports()).unwrap().count() == 0
+    );
+
+    // And a clean draft says nothing.
+    let w = world().await;
+    let (provider, _) = script(
+        ProviderId::Ollama,
+        vec![resume_reply(BULLET, &[&w.item.id])],
+    );
+    let made = agents::draft_resume(
+        &w.db,
+        &router_of(provider),
+        "cli",
+        &w.job.id,
+        pdf(),
+        token(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(made.export_skipped, None);
+}
+
+#[tokio::test]
+async fn a_blocked_draft_says_why_it_was_not_exported() {
+    let w = world().await;
+    let (provider, _) = script(ProviderId::Ollama, vec![resume_reply(BULLET, &[])]);
+    let made = agents::draft_resume(
+        &w.db,
+        &router_of(provider),
+        "cli",
+        &w.job.id,
+        pdf(),
+        token(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(made.export_skipped.as_deref(), Some("claims_blocked"));
+}
+
+/// A cancel that drops the export past its grace leaves the blocking thread running: the file
+/// still lands, so it still gets its audit row.
+#[tokio::test]
+async fn a_file_that_lands_after_a_dropped_export_is_audited() {
+    use jobpilot_core::drafts;
+    use jobpilot_core::render::{Entry, ResumeDoc, Section};
+    let (_tmp, db) = open().await;
+    let entries = (0..300)
+        .map(|i| Entry {
+            title: format!("Role {i}"),
+            subtitle: "Company".into(),
+            dates: "2020 - 2021".into(),
+            bullets: (0..8)
+                .map(|b| format!("Did thing {i}.{b} in depth"))
+                .collect(),
+        })
+        .collect();
+    let doc = ResumeDoc {
+        name: "Ada".into(),
+        sections: vec![Section {
+            heading: "Experience".into(),
+            entries,
+        }],
+        ..ResumeDoc::default()
+    };
+    let draft = drafts::save_manual(&db, "resume", None, doc).await.unwrap();
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(30),
+        drafts::export(
+            &db,
+            &draft.id,
+            Template::Classic,
+            ExportFormat::Pdf,
+            &db.paths().exports(),
+            "cli",
+        ),
+    )
+    .await;
+    assert!(dropped.is_err(), "the export was cut short");
+
+    wait_for("the file lands", async || {
+        std::fs::read_dir(db.paths().exports()).is_ok_and(|mut d| {
+            d.any(|f| f.is_ok_and(|f| f.path().extension().is_some_and(|e| e == "pdf")))
+        })
+    })
+    .await;
+    wait_for("its audit row", async || {
+        count(
+            &db,
+            "SELECT count(*) FROM audit_log WHERE action = 'export'",
+        )
+        .await
+            == 1
+    })
+    .await;
 }
