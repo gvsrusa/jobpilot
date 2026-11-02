@@ -499,7 +499,7 @@ async fn keychain_round_trip() {
     assert_eq!(log[0].target.as_deref(), Some(name));
     for entry in &log {
         let expected = match entry.action.as_str() {
-            "export" => serde_json::json!({ "sensitive_plain": false }),
+            "export" => serde_json::json!({ "sensitive_plain": false, "withheld": 0 }),
             _ => serde_json::json!({}),
         };
         assert_eq!(entry.detail, expected);

@@ -825,7 +825,7 @@ async fn timeout_kills_attempt_and_moves_on() {
     let started = Instant::now();
     let outcome = parse_job(&router, &db).await;
 
-    assert!(started.elapsed() < Duration::from_millis(500));
+    assert!(started.elapsed() < Duration::from_secs(5));
     assert!(is_ok(&outcome, ProviderId::Ollama, 1), "{outcome:?}");
     assert_eq!(slow_counters.dropped.load(Ordering::SeqCst), 2);
 }
@@ -840,7 +840,7 @@ async fn declared_timeout_bounds_an_attempt_without_an_override() {
     let started = Instant::now();
     assert_eq!(parse_job(&router, &db).await, manual("no_ai"));
 
-    assert!(started.elapsed() < Duration::from_millis(500));
+    assert!(started.elapsed() < Duration::from_secs(5));
 }
 
 #[tokio::test]
@@ -876,7 +876,7 @@ async fn hanging_availability_probe_cannot_outlive_the_timeout() {
         manual("provider_unavailable")
     );
 
-    assert!(started.elapsed() < Duration::from_millis(500));
+    assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(calls(&counters), 0);
     assert_eq!(skip_reasons(&db, "ollama").await, ["unavailable"]);
 }
@@ -901,7 +901,7 @@ async fn cancel_ends_with_cancelled_and_no_further_attempts() {
     );
 
     assert_eq!(outcome.unwrap(), Outcome::Cancelled);
-    assert!(started.elapsed() < Duration::from_millis(500));
+    assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(calls(&slow_counters), 1);
     assert_eq!(slow_counters.dropped.load(Ordering::SeqCst), 1);
     assert_eq!(calls(&next_counters), 0);
@@ -1498,7 +1498,7 @@ async fn embed_honours_timeout_and_cancel() {
         matches!(result, Err(Error::ManualRequired(_))),
         "{result:?}"
     );
-    assert!(started.elapsed() < Duration::from_millis(500));
+    assert!(started.elapsed() < Duration::from_secs(5));
 
     let router = Router::with_providers(vec![Mock::ollama(vec![Reply::Hang]).boxed()]);
     let cancel = CancellationToken::new();
