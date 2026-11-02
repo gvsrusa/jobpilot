@@ -1,5 +1,5 @@
 //! Pay, read as written. A figure is pay only with a currency mark beside it, and a figure with
-//! no stated period is a year only if it is 1,000 or more. Equity, bonus, and funding figures
+//! no stated period is a year only if it is 20,000 or more (below that its period is unknown). Equity, bonus, and funding figures
 //! are not pay. Comparison never converts a currency and never guesses a period.
 
 use std::sync::LazyLock;
@@ -11,7 +11,8 @@ use super::{PayPeriod, PayRange, PayWish};
 /// The ISO codes read when written out, and `CHF`.
 const CODES: &str = "USD|EUR|GBP|CAD|AUD|NZD|SGD|HKD|JPY|CNY|INR|CHF|SEK|NOK|DKK|PLN|CZK|HUF|BRL|MXN|ZAR|AED|ILS|KRW|TRY|RUB|THB|MYR|IDR|PHP";
 const SYMBOLS: &str = "$€£¥₹";
-const NUMBER: &str = r"\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d+)?";
+const NUMBER: &str =
+    r"\d{1,2}(?:,\d{2})+,\d{3}(?:\.\d{1,2})?|\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d+)?";
 
 /// A figure or a range of two, with the currency before either or after the last.
 static AMOUNT: LazyLock<Regex> = LazyLock::new(|| {
@@ -23,20 +24,20 @@ static AMOUNT: LazyLock<Regex> = LazyLock::new(|| {
 
 static PERIOD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(?P<hour>per\s+hour|/\s?h(?:ou)?r\b|an\s+hour|\bhourly\b|\ban\s+hr\b)|(?P<year>per\s+year|per\s+annum|\bannual(?:ly)?\b|/\s?(?:yr|year)\b|\ba\s+year\b)|(?P<month>per\s+month|/\s?(?:mo|month)\b|\ba\s+month\b)|(?P<day>per\s+day|/\s?day\b|\ba\s+day\b)|(?P<week>per\s+week|/\s?(?:wk|week)\b|\ba\s+week\b)",
+        r"(?i)(?P<hour>per\s+hour|/\s?h(?:ou)?r\b|an\s+hour|\bhourly\b|\ban\s+hr\b)|(?P<year>per\s+year|per\s+annum|\bannual(?:ly)?\b|/\s?(?:yr|year)\b|\ba\s+year\b)|(?P<month>per\s+month|\bmonthly\b|/\s?(?:mo|month)\b|\ba\s+month\b)|(?P<day>per\s+day|\bdaily\b|/\s?day\b|\ba\s+day\b)|(?P<week>per\s+week|\bweekly\b|/\s?(?:wk|week)\b|\ba\s+week\b)",
     )
     .expect("period pattern")
 });
 
 /// A bonus or equity word just before a figure.
 static BEFORE_NOT_PAY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:bonus|equity|stock|funding|raised|revenue|valuation)(?:\s+(?:of|is|up to|worth|target|at))?\W*$")
+    Regex::new(r"(?i)(?:bonus|equity|stock|stipend|funding|raised|revenue|valuation)(?:\s+(?:of|is|up to|worth|target|at))?\W*$")
         .expect("before pattern")
 });
 
 /// A bonus, equity, or company-size word just after a figure.
 static AFTER_NOT_PAY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^\W{0,2}(?:(?:signing|sign-on|annual|performance|retention|target|referral|relocation|stock)\s+)?(?:bonus|equity|options|in\s+(?:funding|revenue|sales|arr)|funding|revenue|valuation|[mb]\b|million|billion)")
+    Regex::new(r"(?i)^\s*(?:(?:signing|sign-on|annual|performance|retention|target|referral|relocation|stock)\s+)?(?:bonus|equity|stipend|options|in\s+(?:funding|revenue|sales|arr)|funding|revenue|valuation|[mb]\b|million|billion)")
         .expect("after pattern")
 });
 
@@ -113,6 +114,7 @@ fn clip_back(text: &str, mut at: usize) -> usize {
 // ponytail: English text, one figure or one range. A second range in the same text is never
 // read, and a period is looked for within 30 characters of the figure.
 pub fn parse_pay(text: &str) -> Option<PayRange> {
+    let text = super::capped(text);
     for found in AMOUNT.captures_iter(text) {
         let whole = found.get(0)?;
         let currency = ["code1", "code2", "code3"]
@@ -161,16 +163,19 @@ pub fn parse_pay(text: &str) -> Option<PayRange> {
         if min < 1.0 || max > 1.0e9 {
             continue;
         }
+        // No period stated: 20,000 or more is a year; 1,000 to 20,000 could be a month or a
+        // year, so its period stays unknown; less is no pay.
         let period = match period_near(text, whole.start(), whole.end()) {
-            Some(period) => period,
-            None if max >= 1000.0 => PayPeriod::Year,
+            Some(period) => Some(period),
+            None if max >= 20_000.0 => Some(PayPeriod::Year),
+            None if max >= 1000.0 => None,
             None => continue,
         };
         return Some(PayRange {
             min: Some(min.round() as i64),
             max: Some(max.round() as i64),
             currency: Some(currency.to_string()),
-            period: Some(period),
+            period,
         });
     }
     None

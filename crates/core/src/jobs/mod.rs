@@ -31,6 +31,18 @@ macro_rules! now {
     };
 }
 
+/// Parsers read no more than this much of a text.
+pub(crate) const PARSE_LIMIT: usize = 200_000;
+
+/// The text up to [`PARSE_LIMIT`] bytes, cut on a character boundary.
+pub(crate) fn capped(text: &str) -> &str {
+    let mut end = text.len().min(PARSE_LIMIT);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 const COMPANY_LIMIT: usize = 300;
 const URL_LIMIT: usize = 2_000;
 
@@ -662,7 +674,6 @@ async fn insert_posting(
 /// Moves a job to its new text and fields (the rules refill what the new text leaves blank), and drops its score and its old search row.
 async fn revise(db: &Db, id: &str, text: &knowledge::JobText, posting: &Posting) -> Result<()> {
     let mut tx = db.pool.begin().await?;
-    let company = company_id(&mut tx, &posting.company).await?;
     let pay = posting.pay.as_ref();
     // The text it leaves stays, tied to this job so removing the job removes it too.
     sqlx::query(
@@ -673,11 +684,37 @@ async fn revise(db: &Db, id: &str, text: &knowledge::JobText, posting: &Posting)
     .bind(&text.id)
     .execute(&mut *tx)
     .await?;
-    let seq: i64 = sqlx::query_scalar(concat!(
+    let by: String = sqlx::query_scalar("SELECT fields_by FROM jobs WHERE id = ?")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    // What a person or a model set stays: only the text and the links follow the source. A
+    // `rules` row goes back to `none`, so the rules read the new text afresh.
+    let (seq, title, company_name): (i64, String, String) = if matches!(
+        by.as_str(),
+        "user" | "model"
+    ) {
+        sqlx::query_as(concat!(
+            "UPDATE jobs SET job_text_id = ?, url = ?, apply_url = ?, posted_on = ?, last_seen_at = ",
+            now!(),
+            " WHERE id = ? RETURNING seq, title, \
+             coalesce((SELECT name FROM companies WHERE id = jobs.company_id), '')"
+        ))
+        .bind(&text.id)
+        .bind(&posting.url)
+        .bind(posting.apply_url.as_deref())
+        .bind(posting.posted_on.as_deref())
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?
+    } else {
+        let company = company_id(&mut tx, &posting.company).await?;
+        let seq: i64 = sqlx::query_scalar(concat!(
         "UPDATE jobs SET job_text_id = ?, title = ?, company_id = ?, location = ?, country = ?, \
                 work_mode = ?, employment_type = ?, url = ?, apply_url = ?, posted_on = ?, \
                 pay_min = ?, pay_max = ?, pay_currency = ?, pay_period = ?, skills = ?, \
                 seniority = NULL, mentions_authorization = 0, dedupe_key = '', \
+                fields_by = CASE fields_by WHEN 'rules' THEN 'none' ELSE fields_by END, \
                 last_seen_at = ",
         now!(),
         " WHERE id = ? RETURNING seq"
@@ -700,6 +737,8 @@ async fn revise(db: &Db, id: &str, text: &knowledge::JobText, posting: &Posting)
     .bind(id)
     .fetch_one(&mut *tx)
     .await?;
+        (seq, text.title.clone(), posting.company.trim().to_owned())
+    };
     sqlx::query("DELETE FROM match_results WHERE job_id = ?")
         .bind(id)
         .execute(&mut *tx)
@@ -710,8 +749,8 @@ async fn revise(db: &Db, id: &str, text: &knowledge::JobText, posting: &Posting)
         .await?;
     sqlx::query("INSERT INTO jobs_fts (rowid, title, company, body) VALUES (?, ?, ?, ?)")
         .bind(seq)
-        .bind(&text.title)
-        .bind(posting.company.trim())
+        .bind(&title)
+        .bind(&company_name)
         .bind(&text.normalized)
         .execute(&mut *tx)
         .await?;

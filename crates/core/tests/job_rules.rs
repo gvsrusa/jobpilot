@@ -470,3 +470,193 @@ async fn rules_never_touch_a_field_a_person_set() {
     assert_eq!(after.seniority, None);
     assert_eq!(after.pay, None);
 }
+
+#[test]
+fn a_suffix_that_is_both_a_region_and_a_country_is_unknown() {
+    for place in [
+        "Berlin, DE",
+        "Amsterdam, NL",
+        "Toronto, CA",
+        "Mumbai, IN",
+        "Remote, IN",
+        "Tel Aviv, IL",
+        "Lima, PE",
+    ] {
+        assert!(matches!(scope_of(place), Scope::Unknown), "{place}");
+    }
+    assert!(matches!(scope_of("Austin, TX"), Scope::Country("US")));
+    assert!(matches!(scope_of("Toronto, ON"), Scope::Country("CA")));
+    assert!(matches!(scope_of("Remote, US"), Scope::Country("US")));
+    assert!(matches!(scope_of("Paris, FR"), Scope::Country("FR")));
+}
+
+#[test]
+fn more_than_one_place_named_is_unknown() {
+    for place in [
+        "France, Germany",
+        "Remote (US or Canada)",
+        "Dallas, TX, France",
+        "EMEA, Germany",
+    ] {
+        assert!(matches!(scope_of(place), Scope::Unknown), "{place}");
+    }
+    // The same place twice, or a longer name over a shorter one, is one place.
+    assert!(matches!(
+        scope_of("Mexico City, Mexico"),
+        Scope::Country("MX")
+    ));
+    assert!(matches!(scope_of("New Mexico, USA"), Scope::Country("US")));
+}
+
+#[test]
+fn pay_words_for_every_period_are_read() {
+    assert_eq!(
+        parse_pay("$5,000 monthly").unwrap().period,
+        Some(PayPeriod::Month)
+    );
+    assert_eq!(
+        parse_pay("$1,200 weekly").unwrap().period,
+        Some(PayPeriod::Week)
+    );
+    assert_eq!(
+        parse_pay("$300 daily").unwrap().period,
+        Some(PayPeriod::Day)
+    );
+    assert_eq!(
+        parse_pay("$50 hourly").unwrap().period,
+        Some(PayPeriod::Hour)
+    );
+    assert_eq!(
+        parse_pay("£60,000 per annum").unwrap().period,
+        Some(PayPeriod::Year)
+    );
+}
+
+#[test]
+fn a_figure_with_no_period_is_a_year_only_from_20000() {
+    assert_eq!(parse_pay("$20,000").unwrap().period, Some(PayPeriod::Year));
+    let unsure = parse_pay("$5,000").unwrap();
+    assert_eq!(unsure.period, None);
+    assert!(matches!(
+        compare(
+            &unsure,
+            &PayWish {
+                amount: 1,
+                currency: "USD".into(),
+                period: PayPeriod::Year
+            }
+        ),
+        PayCompare::NotCompared("period")
+    ));
+    assert_eq!(parse_pay("$500"), None);
+}
+
+#[test]
+fn a_stipend_is_not_pay() {
+    for text in ["$5,000 stipend", "stipend of $2,000", "a $30,000 stipend"] {
+        assert_eq!(parse_pay(text), None, "{text}");
+    }
+}
+
+#[test]
+fn indian_grouping_is_read() {
+    assert_eq!(
+        parse_pay("₹12,00,000 per year").unwrap().min,
+        Some(1_200_000)
+    );
+    assert_eq!(parse_pay("₹1,00,000 per month").unwrap().min, Some(100_000));
+    assert_eq!(
+        parse_pay("$10,000,000 per year").unwrap().min,
+        Some(10_000_000)
+    );
+    assert_eq!(parse_pay("$120,000 per year").unwrap().min, Some(120_000));
+}
+
+#[test]
+fn a_bonus_beside_pay_does_not_take_the_pay_away() {
+    let a = parse_pay("$100,000 – $120,000, annual bonus").unwrap();
+    assert_eq!((a.min, a.max), (Some(100_000), Some(120_000)));
+    let b = parse_pay("$120,000 + bonus").unwrap();
+    assert_eq!(b.min, Some(120_000));
+    assert_eq!(parse_pay("$10,000 annual bonus"), None);
+}
+
+#[test]
+fn parser_input_is_capped() {
+    let pad = "x ".repeat(150_000);
+    assert!(parse_pay(&format!("{pad} $90,000 per year")).is_none());
+    assert!(parse_pay(&format!("$90,000 per year {pad}")).is_some());
+    let v = vocabulary(&[]);
+    assert!(skills_in(&format!("{pad} Rust"), &[], &v).is_empty());
+    assert_eq!(skills_in(&format!("Rust {pad}"), &[], &v), ["Rust"]);
+    assert_eq!(seniority_of("Engineer", &format!("{pad} 7+ years")), None);
+    assert!(!mentions_authorization(&format!("{pad} right to work")));
+}
+
+async fn stored(db: &Db, id: &str) -> (Option<String>, Option<String>, String, i64) {
+    sqlx::query_as(
+        "SELECT country, seniority, fields_by, mentions_authorization FROM jobs WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_changed_text_keeps_what_a_person_or_model_set_and_recomputes_rules() {
+    let (_tmp, db) = open().await;
+    let decl = connectors::find("remoteok").unwrap().decl();
+    for by in ["user", "model"] {
+        let mut p = posting("Remote, Portugal", Some("PT"), "Needs 5+ years.");
+        p.external_id = format!("keep-{by}");
+        let Upserted::Added(id) = upsert_posting(&db, decl, "", None, &p).await.unwrap() else {
+            panic!("added")
+        };
+        sqlx::query(
+            "UPDATE jobs SET fields_by = ?, country = 'FR', seniority = 'staff', location = 'Paris' \
+             WHERE id = ?",
+        )
+        .bind(by)
+        .bind(&id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let mut changed = p.clone();
+        changed.raw = "Needs 1 year of experience. Right to work required.".into();
+        changed.location = "Remote, Spain".into();
+        changed.country = Some("ES".into());
+        let Upserted::Updated(_) = upsert_posting(&db, decl, "", None, &changed).await.unwrap()
+        else {
+            panic!("updated")
+        };
+        let (country, seniority, fields_by, _) = stored(&db, &id).await;
+        assert_eq!(country.as_deref(), Some("FR"), "{by}");
+        assert_eq!(seniority.as_deref(), Some("staff"), "{by}");
+        assert_eq!(fields_by, by);
+        let location: String = sqlx::query_scalar("SELECT location FROM jobs WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(location, "Paris");
+    }
+
+    let mut p = posting("", None, "Needs 5+ years.");
+    p.external_id = "ruled".into();
+    let Upserted::Added(id) = upsert_posting(&db, decl, "", None, &p).await.unwrap() else {
+        panic!("added")
+    };
+    sqlx::query("UPDATE jobs SET fields_by = 'rules' WHERE id = ?")
+        .bind(&id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let mut changed = p.clone();
+    changed.raw = "Needs 1 year of experience. Right to work required.".into();
+    upsert_posting(&db, decl, "", None, &changed).await.unwrap();
+    let (_, seniority, fields_by, flag) = stored(&db, &id).await;
+    assert_eq!(seniority.as_deref(), Some("junior"));
+    assert_eq!(fields_by, "rules");
+    assert_eq!(flag, 1);
+}

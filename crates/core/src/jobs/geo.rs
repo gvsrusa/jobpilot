@@ -140,32 +140,42 @@ pub fn countries() -> &'static [Country] {
     &table().countries
 }
 
-/// What a location says about where. Order of strength: the longest phrase in the table (so
-/// `New Mexico` is not `Mexico`, and `Anywhere in the World` is not a place), then a state or
-/// province's two-letter form after a comma, then a country's own code after a comma.
+/// What a location says about where: the places the table names, longest name first, and a
+/// two-letter form after a comma. Exactly one place is a place; none, several, or a form that is
+/// both a state or province and a country code is `Unknown`.
 // ponytail: a city names nothing. `Lausanne` is `Unknown` until the table grows past states,
 // provinces, and countries, and a place written in another language is read only by the
 // aliases listed.
 pub fn scope_of(location: &str) -> Scope {
     let table = table();
+    let location = super::capped(location);
     let folded = fold(location);
     let words: Vec<&str> = folded.split(' ').filter(|w| !w.is_empty()).collect();
-    let mut best: Option<(usize, usize, Scope)> = None;
+    // Every phrase the table knows, with where it sits, strongest first.
+    let mut matches: Vec<(usize, usize, usize, Scope)> = Vec::new();
     for start in 0..words.len() {
         for len in 1..=LONGEST.min(words.len() - start) {
             let phrase = words[start..start + len].join(" ");
             if let Some(&scope) = table.phrases.get(&phrase) {
-                let strength = (len, phrase.len());
-                if best.is_none_or(|(l, p, _)| strength > (l, p)) {
-                    best = Some((strength.0, strength.1, scope));
-                }
+                matches.push((start, len, phrase.len(), scope));
             }
         }
     }
-    if let Some((_, _, scope)) = best {
-        return scope;
+    matches.sort_by(|a, b| (b.1, b.2, a.0).cmp(&(a.1, a.2, b.0)));
+    // A longer name covers the shorter one inside it (`New Mexico` is not `Mexico`).
+    let mut taken = vec![false; words.len()];
+    let mut named: Vec<Scope> = Vec::new();
+    for (start, len, _, scope) in matches {
+        if taken[start..start + len].iter().any(|t| *t) {
+            continue;
+        }
+        taken[start..start + len].iter_mut().for_each(|t| *t = true);
+        if !named.contains(&scope) {
+            named.push(scope);
+        }
     }
-    // After a comma, the first word of a part, in capitals, as it was written.
+    // After a comma, the first word of a part, in capitals, as it was written. A form that is
+    // both a state or province and a country code (`DE`, `IN`, `NL`, `CA`) is not decided.
     for part in location.split(',').skip(1) {
         let Some(word) = part.split_whitespace().next() else {
             continue;
@@ -174,14 +184,31 @@ pub fn scope_of(location: &str) -> Scope {
         if word.len() != 2 || !word.chars().all(|c| c.is_ascii_uppercase()) {
             continue;
         }
-        if let Some(&country) = table.subdivisions.get(word) {
-            return Scope::Country(country);
-        }
-        if let Some(&code) = table.codes.get(word) {
-            return Scope::Country(code);
+        match (table.subdivisions.get(word), table.codes.get(word)) {
+            (Some(_), Some(_)) => return Scope::Unknown,
+            (Some(&country), None) | (None, Some(&country)) => {
+                let scope = Scope::Country(country);
+                if !named.contains(&scope) {
+                    named.push(scope);
+                }
+            }
+            (None, None) => {}
         }
     }
-    Scope::Unknown
+    // `US` in capitals is the one two-letter country form read anywhere (`Remote (US or
+    // Canada)`); it is a place like any other, so it also makes a second place.
+    if location
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| w == "US")
+        && !named.contains(&Scope::Country("US"))
+    {
+        named.push(Scope::Country("US"));
+    }
+    // More than one place named is none: a wrong country is worse than an unknown one.
+    match named.as_slice() {
+        [one] => *one,
+        _ => Scope::Unknown,
+    }
 }
 
 /// Whether the region (`EMEA`, `eu`) holds the country code. An unknown region holds nothing.

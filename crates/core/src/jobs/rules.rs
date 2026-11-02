@@ -96,6 +96,7 @@ static YEARS_OF: LazyLock<Regex> = LazyLock::new(|| {
 // ponytail: English only. A years figure that is about the company (`25+ years in business`)
 // reads as a requirement, and the first figure in the text is the only one read.
 pub fn seniority_of(title: &str, text: &str) -> Option<Seniority> {
+    let text = super::capped(text);
     if let Some(level) = title_level(title) {
         return Some(level);
     }
@@ -187,6 +188,7 @@ fn found(hay: &str, name: &str, exact: bool) -> bool {
 /// only as the capital word.
 // ponytail: a capitalised `Go` that starts a sentence (`Go to market`) is read as the language.
 pub fn skills_in(text: &str, tags: &[String], vocabulary: &[String]) -> Vec<String> {
+    let text = super::capped(text);
     let lower = text.to_lowercase();
     let mut out: Vec<String> = Vec::new();
     for entry in vocabulary {
@@ -210,7 +212,7 @@ pub fn skills_in(text: &str, tags: &[String], vocabulary: &[String]) -> Vec<Stri
 /// Whether the text speaks of work authorization at all. It sets a flag to show; nothing reads
 /// the words to decide anything (FR-4.10).
 pub fn mentions_authorization(text: &str) -> bool {
-    crate::drafts::states_authorization(text)
+    crate::drafts::states_authorization(super::capped(text))
 }
 
 #[derive(Debug, Clone, PartialEq)]
