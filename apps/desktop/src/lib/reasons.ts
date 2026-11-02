@@ -65,7 +65,7 @@ const REASONS: [word: string, text: string][] = [
   ],
   [
     "model_has_tools",
-    "That model searches by itself, so JobPilot cannot keep it from tools while it reads a job posting. Choose one without search or deep-research in its name, and without :online.",
+    "That model searches by itself or drives a computer, so JobPilot cannot keep it from tools while it reads a job posting. Choose one without search, research, or computer-use in its name, and without :online.",
   ],
   [
     "model_not_found",

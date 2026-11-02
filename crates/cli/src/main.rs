@@ -301,9 +301,9 @@ fn message(error: &Error) -> String {
                 .into()
         }
         Error::ManualRequired(reason) | Error::Refused(reason) if reason == "model_has_tools" => {
-            "That model searches by itself, so JobPilot cannot keep it from tools while it reads \
-             a job posting. Choose one without search or deep-research in its name, and without \
-             :online."
+            "That model searches by itself or drives a computer, so JobPilot cannot keep it from \
+             tools while it reads a job posting. Choose one without search, research, or \
+             computer-use in its name, and without :online."
                 .into()
         }
         Error::ManualRequired(reason) if reason == "model_not_found" => {
@@ -608,6 +608,7 @@ mod tests {
             let text = message(&error);
             assert!(text.contains("searches by itself"), "{text}");
             assert!(text.contains(":online"), "{text}");
+            assert!(text.contains("computer-use"), "{text}");
         }
         let text = message(&Error::ManualRequired("model_not_found".into()));
         assert!(text.contains("does not know that model id"), "{text}");

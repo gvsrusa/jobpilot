@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 const PATH: &str = "/chat/completions";
+const USAGE_CAP: &str = "You have reached your specified API usage limits. Access returns on x.";
 const KEY: &str = "sk-test";
 const JOB: &str = r#"{"title":"Engineer","company":"Acme","location":"Oslo","remote":"hybrid",
     "skills":["Rust"],"seniority":"senior","compensation":""}"#;
@@ -271,9 +272,9 @@ async fn a_reply_that_did_not_end_cleanly_is_not_an_answer() {
     let good = json!({"message": {"content": JOB}, "finish_reason": "stop"});
     let choices = |second: Value| Canned::json(200, &json!({"choices": [good, second]}));
     let cases = [
-        // A value that is not a non-empty list is still a tool call field.
+        // Only an empty list holds no call. Any other value is still a tool call field.
         (
-            answer(json!({"content": JOB, "tool_calls": []}), "stop"),
+            answer(json!({"content": JOB, "tool_calls": {}}), "stop"),
             "permission_denied",
         ),
         (
@@ -341,6 +342,8 @@ async fn a_clean_reply_still_reads() {
         json!({"choices": [{"message": {"content": JOB, "refusal": null, "tool_calls": null},
                             "finish_reason": "stop"}]}),
         json!({"choices": [{"message": {"content": JOB, "refusal": ""},
+                            "finish_reason": "stop"}]}),
+        json!({"choices": [{"message": {"content": JOB, "tool_calls": []},
                             "finish_reason": "stop"}]}),
     ];
     for reply in cases {
@@ -480,7 +483,28 @@ async fn statuses_map_to_their_reasons() {
             word("credit_balance_exhausted"),
             "refused: quota_exhausted",
         ),
-        (429, word("spend_limit"), "refused: quota_exhausted"),
+        (429, word("spend_limit"), "rate limited"),
+        (400, word("spend_limit"), "failed: http_400"),
+        (
+            429,
+            word("enforced_spend_limit_reached"),
+            "refused: quota_exhausted",
+        ),
+        (
+            400,
+            word("enforced_spend_limit_reached"),
+            "refused: quota_exhausted",
+        ),
+        (
+            400,
+            json!({"error": {"message": USAGE_CAP}}),
+            "refused: quota_exhausted",
+        ),
+        (
+            429,
+            json!({"error": {"message": USAGE_CAP}}),
+            "refused: quota_exhausted",
+        ),
         (429, word("usage_limit"), "refused: quota_exhausted"),
         (
             400,
@@ -848,6 +872,13 @@ fn check_model_holds_the_origin_rules() {
         ("anthropic", "claude-deep-research-x"),
         ("google", "deep-research-pro-preview"),
         ("google", "gemini-search-x"),
+        ("anthropic", "claude-research-x"),
+        ("google", "gemini-research-x"),
+        ("anthropic", "claude-computer-use-x"),
+        ("anthropic", "claude-COMPUTER-USE-x"),
+        ("google", "gemini-2.5-computer-use-preview"),
+        ("openai", "computer-use-preview"),
+        ("openrouter", "openai/computer-use-preview"),
     ] {
         assert_eq!(
             check_model(name, bad).unwrap_err().to_string(),

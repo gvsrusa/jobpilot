@@ -249,12 +249,21 @@ async fn an_anthropic_reply_that_did_not_end_cleanly_is_not_an_answer() {
     let text = json!([claude_text(JOB)]);
     for (stop, reason) in [
         ("tool_use", "permission_denied"),
-        ("pause_turn", "bad_reply"),
+        ("pause_turn", "permission_denied"),
+        ("model_context_window_exceeded", "output_truncated"),
         ("something_new", "bad_reply"),
+        ("", "bad_reply"),
     ] {
         let (outcome, rows, _) = claude_reason(claude_says(text.clone(), stop)).await;
         assert!(!matches!(outcome, Outcome::Ok { .. }), "{stop}");
         assert_eq!(rows, [reason], "{stop}");
+    }
+    for reply in [
+        json!({"content": text}),
+        json!({"content": text, "stop_reason": null}),
+    ] {
+        let (_, rows, _) = claude_reason(Canned::json(200, &reply)).await;
+        assert_eq!(rows, ["bad_reply"], "{reply}");
     }
     for stop in ["end_turn", "stop_sequence"] {
         let fake = Fake::start(vec![(MESSAGES, claude_says(text.clone(), stop))]);
@@ -264,7 +273,14 @@ async fn an_anthropic_reply_that_did_not_end_cleanly_is_not_an_answer() {
 
 #[tokio::test]
 async fn a_tool_use_block_stores_nothing() {
-    for kind in ["tool_use", "server_tool_use", "mcp_tool_use"] {
+    for kind in [
+        "tool_use",
+        "server_tool_use",
+        "mcp_tool_use",
+        "tool_result",
+        "web_search_tool_result",
+        "mcp_tool_result",
+    ] {
         // The text would pass validation: the block is what refuses it, wherever it sits.
         let call = json!({"type": kind, "id": "1", "name": "search", "input": {}});
         for content in [
@@ -310,6 +326,21 @@ async fn a_spend_cap_429_with_no_header_does_not_loop() {
 }
 
 #[tokio::test]
+async fn a_spend_cap_400_is_quota_exhausted() {
+    let message = "You have reached your specified API usage limits. You will regain access soon.";
+    let cases = [
+        json!({"type": "error", "error": {"type": "invalid_request_error", "message": message}}),
+        json!({"error": {"message": "ZXQ"}, "error_code": "enforced_spend_limit_reached"}),
+    ];
+    for body in cases {
+        let (outcome, rows, hits) = claude_reason(Canned::json(400, &body)).await;
+        assert_eq!(outcome, manual("quota_exhausted"), "{body}");
+        assert_eq!(rows, ["quota_exhausted"], "{body}");
+        assert_eq!(hits, 1);
+    }
+}
+
+#[tokio::test]
 async fn an_anthropic_reply_with_no_text_is_bad_reply() {
     let thinking_only = json!([{"type": "thinking", "thinking": "ZXQ"}]);
     let error = json!({"type": "error", "error": {"message": "ZXQ-VENDOR-TEXT"}});
@@ -349,7 +380,10 @@ async fn google_request_is_the_documented_shape() {
             .contains("maxLength")
     );
     assert!(config.get("responseSchema").is_none());
-    assert_eq!(body["systemInstruction"]["parts"][0]["text"], "system text");
+    assert_eq!(
+        body["systemInstruction"],
+        json!({"parts": [{"text": "system text"}]})
+    );
     assert_eq!(
         body["contents"],
         json!([{"role": "user", "parts": [{"text": "user text"}]}])
@@ -436,8 +470,11 @@ async fn a_google_reply_that_did_not_end_cleanly_is_not_an_answer() {
     for (finish, reason) in [
         ("MALFORMED_FUNCTION_CALL", "permission_denied"),
         ("UNEXPECTED_TOOL_CALL", "permission_denied"),
+        ("TOO_MANY_TOOL_CALLS", "permission_denied"),
+        ("CONTINUATION", "output_truncated"),
         ("OTHER", "bad_reply"),
         ("SOMETHING_NEW", "bad_reply"),
+        ("FINISH_REASON_UNSPECIFIED", "bad_reply"),
     ] {
         let (outcome, rows, _) = gemini_reason(gemini_says(text.clone(), finish)).await;
         assert!(!matches!(outcome, Outcome::Ok { .. }), "{finish}");
@@ -457,19 +494,24 @@ async fn a_google_reply_that_did_not_end_cleanly_is_not_an_answer() {
         let (_, rows, _) = gemini_reason(Canned::json(200, &reply)).await;
         assert_eq!(rows, [reason], "{reply}");
     }
-    // A candidate may leave its finish out.
-    let fake = Fake::start(vec![(
-        GENERATE,
-        Canned::json(200, &json!({"candidates": [{"content": {"parts": text}}]})),
-    )]);
-    assert_eq!(complete(&google(&fake)).await.unwrap(), JOB);
+    // With no finish the model has not said it stopped, and only a normal end accepts text.
+    let open = json!({"candidates": [{"content": {"parts": text}}]});
+    let (_, rows, _) = gemini_reason(Canned::json(200, &open)).await;
+    assert_eq!(rows, ["bad_reply"]);
 }
 
 #[tokio::test]
 async fn a_function_call_part_stores_nothing() {
     let call = json!({"functionCall": {"name": "search", "args": {}}});
     let code = json!({"executableCode": {"language": "PYTHON", "code": "print(1)"}});
-    for part in [call, code] {
+    let others = [
+        "functionResponse",
+        "toolCall",
+        "toolResponse",
+        "codeExecutionResult",
+    ];
+    let others = others.map(|name| json!({ name: {} }));
+    for part in [call, code].into_iter().chain(others) {
         for parts in [json!([{"text": JOB}, part]), json!([part, {"text": JOB}])] {
             let (outcome, rows, hits) = gemini_reason(gemini_says(parts, "STOP")).await;
             assert_eq!(outcome, manual("no_ai"));
@@ -477,6 +519,26 @@ async fn a_function_call_part_stores_nothing() {
             assert_eq!(hits, 1);
         }
     }
+}
+
+/// Forum sources only, so Task 11 confirms this body. Without the reason it stays `http_400`.
+#[tokio::test]
+async fn a_bad_google_key_is_auth_failed_and_any_other_400_stays_http_400() {
+    let detail = json!({"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                        "reason": "API_KEY_INVALID", "domain": "googleapis.com"});
+    let error = |details: Value| {
+        let error = json!({"code": 400, "message": "ZXQ", "status": "INVALID_ARGUMENT",
+                           "details": details});
+        Canned::json(400, &json!({ "error": error }))
+    };
+    let (outcome, rows, hits) = gemini_reason(error(json!([detail]))).await;
+    assert_eq!(outcome, manual("auth_failed"));
+    assert_eq!(rows, ["auth_failed"]);
+    assert_eq!(hits, 1);
+
+    let fake = Fake::start(vec![(GENERATE, error(json!([])))]);
+    let failed = complete(&google(&fake)).await.unwrap_err();
+    assert_eq!(failed.to_string(), "failed: http_400");
 }
 
 #[tokio::test]

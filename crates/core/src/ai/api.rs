@@ -37,6 +37,21 @@ const GOOGLE_REFUSED: [&str; 5] = [
     "PROHIBITED_CONTENT",
     "SPII",
 ];
+/// A tool or function call that ended the reply, even a malformed one.
+const GOOGLE_TOOL_ENDS: [&str; 3] = [
+    "MALFORMED_FUNCTION_CALL",
+    "UNEXPECTED_TOOL_CALL",
+    "TOO_MANY_TOOL_CALLS",
+];
+/// Parts only a tool call or its result can hold.
+const GOOGLE_TOOL_PARTS: [&str; 6] = [
+    "functionCall",
+    "functionResponse",
+    "executableCode",
+    "codeExecutionResult",
+    "toolCall",
+    "toolResponse",
+];
 const ENDPOINT_URL: &str = "ai.endpoint.url";
 const ENDPOINT_MODEL: &str = "ai.model.endpoint";
 const ENDPOINT: &str = "endpoint";
@@ -50,15 +65,23 @@ const OPENROUTER_ORIGINS: [&str; 3] = ["openai/", "anthropic/", "google/"];
 const OPENROUTER_SUFFIXES: [&str; 2] = ["nitro", "floor"];
 /// OpenRouter's suffix that turns on web search. Named so the refusal can say why.
 const OPENROUTER_SEARCH_SUFFIX: &str = "online";
-/// These models search by themselves, with no `tools` field to leave out, so `NoTools` would be
-/// false. The endpoint is exempt: its names are the user's, and it has no such vendor model.
-const SEARCH_MODEL_WORDS: [&str; 2] = ["search", "deep-research"];
-const QUOTA_WORDS: [&str; 4] = [
+/// These models search or drive a computer by themselves, with no `tools` field to leave out, so
+/// `NoTools` would be false. `search` also catches `research`. The endpoint is exempt: its names
+/// are the user's, and it has no such vendor model.
+const TOOL_MODEL_WORDS: [&str; 2] = ["search", "computer-use"];
+const QUOTA_WORDS: [&str; 3] = [
     "insufficient_quota",
     "credit_balance_exhausted",
-    "spend_limit",
     "usage_limit",
 ];
+/// Anthropic's limit on a workspace's spend: the `error_code`, and the start of the message.
+/// Sent as a 400, so unlike `QUOTA_WORDS` these count there too.
+const SPEND_CAP_WORDS: [&str; 2] = [
+    "enforced_spend_limit_reached",
+    "you have reached your specified api usage limits",
+];
+/// Google answers a bad key with a 400, in `details[].reason`. Any other 400 stays `http_400`.
+const GOOGLE_BAD_KEY_WORD: &str = "api_key_invalid";
 const OVERFLOW_WORDS: [&str; 4] = [
     "context_length_exceeded",
     "maximum context length",
@@ -375,15 +398,17 @@ fn read_reply(wire: Wire, body: &[u8]) -> Result<String> {
 }
 
 /// Every choice counts, though only the first is read: no request asks for two. A `tool_calls`
-/// field of any value counts, as no request here named a tool. A missing finish reads as clean,
-/// as some local servers leave it out, and the schema check still stands.
+/// field counts unless it is empty, as no request here named a tool. A missing finish reads as
+/// clean, as some local servers leave it out, and the schema check still stands.
 fn read_chat(reply: &Value) -> Reading {
     let mut reading = Reading::default();
     for choice in items(&reply["choices"]) {
         let message = &choice["message"];
         let finish = choice["finish_reason"].as_str().unwrap_or("stop");
         let refusal = &message["refusal"];
-        reading.tool_call |= !message["tool_calls"].is_null()
+        let calls = &message["tool_calls"];
+        let no_calls = calls.is_null() || calls.as_array().is_some_and(Vec::is_empty);
+        reading.tool_call |= !no_calls
             || !message["function_call"].is_null()
             || matches!(finish, "tool_calls" | "function_call");
         reading.refused |= (!refusal.is_null() && refusal != "") || finish == "content_filter";
@@ -399,40 +424,39 @@ fn read_chat(reply: &Value) -> Reading {
     reading
 }
 
-/// `ends_with`: server and MCP tool blocks count too, and no request here asked for any.
+/// Only a normal end accepts text. Every other stop reason, a missing one too, is failed here,
+/// and `read_reply` names it first if a flag above that says more. `tool_` in a block's type:
+/// server and MCP tools and their results count too, and no request here asked for any.
 /// Thinking blocks are neither a tool nor the answer.
 fn read_anthropic(reply: &Value) -> Reading {
     let blocks = items(&reply["content"]);
-    let stop = reply["stop_reason"].as_str().unwrap_or("end_turn");
+    let stop = reply["stop_reason"].as_str().unwrap_or_default();
     Reading {
-        tool_call: stop == "tool_use" || blocks.iter().any(|b| kind(b).ends_with("tool_use")),
+        tool_call: matches!(stop, "tool_use" | "pause_turn")
+            || blocks.iter().any(|b| kind(b).contains("tool_")),
         refused: stop == "refusal",
-        truncated: stop == "max_tokens",
-        failed: !matches!(
-            stop,
-            "end_turn" | "stop_sequence" | "tool_use" | "refusal" | "max_tokens"
-        ),
+        truncated: matches!(stop, "max_tokens" | "model_context_window_exceeded"),
+        failed: !matches!(stop, "end_turn" | "stop_sequence"),
         text: joined(blocks.iter().filter(|b| kind(b) == "text")),
     }
 }
 
-/// `executableCode` is Google's code tool, called as `functionCall` is. A thought is not the
-/// answer. Every candidate counts, though only the first is read: no request asks for two. A
-/// finish ending `_CALL` is a tool or function call, even a malformed one.
+/// Only `STOP` accepts text, as in `read_anthropic`, and a missing finish means the model has not
+/// stopped. A thought is not the answer. Every candidate counts, though only the first is read:
+/// no request asks for two.
 fn read_google(reply: &Value) -> Reading {
     let mut reading = Reading {
         refused: !reply["promptFeedback"]["blockReason"].is_null(),
         ..Reading::default()
     };
     for candidate in items(&reply["candidates"]) {
-        let finish = candidate["finishReason"].as_str().unwrap_or("STOP");
-        let named = finish.ends_with("_CALL");
-        let filtered = GOOGLE_REFUSED.contains(&finish);
-        let called = |p: &Value| !p["functionCall"].is_null() || !p["executableCode"].is_null();
-        reading.tool_call |= named || items(&candidate["content"]["parts"]).iter().any(called);
-        reading.refused |= filtered;
-        reading.truncated |= finish == "MAX_TOKENS";
-        reading.failed |= !(named || filtered || matches!(finish, "STOP" | "MAX_TOKENS"));
+        let finish = candidate["finishReason"].as_str().unwrap_or_default();
+        let called = |p: &Value| GOOGLE_TOOL_PARTS.iter().any(|name| !p[*name].is_null());
+        reading.tool_call |= GOOGLE_TOOL_ENDS.contains(&finish)
+            || items(&candidate["content"]["parts"]).iter().any(called);
+        reading.refused |= GOOGLE_REFUSED.contains(&finish);
+        reading.truncated |= matches!(finish, "MAX_TOKENS" | "CONTINUATION");
+        reading.failed |= finish != "STOP";
     }
     let parts = items(&reply["candidates"][0]["content"]["parts"]);
     reading.text = joined(parts.iter().filter(|p| p["thought"] != true));
@@ -477,10 +501,10 @@ pub fn check_model(name: &str, model: &str) -> Result<()> {
         None => (model, None),
     };
     let lower = model.to_ascii_lowercase();
-    let searches = SEARCH_MODEL_WORDS.iter().any(|word| lower.contains(word));
+    let has_tools = TOOL_MODEL_WORDS.iter().any(|word| lower.contains(word));
     let online = name == "openrouter"
         && suffix.is_some_and(|s| s.to_ascii_lowercase().contains(OPENROUTER_SEARCH_SUFFIX));
-    if searches || online {
+    if has_tools || online {
         return Err(Error::Refused("model_has_tools".into()));
     }
     let eligible = OPENROUTER_ORIGINS.iter().any(|o| id.starts_with(o))
@@ -610,7 +634,9 @@ pub(crate) fn classify_status(status: u16, retry_after: Option<Duration>, body: 
     match status {
         401 | 403 => Error::Refused("auth_failed".into()),
         402 => Error::Refused("quota_exhausted".into()),
+        400 | 429 if holds(&SPEND_CAP_WORDS) => Error::Refused("quota_exhausted".into()),
         429 if holds(&QUOTA_WORDS) => Error::Refused("quota_exhausted".into()),
+        400 if holds(&[GOOGLE_BAD_KEY_WORD]) => Error::Refused("auth_failed".into()),
         404 => Error::Refused("model_not_found".into()),
         400 | 413 if holds(&OVERFLOW_WORDS) => Error::Refused("prompt_too_large".into()),
         429 | 503 | 529 => Error::RateLimited { retry_after },
@@ -621,6 +647,38 @@ pub(crate) fn classify_status(status: u16, retry_after: Option<Duration>, body: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The addresses are spelled out, not the constants, so swapping two bases fails here.
+    #[tokio::test]
+    async fn from_settings_gives_each_provider_its_own_host_and_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::AppPaths::new(tmp.path().join("data"));
+        let db = Db::open(&paths).await.unwrap();
+        set_model(&db, "google", "m").await.unwrap();
+        for (name, url) in [
+            ("openai", "https://api.openai.com/v1/chat/completions"),
+            (
+                "openrouter",
+                "https://openrouter.ai/api/v1/chat/completions",
+            ),
+            ("anthropic", "https://api.anthropic.com/v1/messages"),
+            (
+                "google",
+                "https://generativelanguage.googleapis.com/v1beta/models/m:generateContent",
+            ),
+        ] {
+            let provider = ApiProvider::from_settings(&db, name)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(provider.url(), url, "{name}");
+            assert_eq!(provider.info.name, name);
+            assert!(
+                matches!(&provider.key, KeySource::Keychain(held) if held == name),
+                "{name}"
+            );
+        }
+    }
 
     /// Debug output of a request must never show a key, on any wire.
     #[test]

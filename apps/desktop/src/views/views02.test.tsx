@@ -1112,6 +1112,7 @@ describe("ai", () => {
     expect(said("origin_refused")).toMatch(/not eligible through OpenRouter/);
     expect(said("model_has_tools")).toMatch(/searches by itself/);
     expect(said("model_has_tools")).toMatch(/:online/);
+    expect(said("model_has_tools")).toMatch(/computer-use/);
     expect(said("model_not_found")).toMatch(/does not know that model id/);
     expect(said("model_not_found")).toMatch(/Model id/);
     expect(said("model_refused")).toMatch(/declined this task/);
