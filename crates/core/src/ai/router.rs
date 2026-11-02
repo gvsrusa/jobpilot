@@ -10,6 +10,7 @@ use serde_json::json;
 
 use super::api::ApiProvider;
 use super::claude_code::ClaudeCode;
+use super::codex_cli::CodexCli;
 use super::consent::ConsentState;
 use super::gemini_cli::GeminiCli;
 use super::net::MAX_RETRY_WAIT;
@@ -55,6 +56,7 @@ const GOOGLE: &str = "google";
 const OPENROUTER: &str = "openrouter";
 const ENDPOINT: &str = "endpoint";
 const GEMINI_CLI: &str = "gemini_cli";
+const CODEX_CLI: &str = "codex_cli";
 
 /// Providers in user order. No-AI is not in the list: it runs last, outside the checks.
 /// Holds no `Db`, so build one per call and nothing blocks a restore.
@@ -126,6 +128,13 @@ impl Router {
                         .await
                         .unwrap_or_else(|_| GeminiCli::with_binary(PathBuf::new()));
                     providers.push(Box::new(gemini));
+                }
+                CODEX_CLI => {
+                    // Listed so the run log shows why it was skipped: no task qualifies today.
+                    let codex = CodexCli::locate_in(db)
+                        .await
+                        .unwrap_or_else(|_| CodexCli::with_binary(PathBuf::new()));
+                    providers.push(Box::new(codex));
                 }
                 OPENAI | ANTHROPIC | GOOGLE | OPENROUTER | ENDPOINT => {
                     match ApiProvider::from_settings(db, name).await? {

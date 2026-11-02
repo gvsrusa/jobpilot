@@ -3441,6 +3441,34 @@ mod tests {
         assert_eq!(row["runs_job_text"], true);
     }
 
+    /// Found and not started, and the row says it runs no job text: no tools are proven.
+    #[test]
+    fn ai_status_says_codex_runs_no_job_text() {
+        let h = ready();
+        {
+            // A setting that names another program stops discovery: no installed `claude` runs.
+            let state = h.app.state::<AppState>();
+            let db = block_on(state.db.read());
+            let claude = json!("/bin/sh");
+            let set = jobpilot_core::settings::set(db.as_ref().unwrap(), "ai.claude_path", &claude);
+            block_on(set).unwrap();
+        }
+        let mock = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../crates/core/tests/mock-codex")
+            .join(if cfg!(windows) { "codex.cmd" } else { "codex" });
+        h.pick(&mock);
+        h.ok("ai_set_cli_path", json!({ "provider": "codex_cli" }));
+
+        let status = h.ok("ai_status", json!({}));
+        let rows = status["external"].as_array().unwrap();
+        let row = rows.iter().find(|row| row["name"] == "codex_cli").unwrap();
+        assert_eq!(row["path"], json!(mock));
+        assert_eq!(row["available"], true);
+        assert_eq!(row["runs_job_text"], false);
+        let gemini = rows.iter().find(|row| row["name"] == "gemini_cli").unwrap();
+        assert_eq!(gemini["runs_job_text"], true);
+    }
+
     #[test]
     fn clearing_a_cli_path_that_is_not_set_asks_nothing() {
         let h = ready();

@@ -1,7 +1,7 @@
 #[path = "../../core/tests/fake_http/mod.rs"]
 mod fake_http;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use fake_http::{Canned, Fake};
@@ -587,6 +587,125 @@ fn gemini_cli_absent_shows_unavailable() {
     assert_eq!(row["available"], false);
     assert_eq!(row["reason"], "not_installed");
     assert_eq!(row["path"], serde_json::Value::Null);
+}
+
+/// The mock Codex CLI behind a wrapper that sets `vars`, and the file its stdin lands in.
+fn codex_with(home: &Path, vars: &[(&str, &str)]) -> (String, PathBuf) {
+    let dir = home.parent().unwrap();
+    let stdin = dir.join("codex-stdin");
+    let mocks = Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/tests/mock-codex");
+    let stdin_var = ("MOCK_CODEX_STDIN", stdin.to_str().unwrap());
+    let all = std::iter::once(&stdin_var).chain(vars);
+    if cfg!(windows) {
+        let wrapper = dir.join("codex.cmd");
+        let mut script = String::from("@echo off\r\n");
+        for (name, value) in all {
+            script.push_str(&format!("set \"{name}={value}\"\r\n"));
+        }
+        script.push_str(&format!(
+            "call \"{}\" %*\r\n",
+            mocks.join("codex.cmd").display()
+        ));
+        std::fs::write(&wrapper, script).unwrap();
+        return (wrapper.to_str().unwrap().to_owned(), stdin);
+    }
+    let wrapper = dir.join("codex");
+    let mut script = String::from("#!/bin/sh\n");
+    for (name, value) in all {
+        script.push_str(&format!("export {name}='{value}'\n"));
+    }
+    script.push_str(&format!(
+        "exec '{}' \"$@\"\n",
+        mocks.join("codex").display()
+    ));
+    std::fs::write(&wrapper, script).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &wrapper,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    (wrapper.to_str().unwrap().to_owned(), stdin)
+}
+
+#[test]
+fn codex_is_skipped_for_a_draft_and_says_why() {
+    let (_dir, home) = fresh_home();
+    let (job, _reply) = draftable(&home);
+    let (bin, stdin) = codex_with(&home, &[]);
+    let env = [
+        ("JOBPILOT_CODEX_BIN", bin.as_str()),
+        ("JOBPILOT_CLAUDE_BIN", "not-a-path"),
+    ];
+    for args in [
+        vec!["ai", "disable", "ollama"],
+        vec!["ai", "enable", "codex_cli"],
+        vec![
+            "ai",
+            "consent",
+            "give",
+            "codex_cli",
+            "--categories",
+            DRAFT_CONSENT,
+            "--attest",
+        ],
+    ] {
+        let output = run_env(&home, &args, &env);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            stderr_text(&output)
+        );
+    }
+    let made = run_env(&home, &["resume", "generate", &job], &env);
+    assert_eq!(made.status.code(), Some(1));
+    assert!(
+        stderr_text(&made).starts_with("error[manual_required]"),
+        "{}",
+        stderr_text(&made)
+    );
+    assert!(!stdin.exists(), "Codex was started for a draft");
+    let shown = run_env(&home, &["ai", "consent", "show", "codex_cli"], &env);
+    let shown = String::from_utf8_lossy(&shown.stdout).to_string();
+    assert!(
+        shown.contains("skipped, this provider cannot prove it has no tools"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("Skipped") || shown.contains("skipped"),
+        "{shown}"
+    );
+}
+
+/// The owner's install today: `codex --version` exits 1. Enabling it is what probes it
+/// (decision 28), so the row reads unavailable only after that.
+#[test]
+fn codex_failing_its_version_shows_unavailable() {
+    let (_dir, home) = fresh_home();
+    let (bin, stdin) = codex_with(&home, &[("MOCK_CODEX_VERSION_EXIT", "1")]);
+    let env = [
+        ("JOBPILOT_CODEX_BIN", bin.as_str()),
+        ("JOBPILOT_CLAUDE_BIN", "not-a-path"),
+    ];
+    let row = || {
+        let status = stdout_json(&run_env(&home, &["ai", "status", "--json"], &env));
+        let rows = status["external"].as_array().unwrap();
+        rows.iter()
+            .find(|row| row["name"] == "codex_cli")
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(row()["available"], true, "off, so never started");
+    assert!(
+        run_env(&home, &["ai", "enable", "codex_cli"], &env)
+            .status
+            .success()
+    );
+    let on = row();
+    assert_eq!(on["available"], false, "{on}");
+    assert!(on["reason"].is_string(), "{on}");
+    assert_eq!(on["runs_job_text"], false, "{on}");
+    assert!(!stdin.exists());
 }
 
 /// An nvm install under a GUI launch: only the login shell can find it, and the quick look an

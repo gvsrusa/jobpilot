@@ -24,6 +24,7 @@ use register::ProviderKind;
 pub mod api;
 pub mod child;
 pub mod claude_code;
+pub mod codex_cli;
 pub mod consent;
 pub mod gemini_cli;
 pub mod net;
@@ -547,8 +548,6 @@ async fn bounded_cli_row(db: &Db, name: &str, enabled: bool) -> CliRow {
 }
 
 /// A provider row's availability, by the same checks routing uses. Opens no socket.
-// ponytail: an API row reads `not_built` until its adapter lands; the Codex adapter comes in
-// Task 8.
 async fn api_availability(
     db: &Db,
     info: &register::ProviderInfo,

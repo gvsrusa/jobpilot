@@ -204,6 +204,9 @@ export function ProviderRow(props: {
       {row.kind === "cli" && row.runs_job_text && (
         <p className="text-muted-foreground">Runs job text with every tool denied.</p>
       )}
+      {row.kind === "cli" && !row.runs_job_text && (
+        <p className="text-muted-foreground">No task can use this yet: it cannot prove it has no tools.</p>
+      )}
       {row.newer_than_checked && (
         <p className="text-muted-foreground">This version is newer than the one JobPilot checked.</p>
       )}

@@ -1105,6 +1105,54 @@ describe("ai", () => {
     expect(within(screen.getByRole("listitem", { name: "Gemini CLI" })).queryByText(/Unavailable/)).toBeNull();
   });
 
+  it("codex_row_says_it_runs_no_task_today", async () => {
+    backend({
+      ai_status: () =>
+        aiWith({
+          external: [
+            external({ name: "codex_cli", label: "Codex CLI", kind: "cli", available: true, reason: null, runs_job_text: false }),
+          ],
+        }),
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "Codex CLI" }));
+    expect(row.getByText("No task can use this yet: it cannot prove it has no tools.")).toBeInTheDocument();
+    expect(row.queryByText("Runs job text with every tool denied.")).toBeNull();
+  });
+
+  it("an_off_codex_only_the_login_shell_finds_says_why_and_can_still_be_turned_on", async () => {
+    let on = false;
+    const row = () =>
+      external({
+        name: "codex_cli",
+        label: "Codex CLI",
+        kind: "cli",
+        consent: ["profile_basic"],
+        available: on,
+        reason: on ? null : "not_searched",
+        path: on ? "/home/me/.nvm/bin/codex" : null,
+        runs_job_text: false,
+      });
+    const b = backend({
+      ai_status: () => aiWith({ external: [row()], enabled: { ollama: true, claude_code: false, codex_cli: on } }),
+      ai_enable: () => {
+        on = true;
+        return null;
+      },
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const shown = within(await screen.findByRole("listitem", { name: "Codex CLI" }));
+    expect(shown.getByText("Unavailable: turn on to look for it")).toBeInTheDocument();
+    expect(shown.getByText("No task can use this yet: it cannot prove it has no tools.")).toBeInTheDocument();
+    const use = shown.getByLabelText("Use Codex CLI");
+    expect(use).toBeEnabled();
+    await user.click(use);
+    expect(b.calls.find((c) => c.cmd === "ai_enable")?.args).toEqual({ provider: "codex_cli", enabled: true });
+    expect(await screen.findByText("/home/me/.nvm/bin/codex")).toBeInTheDocument();
+  });
+
   it("the_account_refused_reason_is_a_hint_naming_antigravity", async () => {
     resumeBackend({
       resume_list: () => [],
