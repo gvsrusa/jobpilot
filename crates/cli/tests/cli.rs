@@ -383,6 +383,224 @@ fn resume_import_generate_compare_export_with_no_ai_is_manual_required() {
     ok(&home, &["resume", "compare", &draft]);
 }
 
+/// A `claude` that always answers with `reply` as its structured output. The child gets a
+/// scrubbed environment, so the mock's knob lives in a wrapper next to the data folder.
+fn claude_saying(home: &Path, reply: &serde_json::Value) -> String {
+    let dir = home.parent().unwrap();
+    let line = serde_json::json!({
+        "type": "result", "subtype": "success", "is_error": false, "result": "",
+        "structured_output": reply, "permission_denials": [],
+    });
+    let reply_file = dir.join("reply.json");
+    std::fs::write(&reply_file, format!("{line}\n")).unwrap();
+    let mocks = Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/tests/mock-claude");
+    if cfg!(windows) {
+        let wrapper = dir.join("claude.cmd");
+        let script = format!(
+            "@echo off\r\nset MOCK_CLAUDE_REPLY={}\r\ncall \"{}\" %*\r\n",
+            reply_file.display(),
+            mocks.join("claude.cmd").display()
+        );
+        std::fs::write(&wrapper, script).unwrap();
+        return wrapper.to_str().unwrap().to_owned();
+    }
+    let wrapper = dir.join("claude");
+    let script = format!(
+        "#!/bin/sh\nexport MOCK_CLAUDE_REPLY='{}'\nexec '{}' \"$@\"\n",
+        reply_file.display(),
+        mocks.join("claude").display()
+    );
+    std::fs::write(&wrapper, script).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &wrapper,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    wrapper.to_str().unwrap().to_owned()
+}
+
+/// Claude first, with consent for these categories, and no Ollama.
+fn claude_only(home: &Path, bin: &str, categories: &str) {
+    let env = [("JOBPILOT_CLAUDE_BIN", bin)];
+    for args in [
+        vec!["ai", "disable", "ollama"],
+        vec!["ai", "enable", "claude_code"],
+        vec!["ai", "order", "claude_code"],
+        vec![
+            "ai",
+            "consent",
+            "give",
+            "claude_code",
+            "--categories",
+            categories,
+        ],
+    ] {
+        let output = run_env(home, &args, &env);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            stderr_text(&output)
+        );
+    }
+}
+
+/// A job, evidence the draft can cite, and a reply that cites it.
+fn draftable(home: &Path) -> (String, serde_json::Value) {
+    let item = stdout_json(&run(
+        home,
+        &[
+            "kb",
+            "add",
+            "experience",
+            "Shipped the Rust compiler",
+            "--json",
+        ],
+    ));
+    let posting = home.parent().unwrap().join("posting.txt");
+    std::fs::write(&posting, "Rust engineer wanted").unwrap();
+    let job = stdout_json(&run(
+        home,
+        &[
+            "job",
+            "paste",
+            "Engineer",
+            "--file",
+            posting.to_str().unwrap(),
+            "--json",
+        ],
+    ));
+    let reply = serde_json::json!({
+        "doc": {
+            "name": "x", "contact": [], "summary": [],
+            "sections": [{"heading": "Experience", "entries": [{
+                "title": "", "subtitle": "", "dates": "",
+                "bullets": ["Shipped the Rust compiler"],
+            }]}],
+        },
+        "claims": [{"text": "Shipped the Rust compiler", "evidence_ids": [item["id"]]}],
+    });
+    (job["id"].as_str().unwrap().to_owned(), reply)
+}
+
+const DRAFT_CONSENT: &str = "job_text,resume_text,profile_basic";
+
+#[test]
+fn resume_generate_appears_in_agents_list() {
+    let (_dir, home) = fresh_home();
+    let (job, reply) = draftable(&home);
+    let bin = claude_saying(&home, &reply);
+    claude_only(&home, &bin, DRAFT_CONSENT);
+    let env = [("JOBPILOT_CLAUDE_BIN", bin.as_str())];
+
+    let made = run_env(&home, &["resume", "generate", &job, "--json"], &env);
+    let made = stdout_json(&made);
+    assert_eq!(made["provider"], "claude_code");
+    assert_eq!(made["blocked"], 0);
+    assert!(made["exported"].is_null());
+    let runs = stdout_json(&run(&home, &["agents", "list", "--json"]));
+    assert_eq!(runs.as_array().unwrap().len(), 1);
+    assert_eq!(runs[0]["agent"], "resume");
+    assert_eq!(runs[0]["state"], "completed");
+    assert_eq!(runs[0]["actor"], "cli");
+    assert_eq!(runs[0]["steps"], 2);
+}
+
+#[test]
+fn resume_generate_export_writes_to_the_exports_folder() {
+    let (_dir, home) = fresh_home();
+    let (job, reply) = draftable(&home);
+    let bin = claude_saying(&home, &reply);
+    claude_only(&home, &bin, DRAFT_CONSENT);
+    let env = [("JOBPILOT_CLAUDE_BIN", bin.as_str())];
+
+    let made = run_env(
+        &home,
+        &[
+            "resume",
+            "generate",
+            &job,
+            "--export",
+            "pdf",
+            "--template",
+            "compact",
+            "--json",
+        ],
+        &env,
+    );
+    let made = stdout_json(&made);
+    let path = std::path::PathBuf::from(made["exported"].as_str().expect("a path"));
+    assert!(path.is_file(), "{path:?}");
+    assert_eq!(path.parent().unwrap(), home.join("exports"));
+    assert_eq!(path.extension().unwrap(), "pdf");
+}
+
+#[test]
+fn memory_refresh_with_no_ai_reports_skipped() {
+    let (_dir, home) = fresh_home();
+    ok(&home, &["ai", "disable", "ollama"]);
+    ok(
+        &home,
+        &["memory", "add-question", "Please certify this is true"],
+    );
+    let done = stdout_json(&run(&home, &["memory", "refresh", "--json"]));
+    assert_eq!(done["classified"]["skipped"], true);
+    assert_eq!(done["classified"]["checked"], 0);
+    let text = ok(&home, &["memory", "refresh"]);
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(text.contains("Checked 0, raised 0, indexed 0"), "{text}");
+    assert!(
+        text.contains("No AI took this; classes come from the rules."),
+        "{text}"
+    );
+    let runs = stdout_json(&run(&home, &["agents", "list", "--json"]));
+    assert_eq!(runs[0]["agent"], "career_memory");
+    assert_eq!(runs[0]["state"], "completed");
+}
+
+#[test]
+fn memory_refresh_prints_the_count_and_waits_for_yes() {
+    let (_dir, home) = fresh_home();
+    let bin = claude_saying(&home, &serde_json::json!({ "class": "sensitive" }));
+    claude_only(&home, &bin, "job_text");
+    let env = [("JOBPILOT_CLAUDE_BIN", bin.as_str())];
+    for i in 0..3 {
+        ok(
+            &home,
+            &[
+                "memory",
+                "add-question",
+                &format!("Describe project number {i}"),
+            ],
+        );
+    }
+
+    let asked = run_env(&home, &["memory", "refresh"], &env);
+    assert!(asked.status.success(), "{}", stderr_text(&asked));
+    let text = String::from_utf8_lossy(&asked.stdout);
+    assert!(
+        text.contains(
+            "This will make up to 3 Claude calls, limit 20. \
+             Run `jobpilot memory refresh --yes` to go ahead."
+        ),
+        "{text}"
+    );
+    let json = stdout_json(&run_env(&home, &["memory", "refresh", "--json"], &env));
+    assert_eq!(json["claude_calls"], 3);
+    let runs = stdout_json(&run(&home, &["agents", "list", "--json"]));
+    assert!(runs.as_array().unwrap().is_empty(), "no run started");
+
+    let done = stdout_json(&run_env(
+        &home,
+        &["memory", "refresh", "--yes", "--json"],
+        &env,
+    ));
+    assert_eq!(done["classified"]["checked"], 3);
+    assert_eq!(done["classified"]["raised"], 3);
+    let runs = stdout_json(&run(&home, &["agents", "list", "--json"]));
+    assert_eq!(runs[0]["agent"], "career_memory");
+}
+
 #[test]
 fn ai_status_json_names_both_providers() {
     let (_dir, home) = fresh_home();

@@ -1,18 +1,24 @@
 //! The agents, as the GUI and the CLI reach them. A workflow is deterministic Rust: a model
 //! gets no tools, and nothing in its output starts anything (`docs/agents.md`).
 
-use crate::ai::CancellationToken;
 use crate::ai::router::Router;
+use crate::ai::{CancellationToken, TaskType};
 use crate::applications::{self, Application};
 use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::runner::{self, Finished, RunInput, RunState, Workflow, store};
 
 pub mod analytics;
+pub mod draft;
+pub mod memory;
 pub mod tracking;
 
 use crate::analytics::Report;
 use analytics::Analytics;
+use draft::DraftWorkflow;
+pub use draft::{draft_cover_letter, draft_resume};
+use memory::MemoryWorkflow;
+pub use memory::{MemoryRefreshed, memory_refresh};
 use tracking::Tracking;
 
 /// Bad input gets its plain error and no run, which also keeps a run's stored input to a
@@ -59,7 +65,7 @@ pub async fn analytics_report(db: &Db, actor: &str, cancel: CancellationToken) -
 /// a resume must not rewind it: the run stays halted, for the person to cancel.
 pub async fn resume_run(
     db: &Db,
-    _router: &Router,
+    router: &Router,
     actor: &str,
     run_id: &str,
     cancel: CancellationToken,
@@ -89,7 +95,25 @@ pub async fn resume_run(
             runner::resume(db, actor, run_id, &workflow, cancel).await
         }
         RunInput::Analytics => runner::resume(db, actor, run_id, &Analytics, cancel).await,
-        _ => Err(Error::Validation("this run cannot resume".into())),
+        RunInput::Resume {
+            job_text_id,
+            export,
+        } => {
+            let workflow = DraftWorkflow::new(TaskType::DraftResume, &job_text_id, export, router);
+            runner::resume(db, actor, run_id, &workflow, cancel).await
+        }
+        RunInput::CoverLetter {
+            job_text_id,
+            export,
+        } => {
+            let task = TaskType::DraftCoverLetter;
+            let workflow = DraftWorkflow::new(task, &job_text_id, export, router);
+            runner::resume(db, actor, run_id, &workflow, cancel).await
+        }
+        RunInput::MemoryRefresh => {
+            let workflow = MemoryWorkflow::new(router, true);
+            runner::resume(db, actor, run_id, &workflow, cancel).await
+        }
     }
 }
 

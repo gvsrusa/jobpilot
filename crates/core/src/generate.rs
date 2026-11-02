@@ -22,8 +22,8 @@ use crate::parse::{self, KNOWN_HEADINGS, SUMMARY_HEADINGS};
 use crate::profile::{self, ProfileBasic};
 use crate::render::{ResumeDoc, cover_letter_doc};
 
-const OPEN: &str = "<<<UNTRUSTED_POSTING>>>";
-const CLOSE: &str = "<<<END_UNTRUSTED_POSTING>>>";
+pub(crate) const OPEN: &str = "<<<UNTRUSTED_POSTING>>>";
+pub(crate) const CLOSE: &str = "<<<END_UNTRUSTED_POSTING>>>";
 /// The smallest window any provider declares, so a typical prompt fits every provider.
 // ponytail: a provider with a larger window gets no more evidence. Pass the limit in when one
 // needs it.
@@ -37,6 +37,9 @@ pub struct Generated {
     /// Claims that are not `ok`. Each blocks export.
     pub blocked: usize,
     pub provider: ProviderId,
+    /// Where the file went, when the draft agent was asked to export. Never set by
+    /// [`resume`] or [`cover_letter`].
+    pub exported: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -206,7 +209,7 @@ fn system_text(task: TaskType) -> String {
 /// catches one that a cut joins back together, in one pass over a 200,000-character posting.
 // ponytail: a marker respelled with spaces or look-alike letters stays in place. The block
 // still closes only at the exact marker; the checks on the reply are the next gate.
-fn neutralise(text: &str) -> String {
+pub(crate) fn neutralise(text: &str) -> String {
     let mut clean = String::with_capacity(text.len());
     for c in text.chars() {
         clean.push(c);
@@ -309,5 +312,6 @@ async fn store(
         draft,
         blocked,
         provider,
+        exported: None,
     })
 }

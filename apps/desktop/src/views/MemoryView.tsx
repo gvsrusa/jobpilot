@@ -260,7 +260,13 @@ function SearchSection() {
     mutationFn: (q: string) => ipc.memorySearch(q, SEARCH_LIMIT),
     onSuccess: (_hits, q) => setAsked(q),
   });
-  const refresh = useMutation({ mutationFn: ipc.memoryRefresh });
+  const client = useQueryClient();
+  const plan = useQuery({ queryKey: ["memory", "refresh-plan"], queryFn: ipc.memoryRefreshPlan });
+  const refresh = useMutation({
+    mutationFn: ipc.memoryRefresh,
+    // A raise changes classes, and the plan counts what is left.
+    onSettled: () => client.invalidateQueries({ queryKey: ["memory"] }),
+  });
   const hits = search.data ?? [];
 
   return (
@@ -288,14 +294,23 @@ function SearchSection() {
         >
           {refresh.isPending ? "Refreshing..." : "Refresh index"}
         </Button>
+        {plan.data && (
+          <span className="pb-1.5 text-xs text-muted-foreground">
+            {plan.data.claude_calls > 0
+              ? `Up to ${plan.data.claude_calls} Claude call${plan.data.claude_calls === 1 ? "" : "s"}, limit 20`
+              : "No Claude calls"}
+          </span>
+        )}
       </form>
-      <ErrorAlert error={search.error ?? refresh.error} />
+      <ErrorAlert error={search.error ?? refresh.error ?? plan.error} />
       {refresh.isSuccess && (
-        <p role="status" className="text-sm text-muted-foreground">
-          {refresh.data === 0
-            ? "Nothing new to embed. Search uses text when no embedding model is set."
-            : `Embedded ${refresh.data} question${refresh.data === 1 ? "" : "s"}.`}
-        </p>
+        <div role="status" className="grid gap-0.5 text-sm text-muted-foreground">
+          <p>
+            Checked {refresh.data.classified.checked}, raised {refresh.data.classified.raised}, indexed{" "}
+            {refresh.data.embedded}
+          </p>
+          {refresh.data.classified.skipped && <p>No AI took this; classes come from the rules.</p>}
+        </div>
       )}
       {asked !== null && hits.length === 0 && (
         <p className="text-sm text-muted-foreground">Nothing matches.</p>

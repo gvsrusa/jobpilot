@@ -1102,19 +1102,26 @@ pub async fn export(
             return Err(Error::Refused("claims_blocked".into()));
         }
     }
-    let bytes = match format {
-        ExportFormat::Docx => to_docx(&draft.doc, template)?,
-        ExportFormat::Pdf => to_pdf(&draft.doc, template)?,
-    };
     let name = format!(
         "{}-v{}.{}",
         slug(&draft.title),
         draft.version,
         format.extension()
     );
-    std::fs::create_dir_all(out_dir)?;
     let path = out_dir.join(name);
-    write_file(&path, &bytes)?;
+    // Rendering and the file write run off the async threads: a runner step shares its
+    // overseer's task, and a stretch that never yields would stall its timeout and heartbeat.
+    let (doc, out_dir, target) = (draft.doc.clone(), out_dir.to_owned(), path.clone());
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let bytes = match format {
+            ExportFormat::Docx => to_docx(&doc, template)?,
+            ExportFormat::Pdf => to_pdf(&doc, template)?,
+        };
+        std::fs::create_dir_all(&out_dir)?;
+        write_file(&target, &bytes)
+    })
+    .await
+    .map_err(|_| Error::Failed("export_interrupted".into()))??;
     let detail = json!({ "version": draft.version, "format": format, "template": template });
     audit::record(db, actor, "export", Some(&draft.id), detail).await?;
     Ok(path)

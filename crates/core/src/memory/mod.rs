@@ -6,10 +6,14 @@
 //! showing at once and is sealed later by [`seal_pending`]. Work authorization has no value
 //! here: that question is answered from the encrypted profile row, one country at a time.
 
+pub mod classify;
 pub mod rules;
 pub mod search;
 pub mod usage;
 
+pub use classify::{
+    CLASSIFY_BATCH, Classified, RefreshPlan, classify_pending, classify_prompt, refresh_plan,
+};
 pub use search::{MemoryHit, index_missing, search};
 
 pub use usage::{
@@ -730,8 +734,6 @@ async fn unapprove_all(write: &mut SqliteConnection, question_id: &str) -> Resul
 /// Raises a class on a word from outside a person: `source` is `rules` or `model`. `false`
 /// unless `class` outranks the stored one, so this can never lower. It asks no key: the body
 /// is hidden at once, because every read blanks it, and [`seal_pending`] seals it later.
-// The career memory agent is its caller, in a later task of this release.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn raise_class(
     db: &Db,
     question_id: &str,
@@ -770,6 +772,20 @@ pub(crate) async fn raise_class(
     .await?;
     write.commit().await?;
     Ok(true)
+}
+
+/// The model has looked at this question, whatever it said. A question already gone is not
+/// an error.
+pub(crate) async fn mark_classified(db: &Db, question_id: &str) -> Result<()> {
+    sqlx::query(concat!(
+        "UPDATE memory_questions SET classified_at = ",
+        now!(),
+        " WHERE id = ?"
+    ))
+    .bind(question_id)
+    .execute(&db.pool)
+    .await?;
+    Ok(())
 }
 
 /// The text of one answer, sealed or not, for a person, and audited with no text. A body

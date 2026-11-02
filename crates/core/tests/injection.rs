@@ -124,7 +124,7 @@ fn corpus(canary: &str) -> Vec<Case> {
         })
         .collect();
     cases.sort_by(|a, b| a.name.cmp(&b.name));
-    assert!(cases.len() >= 16, "the corpus holds {} files", cases.len());
+    assert!(cases.len() >= 17, "the corpus holds {} files", cases.len());
     cases
 }
 
@@ -328,7 +328,8 @@ async fn steered_output_never_adds_evidence_free_or_authorization_claims() {
 
     for case in &cases {
         // 15 steers a resume reply the schema refuses, so it stores nothing: its own test.
-        if case.name.starts_with("15") {
+        // 17 steers the classifier, not the drafter: its own test too.
+        if case.name.starts_with("15") || case.name.starts_with("17") {
             continue;
         }
         let job = w.import(case).await;
@@ -578,4 +579,34 @@ async fn no_prompt_ever_contains_a_sensitive_value() {
             assert!(!prompt.contains("needs_sponsorship"), "{}", case.name);
         }
     }
+}
+
+/// Threat path 5: a question that asks the classifier to relabel it. The model obeys, and the
+/// raise-only rule keeps the class the rules gave.
+#[tokio::test]
+async fn a_steered_classifier_never_lowers_a_class() {
+    let w = world().await;
+    let cases = corpus("/canary");
+    let case = case(&cases, "17");
+    let question = jobpilot_core::memory::add_question(&w.db, &case.raw, None)
+        .await
+        .unwrap();
+    assert_eq!(question.class, jobpilot_core::memory::Class::Legal);
+    let (router, sent) = w.router("job");
+
+    let done =
+        jobpilot_core::memory::classify_pending(&w.db, &router, "cli", CancellationToken::new())
+            .await
+            .unwrap();
+
+    assert_eq!((done.checked, done.raised), (1, 0));
+    assert!(
+        sent.lock().unwrap()[0].contains(MOCK_REPLY),
+        "the model was steered"
+    );
+    let stored = jobpilot_core::memory::get(&w.db, &question.id)
+        .await
+        .unwrap();
+    assert_eq!(stored.question.class, jobpilot_core::memory::Class::Legal);
+    assert_eq!(stored.question.class_source, "rules");
 }

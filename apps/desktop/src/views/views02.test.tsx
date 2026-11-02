@@ -450,6 +450,32 @@ describe("knowledge", () => {
     expect(screen.queryByText(/Nothing was generated/)).toBeNull();
   });
 
+  it("export_choice_reaches_resume_generate", async () => {
+    const generated = draft({ id: "g1", lineage_id: "G" });
+    const b = resumeBackend({
+      resume_list: () => [],
+      ai_status: () => CLAUDE_READY,
+      resume_compare: () => ({ ...COMPARE, generated: [], blocked: 0 }),
+      resume_generate: () => ({
+        draft: generated,
+        blocked: 0,
+        provider: "claude_code",
+        exported: "/data/exports/backend-engineer-v1.pdf",
+      }),
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    await user.selectOptions(await screen.findByLabelText("After drafting, export as"), "pdf");
+    await user.click(await screen.findByRole("button", { name: "Generate" }));
+    await waitFor(() => expect(count(b, "resume_generate")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "resume_generate")?.args).toEqual({
+      jobTextId: "j1",
+      export: { format: "pdf", template: "classic" },
+    });
+    expect(await screen.findByText("/data/exports/backend-engineer-v1.pdf")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy path" })).toBeInTheDocument();
+  });
+
   it("approve_all_skips_what_a_draft_could_not_cite_anyway", async () => {
     const kb = store([
       parsed("p1", "Open line"),

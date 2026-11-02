@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use jobpilot_core::agents::{self, analytics, tracking};
+use jobpilot_core::agents::{self, analytics, draft, memory, tracking};
 use jobpilot_core::ai::{BoxFuture, CancellationToken, DataCategory, ProviderId, TaskType};
 use jobpilot_core::runner::{
     self, Agent, Ctx, Limits, Permission, RunInput, RunState, StepDef, StepOutput, Workflow,
@@ -260,6 +260,9 @@ fn every_agent_step_stays_in_its_set() {
     let table: &[(Agent, &[StepDef])] = &[
         (Agent::Tracking, tracking::STEPS),
         (Agent::Analytics, analytics::STEPS),
+        (Agent::Resume, draft::RESUME_STEPS),
+        (Agent::CoverLetter, draft::LETTER_STEPS),
+        (Agent::CareerMemory, memory::STEPS),
     ];
     for (agent, steps) in table {
         let spec = spec_of(*agent);

@@ -118,6 +118,7 @@ impl Command {
                         | MemoryCommand::Confirm { .. }
                         | MemoryCommand::Use { .. }
                         | MemoryCommand::Authorization { .. }
+                        | MemoryCommand::Refresh { yes: true }
                 )
                 | Command::Job(JobCommand::Paste { file: Some(_), .. })
                 | Command::Resume(
@@ -327,12 +328,14 @@ mod tests {
         ("resume list", false),
         ("resume versions l", false),
         ("resume generate j", false),
+        ("resume generate j --export pdf", false),
         ("resume compare d", false),
         ("resume export d --format pdf", false),
         ("resume export d --format pdf --out /o", true),
         ("resume edit-claim c --text t", false),
         ("resume remove-claim c", false),
         ("letter generate j", false),
+        ("letter generate j --export pdf", false),
         ("letter export d --format pdf", false),
         ("letter export d --format pdf --out /o", true),
         ("app add --company c --role r", false),
@@ -360,6 +363,7 @@ mod tests {
         ("memory authorization PT", true),
         ("memory search q", false),
         ("memory refresh", false),
+        ("memory refresh --yes", true),
         ("app answers i", false),
         ("agents list", false),
         ("agents list --limit 5", false),

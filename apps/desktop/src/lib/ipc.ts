@@ -158,6 +158,16 @@ export type Answer = {
 
 export type QuestionRow = { question: Question; answers: Answer[] };
 
+/** At most 20 questions go to a model per press, and Claude is asked about each. */
+export type RefreshPlan = { pending: number; claude_calls: number };
+
+/** `skipped`: no AI took the classifying, so classes are the rules'. */
+export type MemoryRefreshed = {
+  sealed: number;
+  classified: { checked: number; raised: number; skipped: boolean };
+  embedded: number;
+};
+
 /** One search hit. `answer` is set only for an approved answer of the normal class; a sealed
  * class has none and needs a confirmation on an application. Render text only. */
 export type MemoryHit = {
@@ -319,7 +329,12 @@ export type Generated = {
   draft: Draft;
   blocked: number;
   provider: "ollama" | "claude_code" | "no_ai";
+  /** Where the file went, when an export was asked for and no claim was blocked. */
+  exported: string | null;
 };
+
+/** What to render right after drafting. Rust writes it to the exports folder only. */
+export type ExportChoice = { format: ExportFormat; template: Template };
 
 export type Fit = "fits" | "may_slow" | "too_large";
 
@@ -484,16 +499,20 @@ export const ipc = {
   memoryRemoveAnswer: (id: string) => invoke<void>("memory_remove_answer", { id }),
   memorySearch: (query: string, limit: number) =>
     invoke<MemoryHit[]>("memory_search", { query, limit }),
-  /** Embeds the questions with no vector yet. Zero when no embedding model is set. */
-  memoryRefresh: () => invoke<number>("memory_refresh"),
+  /** What a press of Refresh would spend. Reads only. */
+  memoryRefreshPlan: () => invoke<RefreshPlan>("memory_refresh_plan"),
+  /** Rust names the Claude count in its own dialog first, when any call is ahead. */
+  memoryRefresh: () => invoke<MemoryRefreshed>("memory_refresh"),
 
   /** Rust opens the picker. Rejects with `cancelled` when the user closes it. */
   resumeImport: () => invoke<Imported>("resume_import"),
   resumeList: (kind: DraftKind | null) => invoke<Draft[]>("resume_list", { kind }),
   resumeVersions: (lineageId: string) => invoke<Draft[]>("resume_versions", { lineageId }),
   /** `manual_required` opens the editor; its message ends with the reason. */
-  resumeGenerate: (jobTextId: string) => invoke<Generated>("resume_generate", { jobTextId }),
-  letterGenerate: (jobTextId: string) => invoke<Generated>("letter_generate", { jobTextId }),
+  resumeGenerate: (jobTextId: string, exportAs?: ExportChoice) =>
+    invoke<Generated>("resume_generate", { jobTextId, export: exportAs }),
+  letterGenerate: (jobTextId: string, exportAs?: ExportChoice) =>
+    invoke<Generated>("letter_generate", { jobTextId, export: exportAs }),
   resumeCompare: (generatedId: string, originalId: string | null) =>
     invoke<Compare>("resume_compare", { generatedId, originalId }),
   claimEdit: (claimId: string, input: ClaimInput) =>

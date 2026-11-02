@@ -699,7 +699,11 @@ describe("career memory", () => {
     ];
     const api = bank([], {
       memory_search: ({ query }: Args) => (query === "none" ? [] : hits),
-      memory_refresh: () => 2,
+      memory_refresh: () => ({
+        sealed: 0,
+        classified: { checked: 3, raised: 1, skipped: false },
+        embedded: 2,
+      }),
     });
     const { user, container } = renderApp();
     await openMemory(user);
@@ -722,12 +726,39 @@ describe("career memory", () => {
     });
 
     await user.click(screen.getByRole("button", { name: "Refresh index" }));
-    expect(await screen.findByText("Embedded 2 questions.")).toBeInTheDocument();
+    expect(await screen.findByText("Checked 3, raised 1, indexed 2")).toBeInTheDocument();
 
     await user.clear(screen.getByLabelText("Search memory"));
     await user.type(screen.getByLabelText("Search memory"), "none");
     await user.click(screen.getByRole("button", { name: "Search" }));
     expect(await screen.findByText("Nothing matches.")).toBeInTheDocument();
+  });
+
+  it("refresh_says_when_no_ai_took_it", async () => {
+    bank([], {
+      memory_refresh: () => ({
+        sealed: 0,
+        classified: { checked: 0, raised: 0, skipped: true },
+        embedded: 0,
+      }),
+    });
+    const { user } = renderApp();
+    await openMemory(user);
+    await user.click(screen.getByRole("button", { name: "Refresh index" }));
+    expect(await screen.findByText("Checked 0, raised 0, indexed 0")).toBeInTheDocument();
+    expect(screen.getByText("No AI took this; classes come from the rules.")).toBeInTheDocument();
+  });
+
+  it("refresh_shows_the_claude_count_before_the_press", async () => {
+    const api = bank([], {
+      memory_refresh_plan: () => ({ pending: 3, claude_calls: 3 }),
+    });
+    const { user } = renderApp();
+    await openMemory(user);
+    expect(await screen.findByText("Up to 3 Claude calls, limit 20")).toBeInTheDocument();
+    expect(api.calls.filter((c) => c.cmd === "memory_refresh")).toHaveLength(0);
+    await user.click(screen.getByRole("button", { name: "Refresh index" }));
+    await waitFor(() => expect(api.calls.filter((c) => c.cmd === "memory_refresh")).toHaveLength(1));
   });
 
   it("a_cleared_body_offers_no_show_and_no_approve", async () => {

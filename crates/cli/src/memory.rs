@@ -1,6 +1,7 @@
 //! Questions and answers you reuse.
 
 use clap::Subcommand;
+use jobpilot_core::agents;
 use jobpilot_core::ai::router::Router;
 use jobpilot_core::memory::{self, Answer, Class, MemoryHit, QuestionRow};
 use jobpilot_core::profile::Stated;
@@ -90,8 +91,13 @@ pub enum MemoryCommand {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
-    /// Embeds the questions that have no vector yet, with the local model.
-    Refresh,
+    /// Asks a model to double-check classes (up to 20 questions, shown first when Claude is
+    /// used), seals what a raise left plain, and embeds the questions with no vector yet.
+    Refresh {
+        /// Go ahead with the Claude calls the count above announces.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn stated(value: &Stated) -> &'static str {
@@ -273,19 +279,37 @@ pub async fn memory(db: &Db, command: MemoryCommand) -> Result<Output> {
             let text = hits.iter().map(hit_line).collect::<Vec<_>>().join("\n");
             out(&hits, text)
         }
-        MemoryCommand::Refresh => {
+        MemoryCommand::Refresh { yes } => {
             let router = Router::from_settings(db).await?;
-            match with_ctrl_c(|cancel| memory::index_missing(db, &router, cancel)).await {
-                Ok(embedded) => out(
-                    json!({ "embedded": embedded }),
-                    format!("embedded {embedded} question(s)"),
-                ),
-                Err(Error::ManualRequired(reason)) if reason == "no_embedding_model" => out(
-                    json!({ "embedded": 0, "reason": reason }),
-                    "No embedding model is set; search uses text.".into(),
-                ),
-                Err(error) => Err(error),
+            let plan = memory::refresh_plan(db, &router).await?;
+            if plan.claude_calls > 0 && !yes {
+                let text = format!(
+                    "This will make up to {} Claude calls, limit {}. Run `jobpilot memory \
+                     refresh --yes` to go ahead.",
+                    plan.claude_calls,
+                    memory::CLASSIFY_BATCH
+                );
+                let shown = json!({ "claude_calls": plan.claude_calls, "pending": plan.pending });
+                return out(shown, text);
             }
+            let done =
+                with_ctrl_c(|cancel| agents::memory_refresh(db, &router, ACTOR, cancel)).await?;
+            let mut text = format!(
+                "Checked {}, raised {}, indexed {}",
+                done.classified.checked, done.classified.raised, done.embedded
+            );
+            if done.classified.skipped {
+                text.push_str("\nNo AI took this; classes come from the rules.");
+            }
+            if done.embedded == 0 && !embedding_model_set(db).await? {
+                text.push_str("\nNo embedding model is set; search uses text.");
+            }
+            out(&done, text)
         }
     }
+}
+
+async fn embedding_model_set(db: &Db) -> Result<bool> {
+    let value = jobpilot_core::settings::get(db, "ai.embedding_model").await?;
+    Ok(value.is_some_and(|value| value.as_str().is_some_and(|model| !model.is_empty())))
 }

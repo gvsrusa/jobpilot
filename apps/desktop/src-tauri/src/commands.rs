@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use jobpilot_core::agents::MemoryRefreshed;
 use jobpilot_core::ai::claude_code::{self, TERMS_DATE};
 use jobpilot_core::ai::ollama::Ollama;
 use jobpilot_core::ai::router::{Router, ollama_from_settings};
@@ -22,17 +23,17 @@ use jobpilot_core::crypto::{self, KeyState};
 use jobpilot_core::documents::{self, Document, SearchHit};
 use jobpilot_core::drafts::{self, ClaimInput, Compare, Draft, ExportFormat};
 use jobpilot_core::embed::{self, Hit};
-use jobpilot_core::generate::{self, Generated};
+use jobpilot_core::generate::Generated;
 use jobpilot_core::knowledge::{self, JobText, KnowledgeItem};
 use jobpilot_core::memory::{
     self, Answer, AppliedAnswer, AuthorizationAnswer, Class, MemoryHit, Question, QuestionRow,
-    UsedAnswer,
+    RefreshPlan, UsedAnswer,
 };
 use jobpilot_core::parse::{self, Imported};
 use jobpilot_core::profile::{self, Profile, ProfileBasic, WorkAuthorization};
 use jobpilot_core::recovery::{self, RecoveryReceipt};
 use jobpilot_core::render::{ResumeDoc, Template};
-use jobpilot_core::runner::{self, RunDetail, RunSummary};
+use jobpilot_core::runner::{self, ExportChoice, RunDetail, RunSummary};
 use jobpilot_core::{Db, Error, Result, agents, secrets, settings, transfer};
 use serde_json::{Value, json};
 use tauri::ipc::Invoke;
@@ -122,6 +123,7 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         memory_remove_answer,
         memory_search,
         memory_refresh,
+        memory_refresh_plan,
         resume_import,
         resume_list,
         resume_versions,
@@ -823,17 +825,43 @@ pub async fn memory_search(
     memory::search(&db, &router, &query, limit).await
 }
 
-/// Embeds the questions with no vector yet. With no embedding model it embeds none: search
-/// still works by words.
+/// What a press of Refresh would spend. Reads only: it starts no provider and asks no key.
 #[tauri::command]
-pub async fn memory_refresh(state: State<'_, AppState>) -> Result<usize> {
+pub async fn memory_refresh_plan(state: State<'_, AppState>) -> Result<RefreshPlan> {
+    let db = state.work().await?;
+    let router = Router::from_settings(&db).await?;
+    memory::refresh_plan(&db, &router).await
+}
+
+/// Only a person's press starts it. With Claude calls ahead, the count is named in a native
+/// dialog first, with no `work` held, and the plan is read again after the answer: a count
+/// that moved in between is refused, so the yes covers what ran.
+#[tauri::command]
+pub async fn memory_refresh<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+) -> Result<MemoryRefreshed> {
+    let asked = {
+        let db = state.work().await?;
+        let router = Router::from_settings(&db).await?;
+        memory::refresh_plan(&db, &router).await?.claude_calls
+    };
+    if asked > 0 {
+        let message = format!(
+            "This will make up to {asked} Claude calls, limit {}.",
+            memory::CLASSIFY_BATCH
+        );
+        native::confirmed(&app, "Refresh career memory", message, "Refresh").await?;
+    }
     let running = state.ai.begin()?;
     let db = state.work().await?;
     let router = Router::from_settings(&db).await?;
-    match memory::index_missing(&db, &router, running.token.clone()).await {
-        Err(Error::ManualRequired(reason)) if reason == "no_embedding_model" => Ok(0),
-        done => done,
+    if memory::refresh_plan(&db, &router).await?.claude_calls != asked {
+        return Err(Error::Validation(
+            "the number of Claude calls changed since you were asked; press Refresh again".into(),
+        ));
     }
+    agents::memory_refresh(&db, &router, ACTOR, running.token.clone()).await
 }
 
 /// The path comes from the picker: the webview never names a file to read. Closing the
@@ -872,19 +900,29 @@ pub async fn resume_versions(state: State<'_, AppState>, lineage_id: String) -> 
 }
 
 #[tauri::command]
-pub async fn resume_generate(state: State<'_, AppState>, job_text_id: String) -> Result<Generated> {
+pub async fn resume_generate(
+    state: State<'_, AppState>,
+    job_text_id: String,
+    export: Option<ExportChoice>,
+) -> Result<Generated> {
     let running = state.ai.begin()?;
     let db = state.work().await?;
     let router = Router::from_settings(&db).await?;
-    generate::resume(&db, &router, ACTOR, &job_text_id, running.token.clone()).await
+    let token = running.token.clone();
+    agents::draft_resume(&db, &router, ACTOR, &job_text_id, export, token).await
 }
 
 #[tauri::command]
-pub async fn letter_generate(state: State<'_, AppState>, job_text_id: String) -> Result<Generated> {
+pub async fn letter_generate(
+    state: State<'_, AppState>,
+    job_text_id: String,
+    export: Option<ExportChoice>,
+) -> Result<Generated> {
     let running = state.ai.begin()?;
     let db = state.work().await?;
     let router = Router::from_settings(&db).await?;
-    generate::cover_letter(&db, &router, ACTOR, &job_text_id, running.token.clone()).await
+    let token = running.token.clone();
+    agents::draft_cover_letter(&db, &router, ACTOR, &job_text_id, export, token).await
 }
 
 #[tauri::command]
@@ -2387,6 +2425,7 @@ mod tests {
         "memory_remove_answer",
         "memory_search",
         "memory_refresh",
+        "memory_refresh_plan",
         "resume_import",
         "resume_list",
         "resume_versions",
@@ -3630,7 +3669,9 @@ mod tests {
         assert!(none.as_array().unwrap().is_empty());
 
         // With no embedding model the refresh embeds nothing and is not an error.
-        assert_eq!(h.ok("memory_refresh", json!({})), 0);
+        let refreshed = h.ok("memory_refresh", json!({}));
+        assert_eq!(refreshed["embedded"], 0);
+        assert_eq!(refreshed["classified"]["skipped"], true);
     }
 
     #[test]
@@ -4022,6 +4063,120 @@ mod tests {
         }
         let hook = h.app.state::<NativeHook>();
         assert_eq!(*hook.work_at_dialog.lock().unwrap(), [false; 5]);
+    }
+
+    /// A posting, evidence it can cite, and a `claude` that cites it.
+    #[cfg(unix)]
+    fn drafting_with_claude(h: &Harness) -> Value {
+        let item = h.ok("kb_add", json!({ "kind": "skill", "body": "Rust" }));
+        let doc = json!({ "name": "", "contact": [], "summary": ["Rust"], "sections": [] });
+        let claims = json!([{ "text": "Rust", "evidence_ids": [item["id"]] }]);
+        let reply = json!({ "type": "result", "subtype": "success", "is_error": false,
+            "permission_denials": [], "structured_output": { "doc": doc, "claims": claims } });
+        fake_claude(
+            h,
+            &format!("[ \"$1\" = --version ] && exit 0\ncat > /dev/null\nprintf '%s' '{reply}'"),
+        );
+        h.ok(
+            "ai_enable",
+            json!({ "provider": "claude_code", "enabled": true }),
+        );
+        let categories = ["job_text", "profile_basic", "resume_text"];
+        h.ok(
+            "ai_consent_give",
+            json!({ "provider": "claude_code", "categories": categories }),
+        );
+        h.ok("job_paste", json!({ "title": "Role", "raw": "Build" }))["id"].clone()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_generate_runs_through_the_agent() {
+        let h = ready();
+        let job = drafting_with_claude(&h);
+        let export = json!({ "format": "pdf", "template": "compact" });
+        let made = h.ok(
+            "resume_generate",
+            json!({ "jobTextId": job, "export": export }),
+        );
+        assert_eq!(made["provider"], "claude_code");
+        let path = PathBuf::from(made["exported"].as_str().expect("a path"));
+        assert!(path.starts_with(h.paths.exports()), "{path:?}");
+        assert!(path.is_file());
+
+        let runs = h.ok("agents_list", json!({ "limit": 10 }));
+        assert_eq!(runs[0]["agent"], "resume");
+        assert_eq!(runs[0]["state"], "completed");
+        assert_eq!(runs[0]["actor"], "gui");
+
+        let made = h.ok(
+            "resume_generate",
+            json!({ "jobTextId": job, "export": null }),
+        );
+        assert_eq!(made["exported"], Value::Null);
+    }
+
+    /// Two questions waiting, and Claude on with consent: a press names the count first.
+    fn claude_on_with_questions(h: &Harness) {
+        h.ok(
+            "ai_enable",
+            json!({ "provider": "claude_code", "enabled": true }),
+        );
+        h.ok(
+            "ai_consent_give",
+            json!({ "provider": "claude_code", "categories": ["job_text"] }),
+        );
+        for text in ["Describe project one", "Describe project two"] {
+            h.ok(
+                "memory_add_question",
+                json!({ "text": text, "country": null }),
+            );
+        }
+    }
+
+    #[test]
+    fn memory_refresh_names_the_count_natively() {
+        let h = ready();
+        claude_on_with_questions(&h);
+        let plan = h.ok("memory_refresh_plan", json!({}));
+        assert_eq!(
+            (plan["pending"].clone(), plan["claude_calls"].clone()),
+            (json!(2), json!(2))
+        );
+
+        h.answer(false);
+        assert_eq!(h.code("memory_refresh", json!({})), "confirmation_required");
+        let asked = h.asked();
+        let dialog = asked.last().unwrap();
+        assert!(
+            dialog.contains("Refresh career memory")
+                && dialog.contains("This will make up to 2 Claude calls, limit 20."),
+            "{asked:?}"
+        );
+        assert_eq!(
+            h.ok("agents_list", json!({ "limit": 10 })),
+            json!([]),
+            "no run row"
+        );
+        let hook = h.app.state::<NativeHook>();
+        assert_eq!(hook.work_at_dialog.lock().unwrap().last(), Some(&false));
+    }
+
+    #[test]
+    fn memory_refresh_asks_nothing_when_no_claude_call_is_ahead() {
+        let h = ready();
+        h.ok(
+            "memory_add_question",
+            json!({ "text": "Describe project one", "country": null }),
+        );
+        let plan = h.ok("memory_refresh_plan", json!({}));
+        assert_eq!(plan["claude_calls"], 0);
+        h.answer(false);
+        let done = h.ok("memory_refresh", json!({}));
+        assert_eq!(done["classified"]["skipped"], true);
+        assert!(h.asked().is_empty());
+        let runs = h.ok("agents_list", json!({ "limit": 10 }));
+        assert_eq!(runs[0]["agent"], "career_memory");
     }
 
     fn code_of(result: Result<Value, Value>) -> String {
