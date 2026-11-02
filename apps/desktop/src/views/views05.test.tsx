@@ -205,6 +205,14 @@ describe("Jobs screen", () => {
     await waitFor(() => expect(count(b, "jobs_analyze")).toBe(1));
   });
 
+  it("wraps a long Where cell, so the columns after it stay in the window", async () => {
+    jobsBackend([job({ location: "Remote - Argentina, Brazil, Canada, Chile, Colombia, Costa Rica, Mexico, Peru" })]);
+    await openJobs();
+    const cell = await screen.findByRole("cell", { name: /Costa Rica/ });
+    expect(cell).toHaveClass("whitespace-normal", "wrap-anywhere");
+    expect(screen.getByRole("grid", { name: "Jobs" })).toHaveClass("table-fixed");
+  });
+
   it("renders an HTML posting title as text", async () => {
     const title = '<img src=x onerror="alert(1)"><b>Boss</b>';
     jobsBackend([job({ title })]);

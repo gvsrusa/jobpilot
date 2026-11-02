@@ -249,13 +249,13 @@ function JobTable({
     }
   };
   return (
-    <Table role="grid" aria-label="Jobs">
+    <Table role="grid" aria-label="Jobs" className="table-fixed">
       <TableHeader>
         <TableRow>
-          <TableHead>Score</TableHead>
+          <TableHead className="w-20">Score</TableHead>
           <TableHead>Title / Company</TableHead>
-          <TableHead>Where</TableHead>
-          <TableHead>Source</TableHead>
+          <TableHead className="w-1/3">Where</TableHead>
+          <TableHead className="w-36">Source</TableHead>
         </TableRow>
       </TableHeader>
       <TableBody ref={body} onKeyDown={onKey}>
@@ -273,7 +273,7 @@ function JobTable({
               <div>{job.score ?? "--"}</div>
               {job.stale && <div className="text-xs text-muted-foreground">Out of date</div>}
             </TableCell>
-            <TableCell className="whitespace-normal">
+            <TableCell className="align-top whitespace-normal wrap-anywhere">
               <div>
                 {job.title}
                 {job.company ? `, ${job.company}` : ""}
@@ -283,7 +283,7 @@ function JobTable({
                 <div className="text-xs text-muted-foreground">not stated: {job.not_stated.join(", ")}</div>
               )}
             </TableCell>
-            <TableCell className="align-top">{[job.location, job.country].filter(Boolean).join(", ")}</TableCell>
+            <TableCell className="align-top whitespace-normal wrap-anywhere">{[job.location, job.country].filter(Boolean).join(", ")}</TableCell>
             <TableCell className="align-top">
               <div>{sourceLabel(statuses, job.connector)}</div>
               {job.attribution && <div className="text-xs text-muted-foreground">{job.attribution}</div>}
