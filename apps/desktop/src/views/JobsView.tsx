@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ErrorAlert } from "@/components/ErrorAlert";
 import { PageHeading } from "@/components/PageHeading";
 import { Button } from "@/components/ui/button";
@@ -16,15 +15,13 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
+import { JobDetailView } from "@/views/JobDetail";
 import {
   ipc,
   toAppError,
-  type AuthNote,
   type Job,
-  type JobDetail,
   type JobFilter,
   type PayPeriod,
-  type PayRange,
   type SourceResult,
   type SourceStatus,
   type WorkMode,
@@ -44,26 +41,6 @@ const selectClass =
 
 const sourceLabel = (statuses: SourceStatus[], connector: string) =>
   connector === "import" ? "Imported" : (statuses.find((s) => s.name === connector)?.label ?? connector);
-
-function payText(pay: PayRange | null): string {
-  if (!pay || (pay.min === null && pay.max === null)) return "not stated";
-  const range = pay.min !== null && pay.max !== null ? `${pay.min}-${pay.max}` : String(pay.min ?? pay.max);
-  const period = pay.period ? `per ${pay.period}` : "period not stated";
-  return `${range} ${pay.currency ?? "(currency not stated)"}, ${period}`;
-}
-
-function authText(note: AuthNote): string {
-  switch (note.kind) {
-    case "no_country":
-      return "Work authorization: not stated. The job states no country. Not checked.";
-    case "not_stated":
-      return `Work authorization, ${note.country}: not stated by you. Not checked.`;
-    case "stated":
-      return `Work authorization, ${note.country}: you stated authorized ${note.authorized.replace("_", " ")}, needs sponsorship ${note.needs_sponsorship.replace("_", " ")}.`;
-    case "locked":
-      return "Work authorization: Locked. The key is not available.";
-  }
-}
 
 /** What a source row says about a stop. `code` is shown beside it. */
 function problem(code: string, nextAt: string | null, message?: string): string {
@@ -146,12 +123,25 @@ function ImportDialog({ onClose, onSaved }: { onClose(): void; onSaved(): void }
   );
 }
 
-function Filters({ onApply }: { onApply(filter: JobFilter): void }) {
-  const [country, setCountry] = useState("");
-  const [mode, setMode] = useState("");
-  const [amount, setAmount] = useState("");
-  const [currency, setCurrency] = useState("");
-  const [period, setPeriod] = useState<PayPeriod>("year");
+type FilterForm = { country: string; mode: string; amount: string; currency: string; period: PayPeriod };
+const EMPTY_FORM: FilterForm = { country: "", mode: "", amount: "", currency: "", period: "year" };
+
+/** The form lives in the parent, so Back from a job finds the filters as they were left. */
+function Filters({
+  form,
+  onForm,
+  onApply,
+}: {
+  form: FilterForm;
+  onForm(form: FilterForm): void;
+  onApply(filter: JobFilter): void;
+}) {
+  const { country, mode, amount, currency, period } = form;
+  const setCountry = (country: string) => onForm({ ...form, country });
+  const setMode = (mode: string) => onForm({ ...form, mode });
+  const setAmount = (amount: string) => onForm({ ...form, amount });
+  const setCurrency = (currency: string) => onForm({ ...form, currency });
+  const setPeriod = (period: PayPeriod) => onForm({ ...form, period });
   const pay = Number(amount);
   const wantsPay = amount.trim() !== "";
   const invalid = wantsPay && (!Number.isInteger(pay) || pay <= 0 || currency.trim().length !== 3);
@@ -403,8 +393,21 @@ function Sources({ statuses, onFetched }: { statuses: SourceStatus[]; onFetched(
   );
 }
 
-function List({ focusId, onOpen }: { focusId: string | null; onOpen(id: string): void }) {
-  const [filter, setFilter] = useState(EMPTY_FILTER);
+function List({
+  filter,
+  onFilter,
+  form,
+  onForm,
+  focusId,
+  onOpen,
+}: {
+  filter: JobFilter;
+  onFilter(filter: JobFilter): void;
+  form: FilterForm;
+  onForm(form: FilterForm): void;
+  focusId: string | null;
+  onOpen(id: string): void;
+}) {
   const [importing, setImporting] = useState(false);
   const jobs = useQuery({ queryKey: ["jobs", filter], queryFn: () => ipc.jobsList(filter, LIMIT) });
   const statuses = useQuery({ queryKey: ["job-sources-status"], queryFn: ipc.jobSourcesStatus });
@@ -427,7 +430,7 @@ function List({ focusId, onOpen }: { focusId: string | null; onOpen(id: string):
           Import a posting
         </Button>
       </div>
-      <Filters onApply={setFilter} />
+      <Filters form={form} onForm={onForm} onApply={onFilter} />
       <ErrorAlert error={jobs.error ?? statuses.error ?? score.error} />
       {jobs.isSuccess && jobs.data.length === 0 && (
         <p className="text-sm text-muted-foreground">
@@ -452,198 +455,15 @@ function List({ focusId, onOpen }: { focusId: string | null; onOpen(id: string):
   );
 }
 
-function Detail({ id, onBack }: { id: string; onBack(): void }) {
-  const client = useQueryClient();
-  const detail = useQuery({ queryKey: ["job", id], queryFn: () => ipc.jobDetail(id) });
-  const statuses = useQuery({ queryKey: ["job-sources-status"], queryFn: ipc.jobSourcesStatus });
-  const [removing, setRemoving] = useState(false);
-  useEffect(() => {
-    const onKey = (e: globalThis.KeyboardEvent) => {
-      if (e.altKey && e.key === "ArrowLeft") {
-        e.preventDefault();
-        onBack();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onBack]);
-  const refresh = async () => {
-    await client.invalidateQueries({ queryKey: ["job", id] });
-    await client.invalidateQueries({ queryKey: ["jobs"] });
-  };
-  const evaluate = useMutation({ mutationFn: () => ipc.jobsAnalyze([id], true), onSettled: refresh });
-  const track = useMutation({
-    mutationFn: () => ipc.jobToApp(id),
-    onSuccess: () => client.invalidateQueries({ queryKey: ["applications"] }),
-  });
-  const open = useMutation({ mutationFn: () => ipc.jobOpen(id) });
-  const split = useMutation({ mutationFn: () => ipc.jobSplit(id), onSettled: refresh });
-  const remove = useMutation({
-    mutationFn: () => ipc.jobRemove(id),
-    onSuccess: async () => {
-      await client.invalidateQueries({ queryKey: ["jobs"] });
-      onBack();
-    },
-  });
-  const d: JobDetail | undefined = detail.data;
-  const job = d?.job;
-  return (
-    <div className="grid gap-4">
-      <div>
-        <Button type="button" variant="ghost" onClick={onBack}>
-          Back to Jobs
-        </Button>
-      </div>
-      <ErrorAlert error={detail.error} />
-      {d && job && (
-        <>
-          <div className="flex items-baseline justify-between gap-4">
-            <PageHeading>
-              {job.title}
-              {job.company ? `, ${job.company}` : ""}
-            </PageHeading>
-            <span>Score {job.score === null ? "--" : `${job.score} / 100`}</span>
-          </div>
-          <p className="text-sm text-muted-foreground">
-            Source: {sourceLabel(statuses.data ?? [], job.connector)}
-            {job.attribution ? `, ${job.attribution}` : ""}. Untrusted text. Shown as plain text.
-            {job.url ? ` Link: ${job.url}` : " No link."}
-          </p>
-          <div className="grid gap-4 md:grid-cols-2">
-            <section aria-labelledby="why-heading" className="grid content-start gap-2 text-sm">
-              <h2 id="why-heading" className="font-semibold">
-                Why this score
-              </h2>
-              {d.explanation ? (
-                <>
-                  <Table aria-label="Score explanation" tabIndex={0}>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>Criterion</TableHead>
-                        <TableHead>Wt</TableHead>
-                        <TableHead>Pts</TableHead>
-                        <TableHead>Note</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {d.explanation.rows.map((r) => (
-                        <TableRow key={r.criterion}>
-                          <TableCell className="capitalize">{r.criterion}</TableCell>
-                          <TableCell>{r.weight}</TableCell>
-                          <TableCell>{r.points ?? "-"}</TableCell>
-                          <TableCell className="whitespace-normal">{r.note}</TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                  {d.explanation.missing_skills.length > 0 ? (
-                    <p>{`Missing skills: ${d.explanation.missing_skills.join(", ")}`}</p>
-                  ) : (
-                    <p>
-                      {d.explanation.rows.some((r) => r.criterion === "skills" && r.points !== null)
-                        ? "Missing skills: None found"
-                        : "Add your profile to see this."}
-                    </p>
-                  )}
-                </>
-              ) : (
-                <p>Could not read this posting&apos;s fields, or it has not been scored yet.</p>
-              )}
-              <p>Pay: {payText(job.pay)}</p>
-              <p>{authText(d.authorization)}</p>
-              <p>Scored by: {d.explanation?.by ?? "rules"}.</p>
-              {d.semantic && (
-                <div>
-                  <p>{`AI evaluation (${d.semantic.provider}): fit ${d.semantic.fit}. ${d.semantic.summary}`}</p>
-                  {d.semantic.gaps.map((g, i) => (
-                    <p key={i}>{`Gap: ${g}`}</p>
-                  ))}
-                </div>
-              )}
-              <div>
-                <Button type="button" variant="outline" disabled={evaluate.isPending} onClick={() => evaluate.mutate()}>
-                  {evaluate.isPending ? "Evaluating..." : "Add AI evaluation"}
-                </Button>
-              </div>
-              {evaluate.data?.reason && <p role="status">The model step stopped: {evaluate.data.reason}</p>}
-              <ErrorAlert error={evaluate.error} />
-              {d.group.length > 0 && (
-                <p>
-                  Same job on {d.group.length} other {d.group.length === 1 ? "source" : "sources"}.{" "}
-                  <Button type="button" variant="outline" size="sm" onClick={() => split.mutate()}>
-                    Not a duplicate
-                  </Button>
-                </p>
-              )}
-              {d.notes.map((n) => (
-                <p key={n.id}>{`Company note (${n.origin}): ${n.text}`}</p>
-              ))}
-            </section>
-            <section aria-labelledby="text-heading" className="grid content-start gap-2 text-sm">
-              <h2 id="text-heading" className="font-semibold">
-                Posting text
-              </h2>
-              <div
-                role="region"
-                aria-label="Posting text"
-                tabIndex={0}
-                className="max-h-96 overflow-auto rounded-lg border p-3 whitespace-pre-wrap"
-              >
-                {d.text}
-              </div>
-              {d.findings.length > 0 && (
-                <ul aria-label="Findings">
-                  {d.findings.map((f, i) => (
-                    <li key={i}>{`${f.kind}: ${f.excerpt}`}</li>
-                  ))}
-                </ul>
-              )}
-            </section>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <Button type="button" disabled={track.isPending || track.isSuccess} onClick={() => track.mutate()}>
-              Add to tracker
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              disabled={!/^https:\/\//i.test(job.url ?? "")}
-              onClick={() => open.mutate()}
-            >
-              Open posting in my browser
-            </Button>
-            <Button type="button" variant="outline" onClick={() => setRemoving(true)}>
-              Remove job
-            </Button>
-          </div>
-          {track.isSuccess && <p role="status">Added to the tracker.</p>}
-          <ErrorAlert error={track.error ?? open.error ?? split.error} />
-          {removing && (
-            <ConfirmDialog
-              title="Remove this job?"
-              confirmLabel="Remove"
-              busyLabel="Removing..."
-              pending={remove.isPending}
-              error={remove.error}
-              onConfirm={() => remove.mutate()}
-              onCancel={() => setRemoving(false)}
-            >
-              <p>The posting text is deleted with the job, unless a draft cites it.</p>
-            </ConfirmDialog>
-          )}
-        </>
-      )}
-    </div>
-  );
-}
-
 export function JobsView() {
   const [openId, setOpenId] = useState<string | null>(null);
-  // The row to focus when the list comes back.
+  // The row to focus when the list comes back, and the filters it had.
   const [lastId, setLastId] = useState<string | null>(null);
+  const [filter, setFilter] = useState(EMPTY_FILTER);
+  const [form, setForm] = useState(EMPTY_FORM);
   if (openId) {
     return (
-      <Detail
+      <JobDetailView
         id={openId}
         onBack={() => {
           setLastId(openId);
@@ -652,5 +472,5 @@ export function JobsView() {
       />
     );
   }
-  return <List focusId={lastId} onOpen={setOpenId} />;
+  return <List filter={filter} onFilter={setFilter} form={form} onForm={setForm} focusId={lastId} onOpen={setOpenId} />;
 }

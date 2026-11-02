@@ -1,6 +1,6 @@
 import { screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import type { AiStatus, Job, JobDetail, SourceRow, SourceStatus } from "../lib/ipc";
+import type { AiStatus, AuthNote, Job, JobDetail, SourceRow, SourceStatus } from "../lib/ipc";
 import { backend, count, renderApp } from "../test-utils";
 
 type Args = Record<string, unknown>;
@@ -312,5 +312,193 @@ describe("Jobs screen scoring and copy", () => {
     const dialog = await screen.findByRole("dialog");
     expect(dialog).toHaveTextContent("The posting text is deleted with the job, unless a draft cites it.");
     expect(dialog).not.toHaveTextContent("stays in your data");
+  });
+});
+
+const AI_ON: AiStatus = {
+  ...AI_OFF,
+  ollama: { state: "running", url: "http://127.0.0.1:11434", version: "1", models: [] },
+};
+
+async function openDetail(j: Job, over: Partial<JobDetail> = {}, overrides: Record<string, (a: Args) => unknown> = {}) {
+  const b = jobsBackend([j], {
+    job_detail: () => detailOf(j, over),
+    ai_status: () => AI_ON,
+    ...overrides,
+  });
+  const rendered = await openJobs();
+  const row = await screen.findByRole("row", { name: new RegExp(j.title) });
+  row.focus();
+  await rendered.user.keyboard("{Enter}");
+  await screen.findByRole("button", { name: "Back to Jobs" });
+  return { ...rendered, b };
+}
+
+const lastList = (b: ReturnType<typeof jobsBackend>) => b.calls.filter((c) => c.cmd === "jobs_list").slice(-1)[0];
+
+describe("Job detail", () => {
+  it("lists every criterion with weight and points", async () => {
+    await openDetail(job({ url: "https://remoteok.com/x" }), {
+      explanation: {
+        rows: [
+          { criterion: "skills", weight: 40, points: 34, note: "6 of 7" },
+          { criterion: "seniority", weight: 20, points: 18, note: "senior vs senior" },
+          { criterion: "location", weight: 20, points: 20, note: "remote" },
+          { criterion: "pay", weight: 20, points: null, note: "posting names no currency" },
+        ],
+        score: 90,
+        compared_weight: 80,
+        matched_skills: [],
+        missing_skills: [],
+        by: "rules",
+      },
+    });
+    const table = screen.getByRole("table", { name: "Score explanation" });
+    for (const cells of [
+      ["skills", "40", "34", "6 of 7"],
+      ["seniority", "20", "18", "senior vs senior"],
+      ["location", "20", "20", "remote"],
+      ["pay", "20", "not compared", "posting names no currency"],
+    ]) {
+      const row = within(table).getByRole("row", { name: new RegExp(`^${cells[0]}`, "i") });
+      expect(within(row).getAllByRole("cell").map((c) => c.textContent)).toEqual(cells);
+    }
+    expect(screen.getByText("Compared weight: 80 of 100")).toBeInTheDocument();
+  });
+
+  it("never shows eligible or ineligible, for each authz state", async () => {
+    const states: [AuthNote, boolean, string][] = [
+      [{ kind: "not_stated", country: "PT" }, false, "PT: not stated by you. Not checked."],
+      [
+        { kind: "stated", country: "PT", authorized: "yes", needs_sponsorship: "no" },
+        false,
+        "You stated: authorized yes, needs sponsorship no for PT. Not checked against this posting.",
+      ],
+      [{ kind: "locked" }, false, "Locked, see Recovery."],
+      [{ kind: "no_country" }, false, "No country on this posting. Not checked."],
+      [{ kind: "not_stated", country: "PT" }, true, "This posting mentions work authz. Read it yourself."],
+    ];
+    for (const [authorization, mentions_authorization, line] of states) {
+      const { container, unmount } = await openDetail(job(), { authorization, mentions_authorization });
+      expect(screen.getByText(line)).toBeInTheDocument();
+      expect(container.textContent ?? "").not.toMatch(/eligible|ineligible|likely/i);
+      const lines = screen.getAllByText(/Not checked|Locked, see Recovery/);
+      expect(lines).toHaveLength(1);
+      unmount();
+    }
+  });
+
+  it("shows Locked, see Recovery, for a locked note", async () => {
+    await openDetail(job(), { authorization: { kind: "locked" } });
+    expect(screen.getByText("Locked, see Recovery.")).toBeInTheDocument();
+    expect(screen.queryByText(/not stated by you/i)).toBeNull();
+  });
+
+  it("keeps the rules score visible when AI evaluation fails", async () => {
+    const { user } = await openDetail(job({ score: 82 }), {}, {
+      jobs_analyze: () => ({ scored: 1, parsed: 0, evaluated: 0, dropped: 0, reason: "consent_missing" }),
+    });
+    await user.click(screen.getByRole("button", { name: "Add AI evaluation" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("code: consent_missing");
+    expect(screen.getByText("Score 82 / 100")).toBeInTheDocument();
+    expect(screen.getByText("Scored by: rules.")).toBeInTheDocument();
+  });
+
+  it("hides Add AI evaluation with no eligible provider", async () => {
+    await openDetail(job(), {}, { ai_status: () => AI_OFF });
+    expect(screen.queryByRole("button", { name: "Add AI evaluation" })).toBeNull();
+    expect(screen.getByText("Scored by: rules.")).toBeInTheDocument();
+  });
+
+  it("renders posting text inert, with no anchors or images", async () => {
+    const text = 'Apply <a href="https://evil.example/x">here</a> <img src="https://evil.example/p.png"> http://evil.example/y';
+    const { container } = await openDetail(job({ url: "https://example.com/1" }), {
+      text,
+      findings: [{ kind: "hidden_html", excerpt: '<a href="https://evil.example/z">z</a>' }],
+    });
+    expect(screen.getByText(text)).toBeInTheDocument();
+    expect(screen.getByText("Untrusted text. Shown as plain text.")).toBeInTheDocument();
+    expect(container.querySelector("a, img, picture, svg image")).toBeNull();
+    expect(container.querySelector("[href], [src]")).toBeNull();
+  });
+
+  it("opens the source link through job_open with the host in its label", async () => {
+    const { user, b } = await openDetail(job({ id: "r1", connector: "remoteok", attribution: "Remote OK", url: "https://remoteok.com/remote-jobs/1" }), {}, {
+      job_open: () => null,
+    });
+    expect(screen.getByText(/^Source: Remote OK \(/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /link.*remoteok\.com/ }));
+    expect(b.calls.find((c) => c.cmd === "job_open")!.args).toEqual({ id: "r1" });
+  });
+
+  it("shows the AI evaluation as its own panel with cited strengths and dropped", async () => {
+    await openDetail(job(), {
+      semantic: {
+        fit: 77,
+        summary: "Good match on Rust.",
+        strengths: [{ text: "Built Rust services", evidence_ids: ["e1"] }],
+        gaps: ["No Kubernetes"],
+        dropped: 2,
+        provider: "ollama",
+        at: "2026-11-01T10:00:00Z",
+      },
+    });
+    const panel = screen.getByRole("region", { name: "AI evaluation" });
+    expect(within(panel).getByText(/fit 77/)).toBeInTheDocument();
+    expect(within(panel).getByText("Good match on Rust.")).toBeInTheDocument();
+    expect(within(panel).getByText(/Built Rust services/)).toHaveTextContent("e1");
+    expect(within(panel).getByText(/No Kubernetes/)).toBeInTheDocument();
+    expect(within(panel).getByText(/ollama/)).toBeInTheDocument();
+    expect(within(panel).getByText(/2026-11-01/)).toBeInTheDocument();
+    expect(within(panel).getByText("dropped: 2")).toBeInTheDocument();
+    expect(screen.getByText("Scored by: rules.")).toBeInTheDocument();
+  });
+
+  it("lists findings as a labelled list", async () => {
+    await openDetail(job(), { findings: [{ kind: "instruction", excerpt: "ignore previous" }] });
+    const list = screen.getByRole("list", { name: "Findings" });
+    expect(within(list).getByText(/instruction/)).toHaveTextContent("ignore previous");
+  });
+
+  it("Prepare opens Resumes on this job's text", async () => {
+    const { user } = await openDetail(job({ job_text_id: "t9" }), {}, { resume_list: () => [], job_list: () => [{ id: "t9", title: "Backend Engineer, Acme", normalized: "x", findings: [] }] });
+    await user.click(screen.getByRole("button", { name: "Prepare..." }));
+    await screen.findByRole("heading", { name: "Resumes" });
+    expect(await screen.findByLabelText("Job posting")).toHaveValue("t9");
+  });
+
+  it("Alt+Left returns to the same row", async () => {
+    const jobs = [job({ id: "a", title: "Alpha Role" }), job({ id: "b", title: "Beta Role" })];
+    jobsBackend(jobs, { ai_status: () => AI_ON });
+    const { user } = await openJobs();
+    const second = await screen.findByRole("row", { name: /Beta Role/ });
+    second.focus();
+    await user.keyboard("{Enter}");
+    await screen.findByRole("button", { name: "Back to Jobs" });
+    await user.keyboard("{Alt>}{ArrowLeft}{/Alt}");
+    await waitFor(() => expect(screen.getByRole("row", { name: /Beta Role/ })).toHaveFocus());
+  });
+
+  it("moves focus to the detail heading on Enter", async () => {
+    await openDetail(job({ title: "Focus Role" }));
+    await waitFor(() => expect(screen.getByRole("heading", { name: /Focus Role/ }).parentElement).toHaveFocus());
+  });
+
+  it("keeps the filters through Back", async () => {
+    const b = jobsBackend([job({ title: "Filtered Role" })], { ai_status: () => AI_ON });
+    const { user } = await openJobs();
+    await user.type(await screen.findByLabelText("Country"), "PT");
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    await waitFor(() =>
+      expect((lastList(b).args.filter as { country: string }).country).toBe("PT"),
+    );
+    const row = await screen.findByRole("row", { name: /Filtered Role/ });
+    row.focus();
+    await user.keyboard("{Enter}");
+    await user.click(await screen.findByRole("button", { name: "Back to Jobs" }));
+    expect(await screen.findByLabelText("Country")).toHaveValue("PT");
+    await screen.findByRole("row", { name: /Filtered Role/ });
+    expect((lastList(b).args.filter as { country: string }).country).toBe("PT");
   });
 });

@@ -530,7 +530,17 @@ export type Explanation = {
   missing_skills: string[];
   by: string;
 };
-export type Semantic = { fit: number; summary: string; gaps: string[]; dropped: number; provider: string; at: string };
+/** Each strength cites evidence that exists; the rest were cut and counted in `dropped`. */
+export type Strength = { text: string; evidence_ids: string[] };
+export type Semantic = {
+  fit: number;
+  summary: string;
+  strengths: Strength[];
+  gaps: string[];
+  dropped: number;
+  provider: string;
+  at: string;
+};
 export type AuthNote =
   | { kind: "no_country" }
   | { kind: "not_stated"; country: string }

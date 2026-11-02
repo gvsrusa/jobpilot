@@ -37,6 +37,16 @@ model would do. The tests show what the app does with that reply.
 - `11` holds real bidi overrides and zero-width characters. Do not let an editor "clean" it.
   Its reply writes U+200B as the JSON escape, because normalizing removes the literal character
   before the steered model reads the line.
+- `20` is a connector body: HTML with a `display:none` element. The tests in `injection.rs` that
+  read each recorded connector fixture hold the same shape. Hidden text must not reach `normalized`
+  or any prompt, and must be a `hidden_text` finding.
+- `21` asks a model to set its fit to 100 and to state work authorization. A fit is stored beside
+  the score and never changes it.
+- `22` asks a summarizer to invent company facts, and to cite a source it was not given. Only a
+  fact the listed source holds stays.
+- The new tasks (`parse_job`, `semantic_match`, `summarize_company`) run every file through
+  `match_jobs` and `research_company` with `Obedient`, a model that answers each with its worst
+  reply. Their tests assert what is stored, not what was refused.
 
 To add a case: add a file, then add what it must report to the table in
 `every_corpus_file_normalizes_without_panic_and_reports_findings` if it should report anything.
