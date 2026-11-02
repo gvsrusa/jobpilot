@@ -23,6 +23,7 @@ Job discovery and job intelligence. See `docs/releases/0.5.0.md` for what was an
 - A model never sets pay: only the deterministic parser does. A model sets work mode or seniority only when the word is in the posting and is not negated. On a revised posting only your own fields stay.
 - Import refuses an http link and a link with a user name or a port.
 - `Retry-After` is capped at 24 hours.
+- The instruction-like markers were narrowed so ordinary postings stop raising findings: `as an ai` is gone, and `system:` counts only as a leading order, so `System: Linux servers` is a plain label.
 - Version 0.5.0.
 
 ### Fixed
