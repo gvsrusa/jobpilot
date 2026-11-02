@@ -56,6 +56,8 @@ function problem(code: string, nextAt: string | null, message?: string): string 
     source_not_found: "The source says that board or feed does not exist. Check the name.",
     bad_feed: "The source answered in a shape JobPilot does not read.",
     network: "The source could not be reached.",
+    too_large: "The source sent more than 16 MiB, so that answer was not stored.",
+    timeout: "The source took too long to answer. Try again later.",
   };
   return known[code] ?? message ?? `Stopped: ${code}`;
 }

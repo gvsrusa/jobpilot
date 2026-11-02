@@ -382,7 +382,7 @@ Built. Ctrl+0 opens it. Jobs come from connectors whose register read verdict is
 - **Keyboard:** Tab to the filter form, then the job table (one tab stop; arrows, Home, and End move rows; Enter opens screen 9; `i` opens the import dialog). Back from a job returns to the same row with the filters as they were left.
 - **Focus order:** Import a posting, filter controls, Apply, job table, then each source's board field and Fetch button.
 - **Empty state:** "No jobs yet. Import a posting, or fetch from a source marked allowed." The Sources list is still shown.
-- **Error state:** a fetch that stops shows its reason in an alert on that source row, with the code: "Refused by policy: unknown", "Rate limited. Next fetch at {time}." (the time is the true hold, up to 24 hours), a source that refused or showed a challenge page, a board or feed that does not exist, or a changed shape. A source never retries beyond its declared limit. A fetch that works reads "{n} added, {n} updated, {n} skipped."
+- **Error state:** a fetch that stops shows its reason in an alert on that source row, with the code: "Refused by policy: unknown", "Rate limited. Next fetch at {time}." (the time is the true hold, up to 24 hours), a source that refused or showed a challenge page, a board or feed that does not exist, a changed shape, an answer over 16 MiB, or a source too slow to answer. A source never retries beyond its declared limit. A fetch that works reads "{n} added, {n} updated, {n} skipped."
 
 ## 9. Job detail with score explanation (release 0.5)
 

@@ -270,6 +270,8 @@ fn source_reason(reason: &str) -> Option<&'static str> {
         }
         "needs_text" => "That posting has no text to read. Import it with its text instead.",
         "network" => "The source could not be reached. Check the connection and try again.",
+        "too_large" => "The source sent more than 16 MiB, so that answer was not stored.",
+        "timeout" => "The source took too long to answer. Try again later.",
         "no_sources" => {
             "This company has no stored text to read yet. Import a posting or paste a note first."
         }
@@ -770,7 +772,7 @@ mod tests {
 
     #[test]
     fn the_research_reasons_read_in_plain_words() {
-        for word in ["no_sources", "company_gone"] {
+        for word in ["no_sources", "company_gone", "too_large", "timeout"] {
             assert!(super::source_reason(word).is_some(), "{word}");
         }
     }

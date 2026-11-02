@@ -378,6 +378,25 @@ describe("Jobs screen scoring and copy", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("the database is unreadable");
   });
 
+  it.each([
+    ["too_large", "The source sent more than 16 MiB, so that answer was not stored."],
+    ["timeout", "The source took too long to answer. Try again later."],
+  ])("says %s in plain words", async (reason, words) => {
+    const row: SourceRow = { id: "s1", connector: "lever", target: "acme", query: "", cursor: 0, created_at: "t" };
+    jobsBackend([], {
+      jobs_fetch: () => ({
+        sources: [{ source_id: "s1", connector: "lever", target: "acme", added: 0, updated: 0, skipped: 0, reason, next_at: null }],
+        grouped: 0,
+      }),
+    }, [row]);
+    const { user } = await openJobs();
+    const lever = await screen.findByRole("listitem", { name: "Lever" });
+    await user.click(within(lever).getByRole("button", { name: "Fetch Lever" }));
+    const alert = await within(lever).findByRole("alert");
+    expect(alert).toHaveTextContent(words);
+    expect(alert).toHaveTextContent(`code: ${reason}`);
+  });
+
   it("shows the true next fetch time from the stored hold", async () => {
     const row: SourceRow = { id: "s1", connector: "lever", target: "acme", query: "", cursor: 0, created_at: "t" };
     const next = "2026-11-02T16:30:00Z";
