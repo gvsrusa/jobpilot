@@ -1203,6 +1203,14 @@ async fn refresh_plan_counts_any_external_provider_that_can_take_the_task() {
     let both = Router::with_providers(vec![Box::new(claude), Box::new(openai)]);
     assert_eq!(calls(both).await, 3);
 
+    // A failed reply goes on to the next provider, so two eligible providers can make two
+    // calls for one question: the ceiling is pending times the providers that can take it.
+    let (claude, _) = script(ProviderId::ClaudeCode, vec![]);
+    let (openai, _) = script(ProviderId::OpenAi, vec![]);
+    let both = Router::with_providers(vec![Box::new(claude), Box::new(openai)]);
+    consent_to(&db, &[DataCategory::JobText]).await;
+    assert_eq!(calls(both).await, 6, "3 questions, 2 eligible providers");
+
     consent::revoke(&db, OPENAI, "cli").await.unwrap();
     let (gone, _) = script(ProviderId::OpenAi, vec![]);
     assert_eq!(calls(router_of(gone)).await, 0, "revoked");

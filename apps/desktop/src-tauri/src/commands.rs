@@ -855,14 +855,17 @@ pub async fn memory_refresh<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, AppState>,
 ) -> Result<MemoryRefreshed> {
-    let asked = {
+    let plan = {
         let db = state.work().await?;
         let router = Router::from_settings(&db).await?;
-        memory::refresh_plan(&db, &router).await?.external_calls
+        memory::refresh_plan(&db, &router).await?
     };
+    let asked = plan.external_calls;
     if asked > 0 {
         let message = format!(
-            "This will make up to {asked} paid or subscription calls, limit {}.",
+            "This will make at most {asked} paid or subscription calls for {} questions \
+             (a press checks {} questions at most).",
+            plan.pending,
             memory::CLASSIFY_BATCH
         );
         native::confirmed(&app, "Refresh career memory", message, "Refresh").await?;
@@ -5049,7 +5052,10 @@ mod tests {
         let dialog = asked.last().unwrap();
         assert!(
             dialog.contains("Refresh career memory")
-                && dialog.contains("This will make up to 2 paid or subscription calls, limit 20."),
+                && dialog.contains(
+                    "This will make at most 2 paid or subscription calls for 2 questions \
+                     (a press checks 20 questions at most)."
+                ),
             "{asked:?}"
         );
         assert_eq!(
@@ -5085,7 +5091,7 @@ mod tests {
             asked
                 .last()
                 .unwrap()
-                .contains("up to 2 paid or subscription calls")
+                .contains("at most 2 paid or subscription calls")
         );
         assert_eq!(h.ok("agents_list", json!({ "limit": 10 })), json!([]));
         let plan = h.ok("memory_refresh_plan", json!({}));

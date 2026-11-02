@@ -285,9 +285,11 @@ pub async fn memory(db: &Db, command: MemoryCommand) -> Result<Output> {
             let plan = memory::refresh_plan(db, &router).await?;
             if plan.external_calls > 0 && !yes {
                 let text = format!(
-                    "This will make up to {} paid or subscription calls, limit {}. Run \
+                    "This will make at most {} paid or subscription calls for {} questions \
+                     (a press checks {} questions at most). Run \
                      `jobpilot memory refresh --yes` to go ahead.",
                     plan.external_calls,
+                    plan.pending,
                     memory::CLASSIFY_BATCH
                 );
                 let shown = json!({
@@ -299,8 +301,10 @@ pub async fn memory(db: &Db, command: MemoryCommand) -> Result<Output> {
             if plan.external_calls > 0 {
                 // Before the run, on stderr so a JSON reader still gets clean stdout.
                 eprintln!(
-                    "Making up to {} paid or subscription calls, limit {}.",
+                    "Making at most {} paid or subscription calls for {} questions \
+                     (a press checks {} questions at most).",
                     plan.external_calls,
+                    plan.pending,
                     memory::CLASSIFY_BATCH
                 );
             }

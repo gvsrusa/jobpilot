@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
-# The CI gate, run on this Mac. It replaces GitHub Actions when minutes run out.
+# The CI gate, run on this Mac. This is the pre-commit gate: Windows is type-checked here,
+# and CI's Windows job runs it.
 #
 #   scripts/ci-local.sh          everything
 #   scripts/ci-local.sh --fast   skips the keychain suites and the Tauri build
-#
-# ponytail: Windows code is type-checked only (x86_64-pc-windows-gnu with stub
-# tools), never linked or run. Run the workflow by hand, or test on a Windows
-# machine, before trusting a Windows release.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -47,7 +44,8 @@ windows_check() {
 keychain_suites() {
   # One thread: parallel keychain runs have hung here and shown macOS dialogs.
   JOBPILOT_SECRET_SERVICE=jobpilot-test cargo test --workspace -- --ignored \
-    --skip real_claude --skip real_gemini --skip make_fixtures --test-threads=1
+    --skip real_claude --skip real_gemini --skip real_tls --skip make_fixtures \
+    --test-threads=1
 }
 
 step 'install' pnpm install --frozen-lockfile

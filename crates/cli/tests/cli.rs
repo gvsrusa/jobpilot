@@ -1180,7 +1180,8 @@ fn memory_refresh_prints_the_count_and_waits_for_yes() {
     let text = String::from_utf8_lossy(&asked.stdout);
     assert!(
         text.contains(
-            "This will make up to 3 paid or subscription calls, limit 20. \
+            "This will make at most 3 paid or subscription calls for 3 questions \
+             (a press checks 20 questions at most). \
              Run `jobpilot memory refresh --yes` to go ahead."
         ),
         "{text}"

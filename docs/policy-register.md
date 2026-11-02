@@ -4,7 +4,7 @@ Status: draft for owner approval. Register date: 2026-11-01. Source: [master spe
 
 **This is an engineering terms review, not legal advice.** It records what the vendors' own documents say and what the product does as a result. Nobody here is a lawyer, and a vendor or court may read a clause differently.
 
-**Terms change.** Several sources below changed within the last two months, and OpenAI's Usage Policies change again on 2026-11-20. Every entry is true only for its date read. Each release must re-read the entries it depends on before it ships (see [Release re-check](#release-re-check)).
+**Terms change.** Several sources below changed within the last two months, and OpenAI's Usage Policies change again on 2026-11-20. Every entry is true only for its date read. Each release re-reads the site rows it depends on before it ships (see [Release re-check](#release-re-check)). The owner waived that re-read for the AI provider rows, so a release no longer re-reads them, and a changed vendor term can go unnoticed there.
 
 ## Owner decisions (2026-11-01)
 
@@ -246,7 +246,7 @@ An answer is recorded in the row it changes, with date, sender, and text.
 
 ## Release re-check
 
-Before each release, for every row that release depends on:
+Before each release, for every site row that release depends on (the connector rows 0.5 and 0.6 rely on). **The owner waived this re-read for the AI provider rows** (the OpenAI, Anthropic, Google, OpenRouter, Gemini CLI, Codex CLI, Claude Code, and endpoint rows), accepting that a changed vendor term can go unnoticed. The rows below stay as the record of what vendors said on their dates read; no release step edits them, because any change to a provider row's text suspends every consent record for that provider (decision 12 in the [AI providers](ai-providers.md#as-built-in-04) build). A re-read dated after the fact belongs in a new written-answer entry, not in a row.
 
 1. Re-read the source URL. Record the new date read.
 2. Compare the quoted clause. If it changed, re-decide the verdict and its consequence.

@@ -2707,7 +2707,7 @@ dependencies = [
 
 [[package]]
 name = "jobpilot-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "jobpilot-core",
@@ -2724,7 +2724,7 @@ dependencies = [
 
 [[package]]
 name = "jobpilot-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "dirs",
@@ -2751,7 +2751,7 @@ dependencies = [
 
 [[package]]
 name = "jobpilot-desktop"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "jobpilot-core",
  "libc",

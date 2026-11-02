@@ -109,22 +109,21 @@ pub async fn classify_pending(
 }
 
 /// What a press would spend. Reads only: it starts no provider and asks no key.
-/// `external_calls` counts when an external provider declares `NoTools` and holds an active
-/// consent covering job text, as the router would then send the question out. It is an upper
-/// bound: with Ollama first and working, fewer happen.
-// ponytail: one call a question. A second eligible provider behind one whose reply fails can
-// add a call to that question. Count per provider if two ever run side by side for the owner.
+/// `external_calls` is the ceiling: `pending` times the external providers that declare
+/// `NoTools` and hold an active consent covering job text. A reply that fails goes on to the
+/// next provider, so each of them can be asked once per question. With Ollama first and
+/// working, fewer happen. The 20-question limit is `pending`'s, separate from this count.
 pub async fn refresh_plan(db: &Db, router: &Router) -> Result<RefreshPlan> {
     let pending = pending(db).await?.len();
-    let mut outside = false;
+    let mut eligible = 0;
     for declaration in router.declarations() {
         if is_external(&declaration) && declaration.capabilities.contains(&Capability::NoTools) {
             let granted = consent::active(db, &declaration.id.to_string()).await?;
-            outside |= granted.is_some_and(|c| c.contains(&DataCategory::JobText));
+            eligible += usize::from(granted.is_some_and(|c| c.contains(&DataCategory::JobText)));
         }
     }
     Ok(RefreshPlan {
         pending,
-        external_calls: if outside { pending } else { 0 },
+        external_calls: pending * eligible,
     })
 }

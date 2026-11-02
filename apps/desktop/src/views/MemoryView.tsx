@@ -297,7 +297,7 @@ function SearchSection() {
         {plan.data && (
           <span className="pb-1.5 text-xs text-muted-foreground">
             {plan.data.external_calls > 0
-              ? `Up to ${plan.data.external_calls} paid or subscription call${plan.data.external_calls === 1 ? "" : "s"}, limit 20`
+              ? `At most ${plan.data.external_calls} paid or subscription call${plan.data.external_calls === 1 ? "" : "s"} for ${plan.data.pending} question${plan.data.pending === 1 ? "" : "s"} (20 questions a press)`
               : "No outside calls"}
           </span>
         )}

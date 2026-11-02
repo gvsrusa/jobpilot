@@ -122,3 +122,29 @@ fn only_native_tls_is_linked() {
     }
     assert!(lock.contains("name = \"native-tls\""));
 }
+
+/// Proves the TLS handshake with each vendor host: an unauthenticated `GET` with no body, and
+/// any HTTP status counts. It carries no key and no data, so it costs nothing. On Windows it
+/// is the Schannel proof. Run only by CI and by Task 11, with `JOBPILOT_REAL_TLS=1`.
+#[tokio::test]
+#[ignore = "opens a real connection to four vendor hosts"]
+async fn real_tls_handshake() {
+    if std::env::var_os("JOBPILOT_REAL_TLS").is_none_or(|value| value != "1") {
+        eprintln!("skipped: JOBPILOT_REAL_TLS is not 1");
+        return;
+    }
+    let client = hosted_client().unwrap();
+    for host in [
+        "https://api.openai.com/",
+        "https://api.anthropic.com/",
+        "https://generativelanguage.googleapis.com/",
+        "https://openrouter.ai/",
+    ] {
+        let response = client
+            .get(host)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("no TLS handshake with {host}: {error}"));
+        eprintln!("{host} answered {}", response.status());
+    }
+}

@@ -8,6 +8,25 @@ Format follows Keep a Changelog. Versions follow Semantic Versioning.
 - CI on macOS and Windows, and a tag-triggered draft release workflow producing dmg, nsis, and msi installers.
 - Development guide, contributing guide, and Connector SDK stub.
 
+## [0.4.0] - unreleased
+
+External AI backends, all optional and all behind consent. See `docs/releases/0.4.0.md` for what was and was not exercised.
+
+### Added
+- Hosted API providers on your own key: OpenAI, Anthropic, Google (paid key), and OpenRouter, plus one endpoint you name on a loopback address. Native TLS (Schannel, Security.framework), HTTPS only, no redirect, no proxy. Keys live in the OS keychain; the app reads the clipboard in Rust and shows a native dialog, `jobpilot ai key set` reads a hidden prompt, and no key crosses the webview or argv.
+- The Gemini CLI adapter, with every tool denied by a policy file, a run-time guard, and a version floor of 0.40.0. The Codex CLI adapter ships inert: it declares no `no_tools`, so every task skips it.
+- Consent per provider and sign-in method for each new backend, with a required attestation for a Google key and for the Gemini CLI, a native dialog, and "Show exactly what will be sent". A consent record carries the register row's text, so a changed row suspends it. Migration 0012. Schema version 12.
+- `Retry-After` on hosted providers: one retry on 429, 503, or 529 when the header gives whole seconds up to 30.
+- CI step `TLS handshake` on both systems, from the ignored `real_tls_handshake` test.
+- `jobpilot ai key|model|endpoint|cli-path|consent show|give|revoke` for the new providers, and the same on the AI screen.
+
+### Changed
+- Memory refresh states the true ceiling: pending questions times the external providers that could take each, since a failed reply goes on to the next provider. The 20-question limit is stated separately.
+- The AI screen is headed "AI providers".
+- An existing Claude Code consent is suspended once on upgrade and needs one re-confirm.
+- The release re-read of AI provider terms is waived by the owner; it stays for the site rows.
+- Version 0.4.0.
+
 ## [0.3.0] - unreleased
 
 Career memory, application tracking, and emergency pause. See `docs/releases/0.3.0.md` for what was and was not exercised.
