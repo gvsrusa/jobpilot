@@ -206,11 +206,7 @@ pub async fn app(db: &Db, command: AppCommand) -> Result<Output> {
             let text = answers
                 .iter()
                 .map(|a| {
-                    let state = if a.current {
-                        "confirmed"
-                    } else {
-                        "needs confirmation"
-                    };
+                    let state = answer_state(a.class.as_str(), a.current);
                     let used = a
                         .used_at
                         .as_deref()
@@ -230,5 +226,26 @@ pub async fn app(db: &Db, command: AppCommand) -> Result<Output> {
             applications::remove(db, ACTOR, &id).await?;
             out(serde_json::json!({ "id": id }), "removed".into())
         }
+    }
+}
+
+/// A normal answer never needs a confirmation, so it never holds one.
+fn answer_state(class: &str, current: bool) -> &'static str {
+    match (class, current) {
+        ("normal", _) => "no confirmation needed",
+        (_, true) => "confirmed",
+        (_, false) => "needs confirmation",
+    }
+}
+
+#[cfg(test)]
+mod answer_state_tests {
+    use super::answer_state;
+
+    #[test]
+    fn a_normal_answer_is_not_called_unconfirmed() {
+        assert_eq!(answer_state("normal", false), "no confirmation needed");
+        assert_eq!(answer_state("sensitive", false), "needs confirmation");
+        assert_eq!(answer_state("legal", true), "confirmed");
     }
 }

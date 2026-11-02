@@ -1,6 +1,9 @@
 //! A status change to `applied` stamps today's local date. This file holds one test because
 //! it changes `TZ` for the whole process.
 
+// ponytail: Unix only. The Windows CRT does not parse this TZ, so the zone never takes.
+#![cfg(unix)]
+
 use jobpilot_core::applications::{self, ApplicationInput};
 use jobpilot_core::{AppPaths, Db};
 

@@ -1,6 +1,9 @@
 //! The 30-day window follows the local calendar. This file holds one test because it
 //! changes `TZ` for the whole process, which no sibling test may observe.
 
+// ponytail: Unix only. The Windows CRT does not parse this TZ, so the zone never takes.
+#![cfg(unix)]
+
 use jobpilot_core::applications::{self, ApplicationInput};
 use jobpilot_core::{AppPaths, Db};
 
