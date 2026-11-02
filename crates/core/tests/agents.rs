@@ -1255,7 +1255,15 @@ async fn an_export_does_not_stall_the_overseer() {
             }
         })
     };
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Start only once the ticker is running.
+    let clock = Instant::now();
+    while gaps.lock().unwrap().len() < 5 {
+        assert!(
+            clock.elapsed() < Duration::from_secs(5),
+            "the ticker never ran"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
     let started = Instant::now();
     drafts::export(
         &db,

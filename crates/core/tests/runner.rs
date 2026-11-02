@@ -501,7 +501,12 @@ async fn cancel_fires_the_token_and_ends_cancelled() {
     let cancel = token();
     let fired = cancel.clone();
     let canceller = async {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The second step is the one running: the first has finished and been stored.
+        wait_for(
+            &db,
+            "SELECT count(*) FROM agent_runs WHERE state = 'running' AND step = 1",
+        )
+        .await;
         fired.cancel();
     };
     let (done, ()) = tokio::join!(
@@ -976,6 +981,32 @@ async fn age_and_reap(db: &Db) {
     panic!("the run was never reaped");
 }
 
+/// Waits until the count a query returns is above zero, so a test acts on what the run has
+/// reached and not on a guess about how fast this machine is.
+async fn wait_for(db: &Db, sql: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let found: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        if found > 0 {
+            return;
+        }
+        assert!(Instant::now() < deadline, "never reached: {sql}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// A step is running now.
+async fn wait_for_running(db: &Db) {
+    wait_for(
+        db,
+        "SELECT count(*) FROM agent_runs WHERE state = 'running'",
+    )
+    .await;
+}
+
 async fn run_id(db: &Db) -> String {
     let (id,): (String,) = sqlx::query_as("SELECT id FROM agent_runs ORDER BY seq DESC")
         .fetch_one(&db.pool)
@@ -1081,7 +1112,7 @@ async fn a_resume_stops_the_process_it_replaced() {
         })
     });
     let takeover = async {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        wait_for_running(&db).await;
         age_and_reap(&db).await;
         let id = run_id(&db).await;
         runner::resume(&db, "cli", &id, &workflow, token()).await
@@ -1110,7 +1141,7 @@ async fn a_row_lost_under_a_step_fires_its_token() {
     let workflow = script(Agent::Tracking, ONE, |ctx, _| Box::pin(until_stopped(ctx)));
     let cancel = token();
     let meddle = async {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        wait_for_running(&db).await;
         age_and_reap(&db).await;
     };
     let clock = Instant::now();
@@ -1157,8 +1188,12 @@ async fn a_heartbeat_advances_while_a_step_runs() {
                 at
             };
             let before = read().await;
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            assert!(read().await > before);
+            // A beat lands within a few polls; a slow runner gets seconds, not 150 ms.
+            let clock = Instant::now();
+            while read().await <= before {
+                assert!(clock.elapsed() < Duration::from_secs(5), "no beat arrived");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             Ok(StepOutput::default())
         })
     });
@@ -1172,9 +1207,21 @@ async fn a_heartbeat_advances_while_a_step_runs() {
 #[tokio::test]
 async fn a_beat_keeps_a_long_step_from_being_reaped() {
     let (_tmp, db) = setup().await;
-    let workflow = script(Agent::Tracking, ONE, |ctx, _| {
+    // The step stays quiet until the bystander has run, so the bystander always meets a
+    // step that has outlived its stale limit, whatever the speed of this machine.
+    let finished = Arc::new(AtomicBool::new(false));
+    let waiting = finished.clone();
+    let workflow = script(Agent::Tracking, ONE, move |ctx, _| {
+        let waiting = waiting.clone();
         Box::pin(async move {
-            tokio::time::sleep(Duration::from_millis(900)).await;
+            let clock = Instant::now();
+            while !waiting.load(Ordering::SeqCst) {
+                assert!(
+                    clock.elapsed() < Duration::from_secs(10),
+                    "the bystander never ran"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             assert_eq!(ctx.saved("x"), None);
             Ok(StepOutput::default())
         })
@@ -1183,11 +1230,14 @@ async fn a_beat_keeps_a_long_step_from_being_reaped() {
         Box::pin(async { Ok(StepOutput::default()) })
     });
     let bystander = async {
+        wait_for_running(&db).await;
+        // Longer than the stale limit below: only the beats keep the row alive.
         tokio::time::sleep(Duration::from_millis(700)).await;
         let limits = hurried().with_stale(Duration::from_millis(500));
         runner::start_with(&db, "cli", &other, token(), limits)
             .await
             .unwrap();
+        finished.store(true, Ordering::SeqCst);
     };
     let (done, ()) = tokio::join!(
         runner::start_with(&db, "gui", &workflow, token(), hurried()),
@@ -1333,7 +1383,7 @@ async fn a_newer_generation_fires_the_token_of_the_old_process() {
     let workflow = script(Agent::Tracking, ONE, |ctx, _| Box::pin(until_stopped(ctx)));
     let cancel = token();
     let meddle = async {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        wait_for_running(&db).await;
         sqlx::query("UPDATE agent_runs SET generation = generation + 1")
             .execute(&db.pool)
             .await
