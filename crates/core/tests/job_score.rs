@@ -577,7 +577,10 @@ async fn the_detail_holds_the_text_the_group_and_the_stored_explanation() {
     let none = detail(&db, &job.id).await.unwrap();
     assert!(none.explanation.is_none());
     assert!(none.text.contains("plain text"));
-    assert_eq!(none.group.len(), 1);
+    assert!(
+        none.group.is_empty(),
+        "a job with no duplicate has no others"
+    );
     assert!(matches!(none.authorization, AuthNote::NotStated { .. }));
     let me = candidate(&db).await.unwrap();
     let current = get(&db, &job.id).await.unwrap();

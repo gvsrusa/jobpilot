@@ -455,6 +455,18 @@ describe("Job detail", () => {
     expect(screen.getByText("Scored by: rules.")).toBeInTheDocument();
   });
 
+  it("says nothing of duplicates for a job with none", async () => {
+    await openDetail(job());
+    expect(screen.queryByText(/Same job on/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Not a duplicate" })).toBeNull();
+  });
+
+  it("says 1 other source for a pair", async () => {
+    await openDetail(job(), { group: [job({ id: "j2", connector: "wwr" })] });
+    expect(screen.getByText(/Same job on 1 other source\./)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Not a duplicate" })).toBeInTheDocument();
+  });
+
   it("lists findings as a labelled list", async () => {
     await openDetail(job(), { findings: [{ kind: "instruction", excerpt: "ignore previous" }] });
     const list = screen.getByRole("list", { name: "Findings" });

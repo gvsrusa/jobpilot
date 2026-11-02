@@ -1048,6 +1048,7 @@ pub struct JobDetail {
     pub findings: Vec<knowledge::Finding>,
     pub explanation: Option<score::Explanation>,
     pub semantic: Option<semantic::Semantic>,
+    /// The other jobs in this job's group: the leader and its followers, never this job.
     pub group: Vec<Job>,
     pub authorization: AuthNote,
     /// The posting speaks of work authorization at all. Nothing reads its words.
@@ -1088,8 +1089,10 @@ pub async fn detail(db: &Db, id: &str) -> Result<JobDetail> {
         Some(company) => company::notes(db, company).await?,
         None => Vec::new(),
     };
+    let mut others = group(db, &job.id).await?;
+    others.retain(|other| other.id != job.id);
     Ok(JobDetail {
-        group: group(db, &job.id).await?,
+        group: others,
         authorization: authorization_note(db, job.country.as_deref()).await?,
         mentions_authorization: flagged != 0,
         notes,

@@ -12,7 +12,7 @@ use jobpilot_core::ai::router::Router;
 use jobpilot_core::connectors::fetch::Fetcher;
 use jobpilot_core::jobs::dedupe::{self, SIMILAR, company_key, dedupe_key, similar};
 use jobpilot_core::jobs::{
-    JobFilter, Upserted, add_source, group, list, list_sources, remove_source, split,
+    JobFilter, Upserted, add_source, detail, group, list, list_sources, remove_source, split,
 };
 use jobpilot_core::runner::{self, RunState};
 use jobpilot_core::{AppPaths, Db, Error, pause};
@@ -574,6 +574,13 @@ async fn the_same_job_on_two_sources_groups() {
     let from_follower = group(&db, &both[1].id).await.unwrap();
     assert_eq!(from_follower.len(), 2);
     assert_eq!(from_follower[0].id, shown[0].id);
+    // The detail names the others, not the job itself, from either side.
+    let lead_detail = detail(&db, &shown[0].id).await.unwrap();
+    assert_eq!(lead_detail.group.len(), 1);
+    assert_ne!(lead_detail.group[0].id, shown[0].id);
+    let follower_detail = detail(&db, &both[1].id).await.unwrap();
+    assert_eq!(follower_detail.group.len(), 1);
+    assert_eq!(follower_detail.group[0].id, shown[0].id);
     let all = list(
         &db,
         &JobFilter {
