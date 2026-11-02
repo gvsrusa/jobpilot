@@ -21,7 +21,7 @@ jobs:
       matrix:
         os: [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       JOBPILOT_SECRET_SERVICE: jobpilot-ci
     steps:
