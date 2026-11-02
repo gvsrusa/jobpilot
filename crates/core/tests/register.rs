@@ -255,6 +255,29 @@ async fn status_lists_every_provider_but_ollama_and_claude() {
 }
 
 #[tokio::test]
+async fn status_says_which_external_provider_is_suspended() {
+    let (_tmp, db) = setup().await;
+    give_for(&db, "openai", &ALL, false, "gui").await.unwrap();
+    give_for(&db, "anthropic", &ALL, false, "gui")
+        .await
+        .unwrap();
+    sqlx::query("UPDATE consent SET register_row = 'older words' WHERE provider = ?")
+        .bind(KEY)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let status = ai::status(&db).await.unwrap();
+
+    let row = |name: &str| status.external.iter().find(|e| e.name == name).unwrap();
+    assert!(row("openai").suspended);
+    assert_eq!(row("openai").consent, None);
+    assert!(!row("anthropic").suspended);
+    assert_eq!(row("anthropic").consent.as_deref(), Some(&ALL[..]));
+    assert!(!row("google").suspended, "no record is not suspended");
+}
+
+#[tokio::test]
 async fn a_changed_row_suspends_and_a_new_consent_lifts_it() {
     let (_tmp, db) = setup().await;
     consent::give(&db, CLAUDE, &ALL, "2026-11-01", "gui")
@@ -329,6 +352,31 @@ async fn a_name_outside_the_table_is_recorded_with_no_row() {
         .unwrap();
     assert_eq!(row, "");
     assert_eq!(consent::active(&db, CLAUDE).await.unwrap(), None);
+}
+
+/// With no row to compare, nothing can show the record current, whatever it stores.
+#[tokio::test]
+async fn a_provider_with_no_register_row_is_never_active() {
+    let (_tmp, db) = setup().await;
+    for stored in ["", "any words"] {
+        consent::give(&db, "vertex_ai/api_key", &ALL, "2026-11-01", "gui")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE consent SET register_row = ?")
+            .bind(stored)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            consent::state(&db, "vertex_ai/api_key").await.unwrap(),
+            ConsentState::Suspended(ALL.to_vec()),
+            "{stored:?}"
+        );
+        assert_eq!(
+            consent::active(&db, "vertex_ai/api_key").await.unwrap(),
+            None
+        );
+    }
 }
 
 #[tokio::test]

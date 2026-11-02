@@ -19,11 +19,11 @@ const REASONS: [word: string, text: string][] = [
   ],
   [
     "consent_needed",
-    "An AI provider is on, but your consent does not cover this task. See `jobpilot ai status`, then give consent in an ordinary terminal, for example `jobpilot ai consent give claude_code --categories job_text,profile_basic,resume_text`, or on the AI screen.",
+    "An AI provider is on, but your consent does not cover this task. On the AI screen, choose Review, then Allow what drafting needs.",
   ],
   [
     "consent_suspended",
-    "Your consent for this provider was given before the terms on file now, so it is paused and nothing is sent. Review it once on the AI screen, or with `jobpilot ai consent show`.",
+    "Your consent for this provider was given before the terms on file now, so it is paused and nothing is sent. Review it once on the AI screen.",
   ],
   [
     "provider_unavailable",

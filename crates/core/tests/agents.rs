@@ -350,6 +350,7 @@ async fn tracking_stops_before_the_update_once_the_token_fired() {
 // ---- scripted providers -----------------------------------------------------------------
 
 const CLAUDE: &str = "claude_code/cli_login";
+const OPENAI: &str = "openai/api_key";
 const BULLET: &str = "Shipped the Rust compiler";
 
 /// A provider that answers from a list and counts what it is asked. `Ollama` is local and
@@ -1446,6 +1447,40 @@ async fn the_log_names_the_claude_call_that_succeeded() {
     let row = classify_row(&db).await;
     assert_eq!(row.provider.as_deref(), Some(CLAUDE));
     assert_eq!(row.data_categories, [DataCategory::JobText]);
+}
+
+#[tokio::test]
+async fn the_log_names_a_hosted_call() {
+    let (_tmp, db) = open().await;
+    consent::give(&db, OPENAI, &[DataCategory::JobText], "2026-11-01", "cli")
+        .await
+        .unwrap();
+    questions(&db, 1).await;
+    let (provider, _) = script(ProviderId::OpenAi, vec![class_reply("normal")]);
+    agents::memory_refresh(&db, &router_of(provider), "cli", token())
+        .await
+        .unwrap();
+    let row = classify_row(&db).await;
+    assert_eq!(row.provider.as_deref(), Some(OPENAI));
+    assert_eq!(row.data_categories, [DataCategory::JobText]);
+}
+
+/// Ollama answered badly and the hosted provider then took the text, so that is what left.
+#[tokio::test]
+async fn the_log_names_a_hosted_call_over_a_local_one() {
+    let (_tmp, db) = open().await;
+    consent::give(&db, OPENAI, &[DataCategory::JobText], "2026-11-01", "cli")
+        .await
+        .unwrap();
+    questions(&db, 1).await;
+    let (local, _) = script(ProviderId::Ollama, vec!["not json".into()]);
+    let (hosted, handles) = script(ProviderId::OpenAi, vec![class_reply("normal")]);
+    let router = Router::with_providers(vec![Box::new(local), Box::new(hosted)]);
+    agents::memory_refresh(&db, &router, "cli", token())
+        .await
+        .unwrap();
+    assert_eq!(handles.calls(), 1);
+    assert_eq!(classify_row(&db).await.provider.as_deref(), Some(OPENAI));
 }
 
 #[tokio::test]

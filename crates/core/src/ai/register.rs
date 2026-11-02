@@ -177,7 +177,6 @@ pub fn info_for(key: &str) -> Option<&'static ProviderInfo> {
 
 /// A table line's cells. The tables hold no `" | "` inside a cell, which a test keeps true.
 fn cells(line: &str) -> Vec<&str> {
-    let line = line.trim_end_matches('\r');
     let inner = line.strip_prefix("| ").and_then(|l| l.strip_suffix(" |"));
     inner.map_or_else(Vec::new, |inner| inner.split(" | ").collect())
 }
@@ -207,12 +206,7 @@ pub fn rows_of(register: &str, key: &str) -> Option<String> {
         .collect();
     if let Some(prefix) = info.owner_row {
         let owner = format!("| {prefix}");
-        lines.push(
-            register
-                .lines()
-                .find(|line| line.starts_with(&owner))?
-                .trim_end_matches('\r'),
-        );
+        lines.push(register.lines().find(|line| line.starts_with(&owner))?);
     }
     Some(lines.join("\n"))
 }

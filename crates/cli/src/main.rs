@@ -224,8 +224,9 @@ fn message(error: &Error) -> String {
         }
         Error::ManualRequired(reason) if reason == "consent_suspended" => {
             "Your consent for this provider was given before the terms on file now, so it is \
-             paused and nothing is sent. Review it once on the AI screen, or with `jobpilot ai \
-             consent show`."
+             paused and nothing is sent. Review it once on the AI screen. Or read it with \
+             `jobpilot ai consent show`, then give it again with `jobpilot ai consent give` in \
+             an ordinary terminal."
                 .into()
         }
         Error::ManualRequired(reason) if reason == "provider_unavailable" => {
@@ -479,6 +480,10 @@ mod tests {
         let needed = message(&Error::ManualRequired("consent_needed".into()));
         assert!(needed.starts_with("An AI provider is on"), "{needed}");
         let suspended = message(&Error::ManualRequired("consent_suspended".into()));
+        assert!(
+            suspended.contains("jobpilot ai consent give"),
+            "{suspended}"
+        );
         assert!(
             suspended.contains("jobpilot ai consent show"),
             "{suspended}"

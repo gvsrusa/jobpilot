@@ -336,6 +336,35 @@ describe("resumes", () => {
     expect(screen.queryByText(/switched on/)).toBeNull();
   });
 
+  it.each(["consent_needed", "consent_suspended"])("%s_points_to_the_ai_screen_and_no_terminal", async (reason) => {
+    resumeBackend({
+      resume_list: () => [],
+      ai_status: () => OLLAMA_UP,
+      resume_generate: () => {
+        throw { code: "manual_required", message: `this needs manual work: ${reason}` };
+      },
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    await user.click(await screen.findByRole("button", { name: "Generate" }));
+    expect(await screen.findByText(/AI screen/)).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/jobpilot ai|claude_code/);
+  });
+
+  it("consent_needed_says_what_to_press", async () => {
+    resumeBackend({
+      resume_list: () => [],
+      ai_status: () => OLLAMA_UP,
+      resume_generate: () => {
+        throw { code: "manual_required", message: "this needs manual work: consent_needed" };
+      },
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    await user.click(await screen.findByRole("button", { name: "Generate" }));
+    expect(await screen.findByText(/choose Review, then Allow what drafting needs/)).toBeInTheDocument();
+  });
+
   it("failure_reasons_are_explained", async () => {
     resumeBackend({
       resume_list: () => [],
@@ -985,6 +1014,8 @@ describe("ai", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(SUSPENDED_LINE);
     expect(screen.queryByText("Off. Claude Code is used only after you consent below.")).toBeNull();
     expect(screen.getAllByRole("button", { name: "Review consent..." })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "Revoke consent" })).toHaveLength(1);
+    expect(screen.queryByLabelText("Use Claude Code")).toBeNull();
     await user.click(screen.getByRole("button", { name: "Review consent..." }));
     const dialog = within(await screen.findByRole("dialog"));
     for (const name of ["Job text", "Basic profile", "Resume text"]) expect(dialog.getByLabelText(name)).toBeChecked();
@@ -994,6 +1025,56 @@ describe("ai", () => {
       provider: "claude_code",
       categories: ["job_text", "profile_basic", "resume_text"],
     });
+  });
+
+  it("a_suspended_claude_can_be_revoked_and_that_turns_it_off", async () => {
+    const b = backend({
+      ai_status: () =>
+        aiWith({
+          claude_code: { available: true, path: "/opt/claude", consent: null, suspended: true },
+          enabled: { ollama: true, claude_code: true },
+        }),
+      ai_consent_revoke: () => undefined,
+      ai_enable: () => undefined,
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    await user.click(await screen.findByRole("button", { name: "Revoke consent" }));
+    await waitFor(() => expect(count(b, "ai_enable")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_consent_revoke")?.args).toEqual({ provider: "claude_code" });
+    expect(b.calls.find((c) => c.cmd === "ai_enable")?.args).toEqual({ provider: "claude_code", enabled: false });
+  });
+
+  it("every_kind_of_row_offers_review_and_revoke_while_suspended", async () => {
+    const rows = [
+      external({ suspended: true }),
+      external({ name: "endpoint", label: "Compatible endpoint", kind: "endpoint", suspended: true }),
+      external({ name: "gemini_cli", label: "Gemini CLI", kind: "cli", suspended: true }),
+    ];
+    const b = backend({
+      ai_status: () => aiWith({ external: rows }),
+      ai_consent_revoke: () => undefined,
+      ai_enable: () => undefined,
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    for (const { label } of rows) {
+      const row = within(await screen.findByRole("listitem", { name: label }));
+      expect(row.getByRole("button", { name: `Review ${label}...` })).toBeInTheDocument();
+      expect(row.getByRole("button", { name: `Revoke consent for ${label}` })).toBeInTheDocument();
+      expect(row.queryByLabelText(`Use ${label}`)).toBeNull();
+    }
+    await user.click(screen.getByRole("button", { name: "Revoke consent for Gemini CLI" }));
+    await waitFor(() => expect(count(b, "ai_enable")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_consent_revoke")?.args).toEqual({ provider: "gemini_cli" });
+    expect(b.calls.find((c) => c.cmd === "ai_enable")?.args).toEqual({ provider: "gemini_cli", enabled: false });
+  });
+
+  it("use_stays_disabled_on_a_consented_row_that_cannot_run", async () => {
+    backend({ ai_status: () => aiWith({ external: [external({ consent: ["job_text"] })] }) });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    expect(await screen.findByLabelText("Use OpenAI")).toBeDisabled();
   });
 
   it("resumes_view_says_why_generate_is_gone_while_suspended", async () => {

@@ -296,9 +296,14 @@ export function AiView() {
             {s.claude_code.suspended ? (
               <div className="grid justify-items-start gap-2 text-sm">
                 <p role="alert">{SUSPENDED}</p>
-                <Button size="sm" variant="outline" onClick={() => setConsent("claude_code")}>
-                  Review consent...
-                </Button>
+                <div className="flex items-center gap-3">
+                  <Button size="sm" variant="outline" onClick={() => setConsent("claude_code")}>
+                    Review consent...
+                  </Button>
+                  <Button size="sm" variant="outline" onClick={() => revoke.mutate("claude_code")}>
+                    Revoke consent
+                  </Button>
+                </div>
               </div>
             ) : s.claude_code.consent ? (
               <div className="grid gap-2 text-sm">

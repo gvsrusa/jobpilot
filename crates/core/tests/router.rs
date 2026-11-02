@@ -574,6 +574,34 @@ async fn a_suspended_consent_skips_and_says_so() {
     assert_eq!(skip_reasons(&db, CLAUDE).await, ["consent_suspended"]);
 }
 
+/// What a real attempt found outranks what a review could change, as `consent_needed` does.
+#[tokio::test]
+async fn a_real_failure_outranks_a_later_suspended_consent() {
+    let (_tmp, db) = setup().await;
+    let job_text = [DataCategory::JobText];
+    for provider in [CLAUDE, "openai/api_key"] {
+        consent::give(&db, provider, &job_text, "2026-11-01", "gui")
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE consent SET register_row = 'older words' WHERE provider = ?")
+        .bind(CLAUDE)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let capabilities = [Capability::StructuredOutput, Capability::NoTools];
+    let busy = Mock::new(
+        ProviderId::OpenAi,
+        false,
+        &capabilities,
+        vec![Reply::RateLimited(None)],
+    );
+    let waiting = Mock::claude(vec![text(JOB)]);
+    let router = Router::with_providers(vec![busy.boxed(), waiting.boxed()]);
+
+    assert_eq!(parse_job(&router, &db).await, manual("rate_limited"));
+}
+
 /// A provider that could never run the task must not send the user to re-confirm for it.
 #[tokio::test]
 async fn a_suspended_consent_says_so_only_when_it_would_unlock_something() {
