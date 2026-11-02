@@ -14,6 +14,7 @@ pub mod embed;
 pub mod error;
 pub mod generate;
 pub mod hardware;
+pub mod jobs;
 pub mod knowledge;
 pub mod memory;
 pub mod parse;

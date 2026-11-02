@@ -326,11 +326,11 @@ async fn a_0_2_database_upgrades_to_0_3() {
 }
 
 #[tokio::test]
-async fn a_fresh_database_is_schema_12() {
+async fn a_fresh_database_is_schema_13() {
     let (_tmp, paths) = temp_root();
     let db = Db::open(&paths).await.unwrap();
-    assert_eq!(db.schema_version().await.unwrap(), 12);
-    assert_eq!(app_schema_version(), 12);
+    assert_eq!(db.schema_version().await.unwrap(), 13);
+    assert_eq!(app_schema_version(), 13);
     db.close().await;
 }
 
@@ -360,7 +360,7 @@ async fn a_0_3_database_upgrades_to_0_4() {
 
     let db = Db::open(&paths).await.unwrap();
 
-    assert_eq!(db.schema_version().await.unwrap(), 12);
+    assert_eq!(db.schema_version().await.unwrap(), 13);
     assert_eq!(snapshots(&paths, "pre-migrate-11-").len(), 1);
     let kept: (String, String) = sqlx::query_as("SELECT provider, register_row FROM consent")
         .fetch_one(&db.pool)
@@ -372,5 +372,76 @@ async fn a_0_3_database_upgrades_to_0_4() {
         ConsentState::Suspended(vec![DataCategory::JobText, DataCategory::ResumeText])
     );
     assert_eq!(consent::active(&db, CLAUDE).await.unwrap(), None);
+    db.close().await;
+}
+
+// A 0.4 database (schema 12) holds a job text and a draft citing it. Opening it with 0.5
+// snapshots first, keeps every row, and adds one jobs row that carries the text's id.
+#[tokio::test]
+async fn a_0_4_database_upgrades_to_0_5() {
+    let (_tmp, paths) = temp_root();
+    let release_0_4: Vec<Migration> = MIGRATOR
+        .iter()
+        .filter(|m| m.version <= 12)
+        .cloned()
+        .collect();
+    let db = Db::open_with(&paths, &Migrator::with_migrations(release_0_4))
+        .await
+        .unwrap();
+    assert_eq!(db.schema_version().await.unwrap(), 12);
+    for sql in [
+        "INSERT INTO job_texts (id, title, raw, normalized, created_at) \
+         VALUES ('j1', 'Dev', 'raw posting', 'We need Rust', '2026-10-01T00:00:00.000Z')",
+        "INSERT INTO drafts (id, kind, lineage_id, version, origin, title, job_text_id, body, \
+         created_at) VALUES ('dr1', 'resume', 'l1', 1, 'generated', 'Draft', 'j1', '{}', 't')",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    db.close().await;
+
+    let db = Db::open(&paths).await.unwrap();
+
+    assert_eq!(db.schema_version().await.unwrap(), 13);
+    assert_eq!(snapshots(&paths, "pre-migrate-12-").len(), 1);
+    let draft: String = sqlx::query_scalar("SELECT job_text_id FROM drafts WHERE id = 'dr1'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(draft, "j1");
+    let rows: Vec<(String, String, String, String, String)> =
+        sqlx::query_as("SELECT id, job_text_id, connector, title, fields_by FROM jobs")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        vec![(
+            "j1".into(),
+            "j1".into(),
+            "import".into(),
+            "Dev".into(),
+            "none".into()
+        )]
+    );
+    let found = jobpilot_core::jobs::list(
+        &db,
+        &jobpilot_core::jobs::JobFilter {
+            query: Some("Rust".into()),
+            ..Default::default()
+        },
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(found.len(), 1, "the backfilled row is searchable");
+    assert_eq!(jobpilot_core::jobs::text_id(&db, "j1").await.unwrap(), "j1");
+    // The generator reads the text by the same id.
+    let text = jobpilot_core::knowledge::get_job_text(&db, "j1")
+        .await
+        .unwrap();
+    assert_eq!(text.normalized, "We need Rust");
     db.close().await;
 }
