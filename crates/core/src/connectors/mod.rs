@@ -168,6 +168,10 @@ pub trait Connector: Send + Sync {
 // bytes), always on a character boundary.
 const TITLE_MAX: usize = 300;
 const NAME_MAX: usize = 200;
+// ponytail: an id over 200 characters skips the row; a posting keeps 50 tags of 80 characters.
+const ID_MAX: usize = 200;
+const TAGS_MAX: usize = 50;
+const TAG_MAX: usize = 80;
 const RAW_MAX: usize = 200 * 1024;
 
 fn cut_chars(text: &mut String, max: usize) {
@@ -201,7 +205,7 @@ fn link_ok(link: &str, hosts: &[&str]) -> bool {
 }
 
 /// The one check every parsed page passes through, in the fetcher. A row with a bad link or an
-/// over-long title is skipped and counted; a repeated `external_id` keeps its first; a pay
+/// over-long title or id is skipped and counted; a repeated `external_id` keeps its first; a pay
 /// range that is negative or empty becomes unknown; long fields are cut.
 pub fn vet(mut page: Page, link_hosts: &[&str]) -> Page {
     let mut seen = std::collections::HashSet::new();
@@ -214,6 +218,7 @@ pub fn vet(mut page: Page, link_hosts: &[&str]) -> Page {
                 .is_none_or(|link| link_ok(link, link_hosts));
         if !links_ok
             || posting.title.chars().count() > TITLE_MAX
+            || posting.external_id.chars().count() > ID_MAX
             || !seen.insert(posting.external_id.clone())
         {
             page.skipped += 1;
@@ -228,6 +233,11 @@ pub fn vet(mut page: Page, link_hosts: &[&str]) -> Page {
         }
         cut_chars(&mut posting.company, NAME_MAX);
         cut_chars(&mut posting.location, NAME_MAX);
+        posting.tags.truncate(TAGS_MAX);
+        posting
+            .tags
+            .iter_mut()
+            .for_each(|tag| cut_chars(tag, TAG_MAX));
         cut_bytes(&mut posting.raw, RAW_MAX);
         page.postings.push(posting);
     }

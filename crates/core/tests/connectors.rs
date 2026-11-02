@@ -322,7 +322,9 @@ fn every_assisted_src_can_only_import() {
         assert!(c.decl().hosts.is_empty() && c.decl().rate_limit.is_none());
         assert!(check(c.decl()).is_ok());
         let err = c.request(&target("x"), 0).unwrap_err();
-        assert!(matches!(&err, jobpilot_core::Error::Refused(code) if code == "op_not_declared"));
+        assert!(
+            matches!(&err, jobpilot_core::Error::Refused(code) if code == "operation_not_declared")
+        );
         assert!(gate(c.decl(), Operation::ImportPasted).is_ok());
         assert!(gate(c.decl(), Operation::ListBoard).is_err());
         assert!(

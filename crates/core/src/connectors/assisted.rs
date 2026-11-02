@@ -89,7 +89,7 @@ pub(super) fn sources() -> [Assisted; 4] {
 }
 
 fn refused<T>() -> Result<T> {
-    Err(Error::Refused("op_not_declared".into()))
+    Err(Error::Refused("operation_not_declared".into()))
 }
 
 impl Connector for Assisted {

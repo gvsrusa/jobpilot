@@ -782,3 +782,48 @@ async fn a_greenhouse_link_needs_https_only_and_an_ashby_link_needs_its_host() {
         );
     }
 }
+
+fn posting(id: &str) -> jobpilot_core::connectors::Posting {
+    jobpilot_core::connectors::Posting {
+        external_id: id.into(),
+        title: "T".into(),
+        company: "C".into(),
+        location: String::new(),
+        country: None,
+        work_mode: None,
+        employment_type: None,
+        url: "https://jobs.lever.co/acme/1".into(),
+        apply_url: None,
+        posted_on: None,
+        pay: None,
+        tags: Vec::new(),
+        raw: "x".into(),
+    }
+}
+
+fn vetted(postings: Vec<jobpilot_core::connectors::Posting>) -> Page {
+    let page = Page {
+        postings,
+        next: None,
+        skipped: 0,
+    };
+    jobpilot_core::connectors::vet(page, &["jobs.lever.co"])
+}
+
+#[test]
+fn an_id_over_200_characters_skips_the_row() {
+    let page = vetted(vec![posting(&"i".repeat(200)), posting(&"i".repeat(201))]);
+    assert_eq!(page.postings.len(), 1);
+    assert_eq!(page.postings[0].external_id.chars().count(), 200);
+    assert_eq!(page.skipped, 1);
+}
+
+#[test]
+fn tags_are_capped_in_count_and_length() {
+    let mut p = posting("1");
+    p.tags = (0..60).map(|_| "é".repeat(100)).collect();
+    let page = vetted(vec![p]);
+    let tags = &page.postings[0].tags;
+    assert_eq!(tags.len(), 50);
+    assert!(tags.iter().all(|t| t.chars().count() == 80));
+}
