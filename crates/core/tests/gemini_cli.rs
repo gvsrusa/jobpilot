@@ -20,7 +20,7 @@ const PROVIDER: &str = "gemini_cli/cli_login";
 const SENTINEL: &str = "ZXQ-POSTING-SENTINEL";
 const SCHEMA: &str = r#"{"properties":{"ok":{"type":"boolean"}},"type":"object"}"#;
 const JOB: &str = r#"{"title":"Engineer","company":"Acme","location":"Oslo","remote":"hybrid",
-    "skills":["Rust"],"seniority":"senior","compensation":""}"#;
+    "skills":["Rust"],"seniority":"senior"}"#;
 
 /// Per attempt.
 #[cfg(unix)]

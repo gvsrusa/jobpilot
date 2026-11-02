@@ -1124,7 +1124,7 @@ Steps, in this order: `fields` (`ReadJobText`, `Model(ParseJob)`, `WriteJobField
 
 `keep_grounded`: `strip_ids` runs on every text first, as models write ids into prose. `drafts::check_claims` then judges the strengths, and only status `ok` is kept; each other is dropped and counted. `states_authorization` blanks `summary` and drops a gap. `check_fit` uses a fixed error message, because a parser's text can quote output, and returns only `Validation`: any other `Err` ends the task instead of retrying.
 
-The step matches on `Outcome`, not on `Error`. `ManualRequired { reason }` covers `no_ai`, `consent_needed`, `unusable_reply` (every provider's replies failed validation), and `output_truncated`. `Failed { reason }` is kept the same way. `Cancelled` ends the step. `merge_parsed`: per decision 20, a seniority maps through `rules::seniority_of`, and pay through `parse_pay` on text that appears in the normalized posting.
+The step matches on `Outcome`, not on `Error`. `ManualRequired { reason }` covers `no_ai`, `consent_needed`, `unusable_reply` (every provider's replies failed validation), and `output_truncated`. `Failed { reason }` is kept the same way. `Cancelled` ends the step. `merge_parsed`: per decision 20, a seniority maps through `rules::seniority_of`. A model never sets pay: only the deterministic `parse_pay` does, and a pay value in a reply counts as dropped.
 
 - [ ] **Step 1: Write the failing tests** in `crates/core/tests/matching.rs`, using the router tests' scripted provider
 

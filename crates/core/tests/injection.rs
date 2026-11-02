@@ -531,7 +531,7 @@ async fn an_exfiltration_url_stays_flagged_text() {
 fn steered_replies_fail_the_parse_job_schema() {
     let schema = spec(TaskType::ParseJob).schema;
     let ok = r#"{"title":"Engineer","company":"Example","location":"Lisbon","remote":"remote",
-        "skills":["Rust"],"seniority":"senior","compensation":""}"#;
+        "skills":["Rust"],"seniority":"senior"}"#;
     // The control: the schema accepts a faithful reply, so the failures below are its doing.
     assert!(validate(schema, ok).is_ok());
 

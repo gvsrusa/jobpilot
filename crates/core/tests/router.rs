@@ -20,7 +20,7 @@ use tempfile::TempDir;
 
 const CLAUDE: &str = "claude_code/cli_login";
 const JOB: &str = r#"{"title":"Engineer","company":"Acme","location":"Oslo","remote":"hybrid",
-    "skills":["Rust"],"seniority":"senior","compensation":""}"#;
+    "skills":["Rust"],"seniority":"senior"}"#;
 const SENTINEL: &str = "ZXQ-POSTING-SENTINEL";
 
 enum Reply {

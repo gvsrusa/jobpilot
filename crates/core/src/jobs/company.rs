@@ -25,6 +25,10 @@ const FACT_CHARS: usize = 500;
 /// A fact's words of at least this many letters must mostly stand in its source.
 const LONG_WORD: usize = 4;
 const GROUNDED_PERCENT: usize = 60;
+/// Capitalized words that open a sentence or stand for the company, and name nothing.
+const COMMON: [&str; 11] = [
+    "the", "a", "an", "it", "they", "we", "its", "their", "this", "our", "company",
+];
 
 /// The stored note's id: its `seq` as 32 hex digits. A note has no id column, and the
 /// schema it was made in is not edited, so the id is derived and stays stable.
@@ -241,45 +245,46 @@ fn cut(text: &str, room: usize) -> &str {
 }
 
 /// The words of `text` that need no lookup to be wrong: a number, and a capitalized word that
-/// does not open a sentence (a name). Each is folded, as [`fold`] writes it.
+/// is not [`COMMON`] (a name), even at the start of a sentence. Each is folded, as [`fold`]
+/// writes it.
 fn must_appear(text: &str) -> Vec<String> {
-    let mut found = Vec::new();
-    let mut opens = true;
-    let mut word = String::new();
-    let mut flush = |word: &mut String, opens: bool| {
-        if let Some(first) = word.chars().next() {
-            let name = first.is_uppercase() && !opens;
-            let number = word.chars().any(|c| c.is_numeric());
-            if name || number {
-                found.extend(
-                    fold(word)
-                        .split(' ')
-                        .filter(|w| !w.is_empty())
-                        .map(str::to_owned),
-                );
-            }
-        }
-        word.clear();
-    };
-    for c in text.chars() {
-        if c.is_alphanumeric() {
-            word.push(c);
-        } else {
-            let was_open = opens && word.is_empty();
-            flush(&mut word, opens);
-            opens = was_open || matches!(c, '.' | '!' | '?');
-        }
-    }
-    flush(&mut word, opens);
-    found
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| {
+            let name = word.chars().next().is_some_and(char::is_uppercase)
+                && !COMMON.contains(&word.to_lowercase().as_str());
+            name || word.chars().any(char::is_numeric)
+        })
+        .flat_map(|word| {
+            fold(word)
+                .split(' ')
+                .filter(|w| !w.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// `text` with the commas inside a figure gone: `1,000` is the one number `1000`.
+fn join_figures(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let digit = |at: Option<&char>| at.is_some_and(char::is_ascii_digit);
+    chars
+        .iter()
+        .enumerate()
+        .filter(|(at, c)| {
+            **c != ',' || !(*at > 0 && digit(chars.get(at - 1)) && digit(chars.get(at + 1)))
+        })
+        .map(|(_, c)| *c)
+        .collect()
 }
 
 /// Whether at least 60 percent of the fact's distinct words of four or more letters stand in
 /// `src`, as whole words after folding case, marks, and punctuation, and every number and
-/// every name in the fact does too. A repeat counts once. A fact with no such word is not
-/// grounded: nothing in it could be checked.
+/// every name in the fact does too. A figure compares without its commas. A repeat counts
+/// once. A fact with no such word is not grounded: nothing in it could be checked.
 pub fn grounded(fact: &str, src: &str) -> bool {
-    let folded = fold(fact);
+    let fact = join_figures(fact);
+    let folded = fold(&fact);
     let long: HashSet<&str> = folded
         .split(' ')
         .filter(|word| word.chars().count() >= LONG_WORD)
@@ -287,11 +292,11 @@ pub fn grounded(fact: &str, src: &str) -> bool {
     if long.is_empty() {
         return false;
     }
-    let source = fold(src);
+    let source = fold(&join_figures(src));
     let known: HashSet<&str> = source.split(' ').collect();
     let found = long.iter().filter(|word| known.contains(*word)).count();
     found * 100 >= long.len() * GROUNDED_PERCENT
-        && must_appear(fact)
+        && must_appear(&fact)
             .iter()
             .all(|word| known.contains(word.as_str()))
 }

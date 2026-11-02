@@ -15,6 +15,7 @@ use jobpilot_core::ai::{
     Availability, BYTES_PER_TOKEN, BoxFuture, CancellationToken, Capability, DataCategory,
     Declaration, Prompt, Provider, ProviderId, TaskType, consent, spec,
 };
+use jobpilot_core::jobs::rules::names_right_to_work;
 use jobpilot_core::jobs::score::{Candidate, score};
 use jobpilot_core::jobs::semantic::{
     check_fit, keep_grounded, merge_parsed, needs_parsing, parse_job_prompt, semantic_prompt,
@@ -698,7 +699,7 @@ const BARE: &str = "Come and work with our friendly crew. We value Glazing and k
 fn parse_reply(skills: &[&str], location: &str) -> String {
     json!({
         "title": "Something Else", "company": "Not Acme", "location": location,
-        "remote": "hybrid", "skills": skills, "seniority": "senior", "compensation": "",
+        "remote": "hybrid", "skills": skills, "seniority": "senior",
     })
     .to_string()
 }
@@ -770,32 +771,19 @@ async fn parse_job_never_sets_country() {
 }
 
 #[tokio::test]
-async fn parse_job_reads_pay_only_from_text_in_the_posting_and_leaves_filled_fields() {
+async fn parse_job_leaves_filled_fields() {
     let (_tmp, db) = open().await;
     let text = "Join our crew. The salary is EUR 70,000 a year. We value Glazing.";
     let job = paste(&db, "Potter", text).await;
     let posting = knowledge::get_job_text(&db, &job.job_text_id)
         .await
         .unwrap();
-    let said = |pay: &str| {
-        json!({"title": "", "company": "", "location": "", "remote": "unknown", "skills": [],
-               "seniority": "", "compensation": pay})
-    };
-    assert!(job.pay.is_some(), "the rules read it first");
-    let mut blank = job.clone();
-    blank.pay = None;
-    let found = merge_parsed(&blank, &posting, &said("EUR 70,000 a year"));
-    assert_eq!(found.pay.as_ref().and_then(|p| p.min), Some(70_000));
-    let invented = merge_parsed(&blank, &posting, &said("EUR 250,000 a year"));
-    assert!(invented.pay.is_none(), "not in the posting");
-
-    // A field the job has is not touched.
     let mut filled = job.clone();
     filled.work_mode = Some("onsite".into());
     filled.seniority = Some("junior".into());
     filled.skills = vec!["Rust".into()];
     let reply = json!({"title": "", "company": "", "location": "", "remote": "remote",
-        "skills": ["Glazing"], "seniority": "senior", "compensation": ""});
+        "skills": ["Glazing"], "seniority": "senior"});
     let parsed = merge_parsed(&filled, &posting, &reply);
     assert!(parsed.is_empty(), "{parsed:?}");
 }
@@ -1003,9 +991,9 @@ async fn a_run_row_holds_no_prompt_or_reply_text() {
 
 // ---- review fixes -----------------------------------------------------------------------
 
-fn said(remote: &str, skills: &[&str], seniority: &str, pay: &str) -> Value {
+fn said(remote: &str, skills: &[&str], seniority: &str) -> Value {
     json!({"title": "", "company": "", "location": "", "remote": remote, "skills": skills,
-           "seniority": seniority, "compensation": pay})
+           "seniority": seniority})
 }
 
 async fn blank_job(db: &Db, text: &str) -> (jobs::Job, JobText) {
@@ -1018,11 +1006,7 @@ async fn blank_job(db: &Db, text: &str) -> (jobs::Job, JobText) {
 async fn a_skill_stating_authorization_is_dropped_and_counted_and_never_scored() {
     let (_tmp, db) = open().await;
     let (job, posting) = blank_job(&db, "US citizen only. Glazing and Kilns wanted.").await;
-    let parsed = merge_parsed(
-        &job,
-        &posting,
-        &said("", &["US citizen", "Glazing"], "", ""),
-    );
+    let parsed = merge_parsed(&job, &posting, &said("", &["US citizen", "Glazing"], ""));
     assert_eq!(parsed.skills, ["Glazing"]);
     assert_eq!(parsed.dropped, 1);
 
@@ -1040,109 +1024,23 @@ async fn a_skill_stating_authorization_is_dropped_and_counted_and_never_scored()
 }
 
 #[tokio::test]
-async fn pay_needs_its_symbol_and_whole_figures_in_the_posting() {
-    let (_tmp, db) = open().await;
-    let pay_of = async |text: &str, claimed: &str| {
-        let (job, posting) = blank_job(&db, text).await;
-        let mut blank = job.clone();
-        blank.pay = None;
-        merge_parsed(&blank, &posting, &said("", &[], "", claimed)).pay
-    };
-    let found = pay_of("The pay is $70,000 a year.", "$70,000 a year")
-        .await
-        .unwrap();
-    assert_eq!(
-        (found.min, found.currency.as_deref()),
-        (Some(70_000), Some("USD"))
-    );
-    assert!(
-        pay_of("We will fire 70,000 pots a year.", "$70,000 a year")
-            .await
-            .is_none()
-    );
-    assert!(
-        pay_of("The pay is $170,000 a year.", "$70,000 a year")
-            .await
-            .is_none()
-    );
-    assert!(
-        pay_of("The pay is 170,000 EUR a year.", "70,000 EUR a year")
-            .await
-            .is_none()
-    );
-    assert!(
-        pay_of("The pay is $70,000 a year.", "EUR 70,000 a year")
-            .await
-            .is_none()
-    );
-    // Spacing in the posting does not matter.
-    assert!(
-        pay_of("Pay:\n  $70,000   a\nyear.", "$70,000 a year")
-            .await
-            .is_some()
-    );
-    assert!(pay_of("The pay is $70,000 a year.", "").await.is_none());
-    // The figure stands whole, and a pay word is in its sentence.
-    assert!(
-        pay_of("They raised $70,000,000 in funding.", "$70,000")
-            .await
-            .is_none()
-    );
-    assert!(
-        pay_of("Salary: $70,000.50 a year.", "$70,000")
-            .await
-            .is_none()
-    );
-    assert!(
-        pay_of("We raised $5,000,000 in funding.", "$5,000,000")
-            .await
-            .is_none()
-    );
-    assert!(
-        pay_of(
-            "The salary is fair. We raised $60,000 in funding.",
-            "$60,000 a year"
-        )
-        .await
-        .is_none()
-    );
-    for word in [
-        "Salary",
-        "Compensation",
-        "Pay",
-        "Base",
-        "OTE",
-        "Wage",
-        "Range",
-    ] {
-        let text = format!("{word} of $70,000 a year.");
-        assert!(pay_of(&text, "$70,000 a year").await.is_some(), "{word}");
-    }
-    assert!(
-        pay_of("Pay is $70,000 a year!", "$70,000 a year")
-            .await
-            .is_some()
-    );
-}
-
-#[tokio::test]
 async fn work_mode_and_seniority_need_the_posting_to_say_the_word() {
     let (_tmp, db) = open().await;
     let (job, bare) = blank_job(&db, BARE).await;
-    let ungrounded = merge_parsed(&job, &bare, &said("onsite", &["Glazing"], "senior", ""));
+    let ungrounded = merge_parsed(&job, &bare, &said("onsite", &["Glazing"], "senior"));
     assert_eq!((ungrounded.work_mode, ungrounded.seniority), (None, None));
     assert_eq!(ungrounded.skills, ["Glazing"], "the rest is kept");
 
     let (job, said_it) = blank_job(&db, BARE_WORDS).await;
-    let grounded = merge_parsed(&job, &said_it, &said("hybrid", &[], "senior", ""));
+    let grounded = merge_parsed(&job, &said_it, &said("hybrid", &[], "senior"));
     assert_eq!(grounded.work_mode, Some("hybrid"));
     assert_eq!(grounded.seniority.map(|s| s.as_str()), Some("senior"));
     // Another word than the posting's is still unknown.
-    let wrong = merge_parsed(&job, &said_it, &said("remote", &[], "junior", ""));
+    let wrong = merge_parsed(&job, &said_it, &said("remote", &[], "junior"));
     assert_eq!((wrong.work_mode, wrong.seniority), (None, None));
 
     let (job, spelled) = blank_job(&db, "Work on-site with our crew. Glazing.").await;
-    let onsite = merge_parsed(&job, &spelled, &said("onsite", &[], "", ""));
+    let onsite = merge_parsed(&job, &spelled, &said("onsite", &[], ""));
     assert_eq!(onsite.work_mode, Some("onsite"));
 }
 
@@ -1160,7 +1058,7 @@ async fn a_model_fill_marks_even_a_connector_job_as_the_models() {
     let (_tmp, db) = open().await;
     let (job, posting) = blank_job(&db, BARE_WORDS).await;
     set_by(&db, &job.id, "connector").await;
-    let fields = merge_parsed(&job, &posting, &said("hybrid", &["Glazing"], "", ""));
+    let fields = merge_parsed(&job, &posting, &said("hybrid", &["Glazing"], ""));
     store_parsed(&db, &job.id, &fields).await.unwrap();
     assert_eq!(jobs::get(&db, &job.id).await.unwrap().fields_by, "model");
 }
@@ -1204,7 +1102,7 @@ async fn needs_parsing_asks_only_for_a_job_with_nothing_filled_that_no_one_set()
 async fn store_parsed_never_overwrites_what_a_person_or_the_job_already_has() {
     let (_tmp, db) = open().await;
     let (job, posting) = blank_job(&db, BARE_WORDS).await;
-    let fields = merge_parsed(&job, &posting, &said("hybrid", &["Glazing"], "senior", ""));
+    let fields = merge_parsed(&job, &posting, &said("hybrid", &["Glazing"], "senior"));
     assert!(!fields.is_empty());
     for by in ["user", "model"] {
         set_by(&db, &job.id, by).await;
@@ -1227,12 +1125,6 @@ async fn store_parsed_never_overwrites_what_a_person_or_the_job_already_has() {
         work_mode: Some("hybrid"),
         skills: vec!["Glazing".into()],
         seniority: Some(jobpilot_core::jobs::rules::Seniority::Senior),
-        pay: Some(jobs::PayRange {
-            min: Some(70_000),
-            max: Some(80_000),
-            currency: Some("USD".into()),
-            period: Some(jobs::PayPeriod::Month),
-        }),
         dropped: 0,
     };
     store_parsed(&db, &job.id, &all).await.unwrap();
@@ -1405,9 +1297,8 @@ async fn skills_match_whole_words_and_are_capped() {
     .await;
     let mut job = job;
     job.skills.clear();
-    let kept = |skills: &[&str], text: &JobText| {
-        merge_parsed(&job, text, &said("", skills, "", "")).skills
-    };
+    let kept =
+        |skills: &[&str], text: &JobText| merge_parsed(&job, text, &said("", skills, "")).skills;
     assert!(
         kept(&["Rust"], &posting).is_empty(),
         "inside Trust and Rusty"
@@ -1449,7 +1340,7 @@ async fn a_negated_word_does_not_ground_a_mode_or_a_level() {
         "We are not senior-heavy; hire a not senior hand. Glazing.",
     ] {
         let (job, posting) = blank_job(&db, text).await;
-        let parsed = merge_parsed(&job, &posting, &said("remote", &[], "senior", ""));
+        let parsed = merge_parsed(&job, &posting, &said("remote", &[], "senior"));
         seen.push((parsed.work_mode, parsed.seniority.map(|s| s.as_str())));
     }
     assert_eq!(
@@ -1457,7 +1348,7 @@ async fn a_negated_word_does_not_ground_a_mode_or_a_level() {
         [(None, None), (None, None), (None, None), (None, None)]
     );
     let (job, mixed) = blank_job(&db, "Not remote on Mondays, remote otherwise. Glazing.").await;
-    let parsed = merge_parsed(&job, &mixed, &said("remote", &[], "", ""));
+    let parsed = merge_parsed(&job, &mixed, &said("remote", &[], ""));
     assert_eq!(
         parsed.work_mode,
         Some("remote"),
@@ -1470,7 +1361,7 @@ async fn hybrid_remote_and_onsite_each_need_their_own_word() {
     let (_tmp, db) = open().await;
     let (job, bare) = blank_job(&db, BARE).await;
     for word in ["hybrid", "remote", "onsite"] {
-        let parsed = merge_parsed(&job, &bare, &said(word, &[], "", ""));
+        let parsed = merge_parsed(&job, &bare, &said(word, &[], ""));
         assert_eq!(parsed.work_mode, None, "{word}");
     }
     for (text, word, expected) in [
@@ -1481,14 +1372,14 @@ async fn hybrid_remote_and_onsite_each_need_their_own_word() {
         ("An onsite crew. Glazing.", "onsite", "onsite"),
     ] {
         let (job, posting) = blank_job(&db, text).await;
-        let parsed = merge_parsed(&job, &posting, &said(word, &[], "", ""));
+        let parsed = merge_parsed(&job, &posting, &said(word, &[], ""));
         assert_eq!(parsed.work_mode, Some(expected), "{text}");
     }
     // Another word in the posting does not stand in for the one claimed.
     let (job, remote_only) = blank_job(&db, "A remote crew. Glazing.").await;
     for word in ["hybrid", "onsite"] {
         assert_eq!(
-            merge_parsed(&job, &remote_only, &said(word, &[], "", "")).work_mode,
+            merge_parsed(&job, &remote_only, &said(word, &[], "")).work_mode,
             None
         );
     }
@@ -1507,7 +1398,7 @@ async fn dotted_product_names_are_skills_not_authorization() {
     let parsed = merge_parsed(
         &job,
         &posting,
-        &said("", &["Passport.js", "Node.js", "US citizen"], "", ""),
+        &said("", &["Passport.js", "Node.js", "US citizen"], ""),
     );
     assert_eq!(parsed.skills, ["Passport.js", "Node.js"]);
     assert_eq!(parsed.dropped, 1);
@@ -1576,7 +1467,7 @@ async fn a_dropped_count_reaches_the_report_and_the_run_log() {
     let report = match_jobs(&db, &router_of(provider), "cli", req, token())
         .await
         .unwrap();
-    assert_eq!(report.dropped, 3, "{report:?}");
+    assert_eq!(report.dropped, 5, "{report:?}");
     let run = runner::list(&db, 1).await.unwrap().remove(0);
     let log = runner::get(&db, &run.id).await.unwrap().log;
     let of = |step: &str| {
@@ -1585,7 +1476,7 @@ async fn a_dropped_count_reaches_the_report_and_the_run_log() {
             .unwrap()
             .dropped
     };
-    assert_eq!((of("fields"), of("score"), of("semantic")), (1, 0, 2));
+    assert_eq!((of("fields"), of("score"), of("semantic")), (3, 0, 2));
 }
 
 #[tokio::test]
@@ -1694,4 +1585,83 @@ async fn the_score_is_written_by_the_rules_and_the_fit_beside_it() {
     let shown = jobs::detail(&w.db, &w.job.id).await.unwrap();
     assert_eq!(i64::from(shown.semantic.unwrap().fit), FIT);
     assert_eq!(shown.job.score, Some(100));
+}
+
+// ---- final review fixes -----------------------------------------------------------------
+
+#[test]
+fn a_right_to_work_term_joined_by_punctuation_is_still_caught() {
+    for skill in [
+        "U.S.citizenship",
+        "visa.sponsorship",
+        "work.permit",
+        "work-permit",
+        "work_permit",
+        "Passport.js U.S.citizen",
+    ] {
+        assert!(names_right_to_work(skill), "{skill}");
+    }
+    for skill in ["Passport.js", "passport.JS", "Node.js", "Glazing"] {
+        assert!(!names_right_to_work(skill), "{skill}");
+    }
+}
+
+#[tokio::test]
+async fn a_models_pay_is_never_stored_and_counts_as_dropped() {
+    let (_tmp, db) = open().await;
+    let (job, posting) = blank_job(&db, BARE).await;
+    assert!(job.pay.is_none());
+    let mut reply = said("", &["Glazing"], "");
+    reply["compensation"] = json!("$70,000 a year");
+    let fields = merge_parsed(&job, &posting, &reply);
+    assert_eq!(fields.dropped, 1);
+    store_parsed(&db, &job.id, &fields).await.unwrap();
+    let after = jobs::get(&db, &job.id).await.unwrap();
+    assert_eq!(after.skills, ["Glazing"]);
+    assert!(after.pay.is_none());
+
+    let schema: Value = serde_json::from_str(spec(TaskType::ParseJob).schema).unwrap();
+    assert!(schema["properties"].get("compensation").is_none());
+    assert!(
+        !schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("compensation"))
+    );
+}
+
+#[tokio::test]
+async fn every_value_a_reply_loses_is_counted() {
+    let (_tmp, db) = open().await;
+    let (job, posting) = blank_job(&db, BARE).await;
+    let invented = said("remote", &["Kubernetes", "Glazing", "GLAZING"], "senior");
+    let fields = merge_parsed(&job, &posting, &invented);
+    assert_eq!(fields.skills, ["Glazing"]);
+    assert_eq!(
+        fields.dropped, 4,
+        "Kubernetes, the repeat, the mode, the level"
+    );
+    // Saying nothing loses nothing.
+    let nothing = said("unknown", &["", "Glazing"], "unknown");
+    assert_eq!(merge_parsed(&job, &posting, &nothing).dropped, 0);
+}
+
+#[tokio::test]
+async fn negation_reaches_three_words_back_and_through_a_bracket() {
+    let (_tmp, db) = open().await;
+    for text in [
+        "This isn't remote. Glazing.",
+        "This isn\u{2019}t remote. Glazing.",
+        "Our crew (not remote) glazes. Glazing.",
+        "This is not a fully remote role. Glazing.",
+        "A role without remote days. Glazing.",
+        "A non remote role. Glazing.",
+    ] {
+        let (job, posting) = blank_job(&db, text).await;
+        let parsed = merge_parsed(&job, &posting, &said("remote", &[], ""));
+        assert_eq!(parsed.work_mode, None, "{text}");
+    }
+    let (job, posting) = blank_job(&db, "No agencies, please. Fully remote. Glazing.").await;
+    let parsed = merge_parsed(&job, &posting, &said("remote", &[], ""));
+    assert_eq!(parsed.work_mode, Some("remote"));
 }

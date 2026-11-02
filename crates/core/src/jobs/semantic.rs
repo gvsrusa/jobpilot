@@ -7,9 +7,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::pay::parse_pay;
+use super::Job;
 use super::rules::{Seniority, names_right_to_work, seniority_of};
-use super::{Job, PayPeriod, PayRange};
 use crate::ai::{Prompt, TaskType, spec};
 use crate::db::Db;
 use crate::drafts::{ClaimInput, check_claims, states_authorization};
@@ -37,23 +36,20 @@ pub struct Semantic {
     pub at: String,
 }
 
-/// The fields `parse_job` may fill. Nothing else of a job is ever set by a model.
+/// The fields `parse_job` may fill. Nothing else of a job is ever set by a model: pay comes
+/// only from [`super::pay::parse_pay`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ParsedFields {
     pub work_mode: Option<&'static str>,
     pub skills: Vec<String>,
     pub seniority: Option<Seniority>,
-    pub pay: Option<PayRange>,
-    /// Skills cut for stating work authorization.
+    /// Every value of the reply that was not kept.
     pub dropped: usize,
 }
 
 impl ParsedFields {
     pub fn is_empty(&self) -> bool {
-        self.work_mode.is_none()
-            && self.skills.is_empty()
-            && self.seniority.is_none()
-            && self.pay.is_none()
+        self.work_mode.is_none() && self.skills.is_empty() && self.seniority.is_none()
     }
 }
 
@@ -230,6 +226,8 @@ struct ParseReply {
     remote: String,
     skills: Vec<String>,
     seniority: String,
+    /// Not in the schema: a model never sets pay, so one that sends it is counted.
+    #[serde(default)]
     compensation: String,
 }
 
@@ -265,11 +263,8 @@ fn stands_in(needle: &str, text: &str) -> bool {
     !whole(needle, text).1.is_empty()
 }
 
-/// Whether the words just before are a `not`, a `no`, or a `non-`, within the same clause.
+/// Whether one of the three words just before negates, within the same clause.
 fn negated(before: &str) -> bool {
-    if before.ends_with("non-") || before.ends_with("non ") {
-        return true;
-    }
     let clause = before
         .rsplit(['.', '!', '?', ';', ',', ':'])
         .next()
@@ -277,51 +272,20 @@ fn negated(before: &str) -> bool {
     clause
         .split_whitespace()
         .rev()
-        .take(2)
-        .any(|word| word == "not" || word == "no")
+        .take(3)
+        .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric()))
+        .any(|word| {
+            matches!(
+                word,
+                "not" | "no" | "non" | "isn't" | "isn\u{2019}t" | "without"
+            )
+        })
 }
 
 /// [`stands_in`], at least once with no negation before it.
 fn stands_plainly(word: &str, text: &str) -> bool {
     let (text, spots) = whole(word, text);
     spots.iter().any(|(at, _)| !negated(&text[..*at]))
-}
-
-/// The words that make a figure pay.
-const PAY_WORDS: [&str; 7] = [
-    "salary",
-    "compensation",
-    "pay",
-    "base",
-    "ote",
-    "wage",
-    "range",
-];
-
-/// Whether `stated` stands in the posting as one whole amount, in a sentence with a pay word:
-/// `$70,000` is not `$70,000,000`, and a funding round is not a salary.
-fn pay_stands_in(stated: &str, text: &str) -> bool {
-    let (text, spots) = whole(stated, text);
-    spots.into_iter().any(|(start, end)| {
-        let mut after = text[end..].chars();
-        let more = match (after.next(), after.next()) {
-            (Some(c), _) if c.is_ascii_digit() => true,
-            (Some(',' | '.'), Some(d)) => d.is_ascii_digit(),
-            _ => false,
-        };
-        let ends = |at: usize| {
-            let bytes = text.as_bytes();
-            matches!(bytes[at], b'.' | b'!' | b'?')
-                && bytes.get(at + 1).is_none_or(|next| *next == b' ')
-        };
-        let from = (0..start).rev().find(|at| ends(*at)).map_or(0, |at| at + 1);
-        let to = (end..text.len()).find(|at| ends(*at)).unwrap_or(text.len());
-        let sentence = &text[from..to];
-        let paid = sentence
-            .split(|c: char| !c.is_alphanumeric())
-            .any(|word| PAY_WORDS.contains(&word));
-        !more && paid
-    })
 }
 
 /// Whether a job has no usable field yet, so a model may be asked. A job a person set, or a
@@ -336,8 +300,8 @@ pub fn needs_parsing(job: &Job) -> bool {
 
 /// What a reply may fill, per decision 20. A field the job already has is not touched. A
 /// skill stays only when the posting names it. A seniority maps through
-/// [`seniority_of`], and pay is read by [`parse_pay`] from text that stands in the posting.
-/// Title, company, location, and country are the connector's and are never read here.
+/// [`seniority_of`]. A model never sets pay. Title, company, location, and country are the
+/// connector's and are never read here. Each value given and not kept is counted.
 pub fn merge_parsed(job: &Job, posting: &JobText, output: &Value) -> ParsedFields {
     let Ok(reply) = serde_json::from_value::<ParseReply>(output.clone()) else {
         return ParsedFields::default();
@@ -355,26 +319,27 @@ pub fn merge_parsed(job: &Job, posting: &JobText, output: &Value) -> ParsedField
     let seniority = Some(reply.seniority.as_str())
         .filter(|word| plain(word))
         .and_then(|word| seniority_of(word, ""));
+    let given = |value: &str| {
+        let value = value.trim();
+        !value.is_empty() && !value.eq_ignore_ascii_case("unknown")
+    };
+    let mut dropped = usize::from(given(&reply.compensation))
+        + usize::from(work_mode.is_none() && given(&reply.remote))
+        + usize::from(seniority.is_none() && given(&reply.seniority));
     let mut skills: Vec<String> = Vec::new();
-    let mut dropped = 0;
     for skill in reply.skills.iter().map(|skill| skill.trim()) {
-        if names_right_to_work(skill) {
-            dropped += 1;
-            continue;
-        }
         let fresh = !skills.iter().any(|kept| kept.eq_ignore_ascii_case(skill));
-        if fresh
+        if !names_right_to_work(skill)
+            && fresh
             && skill.chars().count() <= SKILL_CHARS
             && skills.len() < SKILL_LIMIT
             && said(skill)
         {
             skills.push(skill.to_owned());
+        } else if !skill.is_empty() {
+            dropped += 1;
         }
     }
-    // The figure and its symbol or code must stand in the posting as written.
-    let pay = pay_stands_in(&reply.compensation, &posting.normalized)
-        .then(|| parse_pay(&reply.compensation))
-        .flatten();
     ParsedFields {
         work_mode: work_mode.filter(|_| job.work_mode.is_none()),
         skills: if job.skills.is_empty() {
@@ -383,7 +348,6 @@ pub fn merge_parsed(job: &Job, posting: &JobText, output: &Value) -> ParsedField
             Vec::new()
         },
         seniority: seniority.filter(|_| job.seniority.is_none()),
-        pay: pay.filter(|_| job.pay.is_none()),
         dropped,
     }
 }
@@ -398,17 +362,10 @@ pub async fn store_parsed(db: &Db, job_id: &str, fields: &ParsedFields) -> Resul
         .then(|| serde_json::to_string(&fields.skills))
         .transpose()
         .map_err(|error| bad(&error.to_string()))?;
-    let pay = fields.pay.as_ref();
     let done = sqlx::query(
         "UPDATE jobs SET work_mode = coalesce(work_mode, ?2), \
              seniority = coalesce(seniority, ?3), \
              skills = CASE WHEN skills = '[]' THEN coalesce(?4, skills) ELSE skills END, \
-             pay_min = CASE WHEN pay_min IS NULL AND pay_max IS NULL THEN ?5 ELSE pay_min END, \
-             pay_max = CASE WHEN pay_min IS NULL AND pay_max IS NULL THEN ?6 ELSE pay_max END, \
-             pay_currency = CASE WHEN pay_min IS NULL AND pay_max IS NULL THEN ?7 \
-                                 ELSE pay_currency END, \
-             pay_period = CASE WHEN pay_min IS NULL AND pay_max IS NULL THEN ?8 \
-                               ELSE pay_period END, \
              fields_by = 'model' \
          WHERE id = ?1 AND fields_by IN ('none','connector','rules')",
     )
@@ -416,10 +373,6 @@ pub async fn store_parsed(db: &Db, job_id: &str, fields: &ParsedFields) -> Resul
     .bind(fields.work_mode)
     .bind(fields.seniority.map(Seniority::as_str))
     .bind(skills)
-    .bind(pay.and_then(|p| p.min))
-    .bind(pay.and_then(|p| p.max))
-    .bind(pay.and_then(|p| p.currency.as_deref()))
-    .bind(pay.and_then(|p| p.period).map(PayPeriod::column))
     .execute(&db.pool)
     .await?;
     if done.rows_affected() == 0 {

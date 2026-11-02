@@ -296,7 +296,7 @@ pub(crate) fn strip_ids(text: &str, known: &[String]) -> String {
         .fold(out, |line, id| strip_bare(&line, id))
 }
 
-/// `id` taken out where it stands as a whole word.
+/// `id` taken out where it stands as a whole word, with round brackets that hold only it.
 fn strip_bare(text: &str, id: &str) -> String {
     let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
     let mut out = String::with_capacity(text.len());
@@ -307,6 +307,9 @@ fn strip_bare(text: &str, id: &str) -> String {
         if word(out.chars().next_back()) || word(after.chars().next()) {
             out.push_str(id);
             rest = after;
+        } else if out.ends_with('(') && after.starts_with(')') {
+            out.pop();
+            rest = close_gap(&mut out, &after[1..]);
         } else {
             rest = close_gap(&mut out, after);
         }

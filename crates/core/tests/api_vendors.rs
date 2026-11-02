@@ -24,7 +24,7 @@ const GENERATE: &str = "/v1beta/models/gemini-x:generateContent";
 const CLAUDE_ROW: &str = "anthropic/api_key";
 const GOOGLE_ROW: &str = "google/paid_key";
 const JOB: &str = r#"{"title":"Engineer","company":"Acme","location":"Oslo","remote":"hybrid",
-    "skills":["Rust"],"seniority":"senior","compensation":""}"#;
+    "skills":["Rust"],"seniority":"senior"}"#;
 const DRAFTING: [DataCategory; 3] = [
     DataCategory::JobText,
     DataCategory::ProfileBasic,
