@@ -1038,7 +1038,9 @@ async fn racing_adds_stay_within_the_cap_and_a_repeat_returns_its_row() {
     let stored = done.iter().filter(|r| r.is_ok()).count();
     assert_eq!(stored, 50, "{done:?}");
     assert_eq!(list_sources(&db).await.unwrap().len(), 50);
-    let same = futures_join((0..10).map(|_| add_source(&db, "lever", "b0", ""))).await;
+    // Ten of the sixty lost the race, and which ten is not fixed.
+    let kept = list_sources(&db).await.unwrap()[0].target.clone();
+    let same = futures_join((0..10).map(|_| add_source(&db, "lever", &kept, ""))).await;
     let ids: std::collections::HashSet<_> = same
         .iter()
         .map(|r| r.as_ref().unwrap().id.clone())
