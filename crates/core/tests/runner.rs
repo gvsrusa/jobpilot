@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use jobpilot_core::agents::{self, analytics, discovery, draft, memory, tracking};
+use jobpilot_core::agents::{self, analytics, discovery, draft, matching, memory, tracking};
 use jobpilot_core::ai::{BoxFuture, CancellationToken, DataCategory, ProviderId, TaskType};
 use jobpilot_core::runner::{
     self, Agent, Ctx, Limits, Permission, RunInput, RunState, StepDef, StepOutput, Workflow,
@@ -264,6 +264,7 @@ fn every_agent_step_stays_in_its_set() {
         (Agent::CoverLetter, draft::LETTER_STEPS),
         (Agent::CareerMemory, memory::STEPS),
         (Agent::Discovery, discovery::STEPS),
+        (Agent::Matching, matching::STEPS),
     ];
     for (agent, steps) in table {
         let spec = spec_of(*agent);
@@ -337,6 +338,28 @@ fn each_step_names_exactly_what_it_needs() {
                 ("dedupe", &[ReadJobText, WriteJobs]),
             ],
         ),
+        (
+            matching::STEPS,
+            &[
+                (
+                    "fields",
+                    &[ReadJobText, Model(TaskType::ParseJob), WriteJobFields],
+                ),
+                (
+                    "score",
+                    &[ReadJobText, ReadProfileBasic, ReadResumeText, WriteMatches],
+                ),
+                (
+                    "semantic",
+                    &[
+                        ReadJobText,
+                        ReadResumeText,
+                        Model(TaskType::SemanticMatch),
+                        WriteMatches,
+                    ],
+                ),
+            ],
+        ),
     ];
     for (steps, wanted) in table {
         assert_eq!(steps.len(), wanted.len());
@@ -402,6 +425,19 @@ fn permission_sets_match_the_spec_table() {
             &[NetConnector, ReadJobText, WriteJobs],
             Duration::from_secs(10 * 60),
         ),
+        (
+            Agent::Matching,
+            &[
+                ReadJobText,
+                ReadProfileBasic,
+                ReadResumeText,
+                Model(TaskType::ParseJob),
+                Model(TaskType::SemanticMatch),
+                WriteJobFields,
+                WriteMatches,
+            ],
+            Duration::from_secs(30 * 60),
+        ),
     ];
     for (agent, permissions, timeout) in table {
         let spec = spec_of(*agent);
@@ -431,6 +467,8 @@ fn no_permission_names_a_forbidden_power() {
         Model(TaskType::DraftCoverLetter),
         Model(TaskType::ClassifyAnswer),
         Model(TaskType::Embed),
+        Model(TaskType::SemanticMatch),
+        Model(TaskType::SummarizeCompany),
         EmbedLocal,
         ReadMatches,
         WriteJobs,

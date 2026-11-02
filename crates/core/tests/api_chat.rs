@@ -802,6 +802,8 @@ fn every_schema_is_strict_ready_after_provider_schema() {
         TaskType::DraftResume,
         TaskType::DraftCoverLetter,
         TaskType::ClassifyAnswer,
+        TaskType::SemanticMatch,
+        TaskType::SummarizeCompany,
     ] {
         let schema = spec(task).schema;
         check(&provider_schema(schema).unwrap(), schema);

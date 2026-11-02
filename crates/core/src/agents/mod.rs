@@ -12,6 +12,7 @@ use crate::runner::{self, Finished, RunInput, RunState, Workflow, store};
 pub mod analytics;
 pub mod discovery;
 pub mod draft;
+pub mod matching;
 pub mod memory;
 pub mod tracking;
 
@@ -21,6 +22,8 @@ use discovery::DiscoveryWorkflow;
 pub use discovery::{DiscoveryReport, SourceResult, discover, discover_with};
 use draft::DraftWorkflow;
 pub use draft::{draft_cover_letter, draft_resume};
+use matching::MatchingWorkflow;
+pub use matching::{AiPlan, MATCH_BATCH, MatchReport, MatchRequest, match_jobs, match_plan};
 use memory::MemoryWorkflow;
 pub use memory::{MemoryRefreshed, memory_refresh};
 use tracking::Tracking;
@@ -151,6 +154,10 @@ async fn resume_from(
                 }
             };
             let workflow = DiscoveryWorkflow::new(source_ids, fetcher);
+            runner::resume(db, actor, run_id, &workflow, cancel).await
+        }
+        RunInput::Matching { job_ids, ai } => {
+            let workflow = MatchingWorkflow::new(router, job_ids, ai, true);
             runner::resume(db, actor, run_id, &workflow, cancel).await
         }
         RunInput::MemoryRefresh => {

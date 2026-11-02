@@ -399,7 +399,13 @@ export type ExternalStatus = {
 };
 
 export type TaskSharing = {
-  task: "parse_job" | "draft_resume" | "draft_cover_letter" | "classify_answer";
+  task:
+    | "parse_job"
+    | "draft_resume"
+    | "draft_cover_letter"
+    | "classify_answer"
+    | "semantic_match"
+    | "summarize_company";
   categories: DataCategory[];
   runs: boolean;
   skipped_because: string | null;

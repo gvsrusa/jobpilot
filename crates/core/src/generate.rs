@@ -33,9 +33,9 @@ pub(crate) const CLOSE: &str = "<<<END_UNTRUSTED_POSTING>>>";
 /// The smallest window any provider declares, so a typical prompt fits every provider.
 // ponytail: a provider with a larger window gets no more evidence. Pass the limit in when one
 // needs it.
-const PROMPT_BYTES: usize = CONTEXT_LIMIT * BYTES_PER_TOKEN;
+pub(crate) const PROMPT_BYTES: usize = CONTEXT_LIMIT * BYTES_PER_TOKEN;
 /// Evidence a long posting cannot push out: past this the prompt is too large, which says so.
-const MIN_EVIDENCE_BYTES: usize = 2_000;
+pub(crate) const MIN_EVIDENCE_BYTES: usize = 2_000;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Generated {
@@ -262,7 +262,7 @@ fn strip_remnants(text: &str) -> String {
 /// bracketed tokens that are ids, and the known ids bare. Other bracketed text stays. This runs
 /// before every check, so a check reads what the page will say, and an id cannot split a word.
 /// It only ever cuts text: `evidence_ids` alone cites, so an id here vouches for nothing.
-fn strip_ids(text: &str, known: &[String]) -> String {
+pub(crate) fn strip_ids(text: &str, known: &[String]) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(open) = rest.find('[') {
@@ -379,7 +379,7 @@ fn words(text: &str) -> HashSet<String> {
 /// the top one goes in and the router judges the size.
 // ponytail: word overlap, offline and free. A language written without spaces ranks poorly,
 // and one kind of item can crowd out another. Embeddings can replace it when they rank better.
-fn ranked_lines(evidence: &[KnowledgeItem], job: &str, room: usize) -> Vec<String> {
+pub(crate) fn ranked_lines(evidence: &[KnowledgeItem], job: &str, room: usize) -> Vec<String> {
     let wanted = words(job);
     let mut items: Vec<&KnowledgeItem> = evidence.iter().filter(|item| usable(item)).collect();
     items.sort_by_cached_key(|item| Reverse(words(&item.body).intersection(&wanted).count()));

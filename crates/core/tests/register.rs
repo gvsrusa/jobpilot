@@ -431,13 +431,39 @@ async fn give_for_takes_its_date_from_the_register() {
 async fn sharing_lists_every_task_and_says_why_codex_runs_none() {
     let (_tmp, db) = setup().await;
     let s = sharing(&db, "codex_cli").await.unwrap();
-    assert_eq!(s.tasks.len(), 4);
+    assert_eq!(s.tasks.len(), 6);
     assert!(s.tasks.iter().all(|t| t.task != TaskType::Embed));
     assert!(
         s.tasks
             .iter()
             .all(|t| !t.runs && t.skipped_because.as_deref() == Some("no_tools"))
     );
+}
+
+#[tokio::test]
+async fn the_new_tasks_appear_in_sharing() {
+    let (_tmp, db) = setup().await;
+    let s = sharing(&db, "google").await.unwrap();
+    let find = |task| s.tasks.iter().find(|t| t.task == task).unwrap();
+    let semantic = find(TaskType::SemanticMatch);
+    assert_eq!(
+        semantic.categories,
+        [DataCategory::JobText, DataCategory::ResumeText]
+    );
+    let company = find(TaskType::SummarizeCompany);
+    assert_eq!(
+        company.categories,
+        [DataCategory::CompanyText, DataCategory::JobText]
+    );
+    assert!(semantic.runs && company.runs);
+
+    // Both carry untrusted text, so a provider with no `NoTools` runs neither.
+    let s = sharing(&db, "codex_cli").await.unwrap();
+    for task in [TaskType::SemanticMatch, TaskType::SummarizeCompany] {
+        let row = s.tasks.iter().find(|t| t.task == task).unwrap();
+        assert!(!row.runs);
+        assert_eq!(row.skipped_because.as_deref(), Some("no_tools"));
+    }
 }
 
 #[tokio::test]

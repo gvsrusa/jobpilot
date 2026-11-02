@@ -1,0 +1,22 @@
+{
+  "type": "object",
+  "required": ["fit", "summary", "strengths", "gaps"],
+  "properties": {
+    "fit": { "type": "integer" },
+    "summary": { "type": "string", "maxLength": 500 },
+    "strengths": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["text", "evidence_ids"],
+        "properties": {
+          "text": { "type": "string", "maxLength": 500 },
+          "evidence_ids": { "type": "array", "items": { "type": "string", "maxLength": 500 } }
+        },
+        "additionalProperties": false
+      }
+    },
+    "gaps": { "type": "array", "items": { "type": "string", "maxLength": 500 } }
+  },
+  "additionalProperties": false
+}

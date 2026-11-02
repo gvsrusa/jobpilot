@@ -9,6 +9,7 @@ pub mod pay;
 pub mod prefs;
 pub mod rules;
 pub mod score;
+pub mod semantic;
 
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
@@ -1034,8 +1035,7 @@ pub struct JobDetail {
     pub text: String,
     pub findings: Vec<knowledge::Finding>,
     pub explanation: Option<score::Explanation>,
-    // Replaced by `Semantic` in Task 9.
-    pub semantic: Option<serde_json::Value>,
+    pub semantic: Option<semantic::Semantic>,
     pub group: Vec<Job>,
     pub authorization: AuthNote,
     /// The posting speaks of work authorization at all. Nothing reads its words.
@@ -1052,17 +1052,19 @@ pub async fn detail(db: &Db, id: &str) -> Result<JobDetail> {
             .bind(&job.id)
             .fetch_optional(&db.pool)
             .await?;
-    let parse = |raw: &str| {
-        serde_json::from_str::<serde_json::Value>(raw)
-            .map_err(|error| Error::Db(sqlx::Error::Decode(Box::new(error))))
-    };
     let (explanation, semantic) = match stored {
         Some((explanation, semantic)) => (
             Some(
                 serde_json::from_str(&explanation)
                     .map_err(|error| Error::Db(sqlx::Error::Decode(Box::new(error))))?,
             ),
-            semantic.as_deref().map(parse).transpose()?,
+            semantic
+                .as_deref()
+                .map(|raw| {
+                    serde_json::from_str(raw)
+                        .map_err(|error| Error::Db(sqlx::Error::Decode(Box::new(error))))
+                })
+                .transpose()?,
         ),
         None => (None, None),
     };

@@ -31,6 +31,8 @@ const TASKS: Record<TaskSharing["task"], string> = {
   draft_resume: "Resume",
   draft_cover_letter: "Cover letter",
   classify_answer: "Sorting an answer",
+  semantic_match: "Comparing a job with your résumé",
+  summarize_company: "Summarizing a company",
 };
 
 /** The part of the consent key after the slash, in words. */
