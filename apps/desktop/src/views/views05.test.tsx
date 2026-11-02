@@ -424,6 +424,7 @@ describe("Jobs screen scoring and copy", () => {
     await user.click(await screen.findByRole("button", { name: "Remove job" }));
     const dialog = await screen.findByRole("dialog");
     expect(dialog).toHaveTextContent("The posting text is deleted with the job, unless a draft cites it.");
+    expect(dialog).toHaveTextContent("If this job is in your tracker, the application stays but loses its posting text.");
     expect(dialog).not.toHaveTextContent("stays in your data");
   });
 });

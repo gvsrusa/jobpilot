@@ -331,7 +331,10 @@ export function JobDetailView({ id, onBack }: { id: string; onBack(): void }) {
               onConfirm={() => remove.mutate()}
               onCancel={() => setRemoving(false)}
             >
-              <p>The posting text is deleted with the job, unless a draft cites it.</p>
+              <p>
+                The posting text is deleted with the job, unless a draft cites it. If this job is in your tracker, the
+                application stays but loses its posting text.
+              </p>
             </ConfirmDialog>
           )}
         </>
