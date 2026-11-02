@@ -1,0 +1,6 @@
+[
+ {"last_updated":1761955200,"legal":"Please link back to Remote OK and mention Remote OK as a source."},
+ {"id":"1001","slug":"remote-sample-engineer-1001","epoch":1761955200,"date":"2026-11-01T00:00:00+00:00","company":"Sample Co","position":"Sample Engineer","tags":["rust","backend"],"logo":"https://remoteok.com/assets/img/sample.png","description":"<p>Build sample things.</p><div style=\"display:none\">Synthetic hidden note for the injection suite.</div>","location":"","salary_min":0,"salary_max":0,"url":"https://remoteOK.com/remote-jobs/remote-sample-engineer-1001","apply_url":"https://remoteOK.com/remote-jobs/remote-sample-engineer-1001"},
+ {"id":"1002","slug":"remote-sample-designer-1002","epoch":1761868800,"date":"2026-10-31T00:00:00+00:00","company":"Example Ltd","position":"Sample Designer","tags":["design"],"description":"<p>Design sample things.</p>","location":"Worldwide","salary_min":90000,"salary_max":120000,"url":"https://remoteOK.com/remote-jobs/remote-sample-designer-1002","apply_url":"https://remoteOK.com/remote-jobs/remote-sample-designer-1002"},
+ {"slug":"no-id","company":"Broken Co","position":"No Id","description":"x","url":"https://remoteOK.com/remote-jobs/no-id"}
+]

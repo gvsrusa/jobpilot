@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/">
+<channel>
+<title>We Work Remotely: Sample Feed</title>
+<link>https://weworkremotely.com/</link>
+<ttl>60</ttl>
+<item>
+<title>ACME: Engineer | Remote</title>
+<region>Anywhere in the World</region>
+<country>Canada</country>
+<state>Ontario</state>
+<skills>Rust, SQL</skills>
+<category>Programming</category>
+<type>Full-Time</type>
+<description>&lt;p&gt;Build sample things &amp;amp; ship.&lt;/p&gt;&lt;div style="display:none"&gt;Synthetic hidden note for the injection suite.&lt;/div&gt;</description>
+<pubDate>Sat, 01 Nov 2026 12:00:00 +0000</pubDate>
+<expires_at>Mon, 01 Dec 2026 12:00:00 +0000</expires_at>
+<guid>https://weworkremotely.com/remote-jobs/acme-engineer</guid>
+<link>https://weworkremotely.com/remote-jobs/acme-engineer</link>
+</item>
+<item>
+<title>Example Ltd: Support Lead</title>
+<region>Europe Only</region>
+<country></country>
+<state></state>
+<skills></skills>
+<category>Customer Support</category>
+<type>Contract</type>
+<description>&lt;p&gt;Lead the sample desk.&lt;/p&gt;</description>
+<pubDate>Fri, 31 Oct 2026 09:30:00 +0000</pubDate>
+<guid>https://weworkremotely.com/remote-jobs/example-support-lead</guid>
+<link>https://weworkremotely.com/remote-jobs/example-support-lead</link>
+</item>
+<item>
+<title>Freelance Sample Writer</title>
+<region>Anywhere in the World</region>
+<country></country>
+<skills>Writing</skills>
+<category>All Other Remote</category>
+<type>Contract</type>
+<description>&lt;p&gt;Write sample text.&lt;/p&gt;</description>
+<pubDate>Thu, 30 Oct 2026 08:00:00 +0000</pubDate>
+<guid>https://weworkremotely.com/remote-jobs/freelance-sample-writer</guid>
+<link>https://weworkremotely.com/remote-jobs/freelance-sample-writer</link>
+</item>
+</channel>
+</rss>

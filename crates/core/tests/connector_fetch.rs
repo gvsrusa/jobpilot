@@ -89,6 +89,7 @@ impl Connector for Test {
         Ok(Page {
             postings: Vec::new(),
             next: None,
+            skipped: 0,
         })
     }
 }

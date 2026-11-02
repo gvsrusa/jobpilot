@@ -8,7 +8,14 @@
 use std::time::Duration;
 
 pub mod fetch;
+mod lever;
 pub mod limit;
+mod remoteok;
+mod wwr;
+
+pub use lever::Lever;
+pub use remoteok::RemoteOk;
+pub use wwr::WeWorkRemotely;
 
 use serde::Serialize;
 
@@ -129,12 +136,19 @@ pub struct Posting {
 pub struct Page {
     pub postings: Vec<Posting>,
     pub next: Option<u32>,
+    /// Rows the source sent that lacked a field this connector needs. Counted, never guessed.
+    pub skipped: usize,
 }
 
 pub trait Connector: Send + Sync {
     fn decl(&self) -> &'static ConnectorDecl;
     fn request(&self, target: &Target, page: u32) -> Result<PageRequest>;
     fn parse(&self, target: &Target, body: &[u8]) -> Result<Page>;
+    /// `parse` for a connector whose paging rule needs the page it just read. The fetcher calls
+    /// this one; the default ignores the page.
+    fn parse_page(&self, target: &Target, body: &[u8], _page: u32) -> Result<Page> {
+        self.parse(target, body)
+    }
 }
 
 fn invalid(why: &str) -> Error {
@@ -171,9 +185,61 @@ pub fn check(decl: &ConnectorDecl) -> Result<()> {
     Ok(())
 }
 
-/// Every connector. Tasks 4 and 5 fill this.
+/// Every connector. Task 5 adds Greenhouse and Ashby.
 pub fn all() -> Vec<Box<dyn Connector>> {
-    Vec::new()
+    vec![
+        Box::new(Lever),
+        Box::new(RemoteOk),
+        Box::new(WeWorkRemotely),
+    ]
+}
+
+/// A board or feed name that cannot leave its path: `[A-Za-z0-9_-]{1,100}`.
+pub fn clean_slug(text: &str) -> Result<String> {
+    let ok = (1..=100).contains(&text.len())
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if ok {
+        Ok(text.to_string())
+    } else {
+        Err(Error::Validation(
+            "a name holds letters, digits, - and _ only, up to 100".into(),
+        ))
+    }
+}
+
+/// `YYYY-MM-DD` from an RFC 3339 or RFC 2822 date, a plain date, or an epoch in seconds or
+/// milliseconds. Anything else is `None`: a date is never guessed.
+pub fn day(text: &str) -> Option<String> {
+    use time::format_description::well_known::{Rfc2822, Rfc3339};
+    use time::{Date, Month, OffsetDateTime};
+    let text = text.trim();
+    let date = if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
+        let n: i64 = text.parse().ok()?;
+        let secs = if n >= 100_000_000_000 { n / 1000 } else { n };
+        OffsetDateTime::from_unix_timestamp(secs).ok()?.date()
+    } else if let Ok(at) = OffsetDateTime::parse(text, &Rfc3339) {
+        at.date()
+    } else if let Ok(at) = OffsetDateTime::parse(text, &Rfc2822) {
+        at.date()
+    } else {
+        let mut parts = text.get(..10)?.split('-');
+        let year: i32 = parts.next()?.parse().ok()?;
+        let month: u8 = parts.next()?.parse().ok()?;
+        let dom: u8 = parts.next()?.parse().ok()?;
+        Date::from_calendar_date(year, Month::try_from(month).ok()?, dom).ok()?
+    };
+    Some(format!(
+        "{:04}-{:02}-{:02}",
+        date.year(),
+        u8::from(date.month()),
+        date.day()
+    ))
+}
+
+fn bad_feed() -> Error {
+    Error::Refused("bad_feed".into())
 }
 
 pub fn find(name: &str) -> Option<Box<dyn Connector>> {

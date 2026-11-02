@@ -101,7 +101,7 @@ impl Fetcher {
             pause::ensure_off(db).await?;
             let sent = self.send(&request, cancel).await;
             match self
-                .classify(db, connector, target, &request, attempt, cancel, sent)
+                .classify(db, connector, target, &request, page, attempt, cancel, sent)
                 .await?
             {
                 Step::Done(page) => return Ok(page),
@@ -117,6 +117,7 @@ impl Fetcher {
         connector: &dyn Connector,
         target: &Target,
         request: &PageRequest,
+        page: u32,
         attempt: u32,
         cancel: &CancellationToken,
         sent: Result<Reply>,
@@ -171,7 +172,9 @@ impl Fetcher {
         if !type_ok {
             return Err(Error::Refused("bad_feed".into()));
         }
-        connector.parse(target, &reply.body).map(Step::Done)
+        connector
+            .parse_page(target, &reply.body, page)
+            .map(Step::Done)
     }
 
     /// One request, bounded by [`REQUEST_TIMEOUT`] and ended at once by the token.
