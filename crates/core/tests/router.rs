@@ -252,6 +252,38 @@ fn is_ok(outcome: &Outcome, id: ProviderId, count: u32) -> bool {
     matches!(outcome, Outcome::Ok { provider, attempts, .. } if *provider == id && *attempts == count)
 }
 
+async fn run_with_unavailable(why: &str) -> Outcome {
+    let (_tmp, db) = setup().await;
+    let mut ollama = Mock::ollama(vec![]);
+    ollama.availability = Availability::Unavailable(why.into());
+    let router = Router::with_providers(vec![ollama.boxed()]);
+    parse_job(&router, &db).await
+}
+
+#[tokio::test]
+async fn ollama_with_no_model_set_says_so() {
+    assert_eq!(
+        run_with_unavailable("no_model").await,
+        manual("no_model_set")
+    );
+}
+
+#[tokio::test]
+async fn ollama_missing_the_model_says_so() {
+    assert_eq!(
+        run_with_unavailable("model_missing").await,
+        manual("model_not_installed")
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_unavailable_stays_provider_unavailable() {
+    assert_eq!(
+        run_with_unavailable("not_running").await,
+        manual("provider_unavailable")
+    );
+}
+
 #[tokio::test]
 async fn falls_back_in_order_and_ends_no_ai_manual_required() {
     let (_tmp, db) = setup().await;

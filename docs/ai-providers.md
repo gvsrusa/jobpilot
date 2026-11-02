@@ -94,7 +94,7 @@ For each backend in fallback order, a provider is eligible only if all of these 
 
 Ineligible providers are skipped, and the reason is logged. Fallback never widens consent: a task the user approved for Ollama does not move to a remote provider because Ollama failed.
 
-Providers run in the stored `ai.order`, then every enabled provider it leaves out, so enabling a provider is enough to route it and the AI screen shows the same order the router uses. When every provider passes, `manual_required` names what would change the result: the reason from a real attempt (`not_logged_in`, `prompt_too_large`), else `consent_needed` when consent alone held a provider back, else `provider_unavailable` when one is on but cannot be reached, else `no_ai`.
+Providers run in the stored `ai.order`, then every enabled provider it leaves out, so enabling a provider is enough to route it and the AI screen shows the same order the router uses. When every provider passes, `manual_required` names what would change the result: the reason from a real attempt (`not_logged_in`, `prompt_too_large`), else `consent_needed` when consent alone held a provider back, else `no_model_set` or `model_not_installed` when Ollama is on but lacks a drafting model or the chosen one, else `provider_unavailable` when one is on but cannot be reached, else `no_ai`.
 
 ### Timeouts and retries
 

@@ -124,7 +124,7 @@ fn corpus(canary: &str) -> Vec<Case> {
         })
         .collect();
     cases.sort_by(|a, b| a.name.cmp(&b.name));
-    assert!(cases.len() >= 14, "the corpus holds {} files", cases.len());
+    assert!(cases.len() >= 16, "the corpus holds {} files", cases.len());
     cases
 }
 
@@ -201,8 +201,8 @@ fn kinds(findings: &[knowledge::Finding]) -> Vec<&str> {
 
 #[test]
 fn every_corpus_file_normalizes_without_panic_and_reports_findings() {
-    // The kinds a file must report. 02, 06, 07, 08, 09, 13 and 14 carry no pattern or hidden
-    // text, only a steered reply, so they may report nothing.
+    // The kinds a file must report. 02, 06, 07, 08, 09, 13, 14, 15 and 16 carry no pattern or
+    // hidden text, only a steered reply, so they may report nothing.
     let required: [(&str, &[&str]); 7] = [
         ("01", &["instruction_like"]),
         ("03", &["hidden_text"]),
@@ -327,6 +327,10 @@ async fn steered_output_never_adds_evidence_free_or_authorization_claims() {
     let states_authorization = ["01", "08", "11", "13"];
 
     for case in &cases {
+        // 15 steers a resume reply the schema refuses, so it stores nothing: its own test.
+        if case.name.starts_with("15") {
+            continue;
+        }
         let job = w.import(case).await;
         let (router, _) = w.router(&job.id);
         for letter in [false, true] {
@@ -404,6 +408,53 @@ async fn output_urls_and_commands_are_data_only() {
     // Stored as text, shown for the user to see; nothing ran it or wrote the file.
     assert!(!PathBuf::from(w.canary()).exists());
     assert!(!w.tmp.path().join("canary-07").exists());
+}
+
+#[tokio::test]
+async fn a_reply_asking_for_a_tool_stores_nothing() {
+    let w = world().await;
+    let cases = corpus(&w.canary());
+    let ask = case(&cases, "15");
+    assert!(ask.raw.contains(&w.canary()), "the canary is not named");
+    let job = w.import(ask).await;
+    let (router, _) = w.router(&job.id);
+
+    // The reply carries a `tool_use` key the schema does not know, so it never validates.
+    // (The harness rebuilds the letter reply from `claims` alone, so only the resume sees it.)
+    let made = generate::resume(&w.db, &router, "gui", &job.id, CancellationToken::new()).await;
+    assert!(made.is_err(), "{made:?}");
+
+    // Only the empty draft the world was built with: nothing was stored from the reply.
+    let stored = drafts::list(&w.db, None).await.unwrap();
+    assert!(stored.iter().all(|d| d.id == w.draft_id), "{stored:?}");
+    assert!(!PathBuf::from(w.canary()).exists());
+}
+
+#[tokio::test]
+async fn an_exfiltration_url_stays_flagged_text() {
+    let w = world().await;
+    let cases = corpus(&w.canary());
+    let job = w.import(case(&cases, "16")).await;
+    let (router, _) = w.router(&job.id);
+
+    let made = generate::resume(&w.db, &router, "gui", &job.id, CancellationToken::new())
+        .await
+        .unwrap();
+
+    // The claim holding the URL cites no evidence: it is shown, flagged, and cannot leave.
+    let claims = drafts::claims(&w.db, &made.draft.id).await.unwrap();
+    assert!(claims[0].text.contains("https://track.evil.example/p?e="));
+    assert_eq!(claims[0].status, "no_evidence");
+    let export = drafts::export(
+        &w.db,
+        &made.draft.id,
+        Template::Classic,
+        ExportFormat::Docx,
+        &w.tmp.path().join("out"),
+        "gui",
+    )
+    .await;
+    assert_eq!(export.unwrap_err().code(), "refused");
 }
 
 // ---- parse: what a steered reply is checked against -------------------------------------

@@ -333,6 +333,32 @@ pub(crate) const KNOWN_HEADINGS: [&str; 18] = [
     "work history",
 ];
 
+/// A stock heading as it prints: each word capitalized, so a model's "work experience"
+/// reads like the upload's "Work Experience". `None` for any other heading, which belongs to
+/// the user or the model and is left as it is.
+pub fn stock_heading_display(heading: &str) -> Option<String> {
+    let key = heading
+        .trim_end_matches(':')
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    if !KNOWN_HEADINGS.contains(&key.as_str()) && !SUMMARY_HEADINGS.contains(&key.as_str()) {
+        return None;
+    }
+    let words: Vec<String> = key
+        .split(' ')
+        .map(|word| {
+            let mut chars = word.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().chain(chars).collect())
+                .unwrap_or_default()
+        })
+        .collect();
+    Some(words.join(" "))
+}
+
 fn tidy(line: &str) -> String {
     line.split(|c: char| c.is_whitespace() || c.is_control())
         .filter(|w| !w.is_empty())
@@ -543,6 +569,19 @@ pub async fn import_resume(db: &Db, path: &Path, title: &str) -> Result<Imported
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_stock_headings_are_title_cased() {
+        let show = |heading| stock_heading_display(heading);
+        assert_eq!(show("work experience").as_deref(), Some("Work Experience"));
+        assert_eq!(show("EDUCATION:").as_deref(), Some("Education"));
+        assert_eq!(
+            show("professional  summary").as_deref(),
+            Some("Professional Summary")
+        );
+        assert_eq!(show("Side quests"), None);
+        assert_eq!(show("Work Authorization"), None);
+    }
 
     #[tokio::test]
     async fn a_hung_parser_times_out_and_is_released() {

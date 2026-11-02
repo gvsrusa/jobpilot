@@ -251,7 +251,7 @@ fn hits_by_line(texts: &[&str], hit: impl Fn(&str) -> bool) -> Vec<bool> {
 }
 
 pub(crate) fn usable(item: &KnowledgeItem) -> bool {
-    item.approved && !item.marked_sensitive && !item.locked
+    item.approved && !item.marked_sensitive && !item.sealed
 }
 
 /// The claim is, whole, the body of something the user typed in.
@@ -326,19 +326,11 @@ fn fragments<'a>(texts: impl Iterator<Item = &'a str>) -> Vec<String> {
 /// `Err` with a key error, or `Err(Locked)`, when a sealed text exists and cannot be opened.
 /// With nothing sealed, the keychain is not touched.
 async fn sealed_text(db: &Db) -> Result<Sealed> {
-    let items = knowledge::list(db).await?;
-    if items.iter().any(|item| item.locked) {
-        return Err(Error::Locked);
-    }
+    let marked = knowledge::marked_bodies(db).await?;
     let notes = profile::authorization_notes(db).await?;
     Ok(Sealed {
         notes: fragments(notes.iter().map(String::as_str)),
-        marked: fragments(
-            items
-                .iter()
-                .filter(|item| item.marked_sensitive)
-                .map(|item| item.body.as_str()),
-        ),
+        marked: fragments(marked.iter().map(String::as_str)),
     })
 }
 
@@ -1030,7 +1022,7 @@ mod tests {
             source_ref: None,
             approved: true,
             marked_sensitive: false,
-            locked: false,
+            sealed: false,
         }
     }
 

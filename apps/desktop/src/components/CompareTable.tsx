@@ -127,7 +127,8 @@ export function CompareTable({ compare, kind, posting, selected, onSelect, onEdi
         {compare.evidence.map((item, i) => (
           <p key={item.id} className={cn("text-sm", cited.has(item.id) && "font-medium")}>
             <span className="mr-2 font-mono">E{i + 1}</span>
-            {item.locked ? "Locked, see Recovery" : `${item.kind}: "${item.body}"`}
+            {/* `compare` lists evidence only (approved, unmarked), so no body here is sealed. */}
+            {`${item.kind}: "${item.body}"`}
           </p>
         ))}
       </section>

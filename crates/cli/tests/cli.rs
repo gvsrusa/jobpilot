@@ -242,6 +242,7 @@ fn panel_marker_refuses_recovery_and_delete_commands() {
         vec!["data", "discard-locked", "--confirm", any],
         vec!["data", "delete", "--confirm", "DELETE"],
         vec!["backup", "restore", any],
+        vec!["kb", "reveal", any],
     ];
     for args in cases {
         let output = run_env(&home, &args, &[("JOBPILOT_PANEL", "1")]);
@@ -642,4 +643,53 @@ fn ctrl_c_cancels_generation_and_leaves_no_child() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(!alive(&child_pid), "the claude child survived");
+}
+
+#[tokio::test]
+async fn kb_reveal_prints_a_text_and_a_sealed_item_lists_empty() {
+    let (_dir, home) = fresh_home();
+    let added = stdout_json(&run(&home, &["kb", "add", "note", "Plain body", "--json"]));
+    let plain = added["id"].as_str().unwrap().to_string();
+    let shown = stdout_json(&run(&home, &["kb", "reveal", &plain, "--json"]));
+    assert_eq!(shown["body"], "Plain body");
+
+    // A sealed row naming a key this root never had, so no keychain entry can exist.
+    let db = Db::open(&AppPaths::new(&home)).await.unwrap();
+    let mut connection = db.pool.acquire().await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO knowledge_items (id, kind, body, body_enc, key_id, source, approved, \
+         marked_sensitive, created_at, updated_at) \
+         VALUES ('sealed1', 'note', '', x'00', 'gone', 'user', 0, 1, 't', 't')",
+    )
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+    drop(connection);
+    db.close().await;
+
+    let service = format!("jobpilot-test-unused-{}", std::process::id());
+    let env = [("JOBPILOT_SECRET_SERVICE", service.as_str())];
+    let listed = stdout_json(&run_env(&home, &["kb", "list", "--json"], &env));
+    let sealed = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == "sealed1")
+        .unwrap();
+    assert_eq!(sealed["sealed"], true);
+    assert_eq!(sealed["body"], "");
+    let text = String::from_utf8_lossy(&run_env(&home, &["kb", "list"], &env).stdout).into_owned();
+    assert!(text.contains("sealed"), "{text}");
+
+    let revealed = run_env(&home, &["kb", "reveal", "sealed1"], &env);
+    assert_eq!(revealed.status.code(), Some(1));
+    assert!(
+        stderr_text(&revealed).contains("key_missing"),
+        "{}",
+        stderr_text(&revealed)
+    );
 }

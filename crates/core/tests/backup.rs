@@ -3,9 +3,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use jobpilot_core::ai::{DataCategory, consent};
+use jobpilot_core::ai::{self, DataCategory, consent};
 use jobpilot_core::crypto::{self, KEY_ACCOUNT_PREFIX, KeyState};
-use jobpilot_core::{AppPaths, Db, Error, MIGRATOR, app_schema_version, audit, backup, documents};
+use jobpilot_core::{
+    AppPaths, Db, Error, MIGRATOR, app_schema_version, audit, backup, documents, settings,
+};
 use serde_json::{Value, json};
 use sqlx::SqlSafeStr;
 use sqlx::migrate::{Migration, MigrationType, Migrator};
@@ -271,6 +273,51 @@ async fn restore_revokes_external_consent_and_says_so_in_the_audit_log() {
         .unwrap();
     assert_eq!(rows, 1);
     db.close().await;
+}
+
+/// A restore that closes Claude Code's consent switches it off too, as the AI screen's own
+/// Revoke does, so the screen never shows it on and failing every task.
+#[tokio::test]
+async fn restore_turns_claude_off_with_its_consent() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    consent::give(&db, CLAUDE, &[DataCategory::JobText], "2026-11-01", "gui")
+        .await
+        .unwrap();
+    ai::set_enabled(&db, "claude_code", true).await.unwrap();
+    ai::set_enabled(&db, "ollama", true).await.unwrap();
+    let info = backup::create(&db, "test").await.unwrap();
+
+    let restored = backup::restore(db, &info.path, "test").await.unwrap().db;
+
+    let enabled = settings::get(&restored, "ai.enabled")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(enabled["claude_code"], false);
+    assert_eq!(
+        enabled["ollama"], true,
+        "only the revoked provider is turned off"
+    );
+    restored.close().await;
+}
+
+/// With no consent to revoke the switch is left as it was.
+#[tokio::test]
+async fn restore_with_no_consent_leaves_the_claude_switch_alone() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    ai::set_enabled(&db, "claude_code", true).await.unwrap();
+    let info = backup::create(&db, "test").await.unwrap();
+
+    let restored = backup::restore(db, &info.path, "test").await.unwrap().db;
+
+    let enabled = settings::get(&restored, "ai.enabled")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(enabled["claude_code"], true);
+    restored.close().await;
 }
 
 /// The recovery screen's restore goes through the same temporary copy.

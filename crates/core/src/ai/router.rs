@@ -27,6 +27,8 @@ const PROMPT_TOO_LARGE: &str = "prompt_too_large";
 const CONSENT: &str = "consent";
 const CONSENT_NEEDED: &str = "consent_needed";
 const PROVIDER_UNAVAILABLE: &str = "provider_unavailable";
+const NO_MODEL_SET: &str = "no_model_set";
+const MODEL_NOT_INSTALLED: &str = "model_not_installed";
 const OLLAMA: &str = "ollama";
 const CLAUDE_CODE: &str = "claude_code";
 
@@ -288,7 +290,12 @@ impl Router {
         match bounded(probe, limit, task.cancel).await {
             Ok(Availability::Available) => {}
             // The provider's text is not logged: it can hold a path.
-            Ok(Availability::Unavailable(_)) | Err(Error::Timeout) => {
+            Ok(Availability::Unavailable(why)) => {
+                let skipped = row(&name, 0, "skipped", Some("unavailable"), task.db).await?;
+                log(task, skipped).await?;
+                return Ok(Step::Manual(unavailable_reason(&why)));
+            }
+            Err(Error::Timeout) => {
                 let skipped = row(&name, 0, "skipped", Some("unavailable"), task.db).await?;
                 log(task, skipped).await?;
                 return Ok(Step::Manual(PROVIDER_UNAVAILABLE));
@@ -390,9 +397,19 @@ fn after_skip<T>(task: &Task<'_>, declaration: &Declaration, reason: &str) -> St
 /// what the user can grant here, then a provider that is simply not there right now.
 fn weight(reason: &str) -> u8 {
     match reason {
-        PROVIDER_UNAVAILABLE => 0,
+        PROVIDER_UNAVAILABLE | NO_MODEL_SET | MODEL_NOT_INSTALLED => 0,
         CONSENT_NEEDED => 1,
         _ => 2,
+    }
+}
+
+/// The words an Ollama probe gives for what is missing, in the user's terms. Anything else
+/// is the generic reason, so provider text never leaves.
+fn unavailable_reason(why: &str) -> &'static str {
+    match why {
+        "no_model" => NO_MODEL_SET,
+        "model_missing" => MODEL_NOT_INSTALLED,
+        _ => PROVIDER_UNAVAILABLE,
     }
 }
 

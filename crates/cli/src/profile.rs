@@ -118,6 +118,10 @@ pub enum KbCommand {
     Unmark {
         id: String,
     },
+    /// Print a sealed item's text. Asks the keychain; refused in the terminal panel.
+    Reveal {
+        id: String,
+    },
     Search {
         query: String,
         #[arg(long, default_value_t = 5)]
@@ -334,8 +338,8 @@ pub async fn kb(db: &Db, command: KbCommand) -> Result<Output> {
                     if i.marked_sensitive {
                         flags.push("sensitive");
                     }
-                    if i.locked {
-                        flags.push("locked");
+                    if i.sealed {
+                        flags.push("sealed");
                     }
                     format!(
                         "{}  {}  [{}]  {}",
@@ -362,6 +366,10 @@ pub async fn kb(db: &Db, command: KbCommand) -> Result<Output> {
         KbCommand::Unapprove { id } => flag(db, &id, "approved", false).await,
         KbCommand::MarkSensitive { id } => flag(db, &id, "marked_sensitive", true).await,
         KbCommand::Unmark { id } => flag(db, &id, "marked_sensitive", false).await,
+        KbCommand::Reveal { id } => {
+            let body = knowledge::reveal(db, &id).await?;
+            out(json!({ "id": id, "body": body }), body)
+        }
         KbCommand::Search { query, limit } => search(db, &query, limit).await,
     }
 }

@@ -21,6 +21,14 @@ const REASONS: [word: string, text: string][] = [
     "provider_unavailable",
     "An AI provider is on but cannot be reached. Check the AI screen: start Ollama, or point JobPilot at claude",
   ],
+  [
+    "no_model_set",
+    "No local model is chosen. Pick one on the AI screen, or write this one yourself",
+  ],
+  [
+    "model_not_installed",
+    "The chosen model is not installed in Ollama. Download it on the AI screen, or choose another",
+  ],
   ["no_ai", "No AI provider could take this task, so nothing was generated"],
   ["no_embedding_model", "No embedding model is set on the AI screen"],
 ];

@@ -65,13 +65,14 @@ export type Profile = {
 export type KnowledgeItem = {
   id: string;
   kind: string;
-  /** Empty while `locked`. Render it as text only. */
+  /** Empty while `sealed`: `kbReveal` fetches it. Render it as text only. */
   body: string;
   source: string;
   source_ref: string | null;
   approved: boolean;
   marked_sensitive: boolean;
-  locked: boolean;
+  /** The body is ciphertext. A list never opens it. */
+  sealed: boolean;
 };
 
 export type Hit = { item_id: string; score: number; body: string };
@@ -237,6 +238,8 @@ export const ipc = {
   kbMarkSensitive: (id: string, marked: boolean) =>
     invoke<void>("kb_mark_sensitive", { id, marked }),
   kbRemove: (id: string) => invoke<void>("kb_remove", { id }),
+  /** Rust asks the user in a native dialog each time; script cannot answer it. */
+  kbReveal: (id: string) => invoke<string>("kb_reveal", { id }),
   kbSearch: (query: string, limit: number) => invoke<Hit[]>("kb_search", { query, limit }),
 
   jobPaste: (title: string, raw: string) => invoke<JobText>("job_paste", { title, raw }),

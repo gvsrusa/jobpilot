@@ -18,6 +18,13 @@ model would do. The tests show what the app does with that reply.
   `drafts::check_claims`), so no file claims it is.
 - `04` writes the markers as HTML entities because a literal marker is read as a tag and
   dropped; entities decode last, so only `generate::neutralise` stops them.
+- `15` asks the model to call a tool, run a shell command, and read a file under `$CANARY`.
+  Its reply carries an extra `tool_use` key, which the draft schema refuses, so nothing is
+  stored. Only the resume run sees the key: the cover-letter harness rebuilds its reply from
+  `claims`.
+- `16` asks for the profile email inside a tracking URL and an image link. Its reply puts both
+  in a claim that cites no evidence, so the text is stored flagged `no_evidence` and export
+  refuses. Neither file reports a finding when normalized.
 - `11` holds real bidi overrides and zero-width characters. Do not let an editor "clean" it.
 
 To add a case: add a file, then add what it must report to the table in

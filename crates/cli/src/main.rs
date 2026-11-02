@@ -73,7 +73,7 @@ impl Command {
     pub fn refused_in_panel(&self) -> bool {
         use ai::{AiCommand, ConsentCommand};
         use data::{BackupCommand, DataCommand};
-        use profile::JobCommand;
+        use profile::{JobCommand, KbCommand};
         use resume::{ExportArgs, LetterCommand, ResumeCommand};
         matches!(
             self,
@@ -92,6 +92,7 @@ impl Command {
                         | DataCommand::RecoveryKey(_)
                         | DataCommand::DiscardLocked { .. }
                 )
+                | Command::Kb(KbCommand::Reveal { .. })
                 | Command::Job(JobCommand::Paste { file: Some(_), .. })
                 | Command::Resume(
                     ResumeCommand::Import { .. }
@@ -179,13 +180,22 @@ fn message(error: &Error) -> String {
         }
         Error::ManualRequired(reason) if reason == "consent_needed" => {
             "Claude Code is on, but your consent does not cover this task. Give consent with \
-             `jobpilot ai consent give` in an ordinary terminal, or on the AI screen."
+             `jobpilot ai consent give claude_code --categories \
+             job_text,profile_basic,resume_text` in an ordinary terminal, or on the AI screen."
                 .into()
         }
         Error::ManualRequired(reason) if reason == "provider_unavailable" => {
             "An AI provider is on but cannot be reached. Check `jobpilot ai status`, or write \
              this one yourself."
                 .into()
+        }
+        Error::ManualRequired(reason) if reason == "no_model_set" => {
+            "No local model is chosen. Set one with `jobpilot ai set-model --drafting <name>` \
+             in an ordinary terminal, or write this one yourself."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "model_not_installed" => {
+            "The chosen model is not installed in Ollama. Check `jobpilot ai models`.".into()
         }
         other => other.to_string(),
     }
@@ -236,7 +246,8 @@ async fn with_db(db: &Db, command: Command) -> Result<Output> {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{Cli, Command};
+    use super::{Cli, Command, message};
+    use jobpilot_core::Error;
 
     /// Every leaf command, with whether the panel refuses it. Script in the webview can type
     /// into the panel, so a command whose GUI twin needs a native dialog, or that changes
@@ -271,6 +282,7 @@ mod tests {
         ("kb unapprove i", false),
         ("kb mark-sensitive i", false),
         ("kb unmark i", false),
+        ("kb reveal i", true),
         ("kb search q", false),
         ("job paste t", false),
         ("job paste t --file /f", true),
@@ -328,6 +340,28 @@ mod tests {
             line.strip_prefix(path)
                 .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
         })
+    }
+
+    #[test]
+    fn consent_hint_names_the_whole_command() {
+        let text = message(&Error::ManualRequired("consent_needed".into()));
+        assert!(
+            text.contains(
+                "jobpilot ai consent give claude_code --categories job_text,profile_basic,resume_text"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn model_reasons_say_what_to_do() {
+        let none = message(&Error::ManualRequired("no_model_set".into()));
+        assert!(
+            none.contains("jobpilot ai set-model --drafting <name>"),
+            "{none}"
+        );
+        let gone = message(&Error::ManualRequired("model_not_installed".into()));
+        assert!(gone.contains("jobpilot ai models"), "{gone}");
     }
 
     #[test]

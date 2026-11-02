@@ -169,15 +169,24 @@ async fn marked_sensitive_item_is_ciphertext_and_withheld_from_evidence() {
     assert_eq!(held_by, key_id);
     assert!(knowledge::evidence(&db).await.unwrap().is_empty());
 
+    // A list shows it sealed and empty; only a reveal opens it.
     let listed = knowledge::list(&db).await.unwrap();
-    assert_eq!(listed[0].body, "ZXQ-SECRET-BODY");
-    assert!(listed[0].marked_sensitive && !listed[0].locked);
+    assert_eq!(listed[0].body, "");
+    assert!(listed[0].marked_sensitive && listed[0].sealed);
+    assert_eq!(
+        knowledge::reveal(&db, &item.id).await.unwrap(),
+        "ZXQ-SECRET-BODY"
+    );
 
-    // The key goes: the item lists locked and empty, and the list still works.
+    // The key goes: the list still works, and a reveal says why it cannot open.
     entry(&key_id).delete_credential().unwrap();
     let listed = knowledge::list(&db).await.unwrap();
-    assert!(listed[0].locked);
+    assert!(listed[0].sealed);
     assert_eq!(listed[0].body, "");
+    assert!(matches!(
+        knowledge::reveal(&db, &item.id).await,
+        Err(Error::KeyMissing { .. })
+    ));
     db.close().await;
 }
 
@@ -212,6 +221,7 @@ async fn unmarking_restores_the_body_and_marking_drops_the_embedding() {
         .unwrap();
     let back = &knowledge::list(&db).await.unwrap()[0];
     assert_eq!(back.body, "ZXQ-BODY");
+    assert!(!back.sealed);
     assert!(!back.marked_sensitive);
     assert_eq!(knowledge::evidence(&db).await.unwrap().len(), 1);
     db.close().await;
@@ -531,7 +541,7 @@ async fn discard_clears_marked_knowledge_bodies() {
         }
     );
     let listed = knowledge::list(&db).await.unwrap();
-    assert!(listed.iter().any(|i| i.id == item.id && i.locked));
+    assert!(listed.iter().any(|i| i.id == item.id && i.sealed));
 
     let state = recovery::discard_locked(&db, &key_id, "cli").await.unwrap();
     let KeyState::Unlocked { key_id: new_id } = state else {
@@ -548,7 +558,7 @@ async fn discard_clears_marked_knowledge_bodies() {
     assert!(enc.is_none() && held.is_none() && !approved);
     let listed = knowledge::list(&db).await.unwrap();
     let cleared = listed.iter().find(|i| i.id == item.id).unwrap();
-    assert!(!cleared.locked && cleared.body.is_empty() && cleared.marked_sensitive);
+    assert!(!cleared.sealed && cleared.body.is_empty() && cleared.marked_sensitive);
     assert!(
         listed
             .iter()
@@ -610,6 +620,62 @@ async fn a_marked_body_counts_as_ciphertext_for_key_creation() {
         .await
         .unwrap();
     assert_eq!(keys, 1);
+    db.close().await;
+}
+
+// A list never asks the store for a key: a marked row lists sealed and empty with no
+// entry anywhere, and the state stays `NotLoaded`. Reveal is the one read that asks.
+#[tokio::test]
+async fn listing_marked_items_asks_the_keychain_nothing() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    data_key_row(&db, "c0de000000000001", false).await;
+    let key = DataKey::from_bytes("c0de000000000001", [7; 32]);
+    let sealed = key
+        .encrypt("knowledge_items", "body_enc", "m", b"ZXQ-MARKED")
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO knowledge_items (id, kind, body, body_enc, key_id, source, approved, \
+         marked_sensitive, created_at, updated_at) \
+         VALUES ('m', 'note', '', ?, 'c0de000000000001', 'user', 0, 1, 't', 't')",
+    )
+    .bind(sealed)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let listed = knowledge::list(&db).await.unwrap();
+
+    assert!(listed[0].sealed && listed[0].marked_sensitive);
+    assert_eq!(listed[0].body, "");
+    assert_eq!(db.key_state(), KeyState::NotLoaded);
+    db.close().await;
+}
+
+// A marked row whose text was discarded is not sealed: there is nothing to reveal.
+#[tokio::test]
+async fn a_marked_item_with_discarded_text_lists_unsealed_and_cannot_be_revealed() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    sqlx::query(
+        "INSERT INTO knowledge_items (id, kind, body, source, approved, marked_sensitive, \
+         created_at, updated_at) VALUES ('d', 'note', '', 'user', 0, 1, 't', 't')",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let listed = knowledge::list(&db).await.unwrap();
+
+    assert!(!listed[0].sealed && listed[0].marked_sensitive);
+    assert!(matches!(
+        knowledge::reveal(&db, "d").await,
+        Err(Error::Validation(_))
+    ));
+    assert!(matches!(
+        knowledge::reveal(&db, "nope").await,
+        Err(Error::NotFound)
+    ));
     db.close().await;
 }
 

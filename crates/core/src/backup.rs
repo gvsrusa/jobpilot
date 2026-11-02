@@ -572,13 +572,27 @@ async fn migrate_and_fill(pool: &SqlitePool, plan: &Plan<'_>) -> Result<()> {
 
 /// Consent is a decision made now, and a backup is an old one, or someone else's copy, so a
 /// restore never brings one back (FR-3.30). Fails closed as the router does: anything but
-/// Ollama is external. The row stays as the record, closed by the restore.
+/// Ollama is external. The row stays as the record, closed by the restore. When one was
+/// closed, Claude Code is also switched off, as the AI screen's own Revoke does, so the
+/// screen shows it off with no consent rather than on and failing every task. With no
+/// consent to close, the switch is left as it was.
 async fn revoke_external_consent(pool: &SqlitePool, actor: &str) -> Result<()> {
     let revoked: Vec<String> = sqlx::query_scalar(
         "UPDATE consent SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
          WHERE revoked_at IS NULL AND provider <> 'ollama' RETURNING provider",
     )
     .fetch_all(pool)
+    .await?;
+    if revoked.is_empty() {
+        return Ok(());
+    }
+    // A missing or non-object setting has nothing to switch off: the default is off.
+    sqlx::query(
+        "UPDATE settings SET value = json_set(value, '$.claude_code', json('false')), \
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE key = 'ai.enabled' AND json_type(value) = 'object'",
+    )
+    .execute(pool)
     .await?;
     for provider in revoked {
         let action = "consent_revoked_by_restore";

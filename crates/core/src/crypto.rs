@@ -1057,6 +1057,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, 0);
+
+        // Reads that name "asks the keychain nothing". With nothing sealed, the check text
+        // is read without a key; with a sealed row seeded, a list still asks no one.
+        crate::knowledge::marked_bodies(&db).await.unwrap();
+        let key = DataKey::from_bytes("c0de000000000001", [3; 32]);
+        let check = key
+            .encrypt(
+                "data_keys",
+                "key_check",
+                "c0de000000000001",
+                key_check_text(),
+            )
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO data_keys (key_id, created_at, key_check, active) VALUES (?, 't', ?, 0)",
+        )
+        .bind("c0de000000000001")
+        .bind(check)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let sealed = key
+            .encrypt("knowledge_items", "body_enc", "m", b"sealed")
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO knowledge_items (id, kind, body, body_enc, key_id, source, approved, \
+             marked_sensitive, created_at, updated_at) \
+             VALUES ('m', 'note', '', ?, 'c0de000000000001', 'user', 0, 1, 't', 't')",
+        )
+        .bind(sealed)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let listed = crate::knowledge::list(&db).await.unwrap();
+        assert!(listed[0].sealed && listed[0].body.is_empty());
+        assert_eq!(calls(), before);
         db.close().await;
 
         // The seam itself: an empty name stops before the OS, but it passed through.

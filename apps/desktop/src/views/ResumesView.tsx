@@ -108,7 +108,7 @@ function ClaimEditor({
     onSuccess: onSaved,
   });
   // The core counts only approved, unmarked items as evidence, so only those are offered.
-  const usable = (knowledge.data ?? []).filter((k) => k.approved && !k.marked_sensitive && !k.locked);
+  const usable = (knowledge.data ?? []).filter((k) => k.approved && !k.marked_sensitive && !k.sealed);
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
       <DialogContent showCloseButton={false}>

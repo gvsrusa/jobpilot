@@ -37,6 +37,8 @@ pub const RUN_REASONS: &[&str] = &[
     "error_max_structured_output_retries",
     "consent_needed",
     "provider_unavailable",
+    "no_model_set",
+    "model_not_installed",
 ];
 
 /// Absent capabilities are false: a declaration lists only what the provider proves.

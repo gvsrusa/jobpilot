@@ -160,7 +160,7 @@ fn evidence_item(
         source_ref: None,
         approved,
         marked_sensitive: marked,
-        locked,
+        sealed: locked,
     }
 }
 
@@ -769,6 +769,21 @@ async fn claims_that_differ_from_the_lines_store_nothing() {
     assert!(matches!(made, Err(Error::Validation(_))), "{made:?}");
     assert_eq!(draft_count(&w.db).await, 0);
     assert_eq!(claim_count(&w.db).await, 0);
+}
+
+#[tokio::test]
+async fn stock_headings_come_out_title_cased() {
+    let w = world().await;
+    let mut reply = reply_citing(&[(BULLET, &[&w.item.id])]);
+    reply["doc"]["sections"][0]["heading"] = json!("work experience");
+    let (router, _) = router(vec![reply]);
+
+    let made = generate::resume(&w.db, &router, "gui", &w.job.id, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(made.draft.doc.sections[0].heading, "Work Experience");
+    assert_eq!(made.blocked, 0);
 }
 
 #[tokio::test]

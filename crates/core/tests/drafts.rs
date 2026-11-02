@@ -58,7 +58,7 @@ fn item(id: &str, body: &str, source: &str, approved: bool, marked: bool) -> Kno
         source_ref: None,
         approved,
         marked_sensitive: marked,
-        locked: false,
+        sealed: false,
     }
 }
 
@@ -1386,6 +1386,28 @@ async fn seal_unreadably(db: &Db, id: &str) {
         .unwrap();
 }
 
+/// The list no longer opens bodies, so the export gate must read them itself: a sealed item
+/// with no key anywhere still stops the export, and nothing is written.
+#[tokio::test]
+async fn a_marked_item_still_stops_export_with_no_key() {
+    let (_tmp, paths, db) = setup().await;
+    let good = user_item(&db, "Rust").await;
+    let draft = generated(&db, None, vec![input("Rust", &[&good])])
+        .await
+        .unwrap();
+    // A sealed row naming a key this root never had: no keychain entry can exist.
+    let sealed = user_item(&db, "A sealed sentence.").await;
+    seal_unreadably(&db, &sealed).await;
+
+    let result = export(&db, &paths, &draft.id).await;
+
+    assert!(
+        matches!(result, Err(Error::Locked | Error::KeyMissing { .. })),
+        "{result:?}"
+    );
+    assert_eq!(exported_files(&paths), 0);
+}
+
 #[tokio::test]
 async fn export_refuses_while_a_sealed_text_cannot_be_read() {
     let (_tmp, paths, db) = setup().await;
@@ -1399,7 +1421,7 @@ async fn export_refuses_while_a_sealed_text_cannot_be_read() {
     seal_unreadably(&db, &sealed).await;
     assert!(matches!(
         export(&db, &paths, &draft.id).await,
-        Err(Error::Locked)
+        Err(Error::KeyMissing { .. })
     ));
     assert_eq!(exported_files(&paths), 0);
     // Compare still works, and the user's own version needs no key.

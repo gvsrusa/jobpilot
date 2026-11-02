@@ -65,7 +65,7 @@ pub async fn index_missing(db: &Db, router: &Router, cancel: CancellationToken) 
     let pending: Vec<_> = knowledge::list(db)
         .await?
         .into_iter()
-        .filter(|item| !item.marked_sensitive && !item.locked && !item.body.is_empty())
+        .filter(|item| !item.marked_sensitive && !item.sealed && !item.body.is_empty())
         .filter(|item| !done.contains(&item.id))
         .collect();
 

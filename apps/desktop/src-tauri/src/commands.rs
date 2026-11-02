@@ -71,6 +71,7 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         kb_approve,
         kb_mark_sensitive,
         kb_remove,
+        kb_reveal,
         kb_search,
         job_paste,
         job_list,
@@ -423,6 +424,33 @@ pub async fn kb_mark_sensitive(state: State<'_, AppState>, id: String, marked: b
 #[tauri::command]
 pub async fn kb_remove(state: State<'_, AppState>, id: String) -> Result<()> {
     knowledge::remove(&*state.work().await?, &id).await
+}
+
+/// The text of one item. A sealed body is shown only after a native confirmation, every
+/// time, so script in the webview cannot read marked text on its own: the dialog is Rust's
+/// and does not name the text. An unknown id answers `not_found` and an unsealed item
+/// answers at once, with no dialog, because neither holds anything to protect.
+#[tauri::command]
+pub async fn kb_reveal<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<String> {
+    let db = state.work().await?;
+    let items = knowledge::list(&db).await?;
+    let item = items
+        .iter()
+        .find(|item| item.id == id)
+        .ok_or(Error::NotFound)?;
+    if item.sealed {
+        let message = format!(
+            "Show the sealed {} item {}?\n\nIts text will appear on screen until you hide it \
+             or leave this screen.",
+            item.kind, item.id
+        );
+        native::confirmed(&app, "Show sealed text", message, "Show").await?;
+    }
+    knowledge::reveal(&db, &id).await
 }
 
 /// Embeddings when a local model is set up, else a plain text match.
@@ -1931,6 +1959,7 @@ mod tests {
         "kb_approve",
         "kb_mark_sensitive",
         "kb_remove",
+        "kb_reveal",
         "kb_search",
         "job_paste",
         "job_list",
@@ -2090,6 +2119,80 @@ mod tests {
         h.ok("kb_remove", json!({ "id": id }));
 
         assert_eq!(h.ok("kb_list", json!({})), json!([]));
+    }
+
+    /// A marked row naming a key this keychain never held, so nothing here asks a keychain.
+    fn seal_without_a_key(h: &Harness, id: &str) {
+        block_on(async {
+            let slot = h.app.state::<AppState>();
+            let slot = slot.db.read().await;
+            let mut connection = slot.as_ref().unwrap().pool.acquire().await.unwrap();
+            sqlx::query("PRAGMA foreign_keys = OFF")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO knowledge_items (id, kind, body, body_enc, key_id, source, \
+                 approved, marked_sensitive, created_at, updated_at) \
+                 VALUES (?, 'note', '', x'00', 'gone', 'user', 0, 1, 't', 't')",
+            )
+            .bind(id)
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn kb_reveal_of_a_sealed_item_needs_a_native_yes_every_time() {
+        let h = ready();
+        seal_without_a_key(&h, "s1");
+        assert_eq!(h.ok("kb_list", json!({}))[0]["sealed"], true);
+
+        h.answer(false);
+        assert_eq!(
+            h.code("kb_reveal", json!({ "id": "s1" })),
+            "confirmation_required"
+        );
+        assert_eq!(h.asked().len(), 1);
+        assert!(h.asked()[0].contains("s1"), "{:?}", h.asked());
+
+        // A yes opens the dialog again and reaches the key, which this keychain lacks.
+        h.answer(true);
+        assert_eq!(h.code("kb_reveal", json!({ "id": "s1" })), "key_missing");
+        assert_eq!(h.asked().len(), 2, "one dialog per reveal");
+    }
+
+    #[test]
+    fn kb_reveal_of_a_plain_item_or_an_unknown_id_asks_nothing() {
+        let h = ready();
+        let item = h.ok("kb_add", json!({ "kind": "note", "body": "Shipped it" }));
+
+        let body = h.ok("kb_reveal", json!({ "id": item["id"] }));
+
+        assert_eq!(body, "Shipped it");
+        assert_eq!(h.code("kb_reveal", json!({ "id": "nope" })), "not_found");
+        assert!(h.asked().is_empty());
+    }
+
+    #[test]
+    #[ignore = "uses the test keychain"]
+    fn kb_reveal_shows_a_sealed_body_after_a_yes() {
+        let h = ready();
+        let item = h.ok("kb_add", json!({ "kind": "note", "body": "ZXQ-SEALED" }));
+        let id = item["id"].as_str().unwrap();
+        h.ok("kb_mark_sensitive", json!({ "id": id, "marked": true }));
+        assert_eq!(h.ok("kb_list", json!({}))[0]["body"], "");
+
+        h.answer(false);
+        assert_eq!(
+            h.code("kb_reveal", json!({ "id": id })),
+            "confirmation_required"
+        );
+        h.answer(true);
+        assert_eq!(h.ok("kb_reveal", json!({ "id": id })), "ZXQ-SEALED");
+        assert!(!h.asked().iter().any(|m| m.contains("ZXQ-SEALED")));
+        h.ok("data_delete", delete("DELETE", true));
     }
 
     #[test]

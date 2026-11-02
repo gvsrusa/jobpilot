@@ -18,7 +18,7 @@ use crate::db::Db;
 use crate::drafts::{self, ClaimInput, Draft, usable};
 use crate::error::{Error, Result};
 use crate::knowledge::{self, JobText, KnowledgeItem};
-use crate::parse::{KNOWN_HEADINGS, SUMMARY_HEADINGS};
+use crate::parse::{self, KNOWN_HEADINGS, SUMMARY_HEADINGS};
 use crate::profile::{self, ProfileBasic};
 use crate::render::{ResumeDoc, cover_letter_doc};
 
@@ -73,6 +73,11 @@ pub async fn resume(
     let ResumeReply { mut doc, claims } = decode(&reply)?;
     doc.name.clone_from(&reply.basic.name);
     doc.contact = contact(&reply.basic);
+    for section in &mut doc.sections {
+        if let Some(display) = parse::stock_heading_display(&section.heading) {
+            section.heading = display;
+        }
+    }
     store(db, "resume", reply, doc, claims).await
 }
 
