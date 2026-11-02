@@ -36,8 +36,14 @@ function Shell({ root }: { root: string }) {
   const main = useRef<HTMLElement>(null);
   const [terminal, setTerminal] = useState(false);
 
-  // On a view change, focus moves to the main view heading.
-  useEffect(() => main.current?.querySelector("h1")?.focus(), [view]);
+  // On a view change, focus moves to the main view heading. Not on launch: that would put
+  // the first tab stop past Emergency pause.
+  const shown = useRef(view);
+  useEffect(() => {
+    if (shown.current === view) return;
+    shown.current = view;
+    main.current?.querySelector("h1")?.focus();
+  }, [view]);
 
   useEffect(() => {
     const onKey = (e: globalThis.KeyboardEvent) => {

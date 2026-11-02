@@ -28,6 +28,15 @@ describe("isPauseKey", () => {
 });
 
 describe("emergency pause", () => {
+  it("a_fresh_launch_leaves_focus_at_the_top_so_tab_reaches_the_pause", async () => {
+    backend();
+    const { user } = renderApp();
+    const button = await screen.findByRole("button", { name: "Emergency pause" });
+    await screen.findByRole("heading", { level: 1 });
+    await user.tab();
+    expect(button).toHaveFocus();
+  });
+
   it.each(VIEWS)("pause_is_the_first_tab_stop_on_%s", async (label) => {
     backend();
     const { user } = renderApp();
