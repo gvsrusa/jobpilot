@@ -487,3 +487,14 @@ async fn splitting_a_leader_regroups_its_followers_at_once() {
         Some(ids[1].as_str())
     );
 }
+
+#[tokio::test]
+async fn a_pasted_link_stores_a_name_a_connector_has() {
+    let (_tmp, db) = open().await;
+    let link = "https://weworkremotely.com/remote-jobs/x";
+    let job = import_pasted(&db, pasted("Dev", "Acme", Some(link), "We need Rust"))
+        .await
+        .unwrap();
+    assert_eq!(job.connector, "wwr");
+    assert!(jobpilot_core::connectors::find(&job.connector).is_some());
+}

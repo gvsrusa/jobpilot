@@ -54,7 +54,7 @@ pub fn connector_of(route: &LinkRoute) -> &'static str {
         LinkRoute::Indeed => "indeed",
         LinkRoute::LinkedIn => "linkedin",
         LinkRoute::RemoteOk => "remoteok",
-        LinkRoute::WeWorkRemotely => "weworkremotely",
+        LinkRoute::WeWorkRemotely => "wwr",
         LinkRoute::CompanyPage => "company_page",
     }
 }
