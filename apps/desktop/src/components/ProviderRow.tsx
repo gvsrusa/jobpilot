@@ -14,7 +14,11 @@ const UNAVAILABLE: Record<string, string> = {
 function KeyControls({ row }: { row: ExternalStatus }) {
   const client = useQueryClient();
   const changed = () => client.resetQueries({ queryKey: ["ai"] });
-  const paste = useMutation({ mutationFn: () => ipc.aiKeyFromClipboard(row.name), onSuccess: changed });
+  // A failure can come after the key is stored. Invalidating keeps this row, and its alert, up.
+  const paste = useMutation({
+    mutationFn: () => ipc.aiKeyFromClipboard(row.name),
+    onSettled: () => client.invalidateQueries({ queryKey: ["ai"] }),
+  });
   const remove = useMutation({ mutationFn: () => ipc.aiKeyRemove(row.name), onSuccess: changed });
   return (
     <div className="grid gap-2">
@@ -65,7 +69,7 @@ export function ProviderRow(props: {
         {row.path && <span className="break-all">{row.path}</span>}
       </div>
       {row.suspended && <p role="alert">{SUSPENDED}</p>}
-      {row.kind === "api" && <KeyControls row={row} />}
+      {row.kind !== "cli" && <KeyControls row={row} />}
       {row.consent && <p>Consent given for: {row.consent.map(labelOf).join(", ")}.</p>}
       <div className="flex flex-wrap items-center gap-3">
         {row.consent && (

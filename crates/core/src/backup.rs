@@ -805,10 +805,13 @@ async fn reopen(
     backup_key_state: Option<KeyState>,
 ) -> Result<RestoreReport> {
     match Db::open_with(paths, migrator).await {
-        Ok(db) => Ok(RestoreReport {
-            db,
-            backup_key_state,
-        }),
+        Ok(db) => {
+            secrets::forget_missing_api_keys(&db).await;
+            Ok(RestoreReport {
+                db,
+                backup_key_state,
+            })
+        }
         Err(error) => Err(Error::RestoredButNotOpened(match &backup_key_state {
             Some(state) => format!("{error}. {}", key_note(state)),
             None => error.to_string(),

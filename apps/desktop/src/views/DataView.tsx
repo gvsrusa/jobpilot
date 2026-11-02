@@ -199,14 +199,17 @@ function SecretsSection() {
         {names.data?.map((n) => (
           <li key={n} className="flex items-center justify-between">
             <span>{n}</span>
-            <Button
-              variant="outline"
-              size="sm"
-              aria-label={`Remove ${n}`}
-              onClick={() => setRemoving(n)}
-            >
-              Remove...
-            </Button>
+            {/* A provider key is removed on the AI screen. Rust refuses it here. */}
+            {!n.toLowerCase().startsWith("ai-key-") && (
+              <Button
+                variant="outline"
+                size="sm"
+                aria-label={`Remove ${n}`}
+                onClick={() => setRemoving(n)}
+              >
+                Remove...
+              </Button>
+            )}
           </li>
         ))}
       </ul>

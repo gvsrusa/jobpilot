@@ -150,7 +150,19 @@ pub fn out(value: impl serde::Serialize, text: String) -> Result<Output> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let args: Vec<String> = std::env::args_os()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            let Some(line) = parse_error(&args, &error) else {
+                error.exit()
+            };
+            eprintln!("{line}");
+            return ExitCode::from(2);
+        }
+    };
     if matches!(cli.command, Command::Shell) {
         // Not through `run`: the panel itself starts this, marker set.
         let input = tokio::io::BufReader::new(tokio::io::stdin());
@@ -187,6 +199,22 @@ async fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// clap repeats the word it could not use, and after `ai key` that word can be a key. So
+/// those errors get this line, naming no argument. `None` leaves clap's own text, which
+/// `--help` needs. Flags are passed over, as `--json` may stand between the two words.
+pub fn parse_error(args: &[String], error: &clap::Error) -> Option<&'static str> {
+    let words: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|arg| !arg.starts_with('-'))
+        .collect();
+    let key_command = words.windows(2).any(|pair| pair == ["ai", "key"]);
+    (key_command && error.use_stderr()).then_some(
+        "error[usage]: use `jobpilot ai key set <provider>` or `jobpilot ai key remove \
+         <provider>`. A key is never an argument: `set` asks for it.",
+    )
 }
 
 /// Stored and parsed text is untrusted: no escape reaches the terminal.

@@ -518,3 +518,25 @@ fn eof_without_exit_ends_cleanly() {
     assert!(output.status.success());
     assert_eq!(text(&output).matches("jobpilot> ").count(), 2);
 }
+
+#[test]
+fn a_key_on_a_panel_line_is_not_repeated() {
+    let (_dir, home) = fresh_home();
+    let lines = b"ai key set openai sk-ZXQ-panel\nai key remove openai sk-ZXQ-panel\nexit\n";
+    let reply = text(&session(&home, lines, &[]));
+    assert!(reply.contains("error[usage]"), "{reply}");
+    assert!(!reply.contains("ZXQ"), "{reply}");
+}
+
+#[test]
+fn panel_help_and_other_parse_errors_are_unchanged() {
+    let (_dir, home) = fresh_home();
+    let reply = text(&session(
+        &home,
+        b"ai key set --help\ndoc nosuch\nexit\n",
+        &[],
+    ));
+    assert!(reply.contains("Usage"), "{reply}");
+    assert!(reply.contains("nosuch"), "{reply}");
+    assert!(!reply.contains("error[usage]"), "{reply}");
+}

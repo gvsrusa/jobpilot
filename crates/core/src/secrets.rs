@@ -65,6 +65,34 @@ pub async fn delete_api_key(db: &Db, provider: &str, actor: &str) -> Result<()> 
     erase(db, &api_key_name(provider), actor).await
 }
 
+/// A restore can bring back the row of a key removed since the backup, and the screen reads
+/// rows. Run after one, so a row names a key the keychain holds. It reads the entry, as
+/// keyring has no check for one, and drops the value at once. Best effort: the restore is
+/// done, and a stale row costs only a `no_key` at the next send.
+pub(crate) async fn forget_missing_api_keys(db: &Db) {
+    forget_unheld(db, |name| Ok(get(name)?.map(Zeroizing::new).is_some())).await
+}
+
+/// Only a definite no drops a row: a locked keychain says nothing about the key. Provider
+/// names come from the table, as a backup is untrusted and each ask can prompt the user.
+async fn forget_unheld(db: &Db, holds: impl Fn(&str) -> Result<bool> + Send + Copy + 'static) {
+    let Ok(listed) = names(db).await else {
+        return;
+    };
+    let takes_key = register::PROVIDERS
+        .iter()
+        .filter(|info| key_provider(info.name).is_ok());
+    for name in takes_key.map(|info| api_key_name(info.name)) {
+        if !listed.contains(&name) {
+            continue;
+        }
+        let asked = name.clone();
+        if let Ok(false) = keychain(move || holds(&asked)).await {
+            let _ = remove_row(db, &name).await;
+        }
+    }
+}
+
 /// Off the runtime. `None` when no entry.
 // Task 4's `KeySource::Keychain` is the first caller.
 #[allow(dead_code)]
@@ -378,6 +406,46 @@ mod tests {
             assert!(key_provider(provider).is_ok(), "{provider}");
         }
         assert!(names(&db).await.unwrap().is_empty());
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn only_a_key_known_to_be_gone_loses_its_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&crate::AppPaths::new(tmp.path().join("data")))
+            .await
+            .unwrap();
+        for name in [
+            "ai-key-anthropic",
+            "ai-key-google",
+            "ai-key-no-such-provider",
+            "ai-key-openai",
+            "my-token",
+        ] {
+            sqlx::query("INSERT INTO secret_index (name, created_at) VALUES (?, 't')")
+                .bind(name)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+
+        forget_unheld(&db, |name| match name {
+            "ai-key-openai" => Ok(true),
+            "ai-key-anthropic" => Err(Error::Secret("locked".into())),
+            "ai-key-google" => Ok(false),
+            other => panic!("asked about {other}"),
+        })
+        .await;
+
+        assert_eq!(
+            names(&db).await.unwrap(),
+            [
+                "ai-key-anthropic",
+                "ai-key-no-such-provider",
+                "ai-key-openai",
+                "my-token"
+            ]
+        );
         db.close().await;
     }
 

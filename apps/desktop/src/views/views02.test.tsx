@@ -916,6 +916,36 @@ describe("ai", () => {
     expect(alert).toHaveTextContent("code: validation");
   });
 
+  it("an_endpoint_row_takes_a_key_too", async () => {
+    const b = backend({
+      ai_status: () =>
+        aiWith({ external: [external({ name: "endpoint", label: "Compatible endpoint", kind: "endpoint" })] }),
+      ai_key_from_clipboard: () => null,
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "Compatible endpoint" }));
+    await user.click(row.getByRole("button", { name: /Paste key from clipboard\.\.\./ }));
+    await waitFor(() => expect(count(b, "ai_key_from_clipboard")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_key_from_clipboard")?.args).toEqual({ provider: "endpoint" });
+  });
+
+  it("a_key_stored_with_a_clipboard_failure_shows_both", async () => {
+    let stored = false;
+    backend({
+      ai_status: () => aiWith({ external: [external({ key_stored: stored })] }),
+      ai_key_from_clipboard: () => {
+        stored = true;
+        throw { code: "failed", message: "the key is stored, but the clipboard could not be cleared. Clear it yourself" };
+      },
+    });
+    const { user } = renderApp();
+    const row = await keyRow(user);
+    await user.click(row.getByRole("button", { name: /Paste key from clipboard\.\.\./ }));
+    expect(await screen.findByText("Key stored")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("Clear it yourself");
+  });
+
   it("a_cli_row_has_no_key_controls", async () => {
     backend({
       ai_status: () => aiWith({ external: [external({ name: "gemini_cli", label: "Gemini CLI", kind: "cli" })] }),

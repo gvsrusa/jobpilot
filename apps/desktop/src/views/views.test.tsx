@@ -223,6 +223,15 @@ describe("data", () => {
     expect(await screen.findByText(/exports\/export-1/)).toBeInTheDocument();
   });
 
+  it("a_provider_key_has_no_remove_here", async () => {
+    backend({ secret_names: () => ["ai-key-openai", "my-token"] });
+    const { user } = renderApp();
+    await open(user, "Data");
+    expect(await screen.findByText("ai-key-openai")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Remove my-token" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Remove ai-key-openai" })).toBeNull();
+  });
+
   it("secret_ui_never_displays_values", async () => {
     const b = backend();
     const { user } = renderApp();

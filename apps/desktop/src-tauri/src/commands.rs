@@ -2672,18 +2672,19 @@ mod tests {
         assert_eq!(dialogs, ["dialog:allow-open"]);
     }
 
+    /// Every capability file, as Tauri loads them all, and the config, which can hold one inline.
     #[test]
     fn the_webview_gains_no_clipboard_capability() {
-        let capability: Value =
-            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
-        let clipboard: Vec<&str> = capability["permissions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(Value::as_str)
-            .filter(|name| name.contains("clipboard"))
-            .collect();
-        assert_eq!(clipboard, [] as [&str; 0]);
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = vec![root.join("tauri.conf.json")];
+        for entry in fs::read_dir(root.join("capabilities")).unwrap() {
+            files.push(entry.unwrap().path());
+        }
+        assert!(files.len() > 1, "no capability file was read");
+        for file in files {
+            let text = fs::read_to_string(&file).unwrap().to_lowercase();
+            assert!(!text.contains("clipboard"), "{}", file.display());
+        }
     }
 
     /// Fake, and the last four are what a dialog may show of it.
@@ -2827,6 +2828,48 @@ mod tests {
         assert_eq!(h.clipboard(), None);
 
         block_on(native::clear_clipboard(app, "copied since")).unwrap();
+    }
+
+    #[test]
+    fn a_clipboard_that_cannot_be_read_says_so_and_asks_nothing() {
+        let h = ready();
+        h.copy(SECRET_KEY);
+        let hook = h.app.state::<NativeHook>();
+        hook.clipboard_fails.store(true, Ordering::SeqCst);
+
+        let args = json!({ "provider": "openai" });
+        assert_eq!(h.code("ai_key_from_clipboard", args), "failed");
+        assert!(h.asked().is_empty());
+    }
+
+    /// The dialog promised a clear, so a key that may still be there must not read as done.
+    #[test]
+    fn a_failed_read_after_storing_tells_the_person_to_clear_it() {
+        let h = ready();
+        h.copy(SECRET_KEY);
+        let hook = h.app.state::<NativeHook>();
+        hook.clipboard_fails.store(true, Ordering::SeqCst);
+
+        let error = block_on(native::clear_clipboard(h.app.handle(), SECRET_KEY)).unwrap_err();
+
+        assert_eq!(error.code(), "failed");
+        let text = error.to_string();
+        assert!(text.contains("the key is stored"), "{text}");
+        assert!(text.contains("Clear it yourself"), "{text}");
+        assert!(!text.contains(SECRET_LAST4), "{text}");
+    }
+
+    #[test]
+    fn the_endpoint_takes_a_key_from_the_clipboard_too() {
+        let h = ready();
+        h.copy(SECRET_KEY);
+        h.answer(false);
+        let args = json!({ "provider": "endpoint" });
+        assert_eq!(
+            h.code("ai_key_from_clipboard", args),
+            "confirmation_required"
+        );
+        assert!(h.asked()[0].contains(SECRET_LAST4), "{:?}", h.asked());
     }
 
     /// The whole path, so the keychain. `.cargo/config.toml` names the throwaway service.

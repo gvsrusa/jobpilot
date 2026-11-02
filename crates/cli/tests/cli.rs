@@ -2102,15 +2102,73 @@ fn run_with_stdin(home: &Path, args: &[&str], input: &str) -> Output {
 #[test]
 fn key_set_refuses_argv_by_shape() {
     let (_dir, home) = fresh_home();
-    let refused = run(&home, &["ai", "key", "set", "openai", "sk-abcdefgh"]);
-    assert_eq!(refused.status.code(), Some(2), "clap's usage error");
-    assert!(refused.stdout.is_empty());
-    let flag = run(&home, &["ai", "key", "set", "openai", "--key=sk-abcdefgh"]);
-    assert_eq!(flag.status.code(), Some(2));
+    for args in [
+        vec!["ai", "key", "set", "openai", "sk-ZXQ-argv"],
+        vec!["ai", "key", "set", "openai", "--key=sk-ZXQ-argv"],
+        vec!["ai", "key", "set", "sk-ZXQ-argv"],
+        vec!["ai", "--json", "key", "set", "openai", "sk-ZXQ-argv"],
+        vec!["--json", "ai", "key", "remove", "openai", "sk-ZXQ-argv"],
+    ] {
+        let refused = run(&home, &args);
+        assert_eq!(refused.status.code(), Some(2), "{args:?}");
+        assert!(refused.stdout.is_empty(), "{args:?}");
+        let text = stderr_text(&refused);
+        assert!(text.starts_with("error[usage]"), "{args:?}: {text}");
+        assert!(!text.contains("ZXQ"), "{args:?}: {text}");
+    }
     assert!(
         !home.exists(),
         "refused while parsing, before any data opened"
     );
+}
+
+#[test]
+fn only_a_key_command_hides_what_clap_says() {
+    let (_dir, home) = fresh_home();
+    let help = run(&home, &["ai", "key", "set", "--help"]);
+    assert_eq!(help.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(text.contains("Usage"), "{text}");
+
+    let other = run(&home, &["doc", "nosuch"]);
+    assert_eq!(other.status.code(), Some(2));
+    let text = stderr_text(&other);
+    assert!(text.contains("nosuch"), "{text}");
+    assert!(!text.contains("error[usage]"), "{text}");
+}
+
+/// Refused before stdin is read: the pipe stays open, and nothing is ever written to it.
+#[test]
+fn a_provider_with_no_key_is_refused_before_any_key_is_asked_for() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let (_dir, home) = fresh_home();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jobpilot"))
+        .args(["ai", "key", "set", "gemini_cli"])
+        .env("JOBPILOT_HOME", &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let held_open = child.stdin.take();
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            child.kill().unwrap();
+            panic!("waited for a key this provider cannot take");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    drop(held_open);
+    assert_eq!(status.code(), Some(1));
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    assert!(stderr.starts_with("error[refused]"), "{stderr}");
 }
 
 #[test]
