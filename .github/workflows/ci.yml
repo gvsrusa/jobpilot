@@ -62,10 +62,12 @@ jobs:
           security set-keychain-settings ci.keychain
           cargo test --workspace -- --ignored --skip real_claude --skip real_gemini --skip real_tls --skip make_fixtures
 
+      # The tests' own `keyring::Entry` calls bypass the product's one-at-a-time rule, and
+      # Credential Manager answers overlapping calls wrongly, so one test runs at a time.
       - name: Keychain tests (Windows)
         if: runner.os == 'Windows'
         timeout-minutes: 10
-        run: cargo test --workspace -- --ignored --skip real_claude --skip real_gemini --skip real_tls --skip make_fixtures
+        run: cargo test --workspace -- --ignored --skip real_claude --skip real_gemini --skip real_tls --skip make_fixtures --test-threads=1
 
       # Four keyless connections, one to each vendor host, any HTTP status counts. On Windows
       # this is the Schannel proof.

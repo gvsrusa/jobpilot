@@ -8,6 +8,9 @@ Format follows Keep a Changelog. Versions follow Semantic Versioning.
 - CI on macOS and Windows, and a tag-triggered draft release workflow producing dmg, nsis, and msi installers.
 - Development guide, contributing guide, and Connector SDK stub.
 
+### Fixed
+- Windows: keychain calls no longer overlap, within a process or between the app and the CLI. Credential Manager could answer "no such entry" for a stored key, which reads as a lost key and offers discard.
+
 ## [0.4.0] - unreleased
 
 External AI backends, all optional and all behind consent. See `docs/releases/0.4.0.md` for what was and was not exercised.

@@ -11,6 +11,9 @@
 // and the row removal stores a value whose row then goes. Both need simultaneous
 // writers from two processes; hold the row in a transaction if that ever happens.
 
+use std::fs::OpenOptions;
+use std::sync::{Mutex, PoisonError};
+
 use serde_json::json;
 pub use zeroize::Zeroizing;
 
@@ -132,9 +135,11 @@ async fn store(db: &Db, name: &str, value: &str, actor: &str) -> Result<()> {
 
     let (entry_name, entry_value) = (name.to_owned(), Zeroizing::new(value.to_owned()));
     if let Err(error) = keychain(move || {
-        entry(&entry_name)?
-            .set_password(&entry_value)
-            .map_err(secret_error)
+        one_at_a_time(|| {
+            entry(&entry_name)?
+                .set_password(&entry_value)
+                .map_err(secret_error)
+        })
     })
     .await
     {
@@ -152,6 +157,10 @@ async fn store(db: &Db, name: &str, value: &str, actor: &str) -> Result<()> {
 /// For Rust callers only: no IPC command or CLI path may reach this. It blocks on the
 /// keychain, so async callers run it in `spawn_blocking`.
 pub fn get(name: &str) -> Result<Option<String>> {
+    one_at_a_time(|| read(name))
+}
+
+fn read(name: &str) -> Result<Option<String>> {
     match entry(name)?.get_password() {
         Ok(value) => Ok(Some(value)),
         Err(keyring::Error::NoEntry) => Ok(None),
@@ -185,24 +194,25 @@ async fn erase(db: &Db, name: &str, actor: &str) -> Result<()> {
 /// new name: a stored key must never be overwritten (threat model section 8).
 pub(crate) async fn store_key(name: &str, value: &str) -> Result<()> {
     let (name, value) = (name.to_owned(), Zeroizing::new(value.to_owned()));
-    keychain(move || entry(&name)?.set_password(&value).map_err(secret_error)).await
+    keychain(move || one_at_a_time(|| entry(&name)?.set_password(&value).map_err(secret_error)))
+        .await
 }
 
 /// Adds a key the caller has proven, and never replaces an entry. An entry that already
 /// holds this value is fine as it is; one holding anything else is `Refused`, because
 /// nothing here can say which of the two is worth keeping.
-// ponytail: the check and the write are two calls, as keyring has no create-only write.
-// Only another import of this same key can land between them, and it writes this value.
 pub(crate) async fn add_key(name: &str, value: &str) -> Result<()> {
     let (name, value) = (name.to_owned(), Zeroizing::new(value.to_owned()));
-    keychain(move || match get(&name)?.map(Zeroizing::new) {
-        Some(stored) if stored == value => Ok(()),
-        Some(_) => Err(Error::Refused(
-            "the keychain holds another value for this key, and it is left as it is. \
-             Remove that entry to import this file"
-                .into(),
-        )),
-        None => entry(&name)?.set_password(&value).map_err(secret_error),
+    keychain(move || {
+        one_at_a_time(|| match read(&name)?.map(Zeroizing::new) {
+            Some(stored) if stored == value => Ok(()),
+            Some(_) => Err(Error::Refused(
+                "the keychain holds another value for this key, and it is left as it is. \
+                 Remove that entry to import this file"
+                    .into(),
+            )),
+            None => entry(&name)?.set_password(&value).map_err(secret_error),
+        })
     })
     .await
 }
@@ -220,13 +230,15 @@ pub async fn names(db: &Db) -> Result<Vec<String>> {
 /// over: it must never block deletion for good.
 pub(crate) async fn remove_all(names: Vec<String>) -> Result<()> {
     keychain(move || {
-        for name in names.iter().filter(|name| !name.is_empty()) {
-            match entry(name)?.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => {}
-                Err(error) => return Err(secret_error(error)),
+        one_at_a_time(|| {
+            for name in names.iter().filter(|name| !name.is_empty()) {
+                match entry(name)?.delete_credential() {
+                    Ok(()) | Err(keyring::Error::NoEntry) => {}
+                    Err(error) => return Err(secret_error(error)),
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     })
     .await
 }
@@ -237,6 +249,30 @@ async fn remove_row(db: &Db, name: &str) -> Result<()> {
         .execute(&db.pool)
         .await?;
     Ok(())
+}
+
+/// Runs one keychain call while no other runs, in this process or another of ours. Windows
+/// Credential Manager mishandles overlapping calls, even on different entries: a read can
+/// answer "no such entry" for a key it holds, and a delete can report success and leave the
+/// entry. That answer is what offers discard (see `crypto`), so a held key must never get it.
+/// The app and the CLI in its terminal are two processes, hence the file as well as the
+/// mutex. It is per user, not per root, because entries are. If it cannot be taken, the call
+/// goes ahead: a key must stay reachable when the temp folder is not.
+///
+/// Every keychain call is made inside this, once, so nothing here may call `get`.
+// ponytail: other programs write Credential Manager too, and nothing can hold them back.
+// An overlap with one reads as a missing key until the next ask, as Retry does.
+fn one_at_a_time<T>(call: impl FnOnce() -> T) -> T {
+    static THIS_PROCESS: Mutex<()> = Mutex::new(());
+    let _this_process = THIS_PROCESS.lock().unwrap_or_else(PoisonError::into_inner);
+    let _other_processes = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(std::env::temp_dir().join("jobpilot-keychain.lock"))
+        .ok()
+        .filter(|file| file.lock().is_ok());
+    call()
 }
 
 /// Every keychain call passes through `entry`, so counting here covers them all.
