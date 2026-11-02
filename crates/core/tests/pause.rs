@@ -917,7 +917,7 @@ async fn indexing_while_paused_says_paused() {
 async fn a_report_is_refused_while_paused_and_drops_nothing() {
     let (_tmp, db) = setup().await;
     sqlx::query(
-        "INSERT INTO reports (id, created_at, complete, figures) VALUES ('half', 't', 0, '{}')",
+        "INSERT INTO reports (id, created_at, complete, figures) VALUES ('half', '2020-01-01T00:00:00Z', 0, '{}')",
     )
     .execute(&db.pool)
     .await
