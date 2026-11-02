@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-01-jobpilot-master-spec.md` sections 5 and 6 (authority), with sections 3, 10, 11, and 12 where they touch this release. Derived: `docs/milestones.md` (Release 0.5), `docs/prd.md` FR-3.20, FR-5.1 to FR-5.18, FR-6.1 to FR-6.12, FR-10.5, FR-10.6, FR-11.1, FR-11.2, FR-11.8, FR-13.5, `docs/policy-register.md` (job source rows), `docs/agents.md` sections 3 and 4, `docs/security/threat-model.md` (M-18, M-23, M-33, M-34, B4), `docs/wireframes.md` sections 8 and 9.
 
-**Branch:** `feat/v0.5-job-discovery`, cut from `main` after `feat/v0.4-external-ai` merges. Signatures below were read on 2026-11-02 at `bb0ce6f`, with another agent's uncommitted edits in the tree. Before Task 1 the controller rechecks `crates/core/src/generate.rs`, `crates/core/src/ai/validate.rs`, and the last migration number against the merged head, and corrects this plan where they moved. If `0013` is taken, every `0013` and `schema 13` below shifts by one. Implementers commit locally and never push. Gate 4 needs a CI run, so the controller pushes when that step comes.
+**Branch:** `feat/v0.5-job-discovery`, cut from `main` after `feat/v0.4-external-ai` merges. Signatures below were rechecked on 2026-11-02 at `c1abd7a` (`main` at `d1a415b` plus this plan), and the scan is in `.superpowers/sdd/2026-11-02-jobpilot-release-0.5/progress.md`. `0012` is the last migration, so `0013` is free. Implementers commit locally and never push. Gate 4 needs a CI run, so the controller pushes when that step comes.
 
 ## Global Constraints
 
@@ -18,7 +18,7 @@
 - **No bypass.** No CAPTCHA solving or bypass. No MFA bypass. No access-control circumvention. On a challenge, a login wall, or a 401 or 403, the source stops and says so. It does not retry another way (FR-5.15 to FR-5.18).
 - **No stealth.** No proxies, no rotating addresses, no browser impersonation. One honest `User-Agent` is sent, and `hosted_client`'s `.no_proxy()` stays. No cookies. No headless browser in this release.
 - **No unauthorized scraping.** No generic crawler. No HTML scraping of any site. Only the JSON and RSS endpoints in the Vendor facts table are ever requested, on the hosts each declaration names.
-- **Register is binding.** A read runs only when the build-time register row says `allowed` or `owner-decision` and the connector's own declaration agrees (M-33). `unknown` behaves as blocked. `owner-decision` (D3) applies only to the Greenhouse and Ashby read rows: a documented, keyless, read-only public listing API, on a board the person names, at this plan's rate limits. It records that the vendor is silent, and it is never `allowed`. The owner's AI waiver and the 0.6 Claude Code apply mode cover no read connector and are not extended here. The apply mode belongs to 0.6 and is not in this plan.
+- **Register is binding.** A read runs only when the build-time register row says `allowed` or `silent-read` and the connector's own declaration agrees (M-33). `unknown` behaves as blocked. `silent-read` (R1) applies only to the Greenhouse and Ashby read rows: a documented, keyless, read-only public listing API, on a board the person names, at this plan's rate limits. It records that the vendor is silent, and it is never `allowed`. The owner's AI waiver and the 0.6 Claude Code apply mode cover no read connector and are not extended here. The apply mode belongs to 0.6 and is not in this plan.
 - **Work authorization.** Never inferred, scored, filtered on, or stated. A stated value is compared by exact country and only displayed. A missing value reads "not stated" (FR-4.10, M-18, M-28).
 - **No fabrication.** A model may not add a qualification or a company fact. A strength needs a valid evidence id, and a company fact needs a listed source. Anything else is dropped and counted. Rust never invents a field: unknown stays unknown.
 - **Emergency pause** stops discovery and every agent. `Fetcher` calls `pause::ensure_off` before each request, and a run's token cancels a request in flight.
@@ -48,15 +48,15 @@
 
 ## Vendor facts
 
-Checked live on **2026-11-02** against the URLs named. Responses were read directly only for Lever, RemoteOK, and We Work Remotely, whose read rows are `allowed`. Greenhouse and Ashby were read from their docs only at planning time. Task 15 reads them live under D3.
+Checked live on **2026-11-02** against the URLs named. Responses were read directly only for Lever, RemoteOK, and We Work Remotely, whose read rows are `allowed`. Greenhouse and Ashby were read from their docs only at planning time. Task 15 reads them live under R1.
 
 | Source | Endpoint | Fields used | Limits and terms, as read | Register read row |
 |---|---|---|---|---|
 | Lever, https://github.com/lever/postings-api (README, commit Apr 6, 2026, and a live `leverdemo` reply) | `GET https://api.lever.co/v0/postings/{site}?mode=json&skip=N&limit=100`; EU `https://api.eu.lever.co/...`. A JSON array; an empty page ends paging. | `id`, `text`, `categories.{location,commitment,team,department,allLocations}`, `country` (ISO 3166-1 alpha-2 or null), `workplaceType` (`unspecified`, `on-site`, `remote`, `hybrid`), `description`, `lists[].{text,content}`, `additional`, `hostedUrl`, `applyUrl`, `createdAt` (ms), `salaryRange.{currency,interval,min,max}` (seen: `per-year-salary`). | "These jobs may be scraped by third parties." The only published rate limit is on application POSTs. No read limit. | `allowed` |
 | RemoteOK, https://remoteok.com/api, https://remoteok.com/legal (updated October 26, 2026) | `GET https://remoteok.com/api`. A JSON array of 100 rows. Row 0 is `{last_updated, legal}`, not a job: live body 650 KB. | `id` (string), `slug`, `epoch`, `date`, `company`, `position`, `tags[]`, `location` (often empty), `description` (HTML), `url`, `apply_url`, `salary_min`, `salary_max` (ints, 0 means none). No currency field. | Row 0: "Please link back (with follow, and without nofollow!) to the URL on Remote OK and mention Remote OK as a source ... If you do not we'll have to suspend API access." "Please don't use the Remote OK logo without written permission". Legal: "You agree to link back with a web hyperlink or in-app hyperlink". No rate limit published. robots.txt: `User-agent: *`, `Content-Signal: search=yes,ai-train=no,use=reference`, `Allow: /`. | `allowed` |
 | We Work Remotely, https://weworkremotely.com/remote-job-rss-feed, terms updated October 23, 2026 | `GET https://weworkremotely.com/remote-jobs.rss`, or `/categories/<slug>.rss` for the 11 slugs in Task 4. RSS 2.0: 100 items, 992 KB live. | `title` (`Company: Role`), `region`, `country`, `state`, `skills`, `category`, `type`, `description` (entity-encoded HTML), `pubDate`, `expires_at`, `guid`, `link`. Often empty: `country`, `state`, `skills`. | "Anyone can use the feed, all we ask is that you attribute the links back to We Work Remotely." `<ttl>60</ttl>`. Terms say nothing of automated access, so HTML stays `unknown`. | `allowed`, RSS only |
-| Greenhouse, https://docs.greenhouse.io/job-board.html (`developers.greenhouse.io` redirects there) | `GET https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs?content=true&pay_transparency=true` gives `{jobs: [...], meta: {total}}`. No paging on this endpoint. | `id`, `title`, `updated_at`, `location.name`, `absolute_url`, `content` (shown with HTML entities, double-encoded in the sample), `company_name`, `first_published`, `language`, `metadata`, `pay_input_ranges[].{min_cents,max_cents,currency_type}`. | "Job Board data is publicly available, so authentication is not required for any GET endpoints." "designed to export information about your public job boards and job posts so your web developers can build custom career and application sites." No rate limit stated. Nothing on third-party readers. | `unknown`, stays `unknown` |
-| Ashby, https://developers.ashbyhq.com/docs/public-job-posting-api (updated 2026-10-23) | `GET https://api.ashbyhq.com/posting-api/job-board/{JOB_BOARD_NAME}?includeCompensation=true` gives `{apiVersion: "1", jobs: [...]}`. | `title`, `location`, `secondaryLocations[]`, `department`, `team`, `isRemote`, `workplaceType` (`OnSite`, `Remote`, `Hybrid`), `descriptionHtml`, `publishedAt`, `employmentType`, `address.postalAddress.addressCountry`, `jobUrl`, `applyUrl`, `isListed`, `compensation.summaryComponents[]`. The field table lists **no job id**, so `jobUrl` is the external id. `isRemote` is true for Hybrid too: use `workplaceType`. `isListed: false` is skipped. | "This API allows you to get data for all currently published Job Postings for your organization." No rate limit stated. Nothing on third-party readers. Customer terms do not mention scraping or automated reads. | `unknown`, stays `unknown` |
+| Greenhouse, https://docs.greenhouse.io/job-board.html (`developers.greenhouse.io` redirects there) | `GET https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs?content=true&pay_transparency=true` gives `{jobs: [...], meta: {total}}`. No paging on this endpoint. | `id`, `title`, `updated_at`, `location.name`, `absolute_url`, `content` (shown with HTML entities, double-encoded in the sample), `company_name`, `first_published`, `language`, `metadata`, `pay_input_ranges[].{min_cents,max_cents,currency_type}`. | "Job Board data is publicly available, so authentication is not required for any GET endpoints." "designed to export information about your public job boards and job posts so your web developers can build custom career and application sites." No rate limit stated. Nothing on third-party readers. | `silent-read` under R1; the vendor stays silent |
+| Ashby, https://developers.ashbyhq.com/docs/public-job-posting-api (updated 2026-10-23) | `GET https://api.ashbyhq.com/posting-api/job-board/{JOB_BOARD_NAME}?includeCompensation=true` gives `{apiVersion: "1", jobs: [...]}`. | `title`, `location`, `secondaryLocations[]`, `department`, `team`, `isRemote`, `workplaceType` (`OnSite`, `Remote`, `Hybrid`), `descriptionHtml`, `publishedAt`, `employmentType`, `address.postalAddress.addressCountry`, `jobUrl`, `applyUrl`, `isListed`, `compensation.summaryComponents[]`. The field table lists **no job id**, so `jobUrl` is the external id. `isRemote` is true for Hybrid too: use `workplaceType`. `isListed: false` is skipped. | "This API allows you to get data for all currently published Job Postings for your organization." No rate limit stated. Nothing on third-party readers. Customer terms do not mention scraping or automated reads. | `silent-read` under R1; the vendor stays silent |
 
 Workday, Indeed, LinkedIn, and company career pages have no public read API in scope, so no request is ever built for them. Their rows are re-read in Task 15.
 
@@ -84,7 +84,7 @@ Nobody was asked. Each is the implementer's instruction, with the price of being
 
 | # | Question | Decision | Why | Cost if wrong |
 |---|---|---|---|---|
-| 1 | The owner's scope names Greenhouse and Ashby connectors, and their read rows are `unknown` | **Build them, and read them under controller decision D3.** Both rows change to verdict `owner-decision`, and both declarations to `PolicyStatus::OwnerDecision`. `job source add greenhouse acme` works, and the UI and `job sources` say "Vendor is silent on third-party readers. Read under decision D3." | Both are documented, keyless, read-only endpoints serving what the employer already publishes, and the spec names them. The person names each board, and reads are limited to one request per 2 s. A personal app that cannot read the two main ATS boards fails the spec's purpose. Silence stays on the record: the row keeps its quotes and `allowed` is not claimed. | The vendor objects: flip both rows and declarations to `unknown`, and they refuse. Risk is a blocked request, and no account is involved. |
+| 1 | The owner's scope names Greenhouse and Ashby connectors, and their read rows are `unknown` | **Build them, and read them under controller ruling R1.** Both rows change to verdict `silent-read`, and both declarations to `PolicyStatus::SilentRead`. `job source add greenhouse acme` works, and the UI and `job sources` say "Vendor is silent on third-party readers. Read under ruling R1." | Both are documented, keyless, read-only endpoints serving what the employer already publishes, and the spec names them. The person names each board, and reads are limited to one request per 2 s. A personal app that cannot read the two main ATS boards fails the spec's purpose. Silence stays on the record: the row keeps its quotes and `allowed` is not claimed. | The vendor objects: flip both rows and declarations to `unknown`, and they refuse. Risk is a blocked request, and no account is involved. |
 | 2 | Company career pages | `company_page` declares `ImportPasted` only, with no host and no fetch. A pasted link on a known ATS host is routed: Lever, Greenhouse, and Ashby suggest `job source add`. | The register's row: "No generic crawler (FR-5.15). A site joins only with its own row after review." | Pasting text is more work than a crawl. A site with a reviewed feed gets its own connector and row. |
 | 3 | Workday, Indeed, LinkedIn | Declarations with `ImportPasted` only, `hosts: &[]`. A pasted URL is stored as a string and never requested. A URL with no text is refused with `needs_text`. | "A person pastes a job or URL", and the register's "JobPilot makes no request to the site." | None. |
 | 4 | Plugin architecture | Compiled in, listed in `connectors::all()`, with no runtime loading. | M-33's proposal: no runtime plugins until a sandbox exists. | A third party rebuilds the app to add a source. |
@@ -107,7 +107,7 @@ Nobody was asked. Each is the implementer's instruction, with the price of being
 | 21 | AI batch | `MATCH_BATCH` = 20 named jobs, person started, with the most calls stated first, as `memory_refresh` does. A resumed run makes no model call. | The rule in `agents.md` for paid calls. | Twenty clicks' worth at most per press. |
 | 22 | Analytics `read:matches` | Not added. The analytics agent has no match figure in 0.5. | YAGNI. | `agents.md` is corrected in Task 14. |
 | 23 | Open posting | `job_open(id)`: Rust reads the stored URL, requires `https`, and opens the default browser. The webview passes only an id. | Inert text stays inert, and RemoteOK needs a working link back. | A posting's own link can point anywhere, as any link can. The user sees the host first in the button label. |
-| 24 | Lever posting link pasted alone | Not fetched. Answer names the site: `job source add lever <site>`. No `FetchPosting` operation. | One read path. | One more command. |
+| 24 | Lever, Greenhouse, or Ashby posting link pasted alone | Not fetched. The answer names the board: `job source add <connector> <board>`. No `FetchPosting` operation. | One read path. | One more command. |
 | 25 | Live feed search | `job fetch` reads a whole feed, and `query` on a source filters locally. RemoteOK and WWR search parameters are not documented, so none are used. | Only documented endpoints. | More bytes per fetch. |
 
 ## Panel table
@@ -155,7 +155,7 @@ crates/core/src/jobs/company.rs                                                T
 crates/core/src/connectors/mod.rs                    decl, registry, gate      Task 2
 crates/core/src/connectors/{fetch,limit}.rs                                    Task 3
 crates/core/src/connectors/{lever,remoteok,wwr}.rs                             Task 4
-crates/core/src/connectors/{greenhouse,ashby,assisted}.rs                      Task 5
+crates/core/src/connectors/{greenhouse,ashby,assisted}.rs, docs/policy-register.md  Task 5
 crates/core/src/agents/{discovery,matching,research}.rs                        Tasks 6, 9, 10
 crates/core/src/runner/{mod,perms}.rs, agents/mod.rs edits                     Tasks 2, 6, 9, 10
 crates/core/src/ai/{mod,register}.rs, generate.rs    edits                     Tasks 2, 9
@@ -295,7 +295,7 @@ Expected: FAIL, `jobs` not found and schema 12.
 
 - [ ] **Step 3: Write `0013_jobs.sql`, `jobs/mod.rs`, and `jobs/link.rs`**
 
-Host matching in `route` is on the parsed host, with a suffix match on a dot boundary, so `indeed.com.evil.test` is a company page. Hosts: `jobs.lever.co`, `jobs.eu.lever.co`, `boards.greenhouse.io`, `job-boards.greenhouse.io`, `jobs.ashbyhq.com`, `*.myworkdayjobs.com`, `*.indeed.com`, `*.linkedin.com`, `remoteok.com`, `weworkremotely.com`. `list` hides rows with a `duplicate_of` unless `include_duplicates`, joins `match_results`, and orders by score descending with nulls last, then `first_seen_at`. `remove` audits `job_removed`, deletes `job_texts` rows no draft cites, and keeps the rest. `import_pasted` needs non-empty text: with none it returns `Refused("needs_text")`, and for a Lever link the message names `job source add lever <site>`. With no URL, `connector` is `import`. With one, it is `connector_of(route)`, and the source's attribution is stored when it has one. In this task `min_pay` filtering is not applied; Task 8 adds it.
+Host matching in `route` is on the parsed host, with a suffix match on a dot boundary, so `indeed.com.evil.test` is a company page. Hosts: `jobs.lever.co`, `jobs.eu.lever.co`, `boards.greenhouse.io`, `job-boards.greenhouse.io`, `jobs.ashbyhq.com`, `*.myworkdayjobs.com`, `*.indeed.com`, `*.linkedin.com`, `remoteok.com`, `weworkremotely.com`. `list` hides rows with a `duplicate_of` unless `include_duplicates`, joins `match_results`, and orders by score descending with nulls last, then `first_seen_at`. `remove` audits `job_removed`, deletes `job_texts` rows no draft cites, and keeps the rest. `import_pasted` needs non-empty text: with none it returns `Refused("needs_text")`, and for a Lever, Greenhouse, or Ashby link the message names `job source add <connector> <board>`. With no URL, `connector` is `import`. With one, it is `connector_of(route)`, and the source's attribution is stored when it has one. In this task `min_pay` filtering is not applied; Task 8 adds it.
 
 - [ ] **Step 4: Run the tests**
 
@@ -323,7 +323,7 @@ git commit -m "feat: job store, schema 13, and user-assisted import with routed 
 ```rust
 pub enum Operation { ListBoard, ListFeed, ImportPasted }
 pub enum Automation { ReadPublic, UserAssisted }   // no fill or submit variant exists in 0.5
-pub enum PolicyStatus { Allowed, OwnerDecision, UserAssisted, Blocked, Unknown }
+pub enum PolicyStatus { Allowed, SilentRead, UserAssisted, Blocked, Unknown }
 pub struct RateLimit { pub min_interval: Duration, pub per_day: u32 }
 pub enum TargetKind { Board, Feed, None }
 pub enum BodyKind { Json, Rss }
@@ -353,14 +353,16 @@ pub fn find(name: &str) -> Option<Box<dyn Connector>>;
 pub fn read_status(decl: &ConnectorDecl) -> PolicyStatus;
 #[doc(hidden)] pub fn read_status_on(register: &str, decl: &ConnectorDecl) -> PolicyStatus;
 pub fn gate(decl: &ConnectorDecl, operation: Operation) -> Result<()>;
+#[doc(hidden)] pub fn gate_on(register: &str, decl: &ConnectorDecl, operation: Operation) -> Result<()>;
 pub struct SourceStatus { pub name: String, pub label: String, pub read: PolicyStatus,
     pub can_fetch: bool, pub operations: Vec<Operation>, pub attribution: Option<String>,
     pub date_read: Option<String>, pub target: TargetKind, pub min_interval_secs: Option<u64>,
-    pub per_day: Option<u32> }
-pub fn statuses() -> Vec<SourceStatus>;
+    pub per_day: Option<u32>, pub note: Option<&'static str> }
+pub const D3_NOTE: &str = "Vendor is silent on third-party readers. Read under ruling R1.";
+pub fn statuses() -> Vec<SourceStatus>;   // `note` is D3_NOTE on an `SilentRead` row
 ```
 
-`gate` passes `Allowed` and `OwnerDecision`. It refuses with `Refused("policy_unknown")`, `Refused("policy_blocked")`, `Refused("policy_user_assisted")`, or `Refused("operation_not_declared")`. `ImportPasted` passes on any declared connector. In this task `all()` is empty; Tasks 4 and 5 fill it, and their tests hold the `allowed` assertions below.
+`gate` checks that the operation is declared first, then the status, so a decl with no read gets `operation_not_declared`. It passes `Allowed` and `SilentRead`. It refuses with `Refused("policy_unknown")`, `Refused("policy_blocked")`, `Refused("policy_user_assisted")`, or `Refused("operation_not_declared")`. `ImportPasted` passes on any declared connector. In this task `all()` is empty; Tasks 4 and 5 fill it, and their tests hold the assertions on real rows. Tests here use `read_status_on` and `gate_on` on a small inline register, because no row reads `silent-read` until Task 5.
 
 - Produces, in `runner::perms::Permission`: `ReadMatches`, `WriteJobs`, `WriteMatches`, `WriteCompanyNotes`, `WriteJobFields`, `NetConnector`. Each joins `no_permission_names_a_forbidden_power`'s list. `NetConnector` reads through the `Fetcher` only. Its doc comment says so.
 
@@ -381,11 +383,17 @@ fn decl(policy: PolicyStatus) -> ConnectorDecl { /* name "t", ListFeed, ReadPubl
 #[test] fn a_connector_claiming_more_than_its_row_counts_as_unknown() {
     let row = ("Greenhouse", "Read public listings through Job Board API");
     let claims = ConnectorDecl { read_row: Some(row), ..decl(PolicyStatus::Allowed) };
-    assert_eq!(read_status(&claims), PolicyStatus::Unknown);
+    assert_eq!(read_status(&claims), PolicyStatus::Unknown);   // holds before and after Task 5
 }
-#[test] fn a_row_turned_allowed_without_the_declaration_stays_unknown() {
-    let register = REGISTER.replace(GREENHOUSE_READ_UNKNOWN, GREENHOUSE_READ_ALLOWED);
-    assert_eq!(read_status_on(&register, &greenhouse_decl_as_unknown()), PolicyStatus::Unknown);
+#[test] fn a_row_that_moves_without_the_declaration_counts_as_unknown() {
+    // Inline register: one row, verdict `silent-read`; the decl says `Unknown`, then `Allowed`.
+    assert_eq!(read_status_on(TABLE, &decl(PolicyStatus::Unknown)), PolicyStatus::Unknown);
+    assert_eq!(read_status_on(TABLE, &decl(PolicyStatus::Allowed)), PolicyStatus::Unknown);
+}
+#[test] fn owner_decision_passes_the_gate_and_never_reads_as_allowed() {
+    let d = decl(PolicyStatus::SilentRead);
+    assert_eq!(read_status_on(TABLE, &d), PolicyStatus::SilentRead);
+    assert!(gate_on(TABLE, &d, Operation::ListFeed).is_ok());
 }
 #[test] fn a_missing_row_counts_as_unknown() { /* read_row names no row */ }
 #[test] fn the_gate_refuses_by_status_with_its_own_code() { /* unknown, blocked, user-assisted */ }
@@ -616,11 +624,11 @@ git add crates/core Cargo.lock
 git commit -m "feat: Lever, RemoteOK, and We Work Remotely read-only connectors"
 ```
 
-### Task 5: Greenhouse and Ashby under D3, and the user-assisted sources
+### Task 5: Greenhouse and Ashby under R1, and the user-assisted sources
 
 **Files:**
 - Create: `crates/core/src/connectors/{greenhouse,ashby,assisted}.rs`, `crates/core/tests/fixtures/connectors/{greenhouse.json,ashby.json}`
-- Modify: `docs/policy-register.md` (the two read rows: verdict `owner-decision`, note "Vendor silent on third-party readers; read under D3, personal use, a board the person names", quotes unchanged; add the `owner-decision` verdict row and D3 to the decisions; touch no AI row and not line 3), `crates/core/src/connectors/mod.rs`, `crates/core/tests/connector_parsers.rs`, `crates/core/tests/connectors.rs`, `crates/core/tests/connector_fetch.rs`
+- Modify: `docs/policy-register.md` (the two read rows: verdict `silent-read`, note "Vendor silent on third-party readers; read under R1, personal use, a board the person names", quotes unchanged; add the `silent-read` verdict row and R1 to the decisions, marked as a controller ruling, not an owner decision; correct the applicant-tracking intro, which says Copilot's `unknown` matches the read rows; touch no AI row and not line 3), `crates/core/src/connectors/mod.rs`, `crates/core/tests/connector_parsers.rs`, `crates/core/tests/connectors.rs`, `crates/core/tests/connector_fetch.rs`
 
 **Interfaces:**
 - Consumes: Task 2 and Task 4.
@@ -628,8 +636,8 @@ git commit -m "feat: Lever, RemoteOK, and We Work Remotely read-only connectors"
 
 | Connector | `policy` | `read_row` | Operations | Hosts | Rate |
 |---|---|---|---|---|---|
-| `greenhouse` | `OwnerDecision` | `("Greenhouse", "Read public listings through Job Board API")` | `ListBoard`, `ImportPasted` | `boards-api.greenhouse.io` | 2 s, 300 |
-| `ashby` | `OwnerDecision` | `("Ashby", "Read public listings through Job Postings API")` | `ListBoard`, `ImportPasted` | `api.ashbyhq.com` | 2 s, 300 |
+| `greenhouse` | `SilentRead` | `("Greenhouse", "Read public listings through Job Board API")` | `ListBoard`, `ImportPasted` | `boards-api.greenhouse.io` | 2 s, 300 |
+| `ashby` | `SilentRead` | `("Ashby", "Read public listings through Job Postings API")` | `ListBoard`, `ImportPasted` | `api.ashbyhq.com` | 2 s, 300 |
 | `workday` | `Unknown` | The Workday row whose operation starts `Read an employer's` (its cell holds backticks: copy it from the register) | `ImportPasted` | none | none |
 | `indeed` | `Blocked` | `("Indeed", "Read listings by connector or crawler")` | `ImportPasted` | none | none |
 | `linkedin` | `Unknown` | `("LinkedIn", "Automated read or logged-in automation")` | `ImportPasted` | none | none |
@@ -647,12 +655,14 @@ Parsing, pinned: Greenhouse `content` is entity-decoded at most twice, and `pay_
 #[test] fn greenhouse_and_ashby_read_under_d3_and_never_read_as_allowed() {
     for name in ["greenhouse", "ashby"] {
         let c = find(name).unwrap();
-        assert_eq!(read_status(c.decl()), PolicyStatus::OwnerDecision);
+        assert_eq!(read_status(c.decl()), PolicyStatus::SilentRead);
         assert!(gate(c.decl(), Operation::ListBoard).is_ok());
     }
 }
-#[test] fn d3_covers_only_those_two_rows() { /* every other read row in the register is not `owner-decision` */ }
-#[test] fn a_board_list_parses_from_the_doc_sample_through_the_fetcher() { /* Fetcher::for_test, fake serves the fixture */ }
+#[test] fn r1_covers_only_those_two_rows() { /* every other read row in the register is not `silent-read` */ }
+#[tokio::test] async fn a_board_list_parses_from_the_doc_sample_through_the_fetcher() { /* Fetcher::for_test, fake serves each fixture, one hit each */ }
+#[test] fn both_declare_the_pinned_limit() { assert_eq!(limit_of("greenhouse"), (2, 300)); assert_eq!(limit_of("ashby"), (2, 300)); }
+#[test] fn a_row_set_back_to_unknown_refuses_both() { /* REGISTER.replace on each row, read_status_on and gate_on: policy_unknown */ }
 #[test] fn indeed_is_blocked_and_declares_no_read_and_no_host() {
     let c = find("indeed").unwrap();
     assert_eq!(read_status(c.decl()), PolicyStatus::Blocked);
@@ -668,9 +678,9 @@ Parsing, pinned: Greenhouse `content` is entity-decoded at most twice, and `pay_
     }
 }
 #[test] fn no_row_ever_grants_more_than_a_status_says() {
-    // For every connector: can_fetch is true only for lever, remoteok, wwr.
+    // can_fetch is true only for these five, in `all()` order; `note` is set only on the D3 two.
     let fetchable: Vec<_> = statuses().into_iter().filter(|s| s.can_fetch).map(|s| s.name).collect();
-    assert_eq!(fetchable, ["lever", "remoteok", "wwr"]);
+    assert_eq!(fetchable, ["lever", "remoteok", "wwr", "greenhouse", "ashby"]);
 }
 #[test] fn greenhouse_decodes_a_double_encoded_body_and_pay_in_cents() { /* "&amp;lt;p&amp;gt;" to <p>, 50000 */ }
 #[test] fn greenhouse_decodes_a_single_encoded_body_too() { /* "&lt;p&gt;" to <p> */ }
@@ -693,7 +703,7 @@ Expected: PASS.
 
 ```bash
 git add crates/core
-git commit -m "feat: Greenhouse and Ashby read under D3, and user-assisted sources"
+git commit -m "feat: Greenhouse and Ashby read under R1, and user-assisted sources"
 ```
 
 ### Task 6: Discovery agent and duplicate detection
@@ -766,9 +776,12 @@ Duplicate rule, in order: same `(connector, board, external_id)` is the same row
 #[tokio::test] async fn a_rerun_is_idempotent() { /* second run: 0 added, rows unchanged */ }
 #[tokio::test] async fn a_changed_posting_gets_a_new_text_and_loses_its_score() { /* old text stays */ }
 #[tokio::test] async fn one_refused_source_does_not_stop_the_next() { /* first 403, second 200 */ }
-#[tokio::test] async fn adding_an_unknown_source_is_refused() {
+#[tokio::test] async fn adding_a_source_with_no_read_is_refused() {
     let e = add_source(&db, "linkedin", "acme", "").await.unwrap_err();
-    assert!(matches!(e, Error::Refused(_)));
+    assert!(matches!(e, Error::Refused(r) if r == "operation_not_declared"));
+}
+#[tokio::test] async fn adding_a_d3_source_is_stored() {
+    assert_eq!(add_source(&db, "greenhouse", "acme", "").await.unwrap().connector, "greenhouse");
 }
 #[tokio::test] async fn a_run_row_holds_no_posting_text() { /* agent_runs, agent_run_log, canary word */ }
 #[tokio::test] async fn a_query_filters_locally_and_requests_the_same_url() { /* one hit, fewer rows */ }
@@ -1067,7 +1080,7 @@ git commit -m "feat: weighted match score, objective filters, and a stated-only 
 - Modify: `crates/core/src/ai/mod.rs`, `crates/core/src/generate.rs`, `crates/core/src/agents/mod.rs`, `crates/core/src/runner/{mod,perms}.rs`, `crates/core/src/jobs/mod.rs`, `crates/core/tests/{runner,register}.rs`, `crates/core/tests/api_chat.rs`
 
 **Interfaces:**
-- Consumes: `Router::{run, run_checked}`, `generate::{OPEN, CLOSE, neutralise, ranked_lines, PROMPT_BYTES}` (each made `pub(crate)`), `drafts::states_authorization`, `knowledge::evidence`.
+- Consumes: `Router::{run, run_checked}`, `Outcome`, `generate::{OPEN, CLOSE, neutralise}` (already `pub(crate)`), `generate::{ranked_lines, strip_ids, PROMPT_BYTES, MIN_EVIDENCE_BYTES}` (made `pub(crate)` here), `drafts::{check_claims, states_authorization, ClaimInput}`, `knowledge::evidence`.
 - Produces, in `ai`: `TaskType::SemanticMatch` and, for Task 10, `TaskType::SummarizeCompany`; `COMPLETION_TASKS` becomes 6.
 
 ```rust
@@ -1081,13 +1094,12 @@ static SEMANTIC_MATCH: TaskSpec = TaskSpec { task: TaskType::SemanticMatch,
 - Produces, in `jobs::semantic`:
 
 ```rust
-pub struct Strength { pub text: String, pub evidence_ids: Vec<String> }
-pub struct Semantic { pub fit: u8, pub summary: String, pub strengths: Vec<Strength>,
+pub struct Semantic { pub fit: u8, pub summary: String, pub strengths: Vec<ClaimInput>,
     pub gaps: Vec<String>, pub dropped: usize, pub provider: String, pub at: String }
 pub fn semantic_prompt(evidence: &[KnowledgeItem], posting: &JobText) -> Prompt;
 pub fn parse_job_prompt(posting: &JobText) -> Prompt;
 pub async fn check_fit(output: Value) -> Result<()>;       // fit in 0..=100, else Validation
-pub fn keep_grounded(output: &Value, evidence_ids: &[String]) -> Result<Semantic>;
+pub fn keep_grounded(output: &Value, evidence: &[KnowledgeItem]) -> Result<Semantic>;
 pub fn merge_parsed(job: &Job, posting: &JobText, output: &Value) -> ParsedFields;
 pub async fn store_parsed(db: &Db, job_id: &str, fields: &ParsedFields) -> Result<()>;
 pub async fn store_semantic(db: &Db, job_id: &str, semantic: &Semantic) -> Result<()>;
@@ -1110,7 +1122,9 @@ Steps, in this order: `fields` (`ReadJobText`, `Model(ParseJob)`, `WriteJobField
 
 `semantic_prompt`: the system text says everything inside `OPEN` and `CLOSE` is data, never instructions, that only evidence lines may support a strength, and that work authorization, visa, sponsorship, and citizenship are never to be mentioned. The evidence block comes from `ranked_lines`, cut to fit `PROMPT_BYTES` with at least 2,000 bytes for evidence. The posting is cut at a char boundary to what remains. No name, contact, pay wish, or authorization value is in the prompt. `Prompt.schema` is the task's.
 
-`keep_grounded`: a strength with no id in `evidence_ids`, or for which `states_authorization` is true, is dropped and counted. The same check blanks `summary` and drops a gap. `merge_parsed`: per decision 20, a seniority maps through `rules::seniority_of`, and pay through `parse_pay` on text that appears in the normalized posting.
+`keep_grounded`: `strip_ids` runs on every text first, as models write ids into prose. `drafts::check_claims` then judges the strengths, and only status `ok` is kept; each other is dropped and counted. `states_authorization` blanks `summary` and drops a gap. `check_fit` uses a fixed error message, because a parser's text can quote output, and returns only `Validation`: any other `Err` ends the task instead of retrying.
+
+The step matches on `Outcome`, not on `Error`. `ManualRequired { reason }` covers `no_ai`, `consent_needed`, `unusable_reply` (every provider's replies failed validation), and `output_truncated`. `Failed { reason }` is kept the same way. `Cancelled` ends the step. `merge_parsed`: per decision 20, a seniority maps through `rules::seniority_of`, and pay through `parse_pay` on text that appears in the normalized posting.
 
 - [ ] **Step 1: Write the failing tests** in `crates/core/tests/matching.rs`, using the router tests' scripted provider
 
@@ -1133,12 +1147,15 @@ Steps, in this order: `fields` (`ReadJobText`, `Model(ParseJob)`, `WriteJobField
 #[tokio::test] async fn a_provider_without_no_tools_gets_no_job_text() { /* skipped, model_has_tools or capability */ }
 #[tokio::test] async fn a_rules_run_never_calls_a_model() { /* ai false, counter 0, Completed */ }
 #[tokio::test] async fn no_ai_leaves_the_rules_score() { /* ai true, no backend: score stays, reason no_ai */ }
-#[tokio::test] async fn a_model_failure_keeps_the_score() { /* scripted bad reply twice */ }
+#[tokio::test] async fn an_unusable_reply_keeps_the_score_and_names_the_reason() { /* scripted bad reply twice: reason unusable_reply */ }
+#[tokio::test] async fn a_truncated_reply_keeps_the_score_and_names_the_reason() { /* Failed("output_truncated") from the provider: reason output_truncated, not retried */ }
+#[tokio::test] async fn a_model_failure_keeps_the_score() { /* provider error with no reply: Failed reason stored in the report */ }
+#[tokio::test] async fn an_id_written_into_a_strength_is_stripped() { /* "Led [abc...] teams" reads "Led teams", evidence_ids stay */ }
 #[tokio::test] async fn the_model_cannot_move_the_score_or_a_filter() {
     // fit 100 stored; match_results.score and list order are unchanged.
 }
 #[tokio::test] async fn a_strength_with_no_valid_evidence_is_dropped_and_counted() {
-    let s = keep_grounded(&reply_citing("not-an-id"), &ids()).unwrap();
+    let s = keep_grounded(&reply_citing("not-an-id"), &evidence()).unwrap();
     assert!(s.strengths.is_empty());
     assert_eq!(s.dropped, 1);
 }
@@ -1221,12 +1238,13 @@ pub async fn research_plan(db: &Db, router: &Router, company_id: &str) -> Result
 
 - `Agent` gains `Research`. `RunInput` gains `Research { company_id: String }`. `perms`: `RESEARCH` = `[ReadJobText, ReadCompanyText, Model(SummarizeCompany), WriteCompanyNotes]`, 10 minutes.
 
-Steps: `gather` (`ReadJobText`, `ReadCompanyText`) and `summarize` (`ReadJobText`, `ReadCompanyText`, `Model(SummarizeCompany)`, `WriteCompanyNotes`). No `net:connector`, no crawler, no `web_search`. `sources` returns up to 10 stored postings of that company and every pasted note, normalized, ids hex, labels the model cites as `S1`, `S2`, each block between `OPEN` and `CLOSE` after `neutralise`. `add_note` normalizes and stores `origin = 'pasted'`. `grounded`: at least 60 percent of the fact's folded words of four or more letters appear in its source. A fact with an unlisted source, or that fails `grounded`, or for which `states_authorization` is true, is dropped and counted. With no backend the run completes, stores nothing, and sets `reason` to `no_ai`, and the stored text still shows.
+Steps: `gather` (`ReadJobText`, `ReadCompanyText`) and `summarize` (`ReadJobText`, `ReadCompanyText`, `Model(SummarizeCompany)`, `WriteCompanyNotes`). No `net:connector`, no crawler, no `web_search`. `sources` returns up to 10 stored postings of that company and every pasted note, normalized, ids hex, labels the model cites as `S1`, `S2`, each block between `OPEN` and `CLOSE` after `neutralise`. `add_note` normalizes and stores `origin = 'pasted'`. `grounded`: at least 60 percent of the fact's folded words of four or more letters appear in its source. A fact with an unlisted source, or that fails `grounded`, or for which `states_authorization` is true, is dropped and counted. With no backend the run completes, stores nothing, and sets `reason` to `no_ai`, and the stored text still shows. `unusable_reply`, `output_truncated`, and every other router end take the same path as Task 9: the `Outcome` is matched, nothing is stored, and the old summary stays.
 
 - [ ] **Step 1: Write the failing tests** in `crates/core/tests/research.rs`
 
 ```rust
 #[tokio::test] async fn with_no_backend_stored_text_still_shows() { /* Completed, reason no_ai */ }
+#[tokio::test] async fn an_unusable_reply_stores_nothing_and_names_the_reason() { /* reason unusable_reply, earlier summary stays */ }
 #[tokio::test] async fn a_fact_keeps_its_source() { /* source_ref == the job id or note id */ }
 #[tokio::test] async fn a_fact_with_no_listed_source_is_dropped() { /* S9 */ }
 #[tokio::test] async fn a_fact_not_in_its_source_is_dropped() {
@@ -1284,7 +1302,7 @@ job company note <company-id>                     job prefs show
 job prefs set [--min-pay 90000:EUR:year] [--seniority senior]
 ```
 
-`job paste` and `job import` print `saved <id>` as `job paste` does today. `job show` prints `Source`, attribution with the link, `Untrusted text`, the explanation table, missing skills, the authorization line, and the text. Every line that can hold outside text goes through `crates/cli/src/text.rs`'s existing cleaner, so a terminal escape in a posting cannot reach the terminal. `job sources` prints each connector's status, operations, declared limit, attribution, and date read. `resume generate` and `letter generate` resolve their argument through `jobs::text_id`. `--ai` follows `memory refresh`'s `--yes` rule: it prints the most calls and stops unless `--yes` is given.
+`job paste` and `job import` print `saved <id>` as `job paste` does today. `job show` prints `Source`, attribution with the link, `Untrusted text`, the explanation table, missing skills, the authorization line, and the text. Every line that can hold outside text goes through `crates/cli/src/text.rs`'s existing cleaner, so a terminal escape in a posting cannot reach the terminal. `job sources` prints each connector's status, operations, declared limit, attribution, and date read. `job sources` and `job source add` print `SourceStatus.note` when set. A report's `reason` prints through `main.rs`'s `message(&Error::ManualRequired(reason))`, so `unusable_reply` and `output_truncated` read as they do for drafts. `resume generate` and `letter generate` resolve their argument through `jobs::text_id`. `--ai` follows `memory refresh`'s `--yes` rule: it prints the most calls and stops unless `--yes` is given.
 
 - [ ] **Step 1: Write the failing tests** in `crates/cli/tests/cli.rs`, each on a temporary `JOBPILOT_HOME` with `JOBPILOT_SECRET_SERVICE=jobpilot-test`, and no provider
 
@@ -1359,7 +1377,7 @@ company_note_add(company_id, text)              match_prefs_get()     match_pref
 const index = e.key === "0" ? 9 : Number(e.key) - 1;
 ```
 
-`JobsView` is wireframe 8, in its focus order: Import a posting, filter controls, Apply, job table, Sources list. The table is one tab stop with a roving row: arrows, Home, End, Enter opens detail, `i` opens import. A duplicate group shows `+N other sources`. Source rows come from `job_sources_status`. A connector that cannot fetch has no Fetch button and shows `read: unknown` with "No connector. Import instead." (`read: blocked` for Indeed; "User-assisted only." for LinkedIn). Attribution text shows on every card from a source with one. Empty and error text are wireframe 8's, and a row alert reads `Refused by policy: unknown`, or `Rate limited. Next fetch at {time}.` No logo and no image is rendered.
+`JobsView` is wireframe 8, in its focus order: Import a posting, filter controls, Apply, job table, Sources list. The table is one tab stop with a roving row: arrows, Home, End, Enter opens detail, `i` opens import. A duplicate group shows `+N other sources`. Source rows come from `job_sources_status`. A connector with `can_fetch` has a board field where its target is `Board`, and a Fetch button. Greenhouse and Ashby show `read: owner decision` and `SourceStatus.note`. A connector that cannot fetch has no Fetch button and shows `read: unknown` with "No connector. Import instead." (`read: blocked` for Indeed; "User-assisted only." for LinkedIn). Attribution text shows on every card from a source with one. Empty and error text are wireframe 8's, and a row alert reads `Refused by policy: unknown`, or `Rate limited. Next fetch at {time}.` No logo and no image is rendered.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1378,6 +1396,7 @@ const index = e.key === "0" ? 9 : Number(e.key) - 1;
 ```tsx
 it("Ctrl+0 opens Jobs, and Ctrl+1 still opens Status", ...);
 it("shows a source's verdict and no Fetch button when it cannot fetch", ...);
+it("shows the D3 note and a Fetch button on Greenhouse and Ashby", ...);
 it("shows Remote OK on a card from that source, with no image", ...);
 it("shows -- and the reason when a job has no score", ...);
 it("renders an HTML posting title as text", ...);
@@ -1420,7 +1439,7 @@ git commit -m "feat: Jobs screen on Ctrl+0 with sources, filters, and fetch"
 - Consumes: `job_detail`, `job_open`, `job_to_application`, `jobs_analyze`, `job_research`.
 - Produces: `JobDetail` view, wireframe 9. No new core interface.
 
-`JobDetail.tsx`, in its focus order: Back, explanation table, Add AI evaluation (only when a provider is eligible), posting text, Add to tracker, Open posting in my browser, Prepare. The Source line reads `Source: {attribution} (link)`, where the link is a button calling `job_open`, with the host shown in its label. `Untrusted text. Shown as plain text.` is fixed copy. Findings show as a labelled list, unobeyed and undropped. `Why this score` lists every row with weight and points, or `not compared` and its note, and the compared weight when below 100. Work authorization shows exactly one of:
+`JobDetail.tsx`, in its focus order: Back, explanation table, Add AI evaluation (only when a provider is eligible), posting text, Add to tracker, Open posting in my browser, Prepare. The Source line reads `Source: {attribution or the connector's label} (link)`, where the link is a button calling `job_open`, with the host shown in its label. `Untrusted text. Shown as plain text.` is fixed copy. Findings show as a labelled list, unobeyed and undropped. `Why this score` lists every row with weight and points, or `not compared` and its note, and the compared weight when below 100. Work authorization shows exactly one of:
 
 ```text
 {Country}: not stated by you. Not checked.
@@ -1455,7 +1474,8 @@ When the posting's flag is set, a further line reads: `This posting mentions wor
 #[tokio::test] async fn a_steered_fit_of_100_leaves_the_score_alone() { /* 21 */ }
 #[tokio::test] async fn a_tool_call_reply_stores_nothing_on_each_new_task() { /* every hosted wire */ }
 #[tokio::test] async fn hidden_html_from_a_connector_never_reaches_a_prompt() {
-    // Fixture posting with a display:none div, through upsert_posting: the canary is absent
+    // Each connector fixture, Greenhouse's double-encoded body included, with a display:none
+    // div, through upsert_posting: the canary is absent
     // from normalized and from the built prompt, and a finding is stored.
 }
 #[tokio::test] async fn a_planted_word_shows_as_a_finding_on_a_fetched_job() { /* 12, via RemoteOK fixture */ }
@@ -1505,17 +1525,17 @@ git commit -m "feat: job detail with explained score, and the injection and bypa
 
 | File | Change |
 |---|---|
-| `docs/policy-register.md` | **Site rows only. Edit no AI provider row and no owner decision line: decision 12 of 0.4 suspends consent on any change. Keep line 3 as it is, since `the_register_date_comes_from_the_third_line` pins it.** Set Date read to 2026-11-02 on the Lever, RemoteOK, We Work Remotely, Greenhouse, and Ashby read rows, and change line 73's "All dates read are 2026-11-01" to say so. Verdicts do not change. Greenhouse's source URL moves to `https://docs.greenhouse.io/job-board.html`. Consequence cells: Greenhouse and Ashby read, "Connector built and held by the gate. Refused until this row reads `allowed` and the declaration agrees. Import meanwhile."; Lever, "JobPilot's limit: 2 s, 300 a day."; RemoteOK, its 15 minutes and 24 a day, the link-back through Open posting, and no logo; WWR, 60 minutes (`<ttl>60</ttl>`), 24 a day. Company career pages, Workday, Indeed, and LinkedIn rows: no change of verdict; Task 15 re-reads them. Policy impact: FR-5.2 and FR-5.4 read "Built, refused by the gate. User-assisted import."; the milestone row says 0.5 ships three read connectors, two held, four assisted. Open written questions: add RemoteOK, the `use=reference` signal and a user's own model. Add a Connector declarations table: name, operations, automation, limit, status. |
-| `docs/connector-sdk.md` | Replace the stub: the four declarations, `ConnectorDecl` field by field, the two pure functions, the gate, how `check` refuses, the rate-limit rules, a worked connector, the fixture rule, and the two-line turn-on for a held connector. FR-13.5. |
-| `docs/milestones.md` | Release 0.5 scope, "0.1 to 0.5 built". Reword the exit test to "has no read connector that runs", the declaration existing and refused. Add the 0.5 gate record with `PLACEHOLDER_TASK_15_*` rows, as 0.4 did. |
-| `docs/agents.md` | Status line. Sections 2 to 4: Discovery, Matching, Research as built, with their timeouts and steps. Permission table: `read:matches` not yet used. Matching without `read:sensitive` (decision 18). Research with no `net:connector` (decision 19). Analytics note (decision 22). The task type sentence at the top names the two new tasks. |
+| `docs/policy-register.md` | **Site rows only. Edit no AI provider row and no owner decision line: decision 12 of 0.4 suspends consent on any change. Keep line 3 as it is, since `the_register_date_comes_from_the_third_line` pins it.** Set Date read to 2026-11-02 on the Lever, RemoteOK, We Work Remotely, Greenhouse, and Ashby read rows, and change line 73's "All dates read are 2026-11-01" to say so. Verdicts do not change beyond Task 5's two rows. Greenhouse's source URL moves to `https://docs.greenhouse.io/job-board.html`. Consequence cells: Greenhouse and Ashby read, "Read under R1, on a board the person names: 2 s, 300 a day. Vendor silent. Setting this row and the declaration to `unknown` refuses it."; Lever, "JobPilot's limit: 2 s, 300 a day."; RemoteOK, its 15 minutes and 24 a day, the link-back through Open posting, and no logo; WWR, 60 minutes (`<ttl>60</ttl>`), 24 a day. Company career pages, Workday, Indeed, and LinkedIn rows: no change of verdict; Task 15 re-reads them. Policy impact: FR-5.2 and FR-5.4 read "Read connector under R1, vendor silent. User-assisted import also works."; the milestone row says 0.5 ships three read connectors on `allowed` rows, two under R1, and four assisted. Open written questions: add RemoteOK, the `use=reference` signal and a user's own model. Add a Connector declarations table: name, operations, automation, limit, status. |
+| `docs/connector-sdk.md` | Replace the stub: the four declarations, `ConnectorDecl` field by field, the two pure functions, the gate, how `check` refuses, the rate-limit rules, a worked connector, the fixture rule, the `silent-read` status, and the two-line change that turns a D3 read off. FR-13.5. |
+| `docs/milestones.md` | Release 0.5 scope, "0.1 to 0.5 built". Reword the exit test: a read connector runs for a source whose verdict is `allowed` or `silent-read`; at `unknown` or `blocked` none runs, and a test proves the refusal. Add the 0.5 gate record with `PLACEHOLDER_TASK_15_*` rows, as 0.4 did. |
+| `docs/agents.md` | Status line. The Discovery row and note: `allowed` rows plus the two D3 rows. Sections 2 to 4: Discovery, Matching, Research as built, with their timeouts and steps. Permission table: `read:matches` not yet used. Matching without `read:sensitive` (decision 18). Research with no `net:connector` (decision 19). Analytics note (decision 22). The task type sentence at the top names the two new tasks. |
 | `docs/architecture.md` | New modules `connectors`, `jobs`, `agents::{discovery, matching, research}`. CLI `job` surface. The Jobs view. Remove `connector SDK` from planned later modules. |
 | `docs/database-schema.md` | Section for `0013` with rule 7. `schema_version` 13. Replace the proposed connector and job rows. |
 | `docs/ai-providers.md` | `semantic_match` and `summarize_company` in the task table: categories, schema, attempts. |
-| `docs/security/threat-model.md` | Status block for 0.5, **Built 0.5**. M-33 built, with test names, and "Declared rate limits are enforced" pointing at `connector_fetch.rs`. M-18 matching with test names. M-23 corpus files 20 to 22. M-34 extended to connector text. B4: Spoofing and Elevation at 0.5 done; Denial of service gains `MAX_FEED_BYTES` and page caps. Section 11 adds: skills and pay rules are English-first; a fake posting from a feed can still score well; RemoteOK's signal; Greenhouse and Ashby shapes unproven. |
-| `docs/wireframes.md` | Screens 8 and 9 as built: the fixed copy above, points as pinned, the compared weight, Locked and no-country lines, and the two held sources. |
+| `docs/security/threat-model.md` | Status block for 0.5, **Built 0.5**. M-33 built, with `silent-read` beside `allowed`, test names, and "Declared rate limits are enforced" pointing at `connector_fetch.rs`. M-18 matching with test names. M-23 corpus files 20 to 22. M-34 extended to connector text. B4: Spoofing and Elevation at 0.5 done; Denial of service gains `MAX_FEED_BYTES` and page caps. Section 11 adds: skills and pay rules are English-first; a fake posting from a feed can still score well; RemoteOK's signal; Greenhouse and Ashby reads rest on D3 and vendor silence. |
+| `docs/wireframes.md` | Screens 8 and 9 as built: the fixed copy above, points as pinned, the compared weight, Locked and no-country lines, and Greenhouse and Ashby with a Fetch button and the D3 note. |
 | `docs/development.md` | `tests/fixtures/connectors`, the synthetic rule, and that no test or CI step reaches a job source. |
-| `docs/prd.md` | Open items line for FR-5.2, FR-5.4, FR-5.7 to FR-5.9. |
+| `docs/prd.md` | Open items line: FR-5.2 and FR-5.4 met under R1; FR-5.7 to FR-5.9 as they stand. |
 | `README.md`, `CHANGELOG.md`, `docs/releases/0.5.0.md` | Built, tests, not exercised, risks, upgrading. |
 
 - [ ] **Step 2: Bump the version** to `0.5.0` in `Cargo.toml` (workspace), `apps/desktop/package.json`, `apps/desktop/src-tauri/tauri.conf.json`, and `Cargo.lock`.
@@ -1535,7 +1555,7 @@ git commit -m "docs: Release 0.5 gates, connector SDK, register, threat model, a
 
 ### Task 15: Real end to end on a temporary root
 
-Driven by the controller, not an implementer subagent. This is the only task that touches a live job source or a real model. **At most two Lever fetches (Steps 4 and 6), one RemoteOK fetch, one We Work Remotely fetch, and one real model call per task type.** No fetch of Greenhouse, Ashby, Workday, Indeed, LinkedIn, or a company site, in any form. Never touch the owner's data root. No full-screen screenshots. If a step fails, stop, fix through a subagent with a failing test first, and rerun from the failed step, counting calls already spent.
+Driven by the controller, not an implementer subagent. This is the only task that touches a live job source or a real model. **At most two Lever fetches (Steps 4 and 6), one each of RemoteOK, We Work Remotely, Greenhouse, and Ashby, and one real model call per task type.** Greenhouse and Ashby read one public board each under R1: `Ashby`, the example in Ashby's docs, and a board token the controller takes from a public Greenhouse posting URL. No fetch of Workday, Indeed, LinkedIn, or a company site, in any form. Never touch the owner's data root. No full-screen screenshots. If a step fails, stop, fix through a subagent with a failing test first, and rerun from the failed step, counting calls already spent.
 
 **Files:**
 - Modify: `docs/milestones.md` (0.5 gate record), `docs/releases/0.5.0.md`, `docs/policy-register.md` (date read cells, only if a re-read changes one)
@@ -1545,7 +1565,7 @@ Driven by the controller, not an implementer subagent. This is the only task tha
 
 - [ ] **Step 1: Re-read the register's site rows**
 
-Follow [Release re-check](../../policy-register.md#release-re-check) for every row this release depends on: the Lever, RemoteOK, We Work Remotely, Greenhouse, and Ashby rows, and the Workday, Indeed, company career page, and LinkedIn rows, whose sources were not re-read when this plan was written. Update dates and quotes in site rows only. If a read verdict changes, stop and fix the declaration and its test. A LinkedIn page that still refuses automated fetch stays `unknown`, and that is recorded. A person's read remains the open item.
+Follow [Release re-check](../../policy-register.md#release-re-check) for every row this release depends on: the Lever, RemoteOK, We Work Remotely, Greenhouse, and Ashby rows, and the Workday, Indeed, company career page, and LinkedIn rows, whose sources were not re-read when this plan was written. Update dates and quotes in site rows only. If a read verdict changes, stop and fix the declaration and its test. A Greenhouse or Ashby clause that now bars third-party readers ends D3 for that row: set it and its declaration to `unknown`, and skip its fetch. A LinkedIn page that still refuses automated fetch stays `unknown`, and that is recorded. A person's read remains the open item.
 
 - [ ] **Step 2: Set up and take stock**
 
@@ -1556,21 +1576,22 @@ JP="$PWD/target/debug/jobpilot"
 $JP status; $JP job sources
 ```
 
-Expected: schema 13, version 0.5.0, nine sources, and exactly Lever, RemoteOK, and We Work Remotely fetchable.
+Expected: schema 13, version 0.5.0, nine sources, and exactly Lever, RemoteOK, We Work Remotely, Greenhouse, and Ashby fetchable, the last two with the D3 note.
 
 - [ ] **Step 3: Offline and no-provider path, no network**
 
-With networking off, or before any source exists: `profile` and `prefs` data as in 0.4's Task 11, `job prefs set`, `job paste`, and `job import --url https://www.linkedin.com/jobs/view/1 --title T` with text on stdin; then `job list`, `job search`, `job analyze`, `job show`. Expect a score with reasons, `not stated by you`, and no request. `sqlite3 "$JOBPILOT_HOME/jobpilot.db" "SELECT count(*) FROM audit_log WHERE action = 'ai_external_call'"` prints 0. `job source add greenhouse acme` is refused with `policy_unknown`, and `job source add indeed x` with `policy_blocked`.
+With networking off, or before any source exists: `profile` and `prefs` data as in 0.4's Task 11, `job prefs set`, `job paste`, and `job import --url https://www.linkedin.com/jobs/view/1 --title T` with text on stdin; then `job list`, `job search`, `job analyze`, `job show`. Expect a score with reasons, `not stated by you`, and no request. `sqlite3 "$JOBPILOT_HOME/jobpilot.db" "SELECT count(*) FROM audit_log WHERE action = 'ai_external_call'"` prints 0. `job source add indeed x` and `job source add linkedin x` are refused with `operation_not_declared`, and no source row is stored.
 
-- [ ] **Step 4: Live fetch, once per allowed source**
+- [ ] **Step 4: Live fetch, once per fetchable source**
 
 ```bash
 $JP job source add lever leverdemo; $JP job source add remoteok; $JP job source add wwr remote-programming-jobs
+$JP job source add greenhouse <board>; $JP job source add ashby Ashby
 $JP job fetch
-$JP job fetch   # again at once
+$JP job fetch --source <remoteok-id> --source <wwr-id>   # again at once, these two only
 ```
 
-Expected: real jobs stored with attribution on RemoteOK and WWR rows. The second press sends nothing for RemoteOK and WWR and reports when each may run. `sqlite3 ... "SELECT connector, day_count FROM connector_limits"` shows one request each for those two. Record bytes, row counts, and elapsed time.
+Expected: real jobs stored from all five, with attribution on RemoteOK and WWR rows. The second press sends nothing and reports when each may run. `sqlite3 ... "SELECT connector, day_count FROM connector_limits"` shows one request each for RemoteOK, WWR, Greenhouse, and Ashby. Record bytes, row counts, and elapsed time.
 
 - [ ] **Step 5: Shapes against fixtures**
 
@@ -1586,7 +1607,7 @@ With Claude Code signed in: `ai enable claude_code`, give consent for `job_text,
 
 - [ ] **Step 8: The GUI, once**
 
-Launch the debug app with the same `JOBPILOT_HOME` and `JOBPILOT_SECRET_SERVICE`. By keyboard: Ctrl+0 opens Jobs; the Sources list shows the verdicts, and Greenhouse has no Fetch button; open a RemoteOK job, which shows `Remote OK` and no image; Open posting opens the default browser on `remoteok.com`; Add to tracker makes an application. Press Emergency pause during a fetch.
+Launch the debug app with the same `JOBPILOT_HOME` and `JOBPILOT_SECRET_SERVICE`. By keyboard: Ctrl+0 opens Jobs; the Sources list shows the verdicts, Greenhouse shows the D3 note and a Fetch button, and LinkedIn has none; open a RemoteOK job, which shows `Remote OK` and no image; Open posting opens the default browser on `remoteok.com`; Add to tracker makes an application. Press Emergency pause during a fetch.
 
 - [ ] **Step 9: Backup and restore**
 
@@ -1598,7 +1619,7 @@ Push the branch, then run `gh workflow run ci.yml --ref feat/v0.5-job-discovery`
 
 - [ ] **Step 11: Clean up and record**
 
-Run `data delete --confirm DELETE` with the debug binary before removing `$E2E`. Fill the gate record: what ran, requests spent per source, calls spent per provider, the CI run id and its Windows result, and what stays unproven: Greenhouse and Ashby live shapes, `job_open` and the Jobs screen on Windows, a person using the screens, and models only ever scripted against the corpus.
+Run `data delete --confirm DELETE` with the debug binary before removing `$E2E`. Fill the gate record: what ran, requests spent per source, calls spent per provider, the CI run id and its Windows result, and what stays unproven: vendor permission for the D3 reads, `job_open` and the Jobs screen on Windows, a person using the screens, and models only ever scripted against the corpus.
 
 ```bash
 git add docs
@@ -1614,7 +1635,7 @@ Run on 2026-11-02 against the spec, the milestone, and this file.
 | Spec item | Task |
 |---|---|
 | Section 5 plugin architecture, declarations | 2, 14 (SDK docs) |
-| Greenhouse, Ashby | 5, refused under decision 1 |
+| Greenhouse, Ashby | 5, read under R1 (decision 1) |
 | Lever, RemoteOK, We Work Remotely | 4 |
 | Company career pages | 1 (routing), 5, under decision 2 |
 | Workday, Indeed, LinkedIn user-assisted | 1, 5, under decision 3 |
@@ -1635,6 +1656,6 @@ Type check: `PayRange`, `PayWish`, and `PayPeriod` are defined in Task 1 and par
 
 Proportion: the plan holds signatures, assertions, and pinned values, and no function body beyond the one-line key mapping.
 
-**Known spec gaps, decided above and to be reported:** Greenhouse and Ashby read under D3, with vendor silence on the record. Company career pages have no automated read. Live Greenhouse and Ashby shapes are unverified. The profile had no pay or seniority wish, so `MatchPrefs` adds one.
+**Known spec gaps, decided above and to be reported:** Greenhouse and Ashby read under R1, with vendor silence on the record. Company career pages have no automated read. Live Greenhouse and Ashby shapes are unverified until Task 15. The profile had no pay or seniority wish, so `MatchPrefs` adds one.
 
 Ready to execute: subagent-driven, starting at Task 1 once the controller's branch check above is done. No approval stop is planned.
