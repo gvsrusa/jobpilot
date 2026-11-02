@@ -477,7 +477,11 @@ async fn splitting_a_leader_regroups_its_followers_at_once() {
 
     split(&db, "cli", &ids[0]).await.unwrap();
 
-    assert_eq!(shown(&db).await, 2, "the leader, and a new leader for the rest");
+    assert_eq!(
+        shown(&db).await,
+        2,
+        "the leader, and a new leader for the rest"
+    );
     let left = detail(&db, &ids[0]).await.unwrap();
     assert!(left.group.is_empty(), "it claims nobody");
     assert_eq!(left.job.duplicates, 0);

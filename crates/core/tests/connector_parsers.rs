@@ -164,7 +164,10 @@ fn remoteok_puts_back_text_the_feed_double_encoded() {
         )
         .unwrap();
     let mended = &page.postings[0];
-    assert_eq!(mended.raw, "<p>We\u{2019}re building for München \u{1F680}</p>");
+    assert_eq!(
+        mended.raw,
+        "<p>We\u{2019}re building for München \u{1F680}</p>"
+    );
     assert_eq!(mended.title, "Engineer \u{2014} Rust");
     assert_eq!(mended.company, "Café Co");
     assert_eq!(mended.location, "Zürich");
