@@ -3,8 +3,8 @@
 //! denied, in an empty folder, with the owner's hooks off.
 //!
 //! Flags, the policy, and the two variables are the plan's no-tools evidence, re-read on
-//! 2026-11-02 from the CLI's docs and its 0.40.0 bundle. The stream's shape and exit 41 come
-//! from the bundle, so the ignored smoke test is what re-checks them.
+//! 2026-11-02 from the CLI's docs and its 0.40.0 bundle. The stream's shape, exit 41, and the
+//! error classes come from the bundle, so the ignored smoke test is what re-checks them.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,8 @@ use crate::error::{Error, Result};
 pub const SPEC: &CliSpec = &child::GEMINI;
 /// The oldest version the no-tools evidence was read from.
 pub const MIN_VERSION: (u32, u32, u32) = (0, 40, 0);
+/// The last version the evidence was read from. Past it the row says so, and nothing stops.
+pub const LAST_CHECKED: (u32, u32, u32) = (0, 40, 0);
 pub const DENY_ALL_POLICY: &str =
     "[[rule]]\ntoolName = \"*\"\ndecision = \"deny\"\npriority = 999\n";
 
@@ -32,11 +34,26 @@ const POLICY_FILE: &str = "deny-all.toml";
 const SYSTEM_FILE: &str = "system.md";
 const SETTINGS_FILE: &str = "settings.json";
 const WORK_DIR: &str = "work";
-/// As the System Overrides file, which beats every other settings file.
-const HOOKS_OFF: &str = r#"{"hooksConfig":{"enabled":false}}"#;
+/// As the System Overrides file, which beats every other settings file. A sandbox would move
+/// the whole prompt into a child's argv and `sh -c`, and Docker drops these policy files.
+const SETTINGS_OVERRIDE: &str = r#"{"hooksConfig":{"enabled":false},"tools":{"sandbox":false}}"#;
+/// Beats `tools.sandbox`. A value already set also beats any `.env` file the CLI loads.
+const SANDBOX_VAR: &str = "GEMINI_SANDBOX";
 const CLI_TOO_OLD: &str = "cli_too_old";
 /// `FatalAuthenticationError`, read from the 0.40.0 bundle.
 const EXIT_NOT_SIGNED_IN: i32 = 41;
+const STDERR_LIMIT: u64 = 64 * 1024;
+/// Lower-case words that name why a run failed. The text they are found in goes nowhere: only
+/// the code does. Google's account errors are unverified, so their copy stays a hint.
+const ACCOUNT_WORDS: &[&str] = &[
+    "ineligibletiererror",
+    "projectidrequirederror",
+    "validationrequirederror",
+];
+const RATE_WORDS: &[&str] = &["retryablequotaerror", "rate limit"];
+const QUOTA_WORDS: &[&str] = &["quota", "resource_exhausted"];
+const MODEL_WORDS: &[&str] = &["modelnotfounderror"];
+const AUTH_WORDS: &[&str] = &["unauthenticated", "unauthorized", "api key not valid"];
 
 pub struct GeminiCli {
     bin: PathBuf,
@@ -82,27 +99,26 @@ impl GeminiCli {
         ]
     }
 
-    /// `PATH` starts with the CLI's own folder, so its `#!/usr/bin/env node` works from a GUI.
     fn env(&self) -> Vec<(String, String)> {
-        let mut env = child::child_env(SPEC.extra_env);
-        env.retain(|(name, _)| name != "PATH");
-        let inherited = std::env::var_os("PATH").unwrap_or_default();
-        let path = child::child_path(&self.bin, SPEC, &inherited);
-        env.push(("PATH".into(), path.to_string_lossy().into_owned()));
-        env
+        child::program_env(&self.bin, SPEC)
     }
 
     async fn run(&self, prompt: &Prompt) -> Result<String> {
+        if opens_a_command(&prompt.user) {
+            return Err(Error::Failed("cli_error".into()));
+        }
+        let mut env = self.env();
+        refuse_sandbox(&env)?;
         // Dropped last, once the child is gone: Windows keeps a live cwd in use.
         let dir = tempfile::tempdir()?;
-        write_attempt(dir.path(), prompt)?;
-        let mut env = self.env();
+        let (system, stdin) = wire_text(prompt);
+        write_attempt(dir.path(), &system)?;
+        env.push((SANDBOX_VAR.into(), "false".into()));
         env.push(path_var("GEMINI_SYSTEM_MD", &dir.path().join(SYSTEM_FILE)));
         env.push(path_var(
             "GEMINI_CLI_SYSTEM_SETTINGS_PATH",
             &dir.path().join(SETTINGS_FILE),
         ));
-        let stdin = stdin_text(&prompt.user);
         let run = ChildRun {
             bin: &self.bin,
             args: GeminiCli::argv(dir.path()),
@@ -111,10 +127,45 @@ impl GeminiCli {
             stdin: stdin.as_bytes(),
             // The stream's framing sits around the reply.
             limit: 4 * MAX_OUTPUT_BYTES as u64,
+            stderr_limit: STDERR_LIMIT,
         };
         let output = child::run_piped(run).await?;
-        read_stream(&output.stdout, output.status)
+        read_stream(&output.stdout, &output.stderr, output.status)
     }
+
+    /// `gemini --version` against the floor: `Ok` says whether it is newer than checked, `Err`
+    /// is the word for `Availability::Unavailable`.
+    pub(crate) async fn check(&self) -> std::result::Result<bool, String> {
+        let text = child::version_of(&self.bin, self.env()).await?;
+        match parse_version(&text) {
+            Some(version) if meets_floor(version) => Ok(version.0 > LAST_CHECKED),
+            _ => Err(CLI_TOO_OLD.into()),
+        }
+    }
+}
+
+/// The system file's text and the stdin text, exactly as a run sends them: the consent
+/// preview shows these, so it cannot differ.
+pub fn wire_text(prompt: &Prompt) -> (String, String) {
+    let system = format!(
+        "{}\n\nReply with one JSON object and nothing else. It must match this JSON Schema:\n{}",
+        prompt.system, prompt.schema
+    );
+    (system, stdin_text(&prompt.user))
+}
+
+/// The CLI runs a stdin text that opens with `/` as a command, and the owner's own commands
+/// can hold shell. Every prompt opens with fixed text, which a test keeps true; this keeps a
+/// new one from arriving unnoticed.
+fn opens_a_command(user: &str) -> bool {
+    user.trim_start().starts_with('/')
+}
+
+fn refuse_sandbox(env: &[(String, String)]) -> Result<()> {
+    if env.iter().any(|(name, _)| name == SANDBOX_VAR) {
+        return Err(Error::Failed("cli_error".into()));
+    }
+    Ok(())
 }
 
 fn path_var(name: &str, path: &Path) -> (String, String) {
@@ -126,7 +177,6 @@ fn path_var(name: &str, path: &Path) -> (String, String) {
 /// the guard sees it. `\@` is the CLI's literal form, at the cost of the model seeing it.
 // ponytail: this leans on `(?<!\\)@` in the 0.40.0 bundle and on main, and the reach without
 // it is the empty cwd plus the owner's `context.includeDirectories`. The smoke test re-checks.
-// A `/` command needs no such step: every prompt opens with fixed text.
 fn stdin_text(user: &str) -> String {
     user.replace('@', "\\@")
 }
@@ -135,28 +185,36 @@ fn stdin_text(user: &str) -> String {
 /// slipped through. The CLI splits `--policy` on commas and only warns about a path it cannot
 /// read, so a comma here would run with no rule at all: that fails closed instead, as does a
 /// folder the child's text variables cannot name.
-fn write_attempt(dir: &Path, prompt: &Prompt) -> Result<()> {
+fn write_attempt(dir: &Path, system: &str) -> Result<()> {
     if dir.to_str().is_none_or(|text| text.contains(',')) {
         return Err(Error::Failed("cli_error".into()));
     }
-    let system = format!(
-        "{}\n\nReply with one JSON object and nothing else. It must match this JSON Schema:\n{}",
-        prompt.system, prompt.schema
-    );
     std::fs::write(dir.join(POLICY_FILE), DENY_ALL_POLICY)?;
     std::fs::write(dir.join(SYSTEM_FILE), system)?;
-    std::fs::write(dir.join(SETTINGS_FILE), HOOKS_OFF)?;
+    std::fs::write(dir.join(SETTINGS_FILE), SETTINGS_OVERRIDE)?;
     std::fs::create_dir(dir.join(WORK_DIR))?;
     Ok(())
 }
 
-/// `x.y.z`, with any pre-release tail and trailing words dropped.
-fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
+/// `x.y.z` and whether a pre-release tail follows, with a leading `v`, build metadata, and any
+/// trailing words dropped.
+fn parse_version(text: &str) -> Option<((u32, u32, u32), bool)> {
     let word = text.split_whitespace().next()?;
-    let mut parts = word.split(['-', '+']).next()?.split('.');
+    let word = word.strip_prefix('v').unwrap_or(word);
+    let word = word.split('+').next()?;
+    let (core, tail) = word.split_once('-').unwrap_or((word, ""));
+    let mut parts = core.split('.');
     let mut number = || parts.next()?.parse().ok();
     let version = (number()?, number()?, number()?);
-    parts.next().is_none().then_some(version)
+    parts
+        .next()
+        .is_none()
+        .then_some((version, !tail.is_empty()))
+}
+
+/// A pre-release of a version comes before it, so `0.40.0-nightly` is below a 0.40.0 floor.
+fn meets_floor((version, prerelease): ((u32, u32, u32), bool)) -> bool {
+    version > MIN_VERSION || (version == MIN_VERSION && !prerelease)
 }
 
 impl Provider for GeminiCli {
@@ -174,12 +232,9 @@ impl Provider for GeminiCli {
     /// `gemini --version`. Sign-in is not probed: the first real call reports it.
     fn available(&self) -> BoxFuture<'_, Availability> {
         Box::pin(async move {
-            match child::version_of(&self.bin, self.env()).await {
-                Err(why) => Availability::Unavailable(why.into()),
-                Ok(text) if parse_version(&text).is_some_and(|found| found >= MIN_VERSION) => {
-                    Availability::Available
-                }
-                Ok(_) => Availability::Unavailable(CLI_TOO_OLD.into()),
+            match self.check().await {
+                Ok(_) => Availability::Available,
+                Err(why) => Availability::Unavailable(why),
             }
         })
     }
@@ -203,40 +258,93 @@ impl Provider for GeminiCli {
     }
 }
 
-/// The whole stream is read before anything is decided, so a tool event anywhere outranks the
-/// exit status and a clean end. Only a line's own `type` counts: a posting can quote one.
+/// A line that parses as an event the stream is documented to carry, in the shape this code
+/// reads. Anything else could be a tool event this code cannot see, so it is not skipped.
+fn known_event(line: &[u8]) -> Option<Value> {
+    let event: Value = serde_json::from_slice(line).ok()?;
+    let fits = match event["type"].as_str()? {
+        "init" | "tool_use" | "tool_result" | "error" => true,
+        "message" => {
+            matches!(event["role"].as_str(), Some("user" | "assistant"))
+                && event["content"].is_string()
+        }
+        "result" => event["status"].is_string(),
+        _ => false,
+    };
+    fits.then_some(event)
+}
+
+/// The fixed code for a failure's words, which go no further than this.
+fn failure(words: &str) -> Error {
+    let words = words.to_lowercase();
+    let says = |list: &[&str]| list.iter().any(|word| words.contains(word));
+    if says(ACCOUNT_WORDS) {
+        Error::Refused("cli_account_refused".into())
+    } else if says(RATE_WORDS) {
+        Error::RateLimited { retry_after: None }
+    } else if says(QUOTA_WORDS) {
+        Error::Refused("quota_exhausted".into())
+    } else if says(MODEL_WORDS) {
+        Error::Refused("model_not_found".into())
+    } else if says(AUTH_WORDS) {
+        Error::Refused("auth_failed".into())
+    } else {
+        Error::Failed("cli_error".into())
+    }
+}
+
+/// An `error` event, warnings included (a loop warning ends the run), or a failed `result`.
+fn failed_event(event: &Value) -> Option<String> {
+    let failed =
+        event["type"] == "error" || (event["type"] == "result" && event["status"] != "success");
+    failed.then(|| {
+        [
+            &event["message"],
+            &event["error"]["type"],
+            &event["error"]["message"],
+        ]
+        .map(|word| word.as_str().unwrap_or_default())
+        .join(" ")
+    })
+}
+
+/// Allow-list: the whole stream is read before anything is decided, so a tool event anywhere
+/// outranks the exit status and a clean end, and a line that is not a known event fails the
+/// attempt. Only a line's own `type` counts: a posting can quote one.
 // ponytail: only a child-reported event can trip the guard, and the deny rule is what stops a
 // tool. A CLI that ran one and did not say so passes here.
-pub(crate) fn read_stream(stdout: &[u8], status: ExitStatus) -> Result<String> {
-    let events: Vec<Value> = stdout
+pub(crate) fn read_stream(stdout: &[u8], stderr: &[u8], status: ExitStatus) -> Result<String> {
+    let lines: Vec<Option<Value>> = stdout
         .split(|byte| *byte == b'\n')
-        .filter_map(|line| serde_json::from_slice(line).ok())
+        .filter(|line| !line.trim_ascii().is_empty())
+        .map(known_event)
         .collect();
-    let kind = |event: &Value| event["type"].as_str().map(str::to_owned);
-    let saw = |wanted: &[&str]| {
-        events
-            .iter()
-            .filter_map(kind)
-            .any(|found| wanted.contains(&found.as_str()))
-    };
-    if saw(&["tool_use", "tool_result"]) {
+    let events = || lines.iter().flatten();
+    let is_tool = |event: &&Value| event["type"] == "tool_use" || event["type"] == "tool_result";
+    if events().any(|event| is_tool(&event)) {
         return Err(Error::Refused("permission_denied".into()));
     }
     if status.code() == Some(EXIT_NOT_SIGNED_IN) {
         return Err(Error::Refused("not_logged_in".into()));
     }
-    let results = || events.iter().filter(|event| event["type"] == "result");
-    if !status.success() || results().any(|event| event["status"] != "success") {
-        return Err(Error::Failed("cli_error".into()));
+    if let Some(words) = events().find_map(failed_event) {
+        return Err(failure(&words));
     }
-    if !saw(&["result"]) {
-        return Err(Error::Failed("bad_reply".into()));
+    if !status.success() {
+        return Err(failure(&String::from_utf8_lossy(stderr)));
     }
-    Ok(events
-        .iter()
+    let bad_reply = || Error::Failed("bad_reply".into());
+    if lines.iter().any(Option::is_none) || !events().any(|event| event["type"] == "result") {
+        return Err(bad_reply());
+    }
+    let text: String = events()
         .filter(|event| event["type"] == "message" && event["role"] == "assistant")
         .filter_map(|event| event["content"].as_str())
-        .collect())
+        .collect();
+    if text.trim().is_empty() {
+        return Err(bad_reply());
+    }
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -248,13 +356,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("a,b");
         std::fs::create_dir(&dir).unwrap();
-        let prompt = Prompt {
-            system: "s".into(),
-            user: "u".into(),
-            schema: "{}",
-        };
-        let error = write_attempt(&dir, &prompt).unwrap_err();
+        let error = write_attempt(&dir, "s").unwrap_err();
         assert!(matches!(&error, Error::Failed(why) if why == "cli_error"));
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_sandbox_variable_in_the_childs_environment_fails_closed() {
+        let env = [("GEMINI_SANDBOX".to_string(), "docker".to_string())];
+        let error = refuse_sandbox(&env).unwrap_err();
+        assert!(matches!(&error, Error::Failed(why) if why == "cli_error"));
+        assert!(refuse_sandbox(&[("HOME".to_string(), "/h".to_string())]).is_ok());
     }
 }

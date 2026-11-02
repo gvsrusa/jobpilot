@@ -248,6 +248,12 @@ fn message(error: &Error) -> String {
              again."
                 .into()
         }
+        Error::ManualRequired(reason) if reason == "cli_account_refused" => {
+            "Gemini CLI refused this account. Its plan may have moved to Antigravity CLI, which \
+             JobPilot does not run. A paid Gemini API key in the CLI may work, or use another \
+             provider."
+                .into()
+        }
         Error::ManualRequired(reason) if reason == "cli_too_old" => {
             "The installed CLI is older than the version JobPilot checked. Update it, then try \
              again."

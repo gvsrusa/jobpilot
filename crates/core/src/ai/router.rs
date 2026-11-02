@@ -39,6 +39,7 @@ const ENDPOINT_CHANGED: &str = "endpoint_changed";
 const ORIGIN_REFUSED: &str = "origin_refused";
 const QUOTA_EXHAUSTED: &str = "quota_exhausted";
 const PROMPT_TOO_LARGE: &str = "prompt_too_large";
+const CLI_ACCOUNT_REFUSED: &str = "cli_account_refused";
 const CONSENT: &str = "consent";
 const CONSENT_NEEDED: &str = "consent_needed";
 const CONSENT_SUSPENDED: &str = "consent_suspended";
@@ -433,6 +434,7 @@ impl Router {
                     MODEL_HAS_TOOLS,
                     MODEL_NOT_FOUND,
                     MODEL_REFUSED,
+                    CLI_ACCOUNT_REFUSED,
                 ]
                 .contains(&reason) =>
                 {

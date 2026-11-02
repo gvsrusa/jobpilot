@@ -37,6 +37,11 @@ const DIRECT_API: Option<&str> = Some("Direct API: OpenAI");
 const CLI_ADAPTERS: Option<&str> = Some("Gemini CLI and Codex CLI adapters");
 const OWN_KEY: &str = "Direct API calls with the user's own key";
 const CLI_TERMS: &str = "The terms of whatever sign-in the installed CLI uses.";
+/// No setting turns this off, in 0.40.0 or on the CLI's main branch. Said in the register row
+/// too, so a record given before it was said is suspended.
+const GEMINI_TERMS: &str = "The terms of whatever sign-in the installed CLI uses. The CLI also \
+                            keeps its own transcript of each prompt and reply on this computer, \
+                            under ~/.gemini/tmp, for 30 days by default.";
 
 pub const PROVIDERS: &[ProviderInfo] = &[
     ProviderInfo {
@@ -138,7 +143,7 @@ pub const PROVIDERS: &[ProviderInfo] = &[
             "JobPilot runs `gemini` with the user's paid Gemini API key",
         ),
         owner_row: CLI_ADAPTERS,
-        data_use: CLI_TERMS,
+        data_use: GEMINI_TERMS,
         attestation: Some(
             "Gemini CLI here is not signed in with a free Gemini API key. A free key is refused \
              for personal data.",

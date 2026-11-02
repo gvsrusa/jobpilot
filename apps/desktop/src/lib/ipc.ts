@@ -395,6 +395,7 @@ export type ExternalStatus = {
   consent: DataCategory[] | null;
   suspended: boolean;
   runs_job_text: boolean;
+  newer_than_checked: boolean;
 };
 
 export type TaskSharing = {
@@ -623,7 +624,8 @@ export const ipc = {
   aiSetEndpoint: (url: string) => invoke<void>("ai_set_endpoint", { url }),
   aiSharing: (provider: Provider) => invoke<Sharing>("ai_sharing", { provider }),
   /** Builds the prompt and sends nothing. */
-  aiPreview: (jobTextId: string) => invoke<PromptPreview>("ai_preview", { jobTextId }),
+  aiPreview: (jobTextId: string, provider: string) =>
+    invoke<PromptPreview>("ai_preview", { jobTextId, provider }),
   aiIndex: () => invoke<number>("ai_index"),
   aiCancel: () => invoke<void>("ai_cancel"),
 

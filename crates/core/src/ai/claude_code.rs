@@ -137,6 +137,7 @@ impl ClaudeCode {
             cwd: dir.path(),
             stdin: prompt.user.as_bytes(),
             limit: MAX_OUTPUT_BYTES as u64,
+            stderr_limit: 0,
         };
         let output = child::run_piped(run).await?;
         read_reply(&output.stdout, output.status)

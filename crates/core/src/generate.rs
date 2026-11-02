@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::ai::gemini_cli;
 use crate::ai::ollama::CONTEXT_LIMIT;
 use crate::ai::router::Router;
 use crate::ai::{BYTES_PER_TOKEN, CancellationToken, Outcome, Prompt, ProviderId, TaskType, spec};
@@ -276,14 +277,24 @@ async fn gather(db: &Db, job_text_id: &str) -> Result<(JobText, ProfileBasic, Ve
     Ok((posting, basic, evidence))
 }
 
-/// The prompt a drafting task would send for this posting. Builds it and sends nothing, so
-/// it runs with no provider, no consent, and while paused.
-pub async fn preview(db: &Db, task: TaskType, job_text_id: &str) -> Result<PromptPreview> {
+/// The prompt a drafting task would send to `provider` for this posting, as that provider's
+/// wire carries it. Builds it and sends nothing, so it runs with no consent and while paused.
+pub async fn preview(
+    db: &Db,
+    task: TaskType,
+    job_text_id: &str,
+    provider: &str,
+) -> Result<PromptPreview> {
     if !matches!(task, TaskType::DraftResume | TaskType::DraftCoverLetter) {
         return Err(Error::Validation("only a draft has a preview".into()));
     }
     let (posting, basic, evidence) = gather(db, job_text_id).await?;
-    let Prompt { system, user, .. } = build_prompt(task, &basic, &evidence, &posting);
+    let prompt = build_prompt(task, &basic, &evidence, &posting);
+    let (system, user) = if provider == "gemini_cli" {
+        gemini_cli::wire_text(&prompt)
+    } else {
+        (prompt.system, prompt.user)
+    };
     Ok(PromptPreview { task, system, user })
 }
 

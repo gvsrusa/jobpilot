@@ -124,6 +124,8 @@ fn sign_in_variables_pass_and_vertex_and_other_keys_do_not() {
         ("GEMINI_API_KEY", "g"),
         ("GOOGLE_API_KEY", "g2"),
         ("GOOGLE_GENAI_USE_VERTEXAI", "true"),
+        ("GOOGLE_CLOUD_PROJECT", "p"),
+        ("GOOGLE_CLOUD_LOCATION", "l"),
         ("OPENAI_API_KEY", "o"),
         ("ANTHROPIC_API_KEY", "a"),
         ("NODE_OPTIONS", "--require x"),
@@ -191,6 +193,7 @@ fn helper_run<'a>(cwd: &'a Path, mode: &str, stdin: &'a [u8], limit: u64) -> Chi
         cwd,
         stdin,
         limit,
+        stderr_limit: 0,
     }
 }
 
@@ -240,6 +243,7 @@ async fn run_piped_kills_the_tree_when_dropped() {
         cwd: dir.path(),
         stdin: b"",
         limit: 1 << 20,
+        stderr_limit: 0,
     };
     let waited = tokio::time::timeout(std::time::Duration::from_millis(600), run_piped(run)).await;
     assert!(waited.is_err(), "the child should still be running");
@@ -280,6 +284,7 @@ async fn cmd_shim_takes_spaces_stdin_and_exit_code() {
         cwd: tmp.path(),
         stdin: b"from stdin\r\n",
         limit: 1 << 20,
+        stderr_limit: 0,
     };
     match run_piped(run).await {
         Ok(out) => {
@@ -308,4 +313,28 @@ async fn an_argument_the_os_refuses_is_cli_error() {
         matches!(&err, jobpilot_core::Error::Failed(why) if why == "cli_error"),
         "{err:?}"
     );
+}
+
+/// More than a pipe buffer on stderr must not stall the child, and only the limit is kept.
+#[cfg(unix)]
+#[tokio::test]
+async fn stderr_is_kept_to_its_limit_and_drained_past_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("noisy");
+    let script = "#!/bin/sh\ni=0\nwhile [ $i -lt 40000 ]; do echo 'xxxxxxxxxxxxxxx' >&2; i=$((i+1)); done\necho done\n";
+    std::fs::write(&bin, script).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let run = ChildRun {
+        bin: &bin,
+        args: Vec::new(),
+        env: Vec::new(),
+        cwd: dir.path(),
+        stdin: b"",
+        limit: 1 << 20,
+        stderr_limit: 64,
+    };
+    let output = run_piped(run).await.unwrap();
+    assert_eq!(output.stderr.len(), 64);
+    assert_eq!(output.stdout, b"done\n");
 }

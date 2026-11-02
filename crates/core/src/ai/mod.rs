@@ -61,6 +61,7 @@ pub const RUN_REASONS: &[&str] = &[
     "origin_refused",
     "model_has_tools",
     "endpoint_changed",
+    "cli_account_refused",
 ];
 
 /// Absent capabilities are false: a declaration lists only what the provider proves.
@@ -333,6 +334,9 @@ pub struct ExternalStatus {
     pub suspended: bool,
     /// It can carry a posting: it declares what the drafting tasks require.
     pub runs_job_text: bool,
+    /// The installed CLI passes the last version the no-tools evidence was read from. A note,
+    /// not a stop: the deny rule, the guard, and the smoke test still stand.
+    pub newer_than_checked: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -489,16 +493,19 @@ async fn cli_path(db: &Db, name: &str) -> Option<String> {
 /// before it is 5 s, so no row holds the screen longer than one of each.
 const CLI_ROW_BOUND: Duration = Duration::from_secs(16);
 
-/// What a CLI row shows: available, the reason it is not, and where its program is.
-type CliRow = (bool, Option<String>, Option<String>);
+/// What a CLI row shows: available, the reason it is not, where its program is, and whether
+/// it is newer than the version checked.
+type CliRow = (bool, Option<String>, Option<String>, bool);
 
 /// Decision 28: a CLI that is off is found, by the folders alone, and never started, because
 /// `status` runs on every refresh of the AI screen and a Node CLI takes seconds to start. Only
 /// an enabled one gets the login shell and the `--version` probe, which for Gemini includes its
-/// version floor. One discovery per row.
+/// version floor. One discovery per row. An off CLI the folders do not show may still be one
+/// only the login shell finds, an nvm install under a GUI launch: it reads `not_searched`, and
+/// turning it on is what looks.
 async fn cli_row(db: &Db, name: &str, enabled: bool) -> CliRow {
     let Some(spec) = child::spec_for(name) else {
-        return (false, Some("not_built".into()), None);
+        return (false, Some("not_built".into()), None, false);
     };
     let found = if enabled {
         child::find_cli(spec, Some(db)).await
@@ -506,34 +513,37 @@ async fn cli_row(db: &Db, name: &str, enabled: bool) -> CliRow {
         child::find_cli_quick(spec, Some(db)).await
     };
     let Ok(bin) = found else {
-        return (false, Some("not_installed".into()), None);
+        let unsearched = !enabled && child::login_shell_may_find(spec);
+        let why = if unsearched {
+            "not_searched"
+        } else {
+            "not_installed"
+        };
+        return (false, Some(why.into()), None, false);
     };
     let path = Some(bin.display().to_string());
     if !enabled {
-        return (true, None, path);
+        return (true, None, path, false);
     }
     let probe = if name == "gemini_cli" {
-        match GeminiCli::with_binary(bin).available().await {
-            Availability::Available => Ok(()),
-            Availability::Unavailable(why) => Err(why),
-        }
+        GeminiCli::with_binary(bin).check().await
     } else {
         let env = child::program_env(&bin, spec);
         child::version_of(&bin, env)
             .await
-            .map(|_| ())
+            .map(|_| false)
             .map_err(str::to_string)
     };
     match probe {
-        Ok(()) => (true, None, path),
-        Err(why) => (false, Some(why), path),
+        Ok(newer) => (true, None, path, newer),
+        Err(why) => (false, Some(why), path, false),
     }
 }
 
 async fn bounded_cli_row(db: &Db, name: &str, enabled: bool) -> CliRow {
     tokio::time::timeout(CLI_ROW_BOUND, cli_row(db, name, enabled))
         .await
-        .unwrap_or((false, Some("no_answer".into()), None))
+        .unwrap_or((false, Some("no_answer".into()), None, false))
 }
 
 /// A provider row's availability, by the same checks routing uses. Opens no socket.
@@ -569,12 +579,12 @@ async fn external_status(db: &Db) -> Result<Vec<ExternalStatus>> {
         }
         let state = consent::state(db, &info.id.to_string()).await?;
         let suspended = matches!(state, ConsentState::Suspended(_));
-        let (available, reason, cli_path) = match info.name {
+        let (available, reason, cli_path, newer_than_checked) = match info.name {
             "gemini_cli" => gemini.clone(),
             "codex_cli" => codex.clone(),
             _ => {
                 let (available, reason) = api_availability(db, info).await?;
-                (available, reason, None)
+                (available, reason, None, false)
             }
         };
         let model = text_setting(db, &format!("ai.model.{}", info.name)).await?;
@@ -596,6 +606,7 @@ async fn external_status(db: &Db) -> Result<Vec<ExternalStatus>> {
             suspended,
             runs_job_text: router::lacking(spec(TaskType::DraftResume), info.capabilities)
                 .is_none(),
+            newer_than_checked,
         });
     }
     Ok(rows)

@@ -28,7 +28,8 @@ pub struct CliSpec {
     /// The npm package and its entry file. The macOS open panel resolves a link, so a picked
     /// `gemini` comes back as `.../node_modules/@google/gemini-cli/.../gemini.js`.
     pub npm_entry: Option<(&'static str, &'static str)>,
-    /// Sign-in variables, copied by name on top of `BASE_ENV` (decision 17). Vertex stays off.
+    /// Sign-in variables, copied by name on top of `BASE_ENV` (decision 17). None of them
+    /// selects Vertex AI, though a CLI's own `.env` file still can, which this app cannot see.
     pub extra_env: &'static [&'static str],
 }
 
@@ -37,12 +38,7 @@ pub const GEMINI: CliSpec = CliSpec {
     env_bin: "JOBPILOT_GEMINI_BIN",
     setting: "ai.gemini_path",
     npm_entry: Some(("@google/gemini-cli", "gemini.js")),
-    extra_env: &[
-        "GEMINI_API_KEY",
-        "GEMINI_CLI_HOME",
-        "GOOGLE_CLOUD_PROJECT",
-        "GOOGLE_CLOUD_LOCATION",
-    ],
+    extra_env: &["GEMINI_API_KEY", "GEMINI_CLI_HOME"],
 };
 
 pub const CODEX: CliSpec = CliSpec {
@@ -105,16 +101,20 @@ pub struct ChildRun<'a> {
     pub cwd: &'a Path,
     pub stdin: &'a [u8],
     pub limit: u64,
+    /// How much of stderr to keep; 0 leaves it unread. It is vendor text, for matching fixed
+    /// words: it never reaches a log or an error.
+    pub stderr_limit: u64,
 }
 
 #[derive(Debug)]
 pub struct ChildOutput {
     pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
     pub status: ExitStatus,
 }
 
 /// The child leads a process group of its own (macOS), so `KillTree` reaches what it
-/// started. Stderr is never read, so there is no pipe to drain and nothing to leak.
+/// started. Stderr has no pipe unless a run asks for one.
 pub(crate) fn command(bin: &Path, env: &[(String, String)], cwd: &Path) -> Command {
     let mut command = Command::new(bin);
     command
@@ -151,6 +151,9 @@ pub async fn run_piped(run: ChildRun<'_>) -> Result<ChildOutput> {
         .args(&run.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
+    if run.stderr_limit > 0 {
+        command.stderr(Stdio::piped());
+    }
     let mut child = command.spawn().map_err(spawn_error)?;
     let tree = KillTree::of(&child);
     let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
@@ -166,7 +169,21 @@ pub async fn run_piped(run: ChildRun<'_>) -> Result<ChildOutput> {
     let mut output = Vec::new();
     let mut capped = stdout.take(limit + 1);
     let read = capped.read_to_end(&mut output);
-    let ((), read) = tokio::join!(write, read);
+    let stderr = child.stderr.take();
+    let stderr_limit = run.stderr_limit;
+    // Past the limit it is still drained, or the child would stall on a full pipe.
+    let errors = async move {
+        let mut text = Vec::new();
+        if let Some(mut stderr) = stderr {
+            let _ = (&mut stderr)
+                .take(stderr_limit)
+                .read_to_end(&mut text)
+                .await;
+            let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+        }
+        text
+    };
+    let ((), read, errors) = tokio::join!(write, read, errors);
     read?;
     if output.len() as u64 > limit {
         return Err(Error::TooLarge { limit });
@@ -175,6 +192,7 @@ pub async fn run_piped(run: ChildRun<'_>) -> Result<ChildOutput> {
     tree.disarm();
     Ok(ChildOutput {
         stdout: output,
+        stderr: errors,
         status,
     })
 }
@@ -521,6 +539,13 @@ pub async fn find_cli_quick(
     db: Option<&Db>,
 ) -> std::result::Result<PathBuf, String> {
     find_cli_by(spec, db, false).await
+}
+
+/// Whether the login shell `find_cli_quick` skips could still find this program: not on
+/// Windows, which has none, and not past an override, which is the only place looked.
+pub fn login_shell_may_find(spec: &CliSpec) -> bool {
+    let overridden = std::env::var_os(spec.env_bin).is_some_and(|bin| !bin.is_empty());
+    cfg!(unix) && !overridden
 }
 
 async fn find_cli_by(

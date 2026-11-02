@@ -1261,9 +1261,13 @@ pub async fn ai_sharing(state: State<'_, AppState>, provider: String) -> Result<
 
 /// The exact resume prompt for a pasted posting. Builds it and sends nothing.
 #[tauri::command]
-pub async fn ai_preview(state: State<'_, AppState>, job_text_id: String) -> Result<PromptPreview> {
+pub async fn ai_preview(
+    state: State<'_, AppState>,
+    job_text_id: String,
+    provider: String,
+) -> Result<PromptPreview> {
     let db = state.work().await?;
-    generate::preview(&db, TaskType::DraftResume, &job_text_id).await
+    generate::preview(&db, TaskType::DraftResume, &job_text_id, &provider).await
 }
 
 /// A key comes from the system clipboard, so it never enters the webview, which sends only a
@@ -3742,7 +3746,8 @@ mod tests {
             "kb_add",
             json!({ "kind": "note", "body": "Shipped a compiler" }),
         );
-        let preview = h.ok("ai_preview", json!({ "jobTextId": job["id"] }));
+        let args = json!({ "jobTextId": job["id"], "provider": "claude_code" });
+        let preview = h.ok("ai_preview", args);
         assert_eq!(preview["task"], "draft_resume");
         assert!(preview["user"].as_str().unwrap().contains("ZXQ-POSTING"));
         assert!(

@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use jobpilot_core::ai::gemini_cli::{DENY_ALL_POLICY, GeminiCli, MIN_VERSION, SPEC};
+use jobpilot_core::ai::gemini_cli::{DENY_ALL_POLICY, GeminiCli, MIN_VERSION, SPEC, wire_text};
 use jobpilot_core::ai::router::Router;
 use jobpilot_core::ai::{
     Availability, CancellationToken, DataCategory, Outcome, Prompt, Provider, ProviderId, TaskType,
@@ -311,7 +311,16 @@ async fn the_hooks_override_is_set_for_this_child() {
     complete(&cli.gemini()).await.unwrap();
     assert!(cli.read("env").contains("GEMINI_CLI_SYSTEM_SETTINGS_PATH="));
     let settings: Value = serde_json::from_str(&cli.read("settings_copy")).unwrap();
-    assert_eq!(settings, json!({"hooksConfig": {"enabled": false}}));
+    assert_eq!(
+        settings,
+        json!({"hooksConfig": {"enabled": false}, "tools": {"sandbox": false}})
+    );
+    // Set here too: `GEMINI_SANDBOX` beats settings, and a `.env` file never beats the process.
+    assert!(
+        cli.read("env")
+            .lines()
+            .any(|line| line.trim() == "GEMINI_SANDBOX=false")
+    );
 }
 
 #[tokio::test]
@@ -390,18 +399,242 @@ async fn a_tool_use_quoted_in_text_does_not() {
     assert_eq!(complete(&cli.gemini()).await.unwrap(), quoted);
 
     // Nested in an event: only a line's own `type` counts.
-    let nested = line(json!({"type": "error", "severity": "warning",
-        "message": {"type": "tool_use"}}));
+    let nested = line(json!({"type": "init", "session_id": "s", "model": {"type": "tool_use"}}));
     let reply = format!("{nested}{}", stream("ok"));
     let cli = MockCli::with_reply(&reply, &[]);
     assert_eq!(complete(&cli.gemini()).await.unwrap(), "ok");
 }
 
+fn deep_call(depth: usize) -> String {
+    let nested = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+    format!(r#"{{"type":"tool_use","tool_name":"x","tool_id":"1","parameters":{{"a":{nested}}}}}"#)
+}
+
+/// A line the parser cannot read could be a tool event, so it never counts as nothing.
 #[tokio::test]
-async fn noise_before_the_stream_is_skipped() {
+async fn a_line_that_is_not_a_known_event_fails_the_attempt() {
+    let call = r#"{"type":"tool_use","tool_name":"x","tool_id":"1","parameters":{}}"#;
+    let lines = [
+        format!("Loaded creds.{call}"),
+        format!("{call} x"),
+        format!("{call}{call}"),
+        format!("\u{feff}{call}"),
+        format!("[{call}]"),
+        r#"{"type":"tool_use","n":1e999}"#.to_string(),
+        r#"{"type":"tool_call","tool_name":"x"}"#.to_string(),
+        r#"{"no_type":true}"#.to_string(),
+        r#"{"type":"message","role":"system","content":"x"}"#.to_string(),
+        r#"{"type":"message","role":"assistant","content":["x"]}"#.to_string(),
+        "7".to_string(),
+        deep_call(127),
+        deep_call(5000),
+    ];
+    for odd in lines {
+        let shown: String = odd.chars().take(40).collect();
+        let cli = MockCli::with_reply(&format!("{odd}\n{}", stream(JOB)), &[]);
+        let result = complete(&cli.gemini()).await;
+        assert!(result.is_err(), "{shown}: {result:?}");
+        let (_tmp, db) = setup().await;
+        let router = Router::with_providers(vec![Box::new(cli.gemini())]);
+        let outcome = parse_job(&router, &db).await;
+        assert!(
+            !matches!(outcome, Outcome::Ok { .. }),
+            "{shown}: {outcome:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_crlf_tool_line_still_trips_the_guard_and_blank_lines_are_fine() {
+    let call = r#"{"type":"tool_use","tool_name":"x","tool_id":"1","parameters":{}}"#;
+    let cli = MockCli::with_reply(&format!("{call}\r\n{}", stream(JOB)), &[]);
+    let error = complete(&cli.gemini()).await.unwrap_err();
+    assert_eq!(error.to_string(), "refused: permission_denied");
+
+    let cli = MockCli::with_reply(&format!("\r\n\n{}\n", stream("ok")), &[]);
+    assert_eq!(complete(&cli.gemini()).await.unwrap(), "ok");
+}
+
+/// An `error` event's text picks a fixed code; the text itself goes nowhere.
+#[tokio::test]
+async fn an_error_event_fails_with_its_mapped_code_and_no_retry() {
+    for (message, reason) in [
+        ("You exceeded your current quota", "quota_exhausted"),
+        ("Loop detected, stopping execution", "cli_error"),
+        ("Maximum session turns exceeded", "cli_error"),
+    ] {
+        let event = line(json!({"type": "error", "severity": "warning", "message": message}));
+        let cli = MockCli::with_reply(&format!("{event}{}", stream(JOB)), &[]);
+        let (_tmp, db) = setup().await;
+        let router = Router::with_providers(vec![Box::new(cli.gemini())]);
+        let outcome = parse_job(&router, &db).await;
+        assert!(!matches!(outcome, Outcome::Ok { .. }), "{outcome:?}");
+        let failed = ("failed".to_string(), Some(reason.to_string()));
+        assert_eq!(reasons(&db).await, [failed], "{message}");
+    }
+}
+
+#[tokio::test]
+async fn a_result_error_type_picks_the_code() {
+    for (kind, reason) in [
+        ("TerminalQuotaError", "quota_exhausted"),
+        ("RetryableQuotaError", "rate_limited"),
+        ("ModelNotFoundError", "model_not_found"),
+        ("IneligibleTierError", "cli_account_refused"),
+        ("SomethingElse", "cli_error"),
+    ] {
+        let failed = line(json!({"type": "result", "status": "error",
+            "error": {"type": kind, "message": "vendor text"}}));
+        let cli = MockCli::with_reply(&failed, &[]);
+        let error = complete(&cli.gemini()).await.unwrap_err();
+        let said = error.to_string().replace(' ', "_");
+        assert!(said.contains(reason), "{kind}: {error}");
+    }
+}
+
+#[tokio::test]
+async fn empty_text_is_a_bad_reply_not_a_validation_retry() {
+    let cli = MockCli::with_reply(&done(), &[]);
+    assert!(matches!(complete(&cli.gemini()).await, Err(Error::Failed(why)) if why == "bad_reply"));
+    let (_tmp, db) = setup().await;
+    let router = Router::with_providers(vec![Box::new(cli.gemini())]);
+    parse_job(&router, &db).await;
+    let failed = ("failed".to_string(), Some("bad_reply".to_string()));
+    assert_eq!(reasons(&db).await, [failed]);
+}
+
+/// `IneligibleTierError` leaves `main`, so it only ever reaches stderr, with exit 1.
+#[tokio::test]
+async fn an_account_refusal_on_stderr_gets_its_class_and_no_text() {
+    let holder = tempfile::tempdir().unwrap();
+    let stderr = holder.path().join("stderr.txt");
+    fs::write(
+        &stderr,
+        "An unexpected critical error occurred:Error: VENDOR-TEXT-ZXQ\n  at new IneligibleTierError (x.js:1:1)\n",
+    )
+    .unwrap();
+    let stderr = stderr.display().to_string();
+    let vars = [
+        ("MOCK_GEMINI_STDERR", stderr.as_str()),
+        ("MOCK_GEMINI_EXIT", "1"),
+    ];
+    let cli = MockCli::with_reply("", &vars);
+    let error = complete(&cli.gemini()).await.unwrap_err();
+    assert!(
+        matches!(&error, Error::Refused(why) if why == "cli_account_refused"),
+        "{error}"
+    );
+    assert!(!error.to_string().contains("VENDOR-TEXT"));
+
+    let (_tmp, db) = setup().await;
+    let router = Router::with_providers(vec![Box::new(cli.gemini())]);
+    assert_eq!(
+        parse_job(&router, &db).await,
+        Outcome::ManualRequired {
+            reason: "cli_account_refused".into()
+        }
+    );
+    let refused = (
+        "failed".to_string(),
+        Some("cli_account_refused".to_string()),
+    );
+    assert_eq!(reasons(&db).await, [refused]);
+}
+
+#[tokio::test]
+async fn an_unknown_stderr_is_a_plain_cli_error() {
+    let holder = tempfile::tempdir().unwrap();
+    let stderr = holder.path().join("stderr.txt");
+    fs::write(&stderr, "boom\n").unwrap();
+    let stderr = stderr.display().to_string();
+    let vars = [
+        ("MOCK_GEMINI_STDERR", stderr.as_str()),
+        ("MOCK_GEMINI_EXIT", "1"),
+    ];
+    let cli = MockCli::with_reply("", &vars);
+    assert!(matches!(complete(&cli.gemini()).await, Err(Error::Failed(why)) if why == "cli_error"));
+}
+
+/// The CLI runs a leading `/` as a command, and the owner's commands can hold shell.
+#[tokio::test]
+async fn a_prompt_opening_with_a_slash_never_starts_the_child() {
+    for user in ["/about", "  /about", "\n/about"] {
+        let cli = MockCli::new(&[]);
+        let posting = Prompt {
+            user: user.into(),
+            ..prompt()
+        };
+        let result = cli
+            .gemini()
+            .complete(&posting, CancellationToken::new())
+            .await;
+        assert!(
+            matches!(result, Err(Error::Failed(why)) if why == "cli_error"),
+            "{user}"
+        );
+        assert!(!cli.file("args").exists(), "the mock was started");
+    }
+}
+
+/// Every prompt builder, on a posting that opens with `/`.
+#[test]
+fn both_builders_open_with_fixed_text() {
+    use jobpilot_core::memory::classify::classify_prompt;
+    let question = classify_prompt("/about");
+    assert!(
+        question.user.starts_with("<<<UNTRUSTED_POSTING>>>\n"),
+        "{}",
+        question.user
+    );
+    let posting = jobpilot_core::knowledge::JobText {
+        id: "j".into(),
+        title: "t".into(),
+        normalized: "/about".into(),
+        findings: Vec::new(),
+    };
+    let basic = jobpilot_core::profile::ProfileBasic::default();
+    for task in [TaskType::DraftResume, TaskType::DraftCoverLetter] {
+        let draft = jobpilot_core::generate::build_prompt(task, &basic, &[], &posting);
+        assert!(draft.user.starts_with("EVIDENCE\n"), "{}", draft.user);
+    }
+}
+
+#[test]
+fn the_preview_text_is_the_wire_text() {
+    let (system, user) = wire_text(&Prompt {
+        user: "jobs@acme.com".into(),
+        ..prompt()
+    });
+    assert_eq!(user, "jobs\\@acme.com");
+    assert_eq!(
+        system,
+        format!(
+            "system rules\n\nReply with one JSON object and nothing else. It must match this \
+             JSON Schema:\n{SCHEMA}"
+        )
+    );
+}
+
+#[test]
+fn consent_says_the_cli_keeps_a_transcript_through_the_register() {
+    let info = register::info("gemini_cli").unwrap();
+    assert!(info.data_use.contains("~/.gemini/tmp"), "{}", info.data_use);
+    assert!(info.data_use.contains("30 days"), "{}", info.data_use);
+    // In the row text, so a record given before this was said is suspended.
+    assert!(
+        register::row_text(PROVIDER)
+            .unwrap()
+            .contains("~/.gemini/tmp")
+    );
+    let codex = register::info("codex_cli").unwrap();
+    assert!(!codex.data_use.contains(".gemini"));
+}
+
+#[tokio::test]
+async fn noise_before_the_stream_fails_the_attempt() {
     let reply = format!("Loaded cached credentials.\n{}", stream("ok"));
     let cli = MockCli::with_reply(&reply, &[]);
-    assert_eq!(complete(&cli.gemini()).await.unwrap(), "ok");
+    assert!(matches!(complete(&cli.gemini()).await, Err(Error::Failed(why)) if why == "bad_reply"));
 }
 
 #[tokio::test]
@@ -445,7 +678,14 @@ async fn exit_41_is_not_logged_in() {
 
 #[tokio::test]
 async fn a_version_below_the_floor_is_unavailable() {
-    for version in ["0.39.9", "0.0.0 (mock)", "1.0", "not a version"] {
+    for version in [
+        "0.39.9",
+        "0.0.0 (mock)",
+        "1.0",
+        "not a version",
+        "0.40.0-nightly.20260101.abc",
+        "0.40.0-preview.0",
+    ] {
         let cli = MockCli::new(&[("MOCK_GEMINI_VERSION", version)]);
         assert_eq!(
             cli.gemini().available().await,
@@ -467,7 +707,14 @@ async fn a_version_below_the_floor_is_unavailable() {
 
 #[tokio::test]
 async fn the_floor_and_above_are_available() {
-    for version in ["0.40.0", "0.40.1", "0.100.0", "1.2.3", "0.41.0-nightly.1"] {
+    for version in [
+        "0.40.0",
+        "v0.40.0",
+        "0.40.1",
+        "0.100.0",
+        "1.2.3",
+        "0.41.0-nightly.1",
+    ] {
         let cli = MockCli::new(&[("MOCK_GEMINI_VERSION", version)]);
         assert_eq!(cli.gemini().available().await, Availability::Available);
     }

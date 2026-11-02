@@ -437,7 +437,9 @@ async fn preview_is_the_prompt_and_withholds_a_marked_item() {
         .unwrap();
     let task = TaskType::DraftResume;
 
-    let preview = generate::preview(&w.db, task, &w.job.id).await.unwrap();
+    let preview = generate::preview(&w.db, task, &w.job.id, "claude_code")
+        .await
+        .unwrap();
 
     let basic = profile::basic(&w.db).await.unwrap();
     let evidence = knowledge::evidence(&w.db).await.unwrap();
@@ -457,7 +459,7 @@ async fn preview_is_the_prompt_and_withholds_a_marked_item() {
 #[tokio::test]
 async fn preview_refuses_a_task_that_is_not_a_draft() {
     let w = world().await;
-    let error = generate::preview(&w.db, TaskType::ParseJob, &w.job.id)
+    let error = generate::preview(&w.db, TaskType::ParseJob, &w.job.id, "claude_code")
         .await
         .unwrap_err();
     assert_eq!(error.code(), "validation");

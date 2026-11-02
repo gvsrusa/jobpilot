@@ -24,6 +24,7 @@ goto :scan
 :scanned
 if defined MOCK_GEMINI_SYSTEM_COPY copy /y "%GEMINI_SYSTEM_MD%" "%MOCK_GEMINI_SYSTEM_COPY%" >nul
 if defined MOCK_GEMINI_SETTINGS_COPY copy /y "%GEMINI_CLI_SYSTEM_SETTINGS_PATH%" "%MOCK_GEMINI_SETTINGS_COPY%" >nul
+if defined MOCK_GEMINI_STDERR type "%MOCK_GEMINI_STDERR%" 1>&2
 if defined MOCK_GEMINI_REPLY goto :reply
 echo {"type":"init","session_id":"s","model":"m"}
 echo {"type":"message","role":"user","content":"x"}

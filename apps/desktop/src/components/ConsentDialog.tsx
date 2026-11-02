@@ -45,10 +45,10 @@ const skipped = (reason: string) =>
   reason === "no_tools" ? "Skipped: this provider cannot prove it has no tools" : `Skipped: ${reason}`;
 
 /** The real prompt for the newest pasted posting, as inert text. Nothing is sent to build it. */
-function ExactPrompt() {
+function ExactPrompt({ provider }: { provider: string }) {
   const jobs = useQuery({ queryKey: ["jobs"], queryFn: ipc.jobList });
   const newest = jobs.data?.[0];
-  const preview = useMutation({ mutationFn: ipc.aiPreview });
+  const preview = useMutation({ mutationFn: (jobTextId: string) => ipc.aiPreview(jobTextId, provider) });
   if (jobs.isPending) return null;
   if (!newest) return <p className="text-sm text-muted-foreground">Paste a posting to see this.</p>;
   return (
@@ -160,7 +160,7 @@ function ConsentForm({ sharing, onClose }: { sharing: Sharing; onClose(): void }
                 </li>
               ))}
             </ul>
-            <ExactPrompt />
+            <ExactPrompt provider={sharing.name} />
           </div>
           <div className="grid gap-1 text-sm">
             <h3 className="font-medium">Where it goes</h3>

@@ -814,6 +814,7 @@ describe("ai", () => {
     consent: null,
     suspended: false,
     runs_job_text: true,
+    newer_than_checked: false,
     ...over,
   });
   const SUSPENDED_LINE =
@@ -1032,6 +1033,93 @@ describe("ai", () => {
     expect(codex.queryByText("Runs job text with every tool denied.")).toBeNull();
   });
 
+  it("a_cli_past_the_checked_version_says_so_and_no_hard_stop", async () => {
+    backend({
+      ai_status: () =>
+        aiWith({
+          external: [
+            external({
+              name: "gemini_cli",
+              label: "Gemini CLI",
+              kind: "cli",
+              available: true,
+              reason: null,
+              newer_than_checked: true,
+            }),
+          ],
+        }),
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "Gemini CLI" }));
+    expect(row.getByText("Runs job text with every tool denied.")).toBeInTheDocument();
+    expect(row.getByText("This version is newer than the one JobPilot checked.")).toBeInTheDocument();
+  });
+
+  it("the_gemini_row_says_the_cli_keeps_a_transcript", async () => {
+    backend({
+      ai_status: () =>
+        aiWith({
+          external: [
+            external({ name: "gemini_cli", label: "Gemini CLI", kind: "cli", reason: null, available: true }),
+            external({ name: "codex_cli", label: "Codex CLI", kind: "cli", runs_job_text: false }),
+          ],
+        }),
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const text = /keeps its own transcript of each prompt under ~\/\.gemini\/tmp, 30 days by default/;
+    expect(within(await screen.findByRole("listitem", { name: "Gemini CLI" })).getByText(text)).toBeInTheDocument();
+    expect(within(screen.getByRole("listitem", { name: "Codex CLI" })).queryByText(text)).toBeNull();
+  });
+
+  it("an_off_cli_past_the_quick_look_can_be_turned_on_and_comes_up", async () => {
+    let on = false;
+    const row = () =>
+      external({
+        name: "gemini_cli",
+        label: "Gemini CLI",
+        kind: "cli",
+        consent: ["job_text"],
+        available: on,
+        reason: on ? null : "not_searched",
+        path: on ? "/home/me/.nvm/bin/gemini" : null,
+      });
+    const b = backend({
+      ai_status: () => aiWith({ external: [row()], enabled: { ollama: true, claude_code: false, gemini_cli: on } }),
+      ai_enable: () => {
+        on = true;
+        return null;
+      },
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const shown = within(await screen.findByRole("listitem", { name: "Gemini CLI" }));
+    expect(shown.getByText("Unavailable: turn on to look for it")).toBeInTheDocument();
+    expect(shown.queryByText(/not installed/)).toBeNull();
+    const use = shown.getByLabelText("Use Gemini CLI");
+    expect(use).toBeEnabled();
+    await user.click(use);
+    expect(b.calls.find((c) => c.cmd === "ai_enable")?.args).toEqual({ provider: "gemini_cli", enabled: true });
+    expect(await screen.findByText("/home/me/.nvm/bin/gemini")).toBeInTheDocument();
+    expect(within(screen.getByRole("listitem", { name: "Gemini CLI" })).queryByText(/Unavailable/)).toBeNull();
+  });
+
+  it("the_account_refused_reason_is_a_hint_naming_antigravity", async () => {
+    resumeBackend({
+      resume_list: () => [],
+      ai_status: () =>
+        aiWith({ ollama: { state: "running", url: "http://127.0.0.1:11434", version: "1", models: [] } }),
+      resume_generate: () => {
+        throw { code: "failed", message: "failed: cli_account_refused" };
+      },
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    await user.click(await screen.findByRole("button", { name: "Generate" }));
+    expect(await screen.findByText(/may have moved to Antigravity CLI/)).toBeInTheDocument();
+  });
+
   it("a_cli_too_old_says_why", async () => {
     backend({
       ai_status: () =>
@@ -1227,7 +1315,7 @@ describe("ai", () => {
     expect(shown.tagName).toBe("PRE");
     expect(shown.textContent).toContain("<script>window.pwned = true</script>");
     expect(shown.querySelector("script, a")).toBeNull();
-    expect(b.calls.find((c) => c.cmd === "ai_preview")?.args).toEqual({ jobTextId: "j1" });
+    expect(b.calls.find((c) => c.cmd === "ai_preview")?.args).toEqual({ jobTextId: "j1", provider: "openai" });
     expect(count(b, "ai_consent_give")).toBe(0);
   });
 

@@ -13,6 +13,10 @@ export const ENDPOINT_SUSPENDED =
 // has to be told from a provider's own text.
 const REASONS: [word: string, text: string][] = [
   ["not_logged_in", "This CLI is not signed in. Run it once in your own terminal to sign in, then try again."],
+  [
+    "cli_account_refused",
+    "Gemini CLI refused this account. Its plan may have moved to Antigravity CLI, which JobPilot does not run. A paid Gemini API key in the CLI may work, or use another provider.",
+  ],
   ["cli_too_old", "The installed CLI is older than the version JobPilot checked. Update it, then try again."],
   [
     "prompt_too_large",

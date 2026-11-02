@@ -227,10 +227,10 @@ pub async fn ai(db: &Db, command: AiCommand) -> Result<Output> {
                 .external
                 .iter()
                 .map(|row| {
-                    let state = if row.available {
-                        "available"
-                    } else {
-                        row.reason.as_deref().unwrap_or("unavailable")
+                    let state = match row.reason.as_deref() {
+                        _ if row.available => "available",
+                        Some("not_searched") => "turn on to look for it",
+                        reason => reason.unwrap_or("unavailable"),
                     };
                     let word = if on(&row.name) { "enabled" } else { "disabled" };
                     let consent = consent_words(row.consent.as_deref(), row.suspended);
@@ -381,7 +381,7 @@ pub async fn ai(db: &Db, command: AiCommand) -> Result<Output> {
             let preview = match job {
                 Some(job) => {
                     let task = TaskType::DraftResume;
-                    Some(generate::preview(db, task, &job).await?)
+                    Some(generate::preview(db, task, &job, provider.name()).await?)
                 }
                 None => None,
             };

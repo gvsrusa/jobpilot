@@ -1321,7 +1321,16 @@ async fn availability_comes_from_settings_and_the_index_alone() {
             gemini.reason.as_deref(),
             gemini.path.as_deref()
         ),
-        (false, Some("not_installed"), None)
+        // Off, so the login shell was not asked; Windows has none to ask.
+        (
+            false,
+            Some(if cfg!(unix) {
+                "not_searched"
+            } else {
+                "not_installed"
+            }),
+            None
+        )
     );
 }
 

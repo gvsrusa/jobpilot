@@ -141,6 +141,7 @@ async fn detection_follows_the_override_then_the_setting_and_probes_only_enabled
         .find(|r| r.name == "gemini_cli")
         .unwrap();
     assert!(row.available, "{row:?}");
+    assert!(!row.newer_than_checked, "the mock is the evidence version");
 
     // The override outranks the setting, and must name the program too.
     set("JOBPILOT_CODEX_BIN", codex.as_os_str());
@@ -155,7 +156,7 @@ async fn detection_follows_the_override_then_the_setting_and_probes_only_enabled
         let slow = tmp.path().join("slow");
         std::fs::create_dir_all(&slow).unwrap();
         // By full path: `PATH` here holds nothing.
-        let script = "#!/bin/sh\n/bin/sleep 2\necho 0.40.0\n";
+        let script = "#!/bin/sh\n/bin/sleep 2\necho 0.41.0\n";
         for (file, provider, variable) in [
             (GEMINI_FILE, "gemini_cli", "JOBPILOT_GEMINI_BIN"),
             (CODEX_FILE, "codex_cli", "JOBPILOT_CODEX_BIN"),
@@ -167,11 +168,17 @@ async fn detection_follows_the_override_then_the_setting_and_probes_only_enabled
             ai::set_enabled(&db, provider, true).await.unwrap();
         }
         let clock = std::time::Instant::now();
-        ai::status(&db).await.unwrap();
+        let status = ai::status(&db).await.unwrap();
         assert!(
             clock.elapsed() < std::time::Duration::from_millis(3500),
             "probed one after the other: {:?}",
             clock.elapsed()
+        );
+        let row = |name: &str| status.external.iter().find(|r| r.name == name).unwrap();
+        assert!(row("gemini_cli").newer_than_checked, "0.41.0 passes 0.40.0");
+        assert!(
+            !row("codex_cli").newer_than_checked,
+            "Codex has no evidence version"
         );
         clear("JOBPILOT_GEMINI_BIN");
     }

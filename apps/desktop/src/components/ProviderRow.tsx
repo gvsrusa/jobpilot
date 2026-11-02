@@ -15,6 +15,7 @@ const UNAVAILABLE: Record<string, string> = {
   no_api_model: "no model chosen",
   no_endpoint: "no address set",
   not_installed: "not installed",
+  not_searched: "turn on to look for it",
   version_failed: "did not answer --version",
   no_answer: "did not answer in time",
   cli_too_old: "older than the version JobPilot checked",
@@ -188,6 +189,8 @@ export function ProviderRow(props: {
 }) {
   const { row, enabled } = props;
   const reason = row.reason ?? "";
+  // Turning it on is what runs the full search, so "not found yet" must not block that.
+  const lookOnUse = reason === "not_searched";
   return (
     <li aria-label={row.label} className="grid gap-2 border-t pt-2 text-sm first:border-t-0 first:pt-0">
       <div className="flex flex-wrap items-center gap-3">
@@ -201,6 +204,14 @@ export function ProviderRow(props: {
       {row.kind === "cli" && row.runs_job_text && (
         <p className="text-muted-foreground">Runs job text with every tool denied.</p>
       )}
+      {row.newer_than_checked && (
+        <p className="text-muted-foreground">This version is newer than the one JobPilot checked.</p>
+      )}
+      {row.name === "gemini_cli" && (
+        <p className="text-muted-foreground">
+          The CLI keeps its own transcript of each prompt under ~/.gemini/tmp, 30 days by default.
+        </p>
+      )}
       {row.kind !== "cli" && <ModelControls row={row} />}
       {row.kind !== "cli" && <KeyControls row={row} />}
       {row.name === "google" && <p className="text-muted-foreground">Free keys are not supported.</p>}
@@ -211,7 +222,7 @@ export function ProviderRow(props: {
             <input
               type="checkbox"
               checked={enabled}
-              disabled={!row.available}
+              disabled={!row.available && !lookOnUse}
               onChange={(e) => props.onUse(e.target.checked)}
             />
             {`Use ${row.label}`}

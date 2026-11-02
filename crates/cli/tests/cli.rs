@@ -589,6 +589,187 @@ fn gemini_cli_absent_shows_unavailable() {
     assert_eq!(row["path"], serde_json::Value::Null);
 }
 
+/// An nvm install under a GUI launch: only the login shell can find it, and the quick look an
+/// off row gets does not ask that shell. Turning it on must still reach it.
+#[cfg(unix)]
+#[test]
+fn an_off_cli_only_the_login_shell_finds_comes_up_once_enabled() {
+    use std::os::unix::fs::PermissionsExt;
+    // A real install in a system folder would be found, and started, instead of the mock.
+    let system = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"];
+    if system
+        .iter()
+        .any(|dir| Path::new(dir).join("gemini").exists())
+    {
+        eprintln!("skipped: a real gemini sits in a system folder");
+        return;
+    }
+    let (dir, home) = fresh_home();
+    let mock = Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/tests/mock-gemini/gemini");
+    let shell = dir.path().join("shell");
+    std::fs::write(&shell, format!("#!/bin/sh\necho '{}'\n", mock.display())).unwrap();
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let empty = dir.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    let empty = empty.to_str().unwrap();
+    let env = [
+        ("PATH", empty),
+        ("HOME", empty),
+        ("SHELL", shell.to_str().unwrap()),
+        ("NVM_DIR", empty),
+        ("VOLTA_HOME", empty),
+        ("FNM_DIR", empty),
+        ("FNM_MULTISHELL_PATH", empty),
+        ("JOBPILOT_GEMINI_BIN", ""),
+        ("JOBPILOT_CLAUDE_BIN", "not-a-path"),
+    ];
+    let row = || {
+        let status = stdout_json(&run_env(&home, &["ai", "status", "--json"], &env));
+        let rows = status["external"].as_array().unwrap();
+        rows.iter()
+            .find(|row| row["name"] == "gemini_cli")
+            .unwrap()
+            .clone()
+    };
+    let off = row();
+    assert_eq!(off["available"], false, "{off}");
+    assert_eq!(off["reason"], "not_searched", "{off}");
+
+    let text = run_env(&home, &["ai", "status"], &env);
+    let text = String::from_utf8_lossy(&text.stdout).to_string();
+    assert!(text.contains("turn on to look for it"), "{text}");
+    assert!(!text.contains("not_searched"), "{text}");
+
+    assert!(
+        run_env(&home, &["ai", "enable", "gemini_cli"], &env)
+            .status
+            .success()
+    );
+    let on = row();
+    assert_eq!(on["available"], true, "{on}");
+    assert_eq!(on["reason"], serde_json::Value::Null, "{on}");
+    assert_eq!(on["path"], mock.to_str().unwrap(), "{on}");
+}
+
+#[test]
+fn an_account_the_cli_refuses_gets_the_plan_hint() {
+    let (_dir, home) = fresh_home();
+    let (job, reply) = draftable(&home);
+    let bin = gemini_saying(&home, &reply);
+    let wrapper = Path::new(&bin);
+    let stderr = home.parent().unwrap().join("stderr.txt");
+    std::fs::write(&stderr, "at new IneligibleTierError (x.js:1:1)\n").unwrap();
+    let script = std::fs::read_to_string(wrapper).unwrap();
+    let refused = if cfg!(windows) {
+        script.replace(
+            "@echo off\r\n",
+            &format!(
+                "@echo off\r\nset MOCK_GEMINI_EXIT=1\r\nset MOCK_GEMINI_STDERR={}\r\n",
+                stderr.display()
+            ),
+        )
+    } else {
+        script.replace(
+            "#!/bin/sh\n",
+            &format!(
+                "#!/bin/sh\nexport MOCK_GEMINI_EXIT=1\nexport MOCK_GEMINI_STDERR='{}'\n",
+                stderr.display()
+            ),
+        )
+    };
+    std::fs::write(wrapper, refused).unwrap();
+    let env = [
+        ("JOBPILOT_GEMINI_BIN", bin.as_str()),
+        ("JOBPILOT_CLAUDE_BIN", "not-a-path"),
+    ];
+    for args in [
+        vec!["ai", "disable", "ollama"],
+        vec!["ai", "enable", "gemini_cli"],
+        vec![
+            "ai",
+            "consent",
+            "give",
+            "gemini_cli",
+            "--categories",
+            DRAFT_CONSENT,
+            "--attest",
+        ],
+    ] {
+        assert!(run_env(&home, &args, &env).status.success(), "{args:?}");
+    }
+    let refused = run_env(&home, &["resume", "generate", &job], &env);
+    assert!(!refused.status.success());
+    let text = stderr_text(&refused);
+    assert!(text.contains("Antigravity CLI"), "{text}");
+    assert!(text.contains("may"), "a hint, not a finding: {text}");
+}
+
+#[test]
+fn consent_show_prints_what_gemini_is_really_sent() {
+    let (_dir, home) = fresh_home();
+    let (job, _reply) = draftable(&home);
+    let env = [
+        ("JOBPILOT_GEMINI_BIN", "not-a-path"),
+        ("JOBPILOT_CLAUDE_BIN", "not-a-path"),
+    ];
+    let posting = home.parent().unwrap().join("at.txt");
+    std::fs::write(&posting, "Write to jobs@acme.com").unwrap();
+    let pasted = stdout_json(&run(
+        &home,
+        &[
+            "job",
+            "paste",
+            "At",
+            "--file",
+            posting.to_str().unwrap(),
+            "--json",
+        ],
+    ));
+    let pasted = pasted["id"].as_str().unwrap();
+    let args = [
+        "ai",
+        "consent",
+        "show",
+        "gemini_cli",
+        "--job",
+        pasted,
+        "--json",
+    ];
+    let shown = stdout_json(&run_env(&home, &args, &env));
+    let preview = &shown["preview"];
+    assert!(
+        preview["user"]
+            .as_str()
+            .unwrap()
+            .contains("jobs\\@acme.com"),
+        "{preview}"
+    );
+    assert!(
+        preview["system"]
+            .as_str()
+            .unwrap()
+            .contains("It must match this JSON Schema")
+    );
+
+    let args = [
+        "ai",
+        "consent",
+        "show",
+        "claude_code",
+        "--job",
+        pasted,
+        "--json",
+    ];
+    let shown = stdout_json(&run_env(&home, &args, &env));
+    assert!(
+        shown["preview"]["user"]
+            .as_str()
+            .unwrap()
+            .contains("jobs@acme.com")
+    );
+    let _ = job;
+}
+
 #[test]
 fn a_cli_too_old_or_signed_out_says_so_for_any_vendor() {
     let (_dir, home) = fresh_home();

@@ -81,8 +81,9 @@ async fn status_is_bounded_spawns_once_and_gives_a_probe_its_programs_folder() {
     // The first status pays a one-time start-up cost that is not the CLIs'.
     rows(&db).await;
     let (both, took) = rows(&db).await;
-    assert_eq!(both[0].1.as_deref(), Some("not_installed"));
-    assert_eq!(both[1].1.as_deref(), Some("not_installed"));
+    // Off and past the quick look: only turning it on asks the login shell.
+    assert_eq!(both[0].1.as_deref(), Some("not_searched"));
+    assert_eq!(both[1].1.as_deref(), Some("not_searched"));
     assert!(took < Duration::from_secs(4), "{took:?}");
     assert_eq!(
         lines(&shell_runs),
