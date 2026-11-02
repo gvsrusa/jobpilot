@@ -109,6 +109,8 @@ const REASONS: [word: string, text: string][] = [
   ["bad_feed", "The source answered in a shape JobPilot does not read, so nothing was stored."],
   ["needs_text", "That posting has no text to read. Import it with its text instead."],
   ["network", "The source could not be reached. Check the connection and try again."],
+  ["no_sources", "This company has no stored text to read yet. Import a posting or paste a note first."],
+  ["company_gone", "This company no longer exists, so nothing was saved."],
   ["no_ai", "No AI provider could take this task, so nothing was generated"],
   ["no_embedding_model", "No embedding model is set on the AI screen"],
 ];

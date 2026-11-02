@@ -476,6 +476,11 @@ pub async fn remove(db: &Db, actor: &str, id: &str) -> Result<()> {
         .bind(id)
         .execute(&mut *tx)
         .await?;
+    // A summary fact cites its job; with the job gone it cites nothing.
+    sqlx::query("DELETE FROM company_notes WHERE origin = 'model' AND source_ref = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query(
         "DELETE FROM job_texts WHERE (id = ?1 OR version_of = ?2) \
            AND NOT EXISTS (SELECT 1 FROM drafts WHERE job_text_id = job_texts.id) \

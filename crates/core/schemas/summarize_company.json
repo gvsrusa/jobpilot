@@ -6,10 +6,10 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["text", "src"],
+        "required": ["text", "source"],
         "properties": {
           "text": { "type": "string", "maxLength": 500 },
-          "src": { "type": "string", "maxLength": 500 }
+          "source": { "type": "string", "maxLength": 500 }
         },
         "additionalProperties": false
       }

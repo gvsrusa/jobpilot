@@ -270,6 +270,10 @@ fn source_reason(reason: &str) -> Option<&'static str> {
         }
         "needs_text" => "That posting has no text to read. Import it with its text instead.",
         "network" => "The source could not be reached. Check the connection and try again.",
+        "no_sources" => {
+            "This company has no stored text to read yet. Import a posting or paste a note first."
+        }
+        "company_gone" => "This company no longer exists, so nothing was saved.",
         _ => return None,
     })
 }
@@ -741,6 +745,13 @@ mod tests {
                 !takes_path || refused,
                 "takes a path, has no refused row: {path}"
             );
+        }
+    }
+
+    #[test]
+    fn the_research_reasons_read_in_plain_words() {
+        for word in ["no_sources", "company_gone"] {
+            assert!(super::source_reason(word).is_some(), "{word}");
         }
     }
 

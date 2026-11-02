@@ -1439,6 +1439,12 @@ describe("ai", () => {
     expect(said("endpoint_changed")).toMatch(/endpoint address changed/);
   });
 
+  it("the_research_reasons_read_in_plain_words", () => {
+    const said = (word: string) => explainReason({ code: "manual_required", message: `this needs manual work: ${word}` });
+    expect(said("no_sources")).toMatch(/no stored text/i);
+    expect(said("company_gone")).toMatch(/no longer exists/i);
+  });
+
   it("consent_focus_starts_on_cancel", async () => {
     consentBackend(null);
     const { user } = renderApp();

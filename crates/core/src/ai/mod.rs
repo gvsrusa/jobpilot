@@ -73,6 +73,8 @@ pub const RUN_REASONS: &[&str] = &[
     "bad_feed",
     "needs_text",
     "network",
+    "no_sources",
+    "company_gone",
 ];
 
 /// Absent capabilities are false: a declaration lists only what the provider proves.
