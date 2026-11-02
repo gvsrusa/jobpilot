@@ -186,6 +186,7 @@ async fn a_run_logs_each_state_in_order() {
             Ok(StepOutput {
                 provider: Some(ProviderId::NoAi),
                 categories: &[DataCategory::JobText],
+                dropped: 0,
             })
         })
     });

@@ -215,9 +215,21 @@ pub fn mentions_authorization(text: &str) -> bool {
     crate::drafts::states_authorization(super::capped(text))
 }
 
-/// Whether a skill name is really a right-to-work term, which no score may compare.
+/// Whether a skill name is really a right-to-work term, which no score may compare. A word
+/// with a dot and a letter after it (`Passport.js`) is a product's name, not the term.
 pub fn names_right_to_work(skill: &str) -> bool {
-    mentions_authorization(skill)
+    let product = |word: &str| {
+        word.char_indices().any(|(at, c)| {
+            c == '.'
+                && at > 0
+                && word[at + 1..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_alphabetic)
+        })
+    };
+    let kept: Vec<&str> = skill.split_whitespace().filter(|w| !product(w)).collect();
+    mentions_authorization(&kept.join(" "))
 }
 
 #[derive(Debug, Clone, PartialEq)]

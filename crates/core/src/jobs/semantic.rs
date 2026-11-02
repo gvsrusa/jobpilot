@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::pay::parse_pay;
-use super::rules::{Seniority, seniority_of};
+use super::rules::{Seniority, names_right_to_work, seniority_of};
 use super::{Job, PayPeriod, PayRange};
 use crate::ai::{Prompt, TaskType, spec};
 use crate::db::Db;
@@ -241,16 +241,87 @@ fn squash(text: &str) -> String {
         .join(" ")
 }
 
-/// Whether `needle` stands in `text` as a whole word, without regard to case or spacing.
+/// Where `needle` stands whole in the squashed `text`, as byte ranges of that squashed text.
 /// Symbols count, so `$70,000` is not `70,000`, and a letter or digit on either side means it
 /// is part of a longer word or figure. An empty needle stands nowhere.
-fn stands_in(needle: &str, text: &str) -> bool {
+fn whole(needle: &str, text: &str) -> (String, Vec<(usize, usize)>) {
     let (needle, text) = (squash(needle), squash(text));
     let edge = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric());
-    !needle.is_empty()
-        && text.match_indices(&needle).any(|(at, found)| {
-            edge(text[..at].chars().next_back()) && edge(text[at + found.len()..].chars().next())
-        })
+    let spots = if needle.is_empty() {
+        Vec::new()
+    } else {
+        text.match_indices(&needle)
+            .filter(|(at, found)| {
+                edge(text[..*at].chars().next_back())
+                    && edge(text[at + found.len()..].chars().next())
+            })
+            .map(|(at, found)| (at, at + found.len()))
+            .collect()
+    };
+    (text, spots)
+}
+
+fn stands_in(needle: &str, text: &str) -> bool {
+    !whole(needle, text).1.is_empty()
+}
+
+/// Whether the words just before are a `not`, a `no`, or a `non-`, within the same clause.
+fn negated(before: &str) -> bool {
+    if before.ends_with("non-") || before.ends_with("non ") {
+        return true;
+    }
+    let clause = before
+        .rsplit(['.', '!', '?', ';', ',', ':'])
+        .next()
+        .unwrap_or("");
+    clause
+        .split_whitespace()
+        .rev()
+        .take(2)
+        .any(|word| word == "not" || word == "no")
+}
+
+/// [`stands_in`], at least once with no negation before it.
+fn stands_plainly(word: &str, text: &str) -> bool {
+    let (text, spots) = whole(word, text);
+    spots.iter().any(|(at, _)| !negated(&text[..*at]))
+}
+
+/// The words that make a figure pay.
+const PAY_WORDS: [&str; 7] = [
+    "salary",
+    "compensation",
+    "pay",
+    "base",
+    "ote",
+    "wage",
+    "range",
+];
+
+/// Whether `stated` stands in the posting as one whole amount, in a sentence with a pay word:
+/// `$70,000` is not `$70,000,000`, and a funding round is not a salary.
+fn pay_stands_in(stated: &str, text: &str) -> bool {
+    let (text, spots) = whole(stated, text);
+    spots.into_iter().any(|(start, end)| {
+        let mut after = text[end..].chars();
+        let more = match (after.next(), after.next()) {
+            (Some(c), _) if c.is_ascii_digit() => true,
+            (Some(',' | '.'), Some(d)) => d.is_ascii_digit(),
+            _ => false,
+        };
+        let ends = |at: usize| {
+            let bytes = text.as_bytes();
+            matches!(bytes[at], b'.' | b'!' | b'?')
+                && bytes.get(at + 1).is_none_or(|next| *next == b' ')
+        };
+        let from = (0..start).rev().find(|at| ends(*at)).map_or(0, |at| at + 1);
+        let to = (end..text.len()).find(|at| ends(*at)).unwrap_or(text.len());
+        let sentence = &text[from..to];
+        let paid = sentence
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|word| PAY_WORDS.contains(&word));
+        !more && paid
+    })
 }
 
 /// Whether a job has no usable field yet, so a model may be asked. A job a person set, or a
@@ -274,19 +345,20 @@ pub fn merge_parsed(job: &Job, posting: &JobText, output: &Value) -> ParsedField
     // A model may set these two only with the posting's own word: a mode that hides a job from
     // a filter, or a level that moves a score, is never a guess.
     let said = |word: &str| stands_in(word, &posting.normalized);
+    let plain = |word: &str| stands_plainly(word, &posting.normalized);
     let work_mode = match reply.remote.as_str() {
-        "remote" if said("remote") => Some("remote"),
-        "hybrid" if said("hybrid") => Some("hybrid"),
-        "onsite" if said("onsite") || said("on-site") || said("on site") => Some("onsite"),
+        "remote" if plain("remote") => Some("remote"),
+        "hybrid" if plain("hybrid") => Some("hybrid"),
+        "onsite" if plain("onsite") || plain("on-site") || plain("on site") => Some("onsite"),
         _ => None,
     };
     let seniority = Some(reply.seniority.as_str())
-        .filter(|word| said(word))
+        .filter(|word| plain(word))
         .and_then(|word| seniority_of(word, ""));
     let mut skills: Vec<String> = Vec::new();
     let mut dropped = 0;
     for skill in reply.skills.iter().map(|skill| skill.trim()) {
-        if states_authorization(skill) {
+        if names_right_to_work(skill) {
             dropped += 1;
             continue;
         }
@@ -300,7 +372,7 @@ pub fn merge_parsed(job: &Job, posting: &JobText, output: &Value) -> ParsedField
         }
     }
     // The figure and its symbol or code must stand in the posting as written.
-    let pay = said(&reply.compensation)
+    let pay = pay_stands_in(&reply.compensation, &posting.normalized)
         .then(|| parse_pay(&reply.compensation))
         .flatten();
     ParsedFields {

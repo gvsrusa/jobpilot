@@ -105,6 +105,7 @@ impl<'r> MemoryWorkflow<'r> {
         Ok(StepOutput {
             provider,
             categories,
+            dropped: 0,
         })
     }
 

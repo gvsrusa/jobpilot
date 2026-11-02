@@ -78,6 +78,8 @@ pub(super) struct Change<'a> {
     pub provider: Option<&'a ProviderId>,
     pub categories: &'a [DataCategory],
     pub duration_ms: i64,
+    /// Model output the checks cut in this step. A count.
+    pub dropped: i64,
 }
 
 /// A run row as the runner needs it again.
@@ -115,6 +117,7 @@ struct LogColumns {
     provider: Option<String>,
     data_categories: String,
     outcome: String,
+    dropped: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -151,9 +154,9 @@ impl TryFrom<SummaryRow> for RunSummary {
 async fn log_row(tx: &mut sqlx::SqliteConnection, change: &Change<'_>) -> Result<()> {
     sqlx::query(concat!(
         "INSERT INTO agent_run_log (run_id, at, agent, step, state, duration_ms, provider, \
-         data_categories, outcome) VALUES (?, ",
+         data_categories, outcome, dropped) VALUES (?, ",
         now!(),
-        ", ?, ?, ?, ?, ?, ?, ?)"
+        ", ?, ?, ?, ?, ?, ?, ?, ?)"
     ))
     .bind(change.id)
     .bind(name(&change.agent)?)
@@ -163,6 +166,7 @@ async fn log_row(tx: &mut sqlx::SqliteConnection, change: &Change<'_>) -> Result
     .bind(change.provider.map(ToString::to_string))
     .bind(to_json(&change.categories)?)
     .bind(change.outcome)
+    .bind(change.dropped)
     .execute(tx)
     .await?;
     Ok(())
@@ -208,6 +212,7 @@ pub(super) async fn insert(
             provider: None,
             categories: &[],
             duration_ms: 0,
+            dropped: 0,
         },
     )
     .await?;
@@ -350,6 +355,7 @@ async fn leave_halted(
         provider: None,
         categories: &[],
         duration_ms: 0,
+        dropped: 0,
     };
     let detail = json!({ "agent": stored.agent });
     let mut tx = db.pool.begin().await?;
@@ -430,6 +436,7 @@ pub(super) async fn reap(db: &Db, stale: Duration) -> Result<usize> {
                 provider: None,
                 categories: &[],
                 duration_ms: 0,
+                dropped: 0,
             },
         )
         .await?;
@@ -464,7 +471,7 @@ pub(super) async fn summary(db: &Db, id: &str) -> Result<RunSummary> {
 
 pub(super) async fn log(db: &Db, id: &str) -> Result<Vec<LogRow>> {
     let rows: Vec<LogColumns> = sqlx::query_as(
-        "SELECT at, step, state, duration_ms, provider, data_categories, outcome \
+        "SELECT at, step, state, duration_ms, provider, data_categories, outcome, dropped \
          FROM agent_run_log WHERE run_id = ? ORDER BY seq",
     )
     .bind(id)
@@ -480,6 +487,7 @@ pub(super) async fn log(db: &Db, id: &str) -> Result<Vec<LogRow>> {
                 provider: row.provider,
                 data_categories: from_json(&row.data_categories)?,
                 outcome: row.outcome,
+                dropped: usize::try_from(row.dropped).unwrap_or(0),
             })
         })
         .collect()

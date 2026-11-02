@@ -692,12 +692,10 @@ async fn revise(db: &Db, id: &str, text: &knowledge::JobText, posting: &Posting)
         .bind(id)
         .fetch_one(&mut *tx)
         .await?;
-    // What a person or a model set stays: only the text and the links follow the source. A
-    // `rules` row goes back to `none`, so the rules read the new text afresh.
-    let (seq, title, company_name): (i64, String, String) = if matches!(
-        by.as_str(),
-        "user" | "model"
-    ) {
+    // What a person set stays: only the text and the links follow the source. A `rules` or
+    // `model` row came from the old text, so it goes back to `none` and the rules read the new
+    // text afresh; its evaluation goes with the score below.
+    let (seq, title, company_name): (i64, String, String) = if by == "user" {
         sqlx::query_as(concat!(
             "UPDATE jobs SET job_text_id = ?, url = ?, apply_url = ?, posted_on = ?, last_seen_at = ",
             now!(),
@@ -718,7 +716,7 @@ async fn revise(db: &Db, id: &str, text: &knowledge::JobText, posting: &Posting)
                 work_mode = ?, employment_type = ?, url = ?, apply_url = ?, posted_on = ?, \
                 pay_min = ?, pay_max = ?, pay_currency = ?, pay_period = ?, skills = ?, \
                 seniority = NULL, mentions_authorization = 0, dedupe_key = '', \
-                fields_by = CASE fields_by WHEN 'rules' THEN 'none' ELSE fields_by END, \
+                fields_by = CASE WHEN fields_by IN ('rules','model') THEN 'none' ELSE fields_by END, \
                 last_seen_at = ",
         now!(),
         " WHERE id = ? RETURNING seq"

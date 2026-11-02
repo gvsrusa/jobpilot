@@ -603,10 +603,10 @@ async fn stored(db: &Db, id: &str) -> (Option<String>, Option<String>, String, i
 }
 
 #[tokio::test]
-async fn a_changed_text_keeps_what_a_person_or_model_set_and_recomputes_rules() {
+async fn a_changed_text_keeps_what_a_person_set_and_recomputes_rules_and_model_fields() {
     let (_tmp, db) = open().await;
     let decl = connectors::find("remoteok").unwrap().decl();
-    for by in ["user", "model"] {
+    for by in ["user"] {
         let mut p = posting("Remote, Portugal", Some("PT"), "Needs 5+ years.");
         p.external_id = format!("keep-{by}");
         let Upserted::Added(id) = upsert_posting(&db, decl, "", None, &p).await.unwrap() else {
@@ -640,6 +640,62 @@ async fn a_changed_text_keeps_what_a_person_or_model_set_and_recomputes_rules() 
             .unwrap();
         assert_eq!(location, "Paris");
     }
+
+    // A model's fields came from the old text: they reset like the rules', and the evaluation
+    // goes with the score.
+    let mut p = posting(
+        "Remote, Portugal",
+        Some("PT"),
+        "Needs 5+ years. Uses Kubernetes.",
+    );
+    p.external_id = "modelled".into();
+    let Upserted::Added(id) = upsert_posting(&db, decl, "", None, &p).await.unwrap() else {
+        panic!("added")
+    };
+    sqlx::query(
+        "UPDATE jobs SET fields_by = 'model', country = 'FR', seniority = 'staff', \
+         skills = '[\"Kubernetes\"]', title = 'Old title' WHERE id = ?",
+    )
+    .bind(&id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO match_results (job_id, score, compared_weight, explanation, semantic, \
+         inputs, created_at) VALUES (?, 50, 1, '{}', '{}', '', 'now')",
+    )
+    .bind(&id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let mut changed = p.clone();
+    changed.raw = "Needs 1 year of experience. Uses Rust.".into();
+    changed.location = "Remote, Spain".into();
+    changed.country = Some("ES".into());
+    changed.title = "New title".into();
+    upsert_posting(&db, decl, "", None, &changed).await.unwrap();
+    let (country, seniority, fields_by, _) = stored(&db, &id).await;
+    assert_eq!(country.as_deref(), Some("ES"));
+    assert_eq!(seniority.as_deref(), Some("junior"));
+    assert_eq!(fields_by, "rules");
+    let (title, skills): (String, String) =
+        sqlx::query_as("SELECT title, skills FROM jobs WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(title, "New title");
+    assert!(
+        skills.contains("Rust") && !skills.contains("Kubernetes"),
+        "{skills}"
+    );
+    let evaluations: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM match_results WHERE job_id = ?")
+            .bind(&id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(evaluations, 0);
 
     let mut p = posting("", None, "Needs 5+ years.");
     p.external_id = "ruled".into();

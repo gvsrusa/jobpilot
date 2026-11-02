@@ -113,6 +113,7 @@ impl<'r> DraftWorkflow<'r> {
         let output = StepOutput {
             provider: Some(made.provider),
             categories: spec(self.task).categories,
+            dropped: 0,
         };
         *self.held() = Some(made);
         Ok(output)

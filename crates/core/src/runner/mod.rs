@@ -95,6 +95,8 @@ pub struct StepDef {
 pub struct StepOutput {
     pub provider: Option<ProviderId>,
     pub categories: &'static [DataCategory],
+    /// Model output the checks cut in this step, logged as a count.
+    pub dropped: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -274,6 +276,7 @@ pub struct LogRow {
     pub provider: Option<String>,
     pub data_categories: Vec<DataCategory>,
     pub outcome: String,
+    pub dropped: usize,
 }
 
 /// A run's bounds. Public only so tests can shorten them through [`start_with`].
@@ -473,6 +476,7 @@ impl Run<'_> {
                 provider: output.and_then(|output| output.provider.as_ref()),
                 categories: output.map_or(&[], |output| output.categories),
                 duration_ms: i64::try_from(self.clock.elapsed().as_millis()).unwrap_or(i64::MAX),
+                dropped: output.map_or(0, |output| i64::try_from(output.dropped).unwrap_or(0)),
             },
         )
         .await?;

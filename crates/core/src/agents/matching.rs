@@ -14,6 +14,7 @@ use crate::ai::{
     BoxFuture, CancellationToken, Capability, DataCategory, Outcome, TaskType, consent, spec,
 };
 use crate::db::Db;
+use crate::drafts::states_authorization;
 use crate::error::{Error, Result};
 use crate::jobs::semantic::{
     check_fit, keep_grounded, merge_parsed, needs_parsing, parse_job_prompt, semantic_prompt,
@@ -69,6 +70,8 @@ pub struct MatchReport {
     pub scored: usize,
     pub parsed: usize,
     pub evaluated: usize,
+    /// Model output the checks cut, over both model steps.
+    pub dropped: usize,
     pub reason: Option<String>,
 }
 
@@ -136,16 +139,19 @@ impl<'r> MatchingWorkflow<'r> {
         let since = now(db).await?;
         let result = self.parse_each(ctx).await;
         let asked = asked_since(db, &since, TaskType::ParseJob).await;
-        result?;
+        let dropped = result?;
         let (provider, categories) = asked?;
+        self.note(|done| done.dropped += dropped);
         Ok(StepOutput {
             provider,
             categories,
+            dropped,
         })
     }
 
-    async fn parse_each(&self, ctx: &Ctx<'_>) -> Result<()> {
+    async fn parse_each(&self, ctx: &Ctx<'_>) -> Result<usize> {
         let db = ctx.db;
+        let mut dropped = 0;
         for id in &self.job_ids {
             ctx.stop_point()?;
             let job = match jobs::get(db, id).await {
@@ -173,11 +179,12 @@ impl<'r> MatchingWorkflow<'r> {
                 Outcome::Cancelled => return Err(Error::Cancelled),
                 Outcome::ManualRequired { reason } | Outcome::Failed { reason } => {
                     self.stopped(&reason);
-                    return Ok(());
+                    return Ok(dropped);
                 }
             };
             ctx.stop_point()?;
             let fields = merge_parsed(&job, &posting, &output);
+            dropped += fields.dropped;
             match store_parsed(db, id, &fields).await {
                 Ok(()) => self.note(|done| done.parsed += usize::from(!fields.is_empty())),
                 Err(Error::NotFound) => continue,
@@ -185,7 +192,7 @@ impl<'r> MatchingWorkflow<'r> {
             }
             Self::saved(ctx, id)?;
         }
-        Ok(())
+        Ok(dropped)
     }
 
     /// The jobs to score: the ones asked for, or all that are unscored or stale.
@@ -233,7 +240,12 @@ impl<'r> MatchingWorkflow<'r> {
             return Ok(StepOutput::default());
         }
         let db = ctx.db;
-        let evidence = knowledge::evidence(db).await?;
+        // A line that states work authorization is never sent: with nothing else, no call is made.
+        let evidence: Vec<_> = knowledge::evidence(db)
+            .await?
+            .into_iter()
+            .filter(|item| !states_authorization(&item.body))
+            .collect();
         if evidence.is_empty() {
             self.stopped("no_evidence");
             return Ok(StepOutput::default());
@@ -241,11 +253,13 @@ impl<'r> MatchingWorkflow<'r> {
         let since = now(db).await?;
         let result = self.evaluate_each(ctx, &evidence).await;
         let asked = asked_since(db, &since, TaskType::SemanticMatch).await;
-        result?;
+        let dropped = result?;
         let (provider, categories) = asked?;
+        self.note(|done| done.dropped += dropped);
         Ok(StepOutput {
             provider,
             categories,
+            dropped,
         })
     }
 
@@ -253,8 +267,9 @@ impl<'r> MatchingWorkflow<'r> {
         &self,
         ctx: &Ctx<'_>,
         evidence: &[knowledge::KnowledgeItem],
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let db = ctx.db;
+        let mut dropped = 0;
         for id in &self.job_ids {
             ctx.stop_point()?;
             let job = match jobs::get(db, id).await {
@@ -276,7 +291,7 @@ impl<'r> MatchingWorkflow<'r> {
                 Outcome::Cancelled => return Err(Error::Cancelled),
                 Outcome::ManualRequired { reason } | Outcome::Failed { reason } => {
                     self.stopped(&reason);
-                    return Ok(());
+                    return Ok(dropped);
                 }
             };
             ctx.stop_point()?;
@@ -284,10 +299,11 @@ impl<'r> MatchingWorkflow<'r> {
                 Ok(semantic) => semantic,
                 Err(Error::Validation(_)) => {
                     self.stopped("unusable_reply");
-                    return Ok(());
+                    return Ok(dropped);
                 }
                 Err(other) => return Err(other),
             };
+            dropped += semantic.dropped;
             semantic.provider = provider.to_string();
             semantic.at = now(db).await?;
             match store_semantic(db, id, &semantic).await {
@@ -297,7 +313,7 @@ impl<'r> MatchingWorkflow<'r> {
             }
             Self::saved(ctx, id)?;
         }
-        Ok(())
+        Ok(dropped)
     }
 }
 

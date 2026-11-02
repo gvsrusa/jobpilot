@@ -1124,6 +1124,7 @@ describe("agents", () => {
     duration_ms: 12,
     provider: null,
     data_categories: [],
+    dropped: 0,
     outcome: "ok",
     ...over,
   });

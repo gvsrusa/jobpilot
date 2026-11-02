@@ -275,6 +275,7 @@ export type LogRow = {
   provider: string | null;
   data_categories: DataCategory[];
   outcome: string;
+  dropped: number;
 };
 
 export type RunDetail = { run: RunSummary; log: LogRow[] };
