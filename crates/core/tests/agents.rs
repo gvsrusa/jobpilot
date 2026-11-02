@@ -1746,6 +1746,31 @@ async fn a_name_that_states_authorization_is_stored_and_the_export_is_skipped_al
     assert_eq!(made.export_skipped, None);
 }
 
+/// The run's id is part of the insert, not a second statement after it.
+#[tokio::test]
+async fn a_version_is_written_with_its_run_id_in_one_statement() {
+    let w = world().await;
+    sqlx::query(
+        "CREATE TRIGGER no_update BEFORE UPDATE ON drafts BEGIN SELECT RAISE(ABORT, 'no'); END",
+    )
+    .execute(&w.db.pool)
+    .await
+    .unwrap();
+    let (provider, _) = script(
+        ProviderId::Ollama,
+        vec![resume_reply(BULLET, &[&w.item.id])],
+    );
+    agents::draft_resume(&w.db, &router_of(provider), "cli", &w.job.id, None, token())
+        .await
+        .unwrap();
+    let run = runner::list(&w.db, 1).await.unwrap().remove(0);
+    let (stored,): (Option<String>,) = sqlx::query_as("SELECT run_id FROM drafts")
+        .fetch_one(&w.db.pool)
+        .await
+        .unwrap();
+    assert_eq!(stored.as_deref(), Some(run.id.as_str()));
+}
+
 #[tokio::test]
 async fn a_blocked_draft_says_why_it_was_not_exported() {
     let w = world().await;
@@ -1763,59 +1788,76 @@ async fn a_blocked_draft_says_why_it_was_not_exported() {
     assert_eq!(made.export_skipped.as_deref(), Some("claims_blocked"));
 }
 
-/// A cancel that drops the export past its grace leaves the blocking thread running: the file
-/// still lands, so it still gets its audit row.
-#[tokio::test]
-async fn a_file_that_lands_after_a_dropped_export_is_audited() {
+/// A cancel that drops the export past its grace leaves the blocking job running: the file
+/// still lands, so it still gets its audit row. The runtime has one blocking thread and the
+/// test holds it, so the render is queued, and the export is dropped while it waits: no clock
+/// decides whether the export was cut short.
+#[test]
+fn a_file_that_lands_after_a_dropped_export_is_audited() {
     use jobpilot_core::drafts;
     use jobpilot_core::render::{Entry, ResumeDoc, Section};
-    let (_tmp, db) = open().await;
-    let entries = (0..300)
-        .map(|i| Entry {
-            title: format!("Role {i}"),
-            subtitle: "Company".into(),
-            dates: "2020 - 2021".into(),
-            bullets: (0..8)
-                .map(|b| format!("Did thing {i}.{b} in depth"))
-                .collect(),
-        })
-        .collect();
-    let doc = ResumeDoc {
-        name: "Ada".into(),
-        sections: vec![Section {
-            heading: "Experience".into(),
-            entries,
-        }],
-        ..ResumeDoc::default()
-    };
-    let draft = drafts::save_manual(&db, "resume", None, doc).await.unwrap();
-    let dropped = tokio::time::timeout(
-        Duration::from_millis(30),
-        drafts::export(
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (_tmp, db) = open().await;
+        let doc = ResumeDoc {
+            name: "Ada".into(),
+            sections: vec![Section {
+                heading: "Experience".into(),
+                entries: vec![Entry {
+                    title: "Role".into(),
+                    bullets: vec!["Did a thing".into()],
+                    ..Entry::default()
+                }],
+            }],
+            ..ResumeDoc::default()
+        };
+        let draft = drafts::save_manual(&db, "resume", None, doc).await.unwrap();
+
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let (held, holding) = tokio::sync::oneshot::channel::<()>();
+        let hold = tokio::task::spawn_blocking(move || {
+            held.send(()).ok();
+            gate.recv().ok();
+        });
+        holding.await.unwrap();
+
+        let exports = db.paths().exports();
+        let (started, render) = tokio::sync::oneshot::channel();
+        let export = drafts::export_signalling(
             &db,
             &draft.id,
             Template::Classic,
             ExportFormat::Pdf,
-            &db.paths().exports(),
+            &exports,
             "cli",
-        ),
-    )
-    .await;
-    assert!(dropped.is_err(), "the export was cut short");
+            Some(started),
+        );
+        // Dropped the moment the render is under way, queued behind the held thread.
+        tokio::select! {
+            _ = export => panic!("the export cannot finish while the thread is held"),
+            sent = render => sent.unwrap(),
+        }
 
-    wait_for("the file lands", async || {
-        std::fs::read_dir(db.paths().exports()).is_ok_and(|mut d| {
-            d.any(|f| f.is_ok_and(|f| f.path().extension().is_some_and(|e| e == "pdf")))
+        release.send(()).unwrap();
+        hold.await.unwrap();
+        wait_for("the file lands", async || {
+            std::fs::read_dir(db.paths().exports()).is_ok_and(|mut d| {
+                d.any(|f| f.is_ok_and(|f| f.path().extension().is_some_and(|e| e == "pdf")))
+            })
         })
-    })
-    .await;
-    wait_for("its audit row", async || {
-        count(
-            &db,
-            "SELECT count(*) FROM audit_log WHERE action = 'export'",
-        )
-        .await
-            == 1
-    })
-    .await;
+        .await;
+        wait_for("its audit row", async || {
+            count(
+                &db,
+                "SELECT count(*) FROM audit_log WHERE action = 'export'",
+            )
+            .await
+                == 1
+        })
+        .await;
+    });
 }

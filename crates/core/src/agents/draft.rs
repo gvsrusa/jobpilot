@@ -103,13 +103,12 @@ impl<'r> DraftWorkflow<'r> {
             return Ok(StepOutput::default());
         }
         let (db, router, actor, job) = (ctx.db, self.router, ctx.actor, &self.job_text_id);
-        let cancel = ctx.cancel.clone();
+        let (cancel, run) = (ctx.cancel.clone(), Some(ctx.run_id()));
         let made = if self.task == TaskType::DraftCoverLetter {
-            generate::cover_letter(db, router, actor, job, cancel).await?
+            generate::cover_letter_for(db, router, actor, job, run, cancel).await?
         } else {
-            generate::resume(db, router, actor, job, cancel).await?
+            generate::resume_for(db, router, actor, job, run, cancel).await?
         };
-        drafts::tag_run(db, &made.draft.id, ctx.run_id()).await?;
         ctx.save("draft", &made.draft.id)?;
         let output = StepOutput {
             provider: Some(made.provider.clone()),

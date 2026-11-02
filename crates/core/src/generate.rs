@@ -72,6 +72,18 @@ pub async fn resume(
     job_text_id: &str,
     cancel: CancellationToken,
 ) -> Result<Generated> {
+    resume_for(db, router, actor, job_text_id, None, cancel).await
+}
+
+/// As [`resume`], for the run `run_id`, whose id is written with the version.
+pub(crate) async fn resume_for(
+    db: &Db,
+    router: &Router,
+    actor: &str,
+    job_text_id: &str,
+    run_id: Option<&str>,
+    cancel: CancellationToken,
+) -> Result<Generated> {
     let task = TaskType::DraftResume;
     let reply = ask(db, router, actor, task, job_text_id, cancel).await?;
     let ResumeReply { mut doc, claims } = decode(&reply)?;
@@ -82,7 +94,7 @@ pub async fn resume(
             section.heading = display;
         }
     }
-    store(db, "resume", reply, doc, claims).await
+    store(db, "resume", run_id, reply, doc, claims).await
 }
 
 /// Fails as [`resume`] does.
@@ -93,12 +105,24 @@ pub async fn cover_letter(
     job_text_id: &str,
     cancel: CancellationToken,
 ) -> Result<Generated> {
+    cover_letter_for(db, router, actor, job_text_id, None, cancel).await
+}
+
+/// As [`cover_letter`], for the run `run_id`.
+pub(crate) async fn cover_letter_for(
+    db: &Db,
+    router: &Router,
+    actor: &str,
+    job_text_id: &str,
+    run_id: Option<&str>,
+    cancel: CancellationToken,
+) -> Result<Generated> {
     let task = TaskType::DraftCoverLetter;
     let reply = ask(db, router, actor, task, job_text_id, cancel).await?;
     let LetterReply { paragraphs } = decode(&reply)?;
     let texts: Vec<String> = paragraphs.iter().map(|p| p.text.clone()).collect();
     let doc = cover_letter_doc(&reply.basic.name, &contact(&reply.basic), &texts);
-    store(db, "cover_letter", reply, doc, paragraphs).await
+    store(db, "cover_letter", run_id, reply, doc, paragraphs).await
 }
 
 /// The fixed prompt for a drafting task. Takes [`ProfileBasic`], not `Profile`, so no
@@ -281,6 +305,7 @@ async fn lineage_of(db: &Db, kind: &str, job_text_id: &str) -> Result<Option<Str
 async fn store(
     db: &Db,
     kind: &str,
+    run_id: Option<&str>,
     reply: Reply,
     doc: ResumeDoc,
     claims: Vec<ClaimInput>,
@@ -295,18 +320,16 @@ async fn store(
         provider, posting, ..
     } = reply;
     let lineage = lineage_of(db, kind, &posting.id).await?;
-    let draft = drafts::create_version(
-        db,
+    let made = drafts::Made {
         kind,
-        lineage.as_deref(),
-        "generated",
-        &posting.title,
-        Some(&posting.id),
-        Some(&provider.to_string()),
-        doc,
-        claims,
-    )
-    .await?;
+        lineage_id: lineage.as_deref(),
+        origin: "generated",
+        title: &posting.title,
+        job_text_id: Some(&posting.id),
+        provider: Some(&provider.to_string()),
+        run_id,
+    };
+    let draft = drafts::create_version_for(db, made, doc, claims).await?;
     let stored = drafts::claims(db, &draft.id).await?;
     let blocked = stored.iter().filter(|claim| claim.status != "ok").count();
     Ok(Generated {

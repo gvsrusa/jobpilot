@@ -631,6 +631,8 @@ struct NewDraft<'a> {
     title: &'a str,
     job_text_id: Option<&'a str>,
     provider: Option<&'a str>,
+    /// The agent run that made a generated version, written with the row.
+    run_id: Option<&'a str>,
 }
 
 /// One statement picks the version and inserts it, so two writers cannot pick the same one.
@@ -639,10 +641,11 @@ async fn store(db: &Db, new: NewDraft<'_>, doc: &ResumeDoc, claims: &[Claim]) ->
     let mut tx = db.pool.begin().await?;
     let row: DraftRow = sqlx::query_as(concat!(
         "INSERT INTO drafts \
-         (id, kind, lineage_id, version, origin, title, job_text_id, provider, body, created_at) \
+         (id, kind, lineage_id, version, origin, title, job_text_id, provider, body, created_at, \
+         run_id) \
          SELECT lower(hex(randomblob(16))), ?1, coalesce(?2, lower(hex(randomblob(16)))), \
          coalesce(max(version), 0) + 1, ?3, ?4, ?5, ?6, ?7, \
-         strftime('%Y-%m-%dT%H:%M:%fZ', 'now') FROM drafts WHERE lineage_id = ?2 RETURNING ",
+         strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?8 FROM drafts WHERE lineage_id = ?2 RETURNING ",
         columns!()
     ))
     .bind(new.kind)
@@ -652,6 +655,7 @@ async fn store(db: &Db, new: NewDraft<'_>, doc: &ResumeDoc, claims: &[Claim]) ->
     .bind(new.job_text_id)
     .bind(new.provider)
     .bind(&body)
+    .bind(new.run_id)
     .fetch_one(&mut *tx)
     .await?;
     for claim in claims {
@@ -671,16 +675,6 @@ async fn store(db: &Db, new: NewDraft<'_>, doc: &ResumeDoc, claims: &[Claim]) ->
     }
     tx.commit().await?;
     row.into_draft()
-}
-
-/// Ties a version to the run that made it, so a repeated step can find it.
-pub(crate) async fn tag_run(db: &Db, draft_id: &str, run_id: &str) -> Result<()> {
-    sqlx::query("UPDATE drafts SET run_id = ? WHERE id = ?")
-        .bind(run_id)
-        .bind(draft_id)
-        .execute(&db.pool)
-        .await?;
-    Ok(())
 }
 
 /// The version a run already made, if any.
@@ -735,6 +729,45 @@ pub async fn create_version(
     doc: ResumeDoc,
     claims: Vec<ClaimInput>,
 ) -> Result<Draft> {
+    let made = Made {
+        kind,
+        lineage_id,
+        origin,
+        title,
+        job_text_id,
+        provider,
+        run_id: None,
+    };
+    create_version_for(db, made, doc, claims).await
+}
+
+/// What [`create_version`] takes besides the document and its claims, and the run that asked.
+pub(crate) struct Made<'a> {
+    pub kind: &'a str,
+    pub lineage_id: Option<&'a str>,
+    pub origin: &'a str,
+    pub title: &'a str,
+    pub job_text_id: Option<&'a str>,
+    pub provider: Option<&'a str>,
+    pub run_id: Option<&'a str>,
+}
+
+/// As [`create_version`], with the run's id written in the same transaction as the version.
+pub(crate) async fn create_version_for(
+    db: &Db,
+    made: Made<'_>,
+    doc: ResumeDoc,
+    claims: Vec<ClaimInput>,
+) -> Result<Draft> {
+    let Made {
+        kind,
+        lineage_id,
+        origin,
+        title,
+        job_text_id,
+        provider,
+        run_id,
+    } = made;
     check_kind(kind)?;
     let title = title.trim();
     if title.is_empty() || title.chars().count() > TITLE_LIMIT {
@@ -777,6 +810,7 @@ pub async fn create_version(
         title,
         job_text_id,
         provider,
+        run_id,
     };
     store(db, new, &doc, &checked).await
 }
@@ -1008,6 +1042,7 @@ pub async fn save_manual(
         title,
         job_text_id: latest.as_ref().and_then(|l| l.job_text_id.as_deref()),
         provider: latest.as_ref().and_then(|l| l.provider.as_deref()),
+        run_id: None,
     };
     store(db, new, &doc, &claims).await
 }
@@ -1111,6 +1146,21 @@ pub async fn export(
     out_dir: &Path,
     actor: &str,
 ) -> Result<PathBuf> {
+    export_signalling(db, draft_id, template, format, out_dir, actor, None).await
+}
+
+/// `export`, sending on `started` once the render is under way, so a test can drop the
+/// future at that exact point. `export` is the only production caller.
+#[doc(hidden)]
+pub async fn export_signalling(
+    db: &Db,
+    draft_id: &str,
+    template: Template,
+    format: ExportFormat,
+    out_dir: &Path,
+    actor: &str,
+    started: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<PathBuf> {
     let draft = get(db, draft_id).await?;
     if holds_generated_text(db, &draft).await? {
         // First, so sealed text that cannot be read refuses before `claims` looks past it.
@@ -1142,13 +1192,21 @@ pub async fn export(
         std::fs::create_dir_all(&out_dir)?;
         write_file(&target, &bytes)
     });
+    if let Some(started) = started {
+        started.send(()).ok();
+    }
     let detail = json!({ "version": draft.version, "format": format, "template": template });
     let (pool, who, id) = (db.pool.clone(), actor.to_owned(), draft.id.clone());
     let landed = tokio::spawn(async move {
         work.await
             .map_err(|_| Error::Failed("export_interrupted".into()))??;
         let mut conn = pool.acquire().await?;
-        audit::record_to(&mut *conn, &who, "export", Some(&id), detail).await
+        let row = audit::record_to(&mut *conn, &who, "export", Some(&id), detail).await;
+        if let Err(error) = &row {
+            // Nobody may be waiting on this any more, so say it here: the file is on disk.
+            eprintln!("export: the file was written but its audit row was not: {error}");
+        }
+        row
     });
     landed
         .await

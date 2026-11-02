@@ -97,8 +97,10 @@ impl<'r> MemoryWorkflow<'r> {
         let result = classify_pending(ctx.db, self.router, ctx.actor, ctx.cancel.clone()).await;
         // What left the machine is read from the router's own log, so a call that came back
         // unusable still counts: the text was sent.
-        let (provider, categories) = asked_since(ctx.db, &since).await?;
+        let asked = asked_since(ctx.db, &since).await;
+        // The classify error is the one to report: a log that cannot be read must not hide it.
         let classified = result?;
+        let (provider, categories) = asked?;
         self.note(|done| done.classified = classified);
         Ok(StepOutput {
             provider,

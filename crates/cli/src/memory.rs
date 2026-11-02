@@ -292,22 +292,22 @@ pub async fn memory(db: &Db, command: MemoryCommand) -> Result<Output> {
                 let shown = json!({ "claude_calls": plan.claude_calls, "pending": plan.pending });
                 return out(shown, text);
             }
+            if plan.claude_calls > 0 {
+                // Before the run, on stderr so a JSON reader still gets clean stdout.
+                eprintln!(
+                    "Making up to {} Claude calls, limit {}.",
+                    plan.claude_calls,
+                    memory::CLASSIFY_BATCH
+                );
+            }
             let done = with_interrupts(db, |cancel| {
                 agents::memory_refresh(db, &router, ACTOR, cancel)
             })
             .await?;
-            let mut text = String::new();
-            if plan.claude_calls > 0 {
-                text.push_str(&format!(
-                    "Making up to {} Claude calls, limit {}.\n",
-                    plan.claude_calls,
-                    memory::CLASSIFY_BATCH
-                ));
-            }
-            text.push_str(&format!(
+            let mut text = format!(
                 "Checked {}, raised {}, indexed {}",
                 done.classified.checked, done.classified.raised, done.embedded
-            ));
+            );
             if done.classified.skipped {
                 text.push_str("\nNo AI took this; classes come from the rules.");
             }
