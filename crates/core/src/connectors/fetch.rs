@@ -8,7 +8,7 @@ use std::time::Duration;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, RETRY_AFTER, USER_AGENT as UA};
 use reqwest::{Client, Url};
 
-use super::limit::{self, MAX_WAIT, Slot};
+use super::limit::{self, MAX_HOLD, MAX_WAIT, Slot};
 use super::{BodyKind, Connector, ConnectorDecl, Operation, Page, PageRequest, Target, gate};
 use crate::ai::CancellationToken;
 use crate::ai::net::{hosted_client, loopback_client, net, read_capped, retry_after};
@@ -96,10 +96,12 @@ impl Fetcher {
                     "connector request names a host its declaration does not".into(),
                 ));
             }
+            // The URL is checked before a slot is taken, since a refused one sends nothing.
+            let url = self.url(decl, &request)?;
             wait_for_slot(db, decl, request.host, cancel).await?;
             // A pause set during the wait still stops this request.
             pause::ensure_off(db).await?;
-            let sent = self.send(&request, cancel).await;
+            let sent = self.send(url, &request, cancel).await;
             match self
                 .classify(db, connector, target, &request, page, attempt, cancel, sent)
                 .await?
@@ -139,9 +141,11 @@ impl Fetcher {
         match reply.status {
             200 => {}
             429 | 503 => {
-                let wait = reply.retry_after;
+                let wait = reply.retry_after.map(|wait| wait.min(MAX_HOLD));
                 match wait {
                     Some(wait) if wait <= MAX_WAIT && !last => {
+                        // Stored first, so a second process waits out the same hold.
+                        limit::hold_off(db, decl, request.host, wait).await?;
                         sleep_polling(wait, cancel).await?;
                         return Ok(Step::Again);
                     }
@@ -178,8 +182,12 @@ impl Fetcher {
     }
 
     /// One request, bounded by [`REQUEST_TIMEOUT`] and ended at once by the token.
-    async fn send(&self, request: &PageRequest, cancel: &CancellationToken) -> Result<Reply> {
-        let url = self.url(request)?;
+    async fn send(
+        &self,
+        url: Url,
+        request: &PageRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Reply> {
         let work = async {
             tokio::time::timeout(REQUEST_TIMEOUT, self.get(url, request.expects))
                 .await
@@ -191,12 +199,37 @@ impl Fetcher {
         }
     }
 
-    fn url(&self, request: &PageRequest) -> Result<Url> {
-        let refused = || Error::Refused("not_loopback".into());
+    /// The URL that will be requested, held to the declaration: the built URL's own scheme and
+    /// host are checked, not the host the connector claimed, so a path such as `@evil.test/x`
+    /// or `//other.test/x` cannot move the request.
+    fn url(&self, decl: &ConnectorDecl, request: &PageRequest) -> Result<Url> {
+        let off_host = || Error::Validation("connector request leaves its declared host".into());
         match &self.origin {
-            Some(origin) => origin.join(&request.path).map_err(|_| refused()),
-            None => Url::parse(&format!("https://{}{}", request.host, request.path))
-                .map_err(|_| Error::Validation("connector path is not a path".into())),
+            Some(origin) => {
+                let url = origin
+                    .join(&request.path)
+                    .map_err(|_| Error::Refused("not_loopback".into()))?;
+                if url.origin() != origin.origin() {
+                    return Err(off_host());
+                }
+                Ok(url)
+            }
+            None => {
+                let url = Url::parse(&format!("https://{}{}", request.host, request.path))
+                    .map_err(|_| Error::Validation("connector path is not a path".into()))?;
+                let host_ok = url
+                    .host_str()
+                    .is_some_and(|host| decl.hosts.contains(&host));
+                let plain = url.scheme() == "https"
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.port().is_none();
+                if host_ok && plain && url.host_str() == Some(request.host) {
+                    Ok(url)
+                } else {
+                    Err(off_host())
+                }
+            }
         }
     }
 

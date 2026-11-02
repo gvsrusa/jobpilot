@@ -13,6 +13,8 @@ use crate::error::{Error, Result};
 
 /// The longest the fetcher sleeps for a slot. A longer wait is refused as `RateLimited`.
 pub const MAX_WAIT: Duration = Duration::from_secs(30);
+/// No reply holds a host for longer than a day, whatever its `Retry-After` says.
+pub const MAX_HOLD: Duration = Duration::from_secs(24 * 3600);
 
 const DAY_MS: i64 = 86_400_000;
 
@@ -80,8 +82,9 @@ pub async fn take_at(db: &Db, decl: &ConnectorDecl, host: &str, now_ms: i64) -> 
     Ok(Slot::Wait(Duration::from_millis(wait as u64)))
 }
 
-/// Keeps the host quiet for `wait` from now. It never shortens an earlier hold.
+/// Keeps the host quiet for `wait` from now, at most [`MAX_HOLD`]. It never shortens an earlier hold.
 pub async fn hold_off(db: &Db, decl: &ConnectorDecl, host: &str, wait: Duration) -> Result<()> {
+    let wait = wait.min(MAX_HOLD);
     let until = now_ms().saturating_add(i64::try_from(wait.as_millis()).unwrap_or(i64::MAX));
     sqlx::query(
         "INSERT INTO connector_limits (connector, host, not_before_ms) VALUES (?1, ?2, ?3) \

@@ -64,6 +64,8 @@ struct Test {
     decl: &'static ConnectorDecl,
     host: &'static str,
     kind: BodyKind,
+    /// A path that replaces `/feed?page=N`, for a request that tries to leave its host.
+    path: Option<&'static str>,
 }
 
 fn conn(decl: &'static ConnectorDecl) -> Test {
@@ -71,6 +73,7 @@ fn conn(decl: &'static ConnectorDecl) -> Test {
         decl,
         host: "lever.test",
         kind: BodyKind::Json,
+        path: None,
     }
 }
 
@@ -81,7 +84,9 @@ impl Connector for Test {
     fn request(&self, _: &Target, page: u32) -> Result<PageRequest> {
         Ok(PageRequest {
             host: self.host,
-            path: format!("/feed?page={page}"),
+            path: self
+                .path
+                .map_or_else(|| format!("/feed?page={page}"), str::to_string),
             expects: self.kind,
         })
     }
@@ -537,4 +542,75 @@ async fn a_reopen_keeps_the_limit() {
         limit::take(&db, &HOURLY, "h").await.unwrap(),
         Slot::Wait(_)
     ));
+}
+
+#[tokio::test]
+async fn a_path_cannot_move_the_request_to_another_host() {
+    let (_t, db) = open().await;
+    let hosted = Fetcher::hosted().unwrap();
+    for path in ["@evil.test/x", ".evil.test/x", ":80@evil.test/x"] {
+        let sneaky = Test {
+            path: Some(path),
+            ..conn(&FAST)
+        };
+        assert_eq!(
+            reason(go(&hosted, &db, &sneaky).await),
+            "validation",
+            "{path}"
+        );
+    }
+    let fake = Fake::start(vec![(FEED, ok())]);
+    let fetcher = Fetcher::for_test(&fake.url).unwrap();
+    let sneaky = Test {
+        path: Some("//other.test/x"),
+        ..conn(&FAST)
+    };
+    assert_eq!(reason(go(&fetcher, &db, &sneaky).await), "validation");
+    assert!(fake.paths().is_empty());
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM connector_limits")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "a refused URL takes no slot");
+}
+
+#[tokio::test]
+async fn a_huge_retry_after_holds_a_day_at_most() {
+    let (_t, db) = open().await;
+    let fake = Fake::start(vec![(
+        FEED,
+        reply(429, "text/plain", "").with_header("Retry-After", "99999999999999"),
+    )]);
+    let fetcher = Fetcher::for_test(&fake.url).unwrap();
+    let err = go(&fetcher, &db, &conn(&FAST)).await.unwrap_err();
+    assert!(
+        matches!(err, Error::RateLimited { retry_after: Some(d) } if d == Duration::from_secs(86_400))
+    );
+    let (_, not_before, _) = row(&db, "fast").await;
+    assert!(
+        not_before - now_ms() <= 86_400_000,
+        "{}",
+        not_before - now_ms()
+    );
+}
+
+#[tokio::test]
+async fn a_short_retry_after_is_stored_before_the_sleep() {
+    let (_t, db) = open().await;
+    let fake = Fake::start(vec![
+        (
+            FEED,
+            reply(429, "text/plain", "").with_header("Retry-After", "1"),
+        ),
+        (FEED, ok()),
+    ]);
+    let fetcher = Fetcher::for_test(&fake.url).unwrap();
+    let began = now_ms();
+    go(&fetcher, &db, &conn(&FAST)).await.unwrap();
+    let (_, not_before, _) = row(&db, "fast").await;
+    assert!(
+        not_before >= began + 900,
+        "the hold was stored: {}",
+        not_before - began
+    );
 }
