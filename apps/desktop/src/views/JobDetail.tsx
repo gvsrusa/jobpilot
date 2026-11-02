@@ -4,8 +4,11 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ErrorAlert } from "@/components/ErrorAlert";
 import { PageHeading } from "@/components/PageHeading";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { backendEnabled } from "@/lib/backend";
+import { explainReason } from "@/lib/reasons";
 import { ipc, type AuthNote, type Job, type JobDetail, type PayRange, type SourceStatus, type Stated } from "@/lib/ipc";
 import { useUiStore } from "@/lib/store";
 
@@ -149,6 +152,16 @@ export function JobDetailView({ id, onBack }: { id: string; onBack(): void }) {
     mutationFn: () => ipc.jobToApp(id),
     onSuccess: () => client.invalidateQueries({ queryKey: ["applications"] }),
   });
+  // Rust names the count of outside calls in its own dialog before it researches.
+  const research = useMutation({ mutationFn: () => ipc.jobResearch(job!.company_id!), onSettled: refresh });
+  const [note, setNote] = useState("");
+  const addNote = useMutation({
+    mutationFn: () => ipc.companyNoteAdd(job!.company_id!, note.trim()),
+    onSuccess: async () => {
+      setNote("");
+      await refresh();
+    },
+  });
   const open = useMutation({ mutationFn: () => ipc.jobOpen(id) });
   const split = useMutation({ mutationFn: () => ipc.jobSplit(id), onSettled: refresh });
   const remove = useMutation({
@@ -221,6 +234,20 @@ export function JobDetailView({ id, onBack }: { id: string; onBack(): void }) {
               )}
               <ErrorAlert error={evaluate.error} />
               <Evaluation detail={d} />
+              {job.company_id && backendEnabled(ai.data) && (
+                <div>
+                  <Button type="button" variant="outline" disabled={research.isPending} onClick={() => research.mutate()}>
+                    {research.isPending ? "Researching..." : "Research company"}
+                  </Button>
+                </div>
+              )}
+              <ErrorAlert error={research.error} />
+              {research.data && (
+                <p role="status">
+                  {`${research.data.sources} source(s) read, ${research.data.facts} fact(s) kept, ${research.data.dropped} dropped.`}
+                  {research.data.reason && ` Stopped: ${explainReason(research.data.reason) ?? research.data.reason}.`}
+                </p>
+              )}
               {d.group.length > 0 && (
                 <p>
                   Same job on {d.group.length} other {d.group.length === 1 ? "source" : "sources"}.{" "}
@@ -234,6 +261,24 @@ export function JobDetailView({ id, onBack }: { id: string; onBack(): void }) {
                   {`Company note (${n.origin}${n.source_ref ? `, from ${n.source_ref}` : ""}): ${n.text}`}
                 </p>
               ))}
+              {job.company_id && (
+                <form
+                  className="grid gap-1.5"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    addNote.mutate();
+                  }}
+                >
+                  <Label htmlFor="company-note">Company note</Label>
+                  <div className="flex gap-2">
+                    <Input id="company-note" value={note} onChange={(e) => setNote(e.target.value)} />
+                    <Button type="submit" variant="outline" disabled={addNote.isPending || note.trim() === ""}>
+                      Save note
+                    </Button>
+                  </div>
+                  <ErrorAlert error={addNote.error} />
+                </form>
+              )}
             </section>
             <section aria-labelledby="text-heading" className="grid content-start gap-2 text-sm">
               <h2 id="text-heading" className="font-semibold">

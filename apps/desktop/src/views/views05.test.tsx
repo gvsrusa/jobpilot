@@ -489,6 +489,51 @@ describe("Job detail", () => {
     expect(alert).toHaveTextContent("The rules score stands.");
   });
 
+  it("researches the company through job_research, and shows what it kept", async () => {
+    const { user, b } = await openDetail(job({ company_id: "c7" }), {}, {
+      job_research: () => ({ company_id: "c7", sources: 2, facts: 3, dropped: 1, reason: null }),
+    });
+    await user.click(screen.getByRole("button", { name: "Research company" }));
+    expect(await screen.findByText("2 source(s) read, 3 fact(s) kept, 1 dropped.")).toBeInTheDocument();
+    expect(b.calls.find((c) => c.cmd === "job_research")!.args).toEqual({ companyId: "c7" });
+  });
+
+  it("hides Research company with no company or no eligible provider", async () => {
+    await openDetail(job({ company_id: null, company: null }));
+    expect(screen.queryByRole("button", { name: "Research company" })).toBeNull();
+    expect(screen.queryByLabelText("Company note")).toBeNull();
+  });
+
+  it("hides Research company when no model is available, and still takes a note", async () => {
+    await openDetail(job({ company_id: "c7" }), {}, { ai_status: () => AI_OFF });
+    expect(screen.queryByRole("button", { name: "Research company" })).toBeNull();
+    expect(screen.getByLabelText("Company note")).toBeInTheDocument();
+  });
+
+  it("saves a company note with one field and a Save button", async () => {
+    const { user, b } = await openDetail(job({ company_id: "c7" }), {}, {
+      company_note_add: () => ({ id: "n1", text: "Series B", origin: "user", source_ref: null, provider: null, created_at: "t" }),
+    });
+    const save = screen.getByRole("button", { name: "Save note" });
+    expect(save).toBeDisabled();
+    await user.type(screen.getByLabelText("Company note"), "Series B");
+    await user.click(save);
+    await waitFor(() => expect(b.calls.find((c) => c.cmd === "company_note_add")!.args).toEqual({ companyId: "c7", text: "Series B" }));
+    await waitFor(() => expect(screen.getByLabelText("Company note")).toHaveValue(""));
+  });
+
+  it("tabs from Add AI evaluation to Research company, then the note field and Save", async () => {
+    const { user } = await openDetail(job({ company_id: "c7" }));
+    screen.getByRole("button", { name: "Add AI evaluation" }).focus();
+    await user.tab();
+    expect(screen.getByRole("button", { name: "Research company" })).toHaveFocus();
+    await user.tab();
+    expect(screen.getByLabelText("Company note")).toHaveFocus();
+    await user.type(screen.getByLabelText("Company note"), "x");
+    await user.tab();
+    expect(screen.getByRole("button", { name: "Save note" })).toHaveFocus();
+  });
+
   it("hides Add AI evaluation with no eligible provider", async () => {
     await openDetail(job(), {}, { ai_status: () => AI_OFF });
     expect(screen.queryByRole("button", { name: "Add AI evaluation" })).toBeNull();
