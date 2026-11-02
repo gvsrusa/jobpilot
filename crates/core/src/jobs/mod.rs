@@ -6,7 +6,9 @@ pub mod dedupe;
 pub mod geo;
 pub mod link;
 pub mod pay;
+pub mod prefs;
 pub mod rules;
+pub mod score;
 
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
@@ -18,6 +20,7 @@ use crate::documents::fts_query;
 use crate::error::{Error, Result};
 use crate::knowledge;
 use crate::pause;
+use crate::profile::{self, Stated};
 use crate::runner;
 
 use link::{LinkRoute, attribution_of, connector_of, route};
@@ -107,6 +110,8 @@ pub struct Job {
     pub last_seen_at: String,
     pub score: Option<i64>,
     pub stale: bool,
+    /// Fields a filter was asked about that this job does not state: `country`, `work_mode`.
+    pub not_stated: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -121,7 +126,6 @@ pub struct PastedJob {
 pub struct JobFilter {
     pub country: Option<String>,
     pub work_mode: Option<String>,
-    // ponytail: not applied until Task 8 reads pay.
     pub min_pay: Option<PayWish>,
     pub query: Option<String>,
     pub include_duplicates: bool,
@@ -145,7 +149,7 @@ macro_rules! select {
                 j.skills, j.fields_by, j.duplicate_of, \
                 (SELECT count(*) FROM jobs d WHERE d.duplicate_of = j.id) AS duplicates, \
                 json_array_length(t.findings) AS findings, j.first_seen_at, j.last_seen_at, \
-                m.score AS score \
+                m.score AS score, m.inputs AS inputs \
          FROM jobs j JOIN job_texts t ON t.id = j.job_text_id \
          LEFT JOIN companies c ON c.id = j.company_id \
          LEFT JOIN match_results m ON m.job_id = j.id "
@@ -180,10 +184,12 @@ struct JobRow {
     first_seen_at: String,
     last_seen_at: String,
     score: Option<i64>,
+    inputs: Option<String>,
 }
 
 impl JobRow {
-    fn into_job(self) -> Result<Job> {
+    /// The job, and the inputs its stored score was made from.
+    fn into_job(self) -> Result<(Job, Option<String>)> {
         let skills = serde_json::from_str(&self.skills)
             .map_err(|error| Error::Db(sqlx::Error::Decode(Box::new(error))))?;
         // A range with no stored period is shown with the period unknown: it is never guessed.
@@ -193,7 +199,8 @@ impl JobRow {
             currency: self.pay_currency,
             period: self.pay_period.as_deref().and_then(PayPeriod::from_column),
         });
-        Ok(Job {
+        let inputs = self.inputs;
+        let job = Job {
             id: self.id,
             job_text_id: self.job_text_id,
             connector: self.connector,
@@ -217,10 +224,29 @@ impl JobRow {
             first_seen_at: self.first_seen_at,
             last_seen_at: self.last_seen_at,
             score: self.score,
-            // ponytail: nothing marks a score stale until scoring exists (Task 8).
             stale: false,
-        })
+            not_stated: Vec::new(),
+        };
+        Ok((job, inputs))
     }
+}
+
+/// Rows to jobs, each score marked stale when its stored inputs differ from the current ones.
+async fn finish(db: &Db, rows: Vec<JobRow>) -> Result<Vec<Job>> {
+    let me = if rows.iter().any(|row| row.inputs.is_some()) {
+        Some(score::candidate(db).await?)
+    } else {
+        None
+    };
+    rows.into_iter()
+        .map(|row| {
+            let (mut job, inputs) = row.into_job()?;
+            if let (Some(me), Some(stored)) = (&me, inputs) {
+                job.stale = score::inputs_key(&job, me) != stored;
+            }
+            Ok(job)
+        })
+        .collect()
 }
 
 fn bad(message: &str) -> Error {
@@ -344,25 +370,66 @@ async fn store(
     Ok(())
 }
 
-/// Best score first, unscored last, then oldest first seen.
+/// Best score first, unscored last, then oldest first seen. A filter on country, work mode, or
+/// pay drops only a job that states something else: a job that does not state the field stays,
+/// marked in `not_stated`.
+// ponytail: country and pay are tested in Rust after the read, so the whole match set is read
+// before the limit applies; fine to a few thousand jobs.
 pub async fn list(db: &Db, filter: &JobFilter, limit: i64) -> Result<Vec<Job>> {
     let query = filter.query.as_deref().and_then(fts_query);
     let rows: Vec<JobRow> = sqlx::query_as(concat!(
         select!(),
-        "WHERE (?1 IS NULL OR j.country = ?1 COLLATE NOCASE) \
-           AND (?2 IS NULL OR j.work_mode = ?2) \
-           AND (?3 IS NULL OR j.seq IN (SELECT rowid FROM jobs_fts WHERE jobs_fts MATCH ?3)) \
-           AND (?4 OR j.duplicate_of IS NULL) \
-         ORDER BY m.score IS NULL, m.score DESC, j.first_seen_at, j.seq LIMIT ?5"
+        "WHERE (?1 IS NULL OR j.work_mode = ?1 OR j.work_mode IS NULL) \
+           AND (?2 IS NULL OR j.seq IN (SELECT rowid FROM jobs_fts WHERE jobs_fts MATCH ?2)) \
+           AND (?3 OR j.duplicate_of IS NULL) \
+         ORDER BY m.score IS NULL, m.score DESC, j.first_seen_at, j.seq"
     ))
-    .bind(filter.country.as_deref())
     .bind(filter.work_mode.as_deref())
     .bind(query)
     .bind(filter.include_duplicates)
-    .bind(limit.max(0))
     .fetch_all(&db.pool)
     .await?;
-    rows.into_iter().map(JobRow::into_job).collect()
+    let mut kept = Vec::new();
+    for mut job in finish(db, rows).await? {
+        if filter.work_mode.is_some() && job.work_mode.is_none() {
+            job.not_stated.push("work_mode");
+        }
+        if let Some(country) = filter.country.as_deref() {
+            match country_fit(&job, country) {
+                Some(false) => continue,
+                None => job.not_stated.push("country"),
+                Some(true) => {}
+            }
+        }
+        if let (Some(wish), Some(pay)) = (&filter.min_pay, &job.pay)
+            && matches!(pay::compare(pay, wish), pay::PayCompare::Below { .. })
+        {
+            continue;
+        }
+        kept.push(job);
+    }
+    kept.truncate(usize::try_from(limit.max(0)).unwrap_or(0));
+    Ok(kept)
+}
+
+/// Whether the job is in the country: `Some(true)` if its country is equal, it is a remote
+/// job open to anywhere, or its region holds the country; `Some(false)` if it states another
+/// place; `None` if it states none.
+fn country_fit(job: &Job, country: &str) -> Option<bool> {
+    let scope = geo::scope_of(&job.location);
+    if job.work_mode.as_deref() == Some("remote") && scope == geo::Scope::Anywhere {
+        return Some(true);
+    }
+    if let geo::Scope::Region(region) = scope
+        && geo::in_region(region, country)
+    {
+        return Some(true);
+    }
+    match &job.country {
+        Some(own) => Some(own.eq_ignore_ascii_case(country.trim())),
+        None if matches!(scope, geo::Scope::Region(_)) => Some(false),
+        None => None,
+    }
 }
 
 pub async fn get(db: &Db, id: &str) -> Result<Job> {
@@ -371,7 +438,7 @@ pub async fn get(db: &Db, id: &str) -> Result<Job> {
         .fetch_optional(&db.pool)
         .await?
         .ok_or(Error::NotFound)?;
-    row.into_job()
+    Ok(finish(db, vec![row]).await?.remove(0))
 }
 
 /// Removes the job, its score, and its search row. Its text goes too, every version of it,
@@ -785,7 +852,7 @@ pub async fn group(db: &Db, id: &str) -> Result<Vec<Job>> {
     .bind(lead)
     .fetch_all(&db.pool)
     .await?;
-    rows.into_iter().map(JobRow::into_job).collect()
+    finish(db, rows).await
 }
 
 #[derive(FromRow)]
@@ -882,4 +949,115 @@ pub async fn apply_rules(db: &Db, id: &str) -> Result<()> {
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// What the profile says about work authorization for the job's country. It is only shown: no
+/// score, filter, or draft step reads it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AuthNote {
+    /// The job states no country.
+    NoCountry,
+    /// The profile has no row for exactly this country.
+    NotStated { country: String },
+    Stated {
+        country: String,
+        authorized: Stated,
+        needs_sponsorship: Stated,
+    },
+    /// A row exists and the key that opens it is not available.
+    Locked,
+}
+
+pub async fn authorization_note(db: &Db, country: Option<&str>) -> Result<AuthNote> {
+    let Some(country) = country.map(str::trim).filter(|c| !c.is_empty()) else {
+        return Ok(AuthNote::NoCountry);
+    };
+    match crate::memory::authorization_for(db, country).await {
+        Ok(answer) if answer.stated => Ok(AuthNote::Stated {
+            country: answer.country,
+            authorized: answer.authorized,
+            needs_sponsorship: answer.needs_sponsorship,
+        }),
+        Ok(answer) => Ok(AuthNote::NotStated {
+            country: answer.country,
+        }),
+        Err(Error::Validation(_)) => Ok(AuthNote::NotStated {
+            country: country.to_ascii_uppercase(),
+        }),
+        Err(error) => profile::degraded(error).map(|_| AuthNote::Locked),
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JobDetail {
+    pub job: Job,
+    pub text: String,
+    pub findings: Vec<knowledge::Finding>,
+    pub explanation: Option<score::Explanation>,
+    // Replaced by `Semantic` in Task 9.
+    pub semantic: Option<serde_json::Value>,
+    pub group: Vec<Job>,
+    pub authorization: AuthNote,
+    /// The posting speaks of work authorization at all. Nothing reads its words.
+    pub mentions_authorization: bool,
+    // Replaced by `CompanyNote` in Task 10.
+    pub notes: Vec<serde_json::Value>,
+}
+
+pub async fn detail(db: &Db, id: &str) -> Result<JobDetail> {
+    let job = get(db, id).await?;
+    let text = knowledge::get_job_text(db, &job.job_text_id).await?;
+    let stored: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT explanation, semantic FROM match_results WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_optional(&db.pool)
+            .await?;
+    let parse = |raw: &str| {
+        serde_json::from_str::<serde_json::Value>(raw)
+            .map_err(|error| Error::Db(sqlx::Error::Decode(Box::new(error))))
+    };
+    let (explanation, semantic) = match stored {
+        Some((explanation, semantic)) => (
+            Some(
+                serde_json::from_str(&explanation)
+                    .map_err(|error| Error::Db(sqlx::Error::Decode(Box::new(error))))?,
+            ),
+            semantic.as_deref().map(parse).transpose()?,
+        ),
+        None => (None, None),
+    };
+    let flagged: i64 = sqlx::query_scalar("SELECT mentions_authorization FROM jobs WHERE id = ?")
+        .bind(&job.id)
+        .fetch_one(&db.pool)
+        .await?;
+    let notes: Vec<(String, String, Option<String>, String)> = match &job.company_id {
+        Some(company) => {
+            sqlx::query_as(
+                "SELECT text, origin, source_ref, created_at FROM company_notes \
+                 WHERE company_id = ? ORDER BY seq",
+            )
+            .bind(company)
+            .fetch_all(&db.pool)
+            .await?
+        }
+        None => Vec::new(),
+    };
+    Ok(JobDetail {
+        group: group(db, &job.id).await?,
+        authorization: authorization_note(db, job.country.as_deref()).await?,
+        mentions_authorization: flagged != 0,
+        notes: notes
+            .into_iter()
+            .map(|(text, origin, source_ref, at)| {
+                serde_json::json!({"text": text, "origin": origin, "source_ref": source_ref,
+                                   "created_at": at})
+            })
+            .collect(),
+        text: text.normalized,
+        findings: text.findings,
+        explanation,
+        semantic,
+        job,
+    })
 }

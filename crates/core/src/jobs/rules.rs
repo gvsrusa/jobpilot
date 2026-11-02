@@ -4,6 +4,7 @@
 use std::sync::LazyLock;
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 use super::PayRange;
 use super::geo::country_code;
@@ -11,7 +12,8 @@ use super::pay::parse_pay;
 
 const SKILLS: &str = include_str!("../../data/skills.txt");
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Seniority {
     Intern,
     Junior,
@@ -22,6 +24,20 @@ pub enum Seniority {
 }
 
 impl Seniority {
+    /// The level a stored form names.
+    pub fn parse(stored: &str) -> Option<Self> {
+        [
+            Self::Intern,
+            Self::Junior,
+            Self::Mid,
+            Self::Senior,
+            Self::Staff,
+            Self::Executive,
+        ]
+        .into_iter()
+        .find(|level| level.as_str() == stored)
+    }
+
     /// The stored form.
     pub fn as_str(self) -> &'static str {
         match self {

@@ -321,8 +321,19 @@ async fn list_filters_hides_duplicates_and_orders_by_score() {
         include_duplicates: true,
         ..Default::default()
     };
-    assert_eq!(list(&db, &pt, 50).await.unwrap()[0].id, low.id);
-    assert_eq!(list(&db, &pt, 50).await.unwrap().len(), 1);
+    // The two jobs that state neither country nor mode stay, marked; the one that states both
+    // is unmarked.
+    let kept = list(&db, &pt, 50).await.unwrap();
+    assert_eq!(kept.len(), 3);
+    let marked: Vec<bool> = kept.iter().map(|j| !j.not_stated.is_empty()).collect();
+    assert_eq!(marked, [true, false, true]);
+    assert_eq!(kept[1].id, low.id);
+    let de = JobFilter {
+        country: Some("DE".into()),
+        include_duplicates: true,
+        ..Default::default()
+    };
+    assert_eq!(list(&db, &de, 50).await.unwrap().len(), 2);
     assert_eq!(list(&db, &with, 1).await.unwrap().len(), 1);
     db.close().await;
 }

@@ -58,7 +58,7 @@ pub struct Exported {
 
 /// Settings core keeps for itself: what the router runs, and the recovery reminder's mark.
 /// The first has a command for each key, and the second is only ever core's to write.
-const OWNED_SETTINGS: &[&str] = &["ai.", "recovery_key_exported_"];
+const OWNED_SETTINGS: &[&str] = &["ai.", "jobs.", "recovery_key_exported_"];
 
 pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
