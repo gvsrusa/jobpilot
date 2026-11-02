@@ -271,6 +271,7 @@ fn every_agent_step_stays_in_its_set() {
                     step.name
                 );
             }
+            assert!(!step.needs.is_empty(), "{agent:?} {}", step.name);
         }
     }
 }
@@ -949,4 +950,397 @@ async fn list_is_newest_first_and_limited() {
     assert_eq!(runs[1].id, first.run_id);
     assert_eq!(runner::list(&db, 1).await.unwrap().len(), 1);
     assert_eq!(runner::get(&db, "x").await.unwrap_err().code(), "not_found");
+}
+
+fn hurried() -> Limits {
+    Limits::for_test(Duration::from_secs(5))
+}
+
+async fn age_and_reap(db: &Db) {
+    sqlx::query(
+        "UPDATE agent_runs SET heartbeat_at = \
+         strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-60 seconds')",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(runner::reap_stale(db).await.unwrap(), 1);
+}
+
+async fn run_id(db: &Db) -> String {
+    let (id,): (String,) = sqlx::query_as("SELECT id FROM agent_runs ORDER BY seq DESC")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    id
+}
+
+async fn cancel_audits(db: &Db) -> Vec<String> {
+    let rows = audit::recent(db, 100).await.unwrap();
+    rows.into_iter()
+        .filter(|row| row.action == "run_cancelled")
+        .map(|row| row.actor)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_cancel_in_the_last_step_leaves_the_run_completed() {
+    let (_tmp, db) = setup().await;
+    let workflow = script(Agent::Tracking, ONE, |ctx, _| {
+        Box::pin(async move {
+            agents::cancel_run(ctx.db, "gui", &run_id(ctx.db).await).await?;
+            Ok(StepOutput::default())
+        })
+    });
+    let done = runner::start(&db, "gui", &workflow, token()).await.unwrap();
+    assert_eq!(done.state, RunState::Completed);
+    assert!(!workflow.abandoned.load(Ordering::SeqCst));
+    assert!(cancel_audits(&db).await.is_empty(), "nothing was cancelled");
+    assert!(done.into_result().is_ok());
+}
+
+#[tokio::test]
+async fn a_token_fired_in_the_last_step_leaves_the_run_completed() {
+    let (_tmp, db) = setup().await;
+    let workflow = script(Agent::Tracking, ONE, |ctx, _| {
+        ctx.cancel.cancel();
+        Box::pin(async { Ok(StepOutput::default()) })
+    });
+    let done = runner::start(&db, "gui", &workflow, token()).await.unwrap();
+    assert_eq!(done.state, RunState::Completed);
+    assert!(!workflow.abandoned.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn a_deadline_passed_by_the_last_step_leaves_the_run_completed() {
+    let (_tmp, db) = setup().await;
+    let workflow = script(Agent::Tracking, ONE, |_, _| {
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Ok(StepOutput::default())
+        })
+    });
+    let limits = Limits::for_test(Duration::from_millis(10));
+    let done = runner::start_with(&db, "gui", &workflow, token(), limits)
+        .await
+        .unwrap();
+    assert_eq!(done.state, RunState::Completed);
+    assert_eq!(done.reason, None);
+}
+
+/// A deadline with a step still to go stays a timeout.
+#[tokio::test]
+async fn a_deadline_passed_with_a_step_left_fails() {
+    let (_tmp, db) = setup().await;
+    let workflow = script(Agent::Tracking, TWO, |_, _| {
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Ok(StepOutput::default())
+        })
+    });
+    let limits = Limits::for_test(Duration::from_millis(10));
+    let done = runner::start_with(&db, "gui", &workflow, token(), limits)
+        .await
+        .unwrap();
+    assert_eq!(done.state, RunState::Failed);
+    assert_eq!(done.reason.as_deref(), Some("timeout"));
+}
+
+/// Reaped under a live step, then resumed: same state, so only the generation tells them
+/// apart.
+#[tokio::test]
+async fn a_resume_stops_the_process_it_replaced() {
+    let (_tmp, db) = setup().await;
+    let calls = Arc::new(AtomicU32::new(0));
+    let count = calls.clone();
+    let old = token();
+    let watched = old.clone();
+    let workflow = script(Agent::Tracking, ONE, move |ctx, _| {
+        let call = count.fetch_add(1, Ordering::SeqCst);
+        let watched = watched.clone();
+        Box::pin(async move {
+            if call == 0 {
+                return until_stopped(ctx).await;
+            }
+            // Still active: the old process must stop on the generation, not on an ended row.
+            let clock = Instant::now();
+            while !watched.is_cancelled() && clock.elapsed() < Duration::from_secs(2) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(watched.is_cancelled(), "the old process kept running");
+            Ok(StepOutput::default())
+        })
+    });
+    let takeover = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        age_and_reap(&db).await;
+        let id = run_id(&db).await;
+        runner::resume(&db, "cli", &id, &workflow, token()).await
+    };
+    let clock = Instant::now();
+    let first = async {
+        let done = runner::start_with(&db, "gui", &workflow, old.clone(), hurried()).await;
+        (done, clock.elapsed())
+    };
+    let ((first, stopped_after), second) = tokio::join!(first, takeover);
+    assert!(old.is_cancelled());
+    assert!(stopped_after < Duration::from_secs(2), "{stopped_after:?}");
+    let first = first.unwrap();
+    assert_ne!(first.state, RunState::Failed, "it did not end the run");
+    let second = second.unwrap();
+    assert_eq!(second.state, RunState::Completed);
+    let states = log_states(&db, &second.run_id).await;
+    let ends = states.iter().filter(|s| s.is_terminal()).count();
+    assert_eq!(ends, 1, "{states:?}");
+    assert!(!workflow.abandoned.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn a_row_lost_under_a_step_fires_its_token() {
+    let (_tmp, db) = setup().await;
+    let workflow = script(Agent::Tracking, ONE, |ctx, _| Box::pin(until_stopped(ctx)));
+    let cancel = token();
+    let meddle = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        age_and_reap(&db).await;
+    };
+    let clock = Instant::now();
+    let (done, ()) = tokio::join!(
+        runner::start_with(&db, "gui", &workflow, cancel.clone(), hurried()),
+        meddle
+    );
+    let done = done.unwrap();
+    assert!(cancel.is_cancelled());
+    assert!(clock.elapsed() < Duration::from_secs(2));
+    assert_eq!(done.state, RunState::Halted);
+    assert_eq!(done.reason.as_deref(), Some("interrupted"));
+    assert!(
+        !workflow.abandoned.load(Ordering::SeqCst),
+        "not this run's to drop"
+    );
+}
+
+/// The step ends cancelled before any poll saw the loss.
+#[tokio::test]
+async fn a_cancel_on_a_lost_run_abandons_nothing() {
+    let (_tmp, db) = setup().await;
+    let workflow = script(Agent::Tracking, ONE, |ctx, _| {
+        Box::pin(async move {
+            age_and_reap(ctx.db).await;
+            Err(Error::Cancelled)
+        })
+    });
+    let done = runner::start(&db, "gui", &workflow, token()).await.unwrap();
+    assert_eq!(done.state, RunState::Halted);
+    assert!(!workflow.abandoned.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn a_heartbeat_advances_while_a_step_runs() {
+    let (_tmp, db) = setup().await;
+    let workflow = script(Agent::Tracking, ONE, |ctx, _| {
+        Box::pin(async move {
+            let read = || async {
+                let (at,): (String,) = sqlx::query_as("SELECT heartbeat_at FROM agent_runs")
+                    .fetch_one(&ctx.db.pool)
+                    .await
+                    .unwrap();
+                at
+            };
+            let before = read().await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert!(read().await > before);
+            Ok(StepOutput::default())
+        })
+    });
+    let done = runner::start_with(&db, "gui", &workflow, token(), hurried())
+        .await
+        .unwrap();
+    assert_eq!(done.state, RunState::Completed);
+}
+
+/// With a fresh beat a row is not stale, however short the limit.
+#[tokio::test]
+async fn a_beat_keeps_a_long_step_from_being_reaped() {
+    let (_tmp, db) = setup().await;
+    let workflow = script(Agent::Tracking, ONE, |ctx, _| {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(900)).await;
+            assert_eq!(ctx.saved("x"), None);
+            Ok(StepOutput::default())
+        })
+    });
+    let other = script(Agent::Analytics, ONE, |_, _| {
+        Box::pin(async { Ok(StepOutput::default()) })
+    });
+    let bystander = async {
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let limits = hurried().with_stale(Duration::from_millis(500));
+        runner::start_with(&db, "cli", &other, token(), limits)
+            .await
+            .unwrap();
+    };
+    let (done, ()) = tokio::join!(
+        runner::start_with(&db, "gui", &workflow, token(), hurried()),
+        bystander
+    );
+    assert_eq!(done.unwrap().state, RunState::Completed);
+}
+
+#[tokio::test]
+async fn starting_a_run_reaps_a_dead_row() {
+    let (_tmp, db) = setup().await;
+    let dead = "aa".repeat(16);
+    seed_row(&db, &dead, "running", "-60 seconds").await;
+    let workflow = script(Agent::Tracking, ONE, |_, _| {
+        Box::pin(async { Ok(StepOutput::default()) })
+    });
+    runner::start(&db, "gui", &workflow, token()).await.unwrap();
+    let (state,): (String,) = sqlx::query_as("SELECT state FROM agent_runs WHERE id = ?")
+        .bind(&dead)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "halted");
+}
+
+#[tokio::test]
+async fn a_stale_limit_decides_what_counts_as_dead() {
+    let (_tmp, db) = setup().await;
+    let dead = "aa".repeat(16);
+    seed_row(&db, &dead, "running", "-5 seconds").await;
+    let workflow = script(Agent::Tracking, ONE, |_, _| {
+        Box::pin(async { Ok(StepOutput::default()) })
+    });
+    let limits = hurried().with_stale(Duration::from_secs(1));
+    runner::start_with(&db, "gui", &workflow, token(), limits)
+        .await
+        .unwrap();
+    let (state,): (String,) = sqlx::query_as("SELECT state FROM agent_runs WHERE id = ?")
+        .bind(&dead)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "halted");
+}
+
+#[tokio::test]
+async fn a_second_cancel_is_quiet_and_audits_once() {
+    let (_tmp, db) = setup().await;
+    let workflow = script(Agent::Tracking, ONE, |ctx, _| {
+        Box::pin(async move {
+            let id = run_id(ctx.db).await;
+            agents::cancel_run(ctx.db, "cli", &id).await?;
+            agents::cancel_run(ctx.db, "gui", &id).await?;
+            until_stopped(ctx).await
+        })
+    });
+    let done = runner::start_with(&db, "gui", &workflow, token(), hurried())
+        .await
+        .unwrap();
+    assert_eq!(done.state, RunState::Cancelled);
+    assert_eq!(cancel_audits(&db).await, ["cli"]);
+}
+
+#[tokio::test]
+async fn a_cancelled_token_alone_writes_no_cancel_audit() {
+    let (_tmp, db) = setup().await;
+    let workflow = script(Agent::Tracking, ONE, |_, _| {
+        Box::pin(async { Ok(StepOutput::default()) })
+    });
+    let cancel = token();
+    cancel.cancel();
+    let done = runner::start(&db, "gui", &workflow, cancel).await.unwrap();
+    assert_eq!(done.state, RunState::Cancelled);
+    assert!(cancel_audits(&db).await.is_empty());
+}
+
+#[tokio::test]
+async fn an_interrupted_run_is_not_called_paused() {
+    let finished = |reason: &str| runner::Finished {
+        run_id: ID.into(),
+        state: RunState::Halted,
+        reason: Some(reason.into()),
+        saved: runner::Checkpoint::default(),
+        error: None,
+    };
+    assert!(matches!(
+        finished("paused").into_result(),
+        Err(Error::Paused)
+    ));
+    assert!(matches!(
+        finished("interrupted").into_result(),
+        Err(Error::Failed(reason)) if reason == "interrupted"
+    ));
+}
+
+/// Another process holds the row, still active: this one has no state of its own to report.
+#[tokio::test]
+async fn a_run_taken_over_says_so() {
+    let (_tmp, db) = setup().await;
+    let workflow = script(Agent::Tracking, ONE, |ctx, _| {
+        Box::pin(async move {
+            let id = run_id(ctx.db).await;
+            age_and_reap(ctx.db).await;
+            sqlx::query(
+                "UPDATE agent_runs SET state = 'running', reason = NULL, \
+                 generation = generation + 1 WHERE id = ?",
+            )
+            .bind(id)
+            .execute(&ctx.db.pool)
+            .await?;
+            Ok(StepOutput::default())
+        })
+    });
+    let done = runner::start(&db, "gui", &workflow, token()).await.unwrap();
+    assert_eq!(done.reason.as_deref(), Some("taken_over"));
+    assert!(matches!(
+        done.into_result(),
+        Err(Error::Failed(reason)) if reason == "taken_over"
+    ));
+}
+
+#[tokio::test]
+async fn a_cancel_is_checked_before_a_retry() {
+    let (_tmp, db) = setup().await;
+    let calls = Arc::new(AtomicU32::new(0));
+    let count = calls.clone();
+    let workflow = script(Agent::Tracking, TWICE, move |ctx, _| {
+        count.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            agents::cancel_run(ctx.db, "gui", &run_id(ctx.db).await).await?;
+            Err(busy("5"))
+        })
+    });
+    let done = runner::start(&db, "gui", &workflow, token()).await.unwrap();
+    assert_eq!(done.state, RunState::Cancelled);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// The row stays active with no gap between states, so only the generation can tell.
+#[tokio::test]
+async fn a_newer_generation_fires_the_token_of_the_old_process() {
+    let (_tmp, db) = setup().await;
+    let workflow = script(Agent::Tracking, ONE, |ctx, _| Box::pin(until_stopped(ctx)));
+    let cancel = token();
+    let meddle = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        sqlx::query("UPDATE agent_runs SET generation = generation + 1")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    };
+    let clock = Instant::now();
+    let (done, ()) = tokio::join!(
+        runner::start_with(&db, "gui", &workflow, cancel.clone(), hurried()),
+        meddle
+    );
+    assert!(
+        clock.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        clock.elapsed()
+    );
+    assert!(cancel.is_cancelled());
+    assert_eq!(done.unwrap().reason.as_deref(), Some("taken_over"));
+    assert!(!workflow.abandoned.load(Ordering::SeqCst));
 }

@@ -53,7 +53,8 @@ pub async fn analytics_report(db: &Db, actor: &str, cancel: CancellationToken) -
 }
 
 /// Rebuilds the workflow from the stored input. Tracking's note is not stored, so a resumed
-/// update carries an empty one.
+/// update carries an empty one. A status moved on since the run began is refused, because
+/// a resume must not rewind it: the run stays halted, for the person to cancel.
 pub async fn resume_run(
     db: &Db,
     _router: &Router,
@@ -61,12 +62,22 @@ pub async fn resume_run(
     run_id: &str,
     cancel: CancellationToken,
 ) -> Result<Finished> {
-    match store::load(db, run_id).await?.input {
+    let stored = store::load(db, run_id).await?;
+    match stored.input {
         RunInput::Tracking {
             application_id,
             status,
             on,
         } => {
+            let current = applications::get(db, &application_id).await?;
+            if current.status != status
+                && applications::status_changed_since(db, &application_id, &stored.created_at)
+                    .await?
+            {
+                return Err(Error::Validation(
+                    "this application's status changed after the run began; cancel the run".into(),
+                ));
+            }
             let workflow = Tracking {
                 application_id,
                 status,
@@ -96,7 +107,7 @@ pub async fn cancel_run(db: &Db, actor: &str, run_id: &str) -> Result<()> {
     } else if stored.state.is_terminal() {
         false
     } else {
-        store::request_cancel(db, actor, run_id, stored.agent).await?
+        store::request_cancel(db, actor, run_id).await?
     };
     if moved {
         Ok(())

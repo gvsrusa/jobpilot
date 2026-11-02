@@ -1,9 +1,11 @@
 //! All of the runner's SQL. A state change and its log row share one transaction, and it
-//! lands only from the state the writer last saw: a run reaped or claimed by another handle
-//! is not written over.
+//! lands only from the state and generation the writer last saw. So a run reaped by another
+//! handle, or resumed by one and running again, is not written over.
 
 // ponytail: runs and logs are never pruned. A run writes a few rows and export reads them
 // all into memory, so add retention past 100,000 rows.
+
+use std::time::Duration;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -65,6 +67,9 @@ pub(super) struct Change<'a> {
     pub agent: Agent,
     pub from: RunState,
     pub to: RunState,
+    pub generation: i64,
+    /// A resume: the next process owns the run from here.
+    pub bump: bool,
     pub step: i64,
     pub step_name: &'a str,
     pub checkpoint: &'a Checkpoint,
@@ -83,6 +88,8 @@ pub(crate) struct Stored {
     pub steps: i64,
     pub reason: Option<String>,
     pub checkpoint: Checkpoint,
+    pub generation: i64,
+    pub created_at: String,
     pub input: RunInput,
 }
 
@@ -94,6 +101,8 @@ struct StoredRow {
     steps: i64,
     reason: Option<String>,
     checkpoint: String,
+    generation: i64,
+    created_at: String,
     input: String,
 }
 
@@ -189,6 +198,8 @@ pub(super) async fn insert(
             agent,
             from: RunState::Queued,
             to: RunState::Queued,
+            generation: 0,
+            bump: false,
             step: 0,
             step_name: RUN_STEP,
             checkpoint: &Checkpoint::default(),
@@ -204,31 +215,48 @@ pub(super) async fn insert(
     Ok(id)
 }
 
-/// False when the run is no longer in `from`: nothing was written.
+/// False when the run is no longer this process's: nothing was written. A run ending
+/// `cancelled` because a person asked is audited here, under who asked. A token alone is
+/// the caller's own stop, not a person's act on a run.
 pub(super) async fn transition(db: &Db, change: &Change<'_>) -> Result<bool> {
     let mut tx = db.pool.begin().await?;
     let moved = transition_in(&mut tx, change).await?;
-    if moved {
-        tx.commit().await?;
+    if !moved {
+        return Ok(false);
     }
-    Ok(moved)
+    if change.to == RunState::Cancelled {
+        let asked: Option<String> =
+            sqlx::query_scalar("SELECT cancel_actor FROM agent_runs WHERE id = ?")
+                .bind(change.id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if let Some(actor) = asked {
+            let detail = json!({ "agent": change.agent });
+            audit::record_to(&mut *tx, &actor, "run_cancelled", Some(change.id), detail).await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(true)
 }
 
 async fn transition_in(tx: &mut sqlx::SqliteConnection, change: &Change<'_>) -> Result<bool> {
     let moved = sqlx::query(concat!(
-        "UPDATE agent_runs SET state = ?, step = ?, checkpoint = ?, reason = ?, heartbeat_at = ",
+        "UPDATE agent_runs SET state = ?, step = ?, checkpoint = ?, reason = ?, \
+         generation = generation + ?, heartbeat_at = ",
         now!(),
         ", finished_at = CASE WHEN ? THEN ",
         now!(),
-        " END WHERE id = ? AND state = ?"
+        " END WHERE id = ? AND state = ? AND generation = ?"
     ))
     .bind(name(&change.to)?)
     .bind(change.step)
     .bind(to_json(change.checkpoint)?)
     .bind(change.reason)
+    .bind(i64::from(change.bump))
     .bind(change.to.is_terminal())
     .bind(change.id)
     .bind(name(&change.from)?)
+    .bind(change.generation)
     .execute(&mut *tx)
     .await?;
     if moved.rows_affected() == 0 {
@@ -238,18 +266,32 @@ async fn transition_in(tx: &mut sqlx::SqliteConnection, change: &Change<'_>) -> 
     Ok(true)
 }
 
-/// False when the run has stopped being active under this process.
-pub(super) async fn heartbeat(db: &Db, id: &str) -> Result<bool> {
+/// False when the run has stopped being this process's.
+pub(super) async fn heartbeat(db: &Db, id: &str, generation: i64) -> Result<bool> {
     let beat = sqlx::query(concat!(
         "UPDATE agent_runs SET heartbeat_at = ",
         now!(),
-        " WHERE id = ? AND state IN ",
+        " WHERE id = ? AND generation = ? AND state IN ",
         active!()
     ))
     .bind(id)
+    .bind(generation)
     .execute(&db.pool)
     .await?;
     Ok(beat.rows_affected() == 1)
+}
+
+/// Whether the row is still as this process last wrote it.
+pub(super) async fn owns(db: &Db, id: &str, state: RunState, generation: i64) -> Result<bool> {
+    let held: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM agent_runs WHERE id = ? AND state = ? AND generation = ?",
+    )
+    .bind(id)
+    .bind(name(&state)?)
+    .bind(generation)
+    .fetch_optional(&db.pool)
+    .await?;
+    Ok(held.is_some())
 }
 
 pub(super) async fn cancel_requested(db: &Db, id: &str) -> Result<bool> {
@@ -263,7 +305,8 @@ pub(super) async fn cancel_requested(db: &Db, id: &str) -> Result<bool> {
 
 pub(crate) async fn load(db: &Db, id: &str) -> Result<Stored> {
     let row: Option<StoredRow> = sqlx::query_as(
-        "SELECT agent, state, step, steps, reason, checkpoint, input FROM agent_runs WHERE id = ?",
+        "SELECT agent, state, step, steps, reason, checkpoint, generation, created_at, input \
+         FROM agent_runs WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&db.pool)
@@ -276,6 +319,8 @@ pub(crate) async fn load(db: &Db, id: &str) -> Result<Stored> {
         steps: row.steps,
         reason: row.reason,
         checkpoint: from_json(&row.checkpoint)?,
+        generation: row.generation,
+        created_at: row.created_at,
         input: from_json(&row.input)?,
     })
 }
@@ -295,6 +340,8 @@ async fn leave_halted(
         agent: stored.agent,
         from: RunState::Halted,
         to,
+        generation: stored.generation,
+        bump: to == RunState::Checking,
         step: stored.step,
         step_name: RUN_STEP,
         checkpoint: &stored.checkpoint,
@@ -323,29 +370,25 @@ pub(crate) async fn cancel_halted(db: &Db, actor: &str, id: &str, stored: &Store
     leave_halted(db, actor, id, stored, RunState::Cancelled, "run_cancelled").await
 }
 
-/// An active run gets the flag its process polls for. False when the run is no longer active.
-pub(crate) async fn request_cancel(db: &Db, actor: &str, id: &str, agent: Agent) -> Result<bool> {
-    let mut tx = db.pool.begin().await?;
+/// An active run gets the flag its process polls for, and the first person to ask stays on
+/// it. Nothing is audited yet: the run may finish first. False when it is no longer active.
+pub(crate) async fn request_cancel(db: &Db, actor: &str, id: &str) -> Result<bool> {
     let flagged = sqlx::query(concat!(
-        "UPDATE agent_runs SET cancel_requested = 1 WHERE id = ? AND state IN ",
+        "UPDATE agent_runs SET cancel_requested = 1, cancel_actor = coalesce(cancel_actor, ?) \
+         WHERE id = ? AND state IN ",
         active!()
     ))
+    .bind(actor)
     .bind(id)
-    .execute(&mut *tx)
+    .execute(&db.pool)
     .await?;
-    if flagged.rows_affected() == 0 {
-        return Ok(false);
-    }
-    let detail = json!({ "agent": agent });
-    audit::record_to(&mut *tx, actor, "run_cancelled", Some(id), detail).await?;
-    tx.commit().await?;
-    Ok(true)
+    Ok(flagged.rows_affected() == 1)
 }
 
 /// Active rows whose process has gone quiet move to `halted`. Reads first, so a list on an
 /// idle app takes no write lock.
-pub(super) async fn reap(db: &Db, stale_seconds: i64) -> Result<usize> {
-    let age = format!("-{stale_seconds} seconds");
+pub(super) async fn reap(db: &Db, stale: Duration) -> Result<usize> {
+    let age = format!("-{:.3} seconds", stale.as_secs_f64());
     let found: Option<i64> = sqlx::query_scalar(concat!(
         "SELECT 1 FROM agent_runs WHERE state IN ",
         active!(),
@@ -377,6 +420,8 @@ pub(super) async fn reap(db: &Db, stale_seconds: i64) -> Result<usize> {
                 agent: parsed(agent)?,
                 from: RunState::Running,
                 to: RunState::Halted,
+                generation: 0,
+                bump: false,
                 step: 0,
                 step_name: RUN_STEP,
                 checkpoint: &Checkpoint::default(),

@@ -371,6 +371,18 @@ pub async fn set_status(
     Ok(app)
 }
 
+/// `since` is a stored timestamp, so the two compare as text. The same millisecond counts.
+pub(crate) async fn status_changed_since(db: &Db, id: &str, since: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM application_events \
+         WHERE application_id = ? AND kind = 'status' AND at >= ?)",
+    )
+    .bind(id)
+    .bind(since)
+    .fetch_one(&db.pool)
+    .await?)
+}
+
 pub async fn add_note(db: &Db, actor: &str, id: &str, note: &str) -> Result<()> {
     let note = note.trim();
     if note.is_empty() || too_long(note, NOTES_LIMIT) {

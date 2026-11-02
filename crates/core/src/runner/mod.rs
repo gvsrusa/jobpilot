@@ -31,10 +31,13 @@ const HEARTBEAT: Duration = Duration::from_secs(2);
 /// How long a step has to end after its token fires. Then it is dropped, which kills any child.
 const GRACE: Duration = Duration::from_secs(5);
 /// A row quiet for this long lost its process. Far above `HEARTBEAT`, so a slow beat is safe.
-const STALE_SECONDS: i64 = 30;
+const STALE: Duration = Duration::from_secs(30);
 /// Reasons a model task can end on beside the router's own.
 const MANUAL_REASONS: &[&str] = &["no_ai", "no_evidence"];
 const RUN_STEP: &str = "run";
+const PAUSED: &str = "paused";
+/// Another process holds the row and has not ended it, so this one has nothing to report.
+const TAKEN_OVER: &str = "taken_over";
 const LIST_LIMIT: i64 = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,7 +206,7 @@ impl Finished {
         let reason = self.reason.unwrap_or_default();
         match (self.state, self.error) {
             (RunState::Completed, _) => Ok(self.saved),
-            (RunState::Halted, _) => Err(Error::Paused),
+            (RunState::Halted, _) if reason == PAUSED => Err(Error::Paused),
             (RunState::Cancelled, _) => Err(Error::Cancelled),
             (_, Some(error)) => Err(error),
             (RunState::ManualRequired, None) => Err(Error::ManualRequired(reason)),
@@ -248,14 +251,34 @@ pub struct LogRow {
 pub struct Limits {
     run_timeout: Duration,
     grace: Duration,
+    watch: Duration,
+    beat: Duration,
+    stale: Duration,
 }
 
 impl Limits {
+    fn of(agent: Agent) -> Limits {
+        Limits {
+            run_timeout: spec_of(agent).run_timeout,
+            grace: GRACE,
+            watch: WATCH,
+            beat: HEARTBEAT,
+            stale: STALE,
+        }
+    }
+
     pub fn for_test(run_timeout: Duration) -> Limits {
         Limits {
             run_timeout,
             grace: Duration::from_millis(50),
+            watch: Duration::from_millis(10),
+            beat: Duration::from_millis(20),
+            stale: STALE,
         }
+    }
+
+    pub fn with_stale(self, stale: Duration) -> Limits {
+        Limits { stale, ..self }
     }
 }
 
@@ -273,10 +296,7 @@ pub async fn start(
     workflow: &dyn Workflow,
     cancel: CancellationToken,
 ) -> Result<Finished> {
-    let limits = Limits {
-        run_timeout: spec_of(workflow.agent()).run_timeout,
-        grace: GRACE,
-    };
+    let limits = Limits::of(workflow.agent());
     start_with(db, actor, workflow, cancel, limits).await
 }
 
@@ -290,7 +310,7 @@ pub async fn start_with(
     limits: Limits,
 ) -> Result<Finished> {
     person(actor)?;
-    reap_stale(db).await?;
+    store::reap(db, limits.stale).await?;
     let agent = workflow.agent();
     let steps = i64::try_from(workflow.steps().len()).unwrap_or(i64::MAX);
     let id = store::insert(db, agent, actor, &workflow.input(), steps).await?;
@@ -299,6 +319,7 @@ pub async fn start_with(
         id,
         agent,
         state: RunState::Queued,
+        generation: 0,
         step: 0,
         clock: Instant::now(),
     };
@@ -328,21 +349,20 @@ pub async fn resume(
         id: run_id.to_owned(),
         agent: stored.agent,
         state: RunState::Checking,
+        generation: stored.generation + 1,
         step: stored.step,
         clock: Instant::now(),
     };
-    let limits = Limits {
-        run_timeout: spec_of(stored.agent).run_timeout,
-        grace: GRACE,
-    };
+    let limits = Limits::of(stored.agent);
     execute(run, stored.checkpoint, actor, workflow, cancel, limits).await
 }
 
 /// Active runs whose process stopped answering move to `halted`, reason `interrupted`.
-/// They never resume on their own. A later write by a process that was only asleep is
-/// refused, so it cannot undo this.
+/// They never resume on their own. A process that was only asleep cannot undo this: its
+/// next write or heartbeat finds another state, or after a resume another generation, so it
+/// stops without touching the row.
 pub async fn reap_stale(db: &Db) -> Result<usize> {
-    store::reap(db, STALE_SECONDS).await
+    store::reap(db, STALE).await
 }
 
 /// Newest first. `limit` is clamped to 1..=1000: SQLite reads a negative `LIMIT` as no limit.
@@ -361,7 +381,7 @@ pub async fn get(db: &Db, run_id: &str) -> Result<RunDetail> {
 
 /// Why a run stopped being this process's to write.
 enum Stop {
-    /// Another handle moved the row. What it says now stands.
+    /// Another handle moved the row, or a resume took it. What it says now stands.
     Lost,
     Failed(Error),
 }
@@ -378,6 +398,8 @@ struct Run<'a> {
     id: String,
     agent: Agent,
     state: RunState,
+    /// Bumped by each resume. A row under a later one belongs to another process.
+    generation: i64,
     step: i64,
     /// Since the last state change: a log row's duration is the time spent reaching it.
     clock: Instant,
@@ -405,6 +427,8 @@ impl Run<'_> {
                 agent: self.agent,
                 from: self.state,
                 to,
+                generation: self.generation,
+                bump: false,
                 step: self.step,
                 step_name,
                 checkpoint: &checkpoint,
@@ -425,7 +449,8 @@ impl Run<'_> {
     }
 
     /// Ends the run with what `error` maps to. A cancel drops its partial result first, so a
-    /// failed drop leaves the run to be reaped and cancelled again.
+    /// failed drop leaves the run to be reaped and cancelled again. Only while this process
+    /// holds the row: the partial result of a lost run is its new owner's to finish.
     async fn end(
         &mut self,
         step_name: &str,
@@ -435,6 +460,9 @@ impl Run<'_> {
     ) -> std::result::Result<Finished, Stop> {
         let (state, reason) = ending(&error);
         if state == RunState::Cancelled {
+            if !store::owns(self.db, &self.id, self.state, self.generation).await? {
+                return Err(Stop::Lost);
+            }
             let saved = ctx.held().clone();
             workflow.abandon(self.db, &saved).await?;
         }
@@ -459,7 +487,7 @@ impl Run<'_> {
 fn ending(error: &Error) -> (RunState, Option<String>) {
     match error {
         Error::Cancelled => (RunState::Cancelled, None),
-        Error::Paused => (RunState::Halted, Some("paused".into())),
+        Error::Paused => (RunState::Halted, Some(PAUSED.into())),
         Error::ManualRequired(why) => {
             let known = RUN_REASONS.iter().chain(MANUAL_REASONS).any(|r| r == why);
             let reason = if known { why } else { error.code() };
@@ -482,28 +510,36 @@ fn is_busy(error: &Error) -> bool {
 }
 
 /// Returns when the step should stop: the token fired, a cancel came through the row, or
-/// another handle took the run. A failed read costs one poll: a busy database must not end
-/// a step that is still working.
-async fn watch(run: &Run<'_>, cancel: &CancellationToken) {
+/// another handle took the run, which alone returns true. A failed read costs one poll: a
+/// busy database must not end a step that is still working.
+async fn watch(run: &Run<'_>, cancel: &CancellationToken, limits: &Limits) -> bool {
     let mut beat = Instant::now();
     loop {
-        sleep(WATCH).await;
+        sleep(limits.watch).await;
         if cancel.is_cancelled() {
-            return;
+            return false;
         }
         if store::cancel_requested(run.db, &run.id)
             .await
             .unwrap_or(false)
         {
-            return;
+            return false;
         }
-        if beat.elapsed() >= HEARTBEAT {
+        if beat.elapsed() >= limits.beat {
             beat = Instant::now();
-            if matches!(store::heartbeat(run.db, &run.id).await, Ok(false)) {
-                return;
+            let held = store::heartbeat(run.db, &run.id, run.generation).await;
+            if matches!(held, Ok(false)) {
+                return true;
             }
         }
     }
+}
+
+/// What the overseer found while a step ran.
+#[derive(Default)]
+struct Overseen {
+    timed_out: bool,
+    lost: bool,
 }
 
 /// Polls the step beside its overseer, never inside one of the overseer's awaits, so a step
@@ -514,12 +550,12 @@ async fn drive(
     cancel: &CancellationToken,
     deadline: Instant,
     limits: &Limits,
-    timed_out: &mut bool,
+    seen: &mut Overseen,
 ) -> Result<StepOutput> {
     let overseer = async {
         tokio::select! {
-            () = sleep_until(deadline) => *timed_out = true,
-            () = watch(run, cancel) => {}
+            () = sleep_until(deadline) => seen.timed_out = true,
+            lost = watch(run, cancel, limits) => seen.lost = lost,
         }
         cancel.cancel();
         sleep(limits.grace).await;
@@ -529,6 +565,14 @@ async fn drive(
         result = step => result,
         () = overseer => Err(Error::Cancelled),
     }
+}
+
+/// Between attempts and steps, where no watch is running: the row can hold a cancel too.
+async fn stop_asked(run: &Run<'_>, ctx: &Ctx<'_>) -> Result<bool> {
+    if store::cancel_requested(run.db, &run.id).await? {
+        ctx.cancel.cancel();
+    }
+    Ok(ctx.cancel.is_cancelled())
 }
 
 async fn execute(
@@ -554,10 +598,11 @@ async fn execute(
         Err(Stop::Lost) => {
             ctx.cancel.cancel();
             let stored = store::load(db, &id).await?;
+            let held = !stored.state.is_terminal() && stored.state != RunState::Halted;
             Ok(Finished {
                 run_id: id,
                 state: stored.state,
-                reason: stored.reason,
+                reason: stored.reason.or(held.then(|| TAKEN_OVER.to_owned())),
                 saved: stored.checkpoint,
                 error: None,
             })
@@ -574,24 +619,23 @@ async fn walk(
     let steps = workflow.steps();
     let spec = spec_of(run.agent);
     let deadline = Instant::now() + limits.run_timeout;
-    let mut timed_out = false;
+    let mut seen = Overseen::default();
     loop {
-        if timed_out || Instant::now() >= deadline {
-            ctx.cancel.cancel();
-            return run.end(RUN_STEP, ctx, workflow, Error::Timeout).await;
-        }
-        if store::cancel_requested(run.db, &run.id).await? {
-            ctx.cancel.cancel();
-        }
-        if ctx.cancel.is_cancelled() {
-            return run.end(RUN_STEP, ctx, workflow, Error::Cancelled).await;
-        }
+        // First: with every step done the work is done, and a cancel or a deadline that came
+        // while the last one finished has nothing left to stop.
         let index = usize::try_from(run.step).unwrap_or(usize::MAX);
         let Some(def) = steps.get(index) else {
             run.change(RunState::Completed, RUN_STEP, ctx, None, None)
                 .await?;
             return Ok(run.finished(ctx, None, None));
         };
+        if seen.timed_out || Instant::now() >= deadline {
+            ctx.cancel.cancel();
+            return run.end(RUN_STEP, ctx, workflow, Error::Timeout).await;
+        }
+        if stop_asked(&run, ctx).await? {
+            return run.end(RUN_STEP, ctx, workflow, Error::Cancelled).await;
+        }
 
         // A resume has already entered Checking.
         if run.state != RunState::Checking {
@@ -608,7 +652,10 @@ async fn walk(
             run.change(RunState::Running, def.name, ctx, None, None)
                 .await?;
             let step = workflow.step(ctx, index);
-            let result = drive(&run, step, &ctx.cancel, deadline, limits, &mut timed_out).await;
+            let result = drive(&run, step, &ctx.cancel, deadline, limits, &mut seen).await;
+            if seen.lost {
+                return Err(Stop::Lost);
+            }
             match result {
                 Ok(output) => break output,
                 Err(error)
@@ -617,9 +664,12 @@ async fn walk(
                     attempt += 1;
                     run.change(RunState::Retrying, def.name, ctx, Some("busy"), None)
                         .await?;
+                    if stop_asked(&run, ctx).await? {
+                        return run.end(def.name, ctx, workflow, Error::Cancelled).await;
+                    }
                 }
                 Err(error) => {
-                    let error = if timed_out {
+                    let error = if seen.timed_out {
                         Error::Timeout
                     } else if ctx.cancel.is_cancelled() && !matches!(error, Error::Paused) {
                         // Whatever a step says on its way out, the person asked it to stop.

@@ -1,11 +1,13 @@
 //! Agents as the adapters reach them.
 
-use jobpilot_core::agents;
-use jobpilot_core::ai::CancellationToken;
+use jobpilot_core::agents::{self, tracking};
 use jobpilot_core::ai::router::Router;
+use jobpilot_core::ai::{BoxFuture, CancellationToken};
 use jobpilot_core::applications::{self, Application, ApplicationInput};
-use jobpilot_core::runner::{self, Agent, RunState};
-use jobpilot_core::{AppPaths, Db, backup, transfer};
+use jobpilot_core::runner::{
+    self, Agent, Ctx, Permission, RunInput, RunState, StepDef, StepOutput, Workflow,
+};
+use jobpilot_core::{AppPaths, Db, Result, backup, transfer};
 use tempfile::TempDir;
 
 async fn setup() -> (TempDir, Db, Application) {
@@ -109,13 +111,19 @@ async fn a_halted_tracking_run_resumes_from_its_stored_input() {
         .await
         .unwrap();
     let id = runner::list(&db, 1).await.unwrap().remove(0).id;
-    sqlx::query(
-        "UPDATE agent_runs SET state = 'halted', step = 0, finished_at = NULL, \
-         input = json_set(input, '$.status', 'screening')",
-    )
-    .execute(&db.pool)
-    .await
-    .unwrap();
+    // As a process that died before its update left things.
+    sqlx::query("UPDATE agent_runs SET state = 'halted', step = 0, finished_at = NULL")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE applications SET status = 'saved', applied_on = NULL")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM application_events WHERE kind = 'status'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
 
     let router = Router::from_settings(&db).await.unwrap();
     let done = agents::resume_run(&db, &router, "cli", &id, token())
@@ -123,7 +131,7 @@ async fn a_halted_tracking_run_resumes_from_its_stored_input() {
         .unwrap();
     assert_eq!(done.state, RunState::Completed);
     let app = applications::get(&db, &app.id).await.unwrap();
-    assert_eq!(app.status, "screening");
+    assert_eq!(app.status, "applied");
     let last = applications::history(&db, &app.id).await.unwrap();
     assert_eq!(last.last().unwrap().note, "", "the note is not stored");
     assert_eq!(
@@ -188,4 +196,132 @@ async fn run_rows_go_through_backup_export_and_delete_all() {
     let db = Db::open(&paths).await.unwrap();
     assert!(runner::list(&db, 10).await.unwrap().is_empty());
     db.close().await;
+}
+
+async fn halt(db: &Db, id: &str) {
+    sqlx::query(
+        "UPDATE agent_runs SET state = 'halted', step = 0, finished_at = NULL WHERE id = ?",
+    )
+    .bind(id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_resume_never_rewinds_a_newer_status() {
+    let (_tmp, db, app) = setup().await;
+    agents::set_status(&db, "cli", &app.id, "applied", None, "", token())
+        .await
+        .unwrap();
+    let id = runner::list(&db, 1).await.unwrap().remove(0).id;
+    halt(&db, &id).await;
+    agents::set_status(&db, "cli", &app.id, "interviewing", None, "", token())
+        .await
+        .unwrap();
+
+    let router = Router::from_settings(&db).await.unwrap();
+    let error = agents::resume_run(&db, &router, "cli", &id, token())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "validation");
+    let current = applications::get(&db, &app.id).await.unwrap();
+    assert_eq!(current.status, "interviewing");
+    let run = runner::get(&db, &id).await.unwrap().run;
+    assert_eq!(run.state, RunState::Halted, "still the person's to cancel");
+    agents::cancel_run(&db, "cli", &id).await.unwrap();
+}
+
+/// The update landed and its process died before the checkpoint: nothing to rewind.
+#[tokio::test]
+async fn a_resume_of_an_update_that_landed_is_quiet() {
+    let (_tmp, db, app) = setup().await;
+    agents::set_status(&db, "cli", &app.id, "applied", None, "", token())
+        .await
+        .unwrap();
+    let id = runner::list(&db, 1).await.unwrap().remove(0).id;
+    halt(&db, &id).await;
+    let events = applications::history(&db, &app.id).await.unwrap().len();
+    let router = Router::from_settings(&db).await.unwrap();
+    let done = agents::resume_run(&db, &router, "cli", &id, token())
+        .await
+        .unwrap();
+    assert_eq!(done.state, RunState::Completed);
+    assert_eq!(
+        applications::history(&db, &app.id).await.unwrap().len(),
+        events
+    );
+}
+
+/// Tracking's step, run as another agent or with a fired token, so its own checks are what
+/// stops it. The runner's would stop it first otherwise.
+struct Wrapped {
+    inner: tracking::Tracking,
+    agent: Agent,
+    fire: bool,
+}
+
+static WRAPPED: &[StepDef] = &[StepDef {
+    name: "update",
+    needs: &[Permission::ReadApplications],
+    attempts: 1,
+}];
+
+impl Workflow for Wrapped {
+    fn agent(&self) -> Agent {
+        self.agent
+    }
+
+    fn input(&self) -> RunInput {
+        self.inner.input()
+    }
+
+    fn steps(&self) -> &'static [StepDef] {
+        WRAPPED
+    }
+
+    fn step<'a>(&'a self, ctx: &'a Ctx<'a>, index: usize) -> BoxFuture<'a, Result<StepOutput>> {
+        if self.fire {
+            ctx.cancel.cancel();
+        }
+        self.inner.step(ctx, index)
+    }
+}
+
+fn wrapped(app: &Application, agent: Agent, fire: bool) -> Wrapped {
+    Wrapped {
+        inner: tracking::Tracking {
+            application_id: app.id.clone(),
+            status: "applied".into(),
+            on: None,
+            note: String::new(),
+        },
+        agent,
+        fire,
+    }
+}
+
+#[tokio::test]
+async fn tracking_checks_its_own_permissions() {
+    let (_tmp, db, app) = setup().await;
+    let workflow = wrapped(&app, Agent::Analytics, false);
+    let done = runner::start(&db, "cli", &workflow, token()).await.unwrap();
+    assert_eq!(done.state, RunState::Refused);
+    assert_eq!(done.reason.as_deref(), Some("permission_denied"));
+    assert_eq!(
+        applications::get(&db, &app.id).await.unwrap().status,
+        "saved"
+    );
+}
+
+#[tokio::test]
+async fn tracking_stops_before_the_update_once_the_token_fired() {
+    let (_tmp, db, app) = setup().await;
+    let workflow = wrapped(&app, Agent::Tracking, true);
+    let done = runner::start(&db, "cli", &workflow, token()).await.unwrap();
+    assert_eq!(done.state, RunState::Cancelled);
+    assert_eq!(
+        applications::get(&db, &app.id).await.unwrap().status,
+        "saved"
+    );
 }

@@ -13,7 +13,8 @@ pub static STEPS: &[StepDef] = &[StepDef {
     attempts: 2,
 }];
 
-pub(super) struct Tracking {
+/// Public so a test can wrap it.
+pub struct Tracking {
     pub application_id: String,
     pub status: String,
     pub on: Option<String>,
