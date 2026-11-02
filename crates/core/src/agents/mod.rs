@@ -4,17 +4,21 @@
 use crate::ai::router::Router;
 use crate::ai::{CancellationToken, TaskType};
 use crate::applications::{self, Application};
+use crate::connectors::fetch::Fetcher;
 use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::runner::{self, Finished, RunInput, RunState, Workflow, store};
 
 pub mod analytics;
+pub mod discovery;
 pub mod draft;
 pub mod memory;
 pub mod tracking;
 
 use crate::analytics::Report;
 use analytics::Analytics;
+use discovery::DiscoveryWorkflow;
+pub use discovery::{DiscoveryReport, SourceResult, discover, discover_with};
 use draft::DraftWorkflow;
 pub use draft::{draft_cover_letter, draft_resume};
 use memory::MemoryWorkflow;
@@ -71,6 +75,20 @@ pub async fn resume_run(
     run_id: &str,
     cancel: CancellationToken,
 ) -> Result<Finished> {
+    resume_run_with(db, router, &Fetcher::hosted()?, actor, run_id, cancel).await
+}
+
+/// [`resume_run`] with the fetcher a discovery run reads through, so a test can point it at a
+/// loopback server.
+#[doc(hidden)]
+pub async fn resume_run_with(
+    db: &Db,
+    router: &Router,
+    fetcher: &Fetcher,
+    actor: &str,
+    run_id: &str,
+    cancel: CancellationToken,
+) -> Result<Finished> {
     let stored = store::load(db, run_id).await?;
     match stored.input {
         RunInput::Tracking {
@@ -109,6 +127,10 @@ pub async fn resume_run(
         } => {
             let task = TaskType::DraftCoverLetter;
             let workflow = DraftWorkflow::new(task, &job_text_id, export, router);
+            runner::resume(db, actor, run_id, &workflow, cancel).await
+        }
+        RunInput::Discovery { source_ids } => {
+            let workflow = DiscoveryWorkflow::new(source_ids, fetcher);
             runner::resume(db, actor, run_id, &workflow, cancel).await
         }
         RunInput::MemoryRefresh => {

@@ -49,6 +49,7 @@ pub enum Agent {
     CareerMemory,
     Tracking,
     Analytics,
+    Discovery,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +113,9 @@ pub enum RunInput {
         on: Option<String>,
     },
     Analytics,
+    Discovery {
+        source_ids: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

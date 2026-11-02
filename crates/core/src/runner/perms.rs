@@ -86,6 +86,12 @@ static ANALYTICS: AgentSpec = AgentSpec {
     run_timeout: Duration::from_secs(60),
 };
 
+static DISCOVERY: AgentSpec = AgentSpec {
+    agent: Agent::Discovery,
+    permissions: &[NetConnector, ReadJobText, WriteJobs],
+    run_timeout: Duration::from_secs(10 * 60),
+};
+
 pub fn spec_of(agent: Agent) -> &'static AgentSpec {
     match agent {
         Agent::Resume => &RESUME,
@@ -93,5 +99,6 @@ pub fn spec_of(agent: Agent) -> &'static AgentSpec {
         Agent::CareerMemory => &CAREER_MEMORY,
         Agent::Tracking => &TRACKING,
         Agent::Analytics => &ANALYTICS,
+        Agent::Discovery => &DISCOVERY,
     }
 }
