@@ -2,15 +2,18 @@
 
 use jobpilot_core::Error;
 use jobpilot_core::connectors::{
-    Connector, Lever, PolicyStatus, RemoteOk, Target, WeWorkRemotely, check, clean_slug, day, find,
-    read_status,
+    Ashby, Connector, Greenhouse, Lever, PolicyStatus, RemoteOk, Target, WeWorkRemotely, check,
+    clean_slug, day, find, read_status,
 };
+use jobpilot_core::jobs::PayPeriod;
 use serde_json::json;
 
 const LEVER: &[u8] = include_bytes!("fixtures/connectors/lever.json");
 const LEVER_EMPTY: &[u8] = include_bytes!("fixtures/connectors/lever_empty.json");
 const LEVER_CHANGED: &[u8] = include_bytes!("fixtures/connectors/lever_changed.json");
 const REMOTEOK: &[u8] = include_bytes!("fixtures/connectors/remoteok.json");
+const GREENHOUSE: &[u8] = include_bytes!("fixtures/connectors/greenhouse.json");
+const ASHBY: &[u8] = include_bytes!("fixtures/connectors/ashby.json");
 const WWR: &[u8] = include_bytes!("fixtures/connectors/wwr.rss");
 
 fn target(name: &str) -> Target {
@@ -62,6 +65,7 @@ fn lever_maps_its_fields() {
     assert_eq!(job.work_mode, Some("hybrid"));
     assert_eq!(job.pay.as_ref().unwrap().max, Some(175000));
     assert_eq!(job.pay.as_ref().unwrap().currency.as_deref(), Some("USD"));
+    assert_eq!(job.pay.as_ref().unwrap().period, Some(PayPeriod::Year));
     assert_eq!(job.posted_on.as_deref(), Some("2025-11-01"));
     assert!(
         job.raw.contains("<div"),
@@ -132,6 +136,8 @@ fn remoteok_skips_the_legal_row_and_stores_no_pay_at_zero() {
         .find(|p| p.external_id == "1002")
         .unwrap();
     assert_eq!(paid.pay.as_ref().unwrap().currency, None);
+    // The feed names no period, so none is stored: a figure is never read as yearly by guess.
+    assert_eq!(paid.pay.as_ref().unwrap().period, None);
     assert_eq!(paid.pay.as_ref().unwrap().min, Some(90000));
 }
 
@@ -271,4 +277,141 @@ fn dates_become_days_or_nothing() {
     assert_eq!(day("2026-02-30"), None);
     assert_eq!(day("soon"), None);
     assert_eq!(day(""), None);
+}
+
+#[test]
+fn greenhouse_builds_only_the_documented_request() {
+    let r = Greenhouse.request(&target("acme"), 0).unwrap();
+    assert_eq!(r.host, "boards-api.greenhouse.io");
+    assert_eq!(
+        r.path,
+        "/v1/boards/acme/jobs?content=true&pay_transparency=true"
+    );
+    for bad in ["../x", "a/b", "", "a?b"] {
+        assert_eq!(
+            Greenhouse.request(&target(bad), 0).unwrap_err().code(),
+            "validation"
+        );
+    }
+}
+
+#[test]
+fn greenhouse_decodes_a_double_encoded_body_and_pay_in_cents() {
+    let page = Greenhouse.parse(&target("acme"), GREENHOUSE).unwrap();
+    assert_eq!(page.postings.len(), 2);
+    assert_eq!(page.skipped, 1, "the row with no title");
+    assert!(page.next.is_none());
+    let job = &page.postings[0];
+    assert_eq!(job.external_id, "4001");
+    assert_eq!(job.company, "Acme Sample");
+    assert_eq!(job.location, "Remote - US");
+    assert_eq!(job.posted_on.as_deref(), Some("2026-10-01"));
+    assert!(
+        job.raw
+            .starts_with("<p>Build sample things &amp; ship.</p>")
+    );
+    assert!(job.raw.contains("display:none"));
+    let pay = job.pay.as_ref().unwrap();
+    assert_eq!((pay.min, pay.max), (Some(50000), Some(70000)));
+    assert_eq!(pay.currency.as_deref(), Some("USD"));
+    assert_eq!(pay.period, None, "the API names no period");
+    assert!(job.work_mode.is_none() && job.country.is_none());
+}
+
+#[test]
+fn greenhouse_decodes_a_single_encoded_body_too() {
+    let page = Greenhouse.parse(&target("acme"), GREENHOUSE).unwrap();
+    let job = &page.postings[1];
+    assert_eq!(job.raw, "<p>Single &amp; sample.</p>");
+    assert!(job.pay.is_none());
+    assert_eq!(job.url, "https://careers.example.com/jobs/4002?gh_jid=4002");
+}
+
+#[test]
+fn greenhouse_with_a_changed_shape_stores_nothing() {
+    for body in [
+        &b"[]"[..],
+        b"{\"jobs\":5}",
+        b"{\"jobs\":[{\"x\":1}]}",
+        b"nope",
+    ] {
+        assert_eq!(refusal(Greenhouse.parse(&target("acme"), body)), "bad_feed");
+    }
+    let empty = Greenhouse.parse(&target("acme"), b"{\"jobs\":[]}").unwrap();
+    assert!(empty.postings.is_empty());
+}
+
+#[test]
+fn ashby_builds_only_the_documented_request() {
+    let r = Ashby.request(&target("acme"), 0).unwrap();
+    assert_eq!(r.host, "api.ashbyhq.com");
+    assert_eq!(
+        r.path,
+        "/posting-api/job-board/acme?includeCompensation=true"
+    );
+    assert_eq!(
+        Ashby.request(&target("a/b"), 0).unwrap_err().code(),
+        "validation"
+    );
+}
+
+#[test]
+fn ashby_uses_workplace_type_and_skips_unlisted() {
+    let page = Ashby.parse(&target("acme"), ASHBY).unwrap();
+    let ids: Vec<_> = page.postings.iter().map(|p| p.title.as_str()).collect();
+    assert_eq!(ids, ["Platform Engineer", "Office Manager", "Designer"]);
+    assert_eq!(page.skipped, 1, "no link counts, an unlisted row does not");
+    let modes: Vec<_> = page.postings.iter().map(|p| p.work_mode).collect();
+    assert_eq!(modes, [Some("hybrid"), Some("onsite"), Some("remote")]);
+    let job = &page.postings[0];
+    assert_eq!(
+        job.external_id,
+        "https://jobs.ashbyhq.com/acme/00000000-0000-4000-8000-0000000000a1"
+    );
+    assert_eq!(job.company, "acme");
+    assert_eq!(job.country.as_deref(), Some("US"));
+    assert_eq!(page.postings[1].country, None, "a name is not a code");
+    assert_eq!(job.employment_type.as_deref(), Some("FullTime"));
+    assert_eq!(job.posted_on.as_deref(), Some("2026-10-01"));
+    assert!(job.raw.contains("display:none"));
+    assert_eq!(job.tags, ["Platform", "Engineering"]);
+    assert!(job.apply_url.as_deref().unwrap().ends_with("/application"));
+}
+
+#[test]
+fn ashby_pay_is_the_salary_row_by_year_only() {
+    let page = Ashby.parse(&target("acme"), ASHBY).unwrap();
+    let pay = page.postings[0].pay.as_ref().unwrap();
+    assert_eq!((pay.min, pay.max), (Some(140000), Some(175000)));
+    assert_eq!(pay.currency.as_deref(), Some("USD"));
+    assert_eq!(pay.period, Some(PayPeriod::Year));
+    assert!(page.postings[1].pay.is_none(), "equity is not pay");
+    assert!(page.postings[2].pay.is_none());
+}
+
+#[test]
+fn ashby_with_a_changed_shape_stores_nothing() {
+    for body in [
+        &b"[]"[..],
+        b"{\"jobs\":{}}",
+        b"{\"jobs\":[{\"x\":1}]}",
+        b"nope",
+    ] {
+        assert_eq!(refusal(Ashby.parse(&target("acme"), body)), "bad_feed");
+    }
+}
+
+#[test]
+fn both_declare_the_pinned_limit() {
+    assert_eq!(limit_of("greenhouse"), (2, 300));
+    assert_eq!(limit_of("ashby"), (2, 300));
+}
+
+#[test]
+fn the_two_r1_sources_pass_check_and_read_silent() {
+    for name in ["greenhouse", "ashby"] {
+        let c = find(name).unwrap();
+        assert_eq!(read_status(c.decl()), PolicyStatus::SilentRead, "{name}");
+        assert!(check(c.decl()).is_ok());
+    }
 }

@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use super::{
     Automation, BodyKind, Connector, ConnectorDecl, Operation, Page, PageRequest, PolicyStatus,
-    Posting, RateLimit, Target, TargetKind, bad_feed, clean_slug, day,
+    Posting, RateLimit, Target, TargetKind, bad_feed, clean_slug, day, text,
 };
 use crate::error::Result;
 use crate::jobs::{PayPeriod, PayRange};
@@ -45,14 +45,6 @@ fn site(target: &Target) -> Result<(bool, String)> {
     }
 }
 
-fn text(row: &Value, key: &str) -> String {
-    row.get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_string()
-}
-
 fn pay(row: &Value) -> Option<PayRange> {
     let range = row.get("salaryRange")?;
     let interval = range.get("interval")?.as_str()?;
@@ -84,7 +76,7 @@ fn pay(row: &Value) -> Option<PayRange> {
         min,
         max,
         currency,
-        period,
+        period: Some(period),
     })
 }
 

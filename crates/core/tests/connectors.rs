@@ -1,8 +1,9 @@
-//! The connector SDK and its gate. Rows come from an inline register where no real row reads
-//! `silent-read` yet.
+//! The connector SDK and its gate. Most rows come from an inline register; the R1 and
+//! assisted-source tests read the real one.
 
 use std::time::Duration;
 
+use jobpilot_core::ai::register::REGISTER;
 use jobpilot_core::connectors::{
     Automation, ConnectorDecl, Operation, PolicyStatus, RateLimit, TargetKind, all, check, find,
     gate, gate_on, read_status, read_status_on, statuses,
@@ -211,4 +212,185 @@ fn a_duplicate_row_with_another_verdict_reads_unknown() {
         "{TABLE}| Lever | Read public listings through Postings API | https://x.test | 2026-11-01 | \"q\" | `silent-read` | n |\n"
     );
     assert_eq!(read_status_on(&same, &d), PolicyStatus::SilentRead);
+}
+
+fn target(name: &str) -> jobpilot_core::connectors::Target {
+    jobpilot_core::connectors::Target { name: name.into() }
+}
+
+#[test]
+fn greenhouse_and_ashby_read_under_r1_and_never_read_as_allowed() {
+    for name in ["greenhouse", "ashby"] {
+        let c = find(name).unwrap();
+        assert_eq!(read_status(c.decl()), PolicyStatus::SilentRead);
+        assert_ne!(read_status(c.decl()), PolicyStatus::Allowed);
+        assert!(gate(c.decl(), Operation::ListBoard).is_ok());
+        assert!(gate(c.decl(), Operation::ListFeed).is_err());
+    }
+}
+
+/// Integration and Operation of every register row whose verdict is `silent-read`.
+fn silent_rows() -> Vec<(String, String)> {
+    REGISTER
+        .lines()
+        .filter_map(|line| {
+            let cells: Vec<&str> = line
+                .strip_prefix("| ")?
+                .strip_suffix(" |")?
+                .split(" | ")
+                .collect();
+            (cells.get(5) == Some(&"`silent-read`")).then(|| (cells[0].into(), cells[1].into()))
+        })
+        .collect()
+}
+
+#[test]
+fn r1_covers_only_those_two_rows() {
+    assert_eq!(
+        silent_rows(),
+        [
+            (
+                "Greenhouse".to_string(),
+                "Read public listings through Job Board API".to_string()
+            ),
+            (
+                "Ashby".to_string(),
+                "Read public listings through Job Postings API".to_string()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn the_register_calls_r1_a_controller_ruling_not_an_owner_decision() {
+    let heading = REGISTER
+        .lines()
+        .find(|line| line.starts_with('#') && line.contains("R1"))
+        .expect("an R1 heading");
+    assert!(heading.contains("Controller ruling"), "{heading}");
+    assert!(REGISTER.contains("not an owner decision"));
+    assert!(!REGISTER.contains("is `unknown`, matching the read rows"));
+}
+
+#[test]
+fn a_row_set_back_to_unknown_refuses_both() {
+    for (name, row) in [
+        (
+            "greenhouse",
+            "| Greenhouse | Read public listings through Job Board API |",
+        ),
+        (
+            "ashby",
+            "| Ashby | Read public listings through Job Postings API |",
+        ),
+    ] {
+        let changed: String = REGISTER
+            .lines()
+            .map(|line| {
+                if line.starts_with(row) {
+                    line.replace("`silent-read`", "`unknown`")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_ne!(changed, REGISTER, "{name}: the row was found");
+        let c = find(name).unwrap();
+        assert_eq!(read_status_on(&changed, c.decl()), PolicyStatus::Unknown);
+        assert_eq!(
+            code(gate_on(&changed, c.decl(), Operation::ListBoard)),
+            "policy_unknown"
+        );
+    }
+}
+
+#[test]
+fn indeed_is_blocked_and_declares_no_read_and_no_host() {
+    let c = find("indeed").unwrap();
+    assert_eq!(read_status(c.decl()), PolicyStatus::Blocked);
+    assert!(c.decl().hosts.is_empty());
+    assert!(gate(c.decl(), Operation::ListFeed).is_err());
+    assert!(gate(c.decl(), Operation::ImportPasted).is_ok());
+}
+
+#[test]
+fn every_assisted_src_can_only_import() {
+    for name in ["workday", "indeed", "linkedin", "company_page"] {
+        let c = find(name).unwrap();
+        assert_eq!(c.decl().operations, &[Operation::ImportPasted], "{name}");
+        assert!(c.decl().hosts.is_empty() && c.decl().rate_limit.is_none());
+        assert!(check(c.decl()).is_ok());
+        let err = c.request(&target("x"), 0).unwrap_err();
+        assert!(matches!(&err, jobpilot_core::Error::Refused(code) if code == "op_not_declared"));
+        assert!(gate(c.decl(), Operation::ImportPasted).is_ok());
+        assert!(gate(c.decl(), Operation::ListBoard).is_err());
+        assert!(
+            c.parse(&target("x"), b"[]").is_err(),
+            "{name} parses nothing"
+        );
+    }
+    let unknown = |name: &str| read_status(find(name).unwrap().decl());
+    assert_eq!(unknown("workday"), PolicyStatus::Unknown);
+    assert_eq!(unknown("linkedin"), PolicyStatus::Unknown);
+    assert_eq!(unknown("company_page"), PolicyStatus::Unknown);
+}
+
+#[test]
+fn an_import_only_decl_needs_a_user_assisted_row() {
+    let base = ConnectorDecl {
+        operations: &[Operation::ImportPasted],
+        read_row: None,
+        rate_limit: None,
+        hosts: &[],
+        automation: &[Automation::UserAssisted],
+        ..decl(PolicyStatus::UserAssisted)
+    };
+    assert!(check(&base).is_ok());
+    let missing = ConnectorDecl {
+        assisted_row: ("Nobody", "Nothing"),
+        ..base.clone()
+    };
+    assert_eq!(check(&missing).unwrap_err().code(), "validation");
+    // A row with another verdict does not count.
+    let wrong = ConnectorDecl {
+        assisted_row: ("Greenhouse", "Submit through Job Board API"),
+        ..base
+    };
+    assert_eq!(check(&wrong).unwrap_err().code(), "validation");
+}
+
+#[test]
+fn no_row_ever_grants_more_than_a_status_says() {
+    let all = statuses();
+    let fetchable: Vec<_> = all
+        .iter()
+        .filter(|s| s.can_fetch)
+        .map(|s| s.name.as_str())
+        .collect();
+    assert_eq!(
+        fetchable,
+        ["lever", "remoteok", "wwr", "greenhouse", "ashby"]
+    );
+    let noted: Vec<_> = all
+        .iter()
+        .filter(|s| s.note.is_some())
+        .map(|s| s.name.as_str())
+        .collect();
+    assert_eq!(noted, ["greenhouse", "ashby"]);
+    let names: Vec<_> = all.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "lever",
+            "remoteok",
+            "wwr",
+            "greenhouse",
+            "ashby",
+            "workday",
+            "indeed",
+            "linkedin",
+            "company_page"
+        ]
+    );
 }

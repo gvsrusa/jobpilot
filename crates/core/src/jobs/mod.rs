@@ -54,7 +54,9 @@ pub struct PayRange {
     pub min: Option<i64>,
     pub max: Option<i64>,
     pub currency: Option<String>,
-    pub period: PayPeriod,
+    /// `None` when the source names no period. It is never guessed, and nothing compares a
+    /// range whose period is unknown.
+    pub period: Option<PayPeriod>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,16 +171,13 @@ impl JobRow {
     fn into_job(self) -> Result<Job> {
         let skills = serde_json::from_str(&self.skills)
             .map_err(|error| Error::Db(sqlx::Error::Decode(Box::new(error))))?;
-        // A range with no stored period is not shown: a period is never guessed.
-        let pay = match self.pay_period.as_deref().and_then(PayPeriod::from_column) {
-            Some(period) if self.pay_min.is_some() || self.pay_max.is_some() => Some(PayRange {
-                min: self.pay_min,
-                max: self.pay_max,
-                currency: self.pay_currency,
-                period,
-            }),
-            _ => None,
-        };
+        // A range with no stored period is shown with the period unknown: it is never guessed.
+        let pay = (self.pay_min.is_some() || self.pay_max.is_some()).then(|| PayRange {
+            min: self.pay_min,
+            max: self.pay_max,
+            currency: self.pay_currency,
+            period: self.pay_period.as_deref().and_then(PayPeriod::from_column),
+        });
         Ok(Job {
             id: self.id,
             job_text_id: self.job_text_id,

@@ -718,3 +718,67 @@ async fn long_fields_are_cut_and_a_long_title_skips_the_row() {
     );
     assert_eq!(page.postings[1].title.chars().count(), 300);
 }
+
+const GREENHOUSE: &str = include_str!("fixtures/connectors/greenhouse.json");
+const ASHBY: &str = include_str!("fixtures/connectors/ashby.json");
+
+#[tokio::test]
+async fn a_board_list_parses_from_the_doc_sample_through_the_fetcher() {
+    let (_t, db) = open().await;
+    let gh = "/v1/boards/acme/jobs?content=true&pay_transparency=true";
+    let ab = "/posting-api/job-board/acme?includeCompensation=true";
+    let body = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
+    let fake = Fake::start(vec![
+        (gh, Canned::json(200, &body(GREENHOUSE))),
+        (ab, Canned::json(200, &body(ASHBY))),
+    ]);
+    let fetcher = Fetcher::for_test(&fake.url).unwrap();
+    let token = CancellationToken::new();
+    for (name, path, rows, skipped) in [("greenhouse", gh, 2, 1), ("ashby", ab, 3, 1)] {
+        let c = jobpilot_core::connectors::find(name).unwrap();
+        let page = fetcher
+            .page(&db, &*c, &target(), 0, Operation::ListBoard, &token)
+            .await
+            .unwrap();
+        assert_eq!(
+            (page.postings.len(), page.skipped),
+            (rows, skipped),
+            "{name}"
+        );
+        assert_eq!(fake.hits(path).len(), 1, "{name}: one request");
+    }
+}
+
+#[tokio::test]
+async fn a_greenhouse_link_needs_https_only_and_an_ashby_link_needs_its_host() {
+    let (_t, db) = open().await;
+    let gh = "/v1/boards/acme/jobs?content=true&pay_transparency=true";
+    let ab = "/posting-api/job-board/acme?includeCompensation=true";
+    let gh_rows = json!({"jobs": [
+        {"id": 1, "title": "A", "absolute_url": "https://careers.example.com/a"},
+        {"id": 2, "title": "B", "absolute_url": "http://careers.example.com/b"},
+        {"id": 3, "title": "C", "absolute_url": "javascript:alert(1)"},
+    ]});
+    let ab_rows = json!({"jobs": [
+        {"title": "A", "jobUrl": "https://jobs.ashbyhq.com/acme/1"},
+        {"title": "B", "jobUrl": "https://evil.test/acme/2"},
+    ]});
+    let fake = Fake::start(vec![
+        (gh, Canned::json(200, &gh_rows)),
+        (ab, Canned::json(200, &ab_rows)),
+    ]);
+    let fetcher = Fetcher::for_test(&fake.url).unwrap();
+    let token = CancellationToken::new();
+    for (name, kept, skipped) in [("greenhouse", 1, 2), ("ashby", 1, 1)] {
+        let c = jobpilot_core::connectors::find(name).unwrap();
+        let page = fetcher
+            .page(&db, &*c, &target(), 0, Operation::ListBoard, &token)
+            .await
+            .unwrap();
+        assert_eq!(
+            (page.postings.len(), page.skipped),
+            (kept, skipped),
+            "{name}"
+        );
+    }
+}

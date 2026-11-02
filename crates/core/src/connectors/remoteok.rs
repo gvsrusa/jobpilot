@@ -6,10 +6,10 @@ use serde_json::Value;
 
 use super::{
     Automation, BodyKind, Connector, ConnectorDecl, Operation, Page, PageRequest, PolicyStatus,
-    Posting, RateLimit, Target, TargetKind, bad_feed, day,
+    Posting, RateLimit, Target, TargetKind, bad_feed, day, text,
 };
 use crate::error::Result;
-use crate::jobs::{PayPeriod, PayRange};
+use crate::jobs::PayRange;
 use crate::knowledge::decode_entities;
 
 pub struct RemoteOk;
@@ -30,14 +30,6 @@ static DECL: ConnectorDecl = ConnectorDecl {
     attribution: Some("Remote OK"),
     target: TargetKind::None,
 };
-
-fn text(row: &Value, key: &str) -> String {
-    row.get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_string()
-}
 
 /// The feed sends `remoteOK.com`. A link to any other host is dropped, not followed.
 fn own_link(url: &str) -> Option<String> {
@@ -64,13 +56,13 @@ fn pay(row: &Value) -> Option<PayRange> {
     if min.is_none() && max.is_none() {
         return None;
     }
-    // ponytail: the feed names no currency and no period. The currency stays unknown and is
-    // never compared; the period is a yearly figure, the way the board lists salaries.
+    // The feed names no currency and no period. Both stay unknown: Rust never invents a field,
+    // and nothing compares a range whose period or currency is unknown.
     Some(PayRange {
         min,
         max,
         currency: None,
-        period: PayPeriod::Year,
+        period: None,
     })
 }
 

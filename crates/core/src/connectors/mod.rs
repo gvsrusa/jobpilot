@@ -7,17 +7,24 @@
 
 use std::time::Duration;
 
+mod ashby;
+mod assisted;
 pub mod fetch;
+mod greenhouse;
 mod lever;
 pub mod limit;
 mod remoteok;
 mod wwr;
 
+pub use ashby::Ashby;
+pub use assisted::Assisted;
+pub use greenhouse::Greenhouse;
 pub use lever::Lever;
 pub use remoteok::RemoteOk;
 pub use wwr::WeWorkRemotely;
 
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::ai::register::{REGISTER, site_row};
 use crate::error::{Error, Result};
@@ -240,10 +247,16 @@ pub fn check(decl: &ConnectorDecl) -> Result<()> {
     if decl.operations.is_empty() {
         return Err(invalid("no operations"));
     }
-    if decl.hosts.is_empty() {
+    let (integration, op) = decl.assisted_row;
+    if site_row(REGISTER, integration, op).is_none_or(|row| row.verdict != "user-assisted") {
+        return Err(invalid("an assisted row marked user-assisted"));
+    }
+    let reads = decl.operations.iter().any(|op| op.reads());
+    // A source that only imports a paste makes no request, so it needs no host.
+    if reads && decl.hosts.is_empty() {
         return Err(invalid("no hosts"));
     }
-    if decl.operations.iter().any(|op| op.reads()) {
+    if reads {
         if decl.automation.contains(&Automation::UserAssisted) {
             return Err(invalid("a user-assisted connector cannot declare a read"));
         }
@@ -261,13 +274,30 @@ pub fn check(decl: &ConnectorDecl) -> Result<()> {
     Ok(())
 }
 
-/// Every connector. Task 5 adds Greenhouse and Ashby.
+/// Every connector, the four user-assisted sources last.
 pub fn all() -> Vec<Box<dyn Connector>> {
-    vec![
+    let mut all: Vec<Box<dyn Connector>> = vec![
         Box::new(Lever),
         Box::new(RemoteOk),
         Box::new(WeWorkRemotely),
-    ]
+        Box::new(Greenhouse),
+        Box::new(Ashby),
+    ];
+    all.extend(
+        assisted::sources()
+            .into_iter()
+            .map(|source| Box::new(source) as Box<dyn Connector>),
+    );
+    all
+}
+
+/// A trimmed string field, empty when absent or not a string.
+fn text(row: &Value, key: &str) -> String {
+    row.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 /// A board or feed name that cannot leave its path: `[A-Za-z0-9_-]{1,100}`.

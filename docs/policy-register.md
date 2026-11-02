@@ -53,6 +53,12 @@ What stays in force, with no setting that turns it off:
 
 The Verdict and Consequence columns in the AI sections below describe what the vendors say. They are not changed, and the written questions stay open as optional follow-up.
 
+### Controller ruling R1 (2026-11-02): read two public job-board APIs while the vendor is silent
+
+**This is a controller ruling made while planning Release 0.5. It is not an owner decision.** The owner has not been asked, and can overturn it. The owner's AI-subscription waiver above covers AI provider terms only and is not extended to any read connector.
+
+R1 applies to exactly two rows: Greenhouse "Read public listings through Job Board API" and Ashby "Read public listings through Job Postings API". Both are documented, keyless, read-only public listing APIs. Each vendor's own text addresses the employer and says nothing about a third-party reader, so neither row can be `allowed`. Under R1 JobPilot reads them for the owner's personal use, only for a board the person names, at 2 seconds between requests and 300 a day, and shows the source as read under R1. The verdict `silent-read` records that the vendor is silent. If a vendor answers, or a term changes, the row is re-decided. Every other read row keeps the verdict its source supports. No AI provider row and no Copilot or submit row changes.
+
 ## How to read this register
 
 The analyzed case is a desktop app run by a user on their own machine, under their own login, with no JobPilot server between the user and the vendor. The separate case where a hosted service acts for users is listed in its own rows. It is a [PRD non-goal](prd.md#4-non-goals) and is recorded only so that nobody builds it by accident.
@@ -62,9 +68,10 @@ Each row covers one operation, because one integration can be fine to read and f
 | Verdict | Meaning | Product behaviour |
 |---|---|---|
 | `allowed` | A primary source permits this operation for the analyzed case. | May ship, subject to the row's conditions and FR-3.30 consent. |
+| `silent-read` | Controller ruling R1 only, never an owner decision: a documented, keyless, read-only public listing API whose vendor is silent on third-party readers, read for personal use on a board the person names. | May ship as a read-only connector at the stated rate limits. It is never reported as `allowed`. Only the Greenhouse and Ashby read rows carry it. |
 | `user-assisted` | A person performs the consequential step in their own browser, terminal, or local server. JobPilot prepares material, makes no request to the third-party site, and drives no browser there. | Manual only. JobPilot never fills a third-party form and never submits. |
 | `blocked` | A primary source forbids it, or a technical gate only the vendor or an employer can open stops it. | Not built. Code paths refuse it. |
-| `unknown` | The source is ambiguous, silent, or could not be read. A site or vendor being silent is `unknown`, whatever the operation. | **Behaves as blocked** for site rows until a primary source or written vendor answer resolves it, except Copilot fill on a row recording "no clause found" (D2). **AI provider rows follow the [owner decisions](#owner-decisions-2026-11-01)**, not this default. |
+| `unknown` | The source is ambiguous, silent, or could not be read. A site or vendor being silent is `unknown`, whatever the operation, except the two read rows R1 names. | **Behaves as blocked** for site rows until a primary source or written vendor answer resolves it, except Copilot fill on a row recording "no clause found" (D2). **AI provider rows follow the [owner decisions](#owner-decisions-2026-11-01)**, not this default. |
 
 Rules for this register:
 
@@ -72,7 +79,7 @@ Rules for this register:
 - Copilot fill, where JobPilot drives a browser through a form and the user clicks submit, is automation of that site. It needs its own `allowed` row, or under owner decision D2 a row that records "no clause found". A row `blocked` for a site stays blocked. A human clicking submit does not make it `user-assisted`.
 - Quotes are short and exact. Link markup and bold in the source are dropped. All dates read are 2026-11-01.
 - The AI use rules below bind by mode and model, not only by provider. The router must apply them (see [Routing](ai-providers.md#routing)).
-- Connectors and providers carry these four values as their policy-review status (FR-5.14). See [AI providers](ai-providers.md#capability-and-policy-vocabulary).
+- Connectors and providers carry these five values as their policy-review status (FR-5.14). See [AI providers](ai-providers.md#capability-and-policy-vocabulary).
 
 ## Subscription AI: Claude Code (FR-3.9)
 
@@ -150,11 +157,11 @@ One rule applies to every vendor: `allowed` only where a primary clause covers a
 
 ## Job sources: applicant tracking systems
 
-JobPilot acts for the applicant, who holds no employer key. All three vendors below publish customer terms. No applicant-facing terms were found for their hosted forms, so Copilot fill on them is `unknown`, matching the read rows. Under owner decision D2 that silence lets Copilot run, recorded as "no clause found".
+JobPilot acts for the applicant, who holds no employer key. All three vendors below publish customer terms. No applicant-facing terms were found for their hosted forms, so Copilot fill on them is `unknown`. The Greenhouse and Ashby read rows are `silent-read` under [R1](#controller-ruling-r1-2026-11-02-read-two-public-job-board-apis-while-the-vendor-is-silent), a controller ruling, and Lever's read row is `allowed`. Under owner decision D2 that silence lets Copilot run, recorded as "no clause found".
 
 | Integration | Operation | Primary source URL | Date read | Quoted clause | Verdict | Consequence |
 |---|---|---|---|---|---|---|
-| Greenhouse | Read public listings through Job Board API | https://support.greenhouse.io/hc/en-us/articles/10568627186203-Greenhouse-API-overview | 2026-11-01 | "Job Board API is designed to export information about your public job boards and job posts so your web developers can build custom career and application sites." | `unknown` | Off until Greenhouse answers. GET needs no key ("Only the application submission endpoint" does, https://developers.greenhouse.io/job-board.html), but the docs address the employer and say nothing of third-party readers. FR-5.2 ships as user-assisted import meanwhile. |
+| Greenhouse | Read public listings through Job Board API | https://support.greenhouse.io/hc/en-us/articles/10568627186203-Greenhouse-API-overview | 2026-11-01 | "Job Board API is designed to export information about your public job boards and job posts so your web developers can build custom career and application sites." | `silent-read` | Vendor silent on third-party readers; read under R1, personal use, a board the person names. GET needs no key ("Only the application submission endpoint" does, https://developers.greenhouse.io/job-board.html), but the docs address the employer and say nothing of third-party readers. FR-5.2 ships as a read-only connector under R1, and user-assisted import stays. |
 | Greenhouse | Submit through Job Board API | https://developers.greenhouse.io/job-board.html | 2026-11-01 | "the HTTP Basic Auth API token is a secret key. Any form posts should be proxied by your own servers." | `blocked` | Employer-side key and server. No applicant path. |
 | Greenhouse | User applies on the hosted form in their own browser | https://www.greenhouse.com/legal | 2026-11-01 | No applicant terms found. The legal page lists a "Master subscription agreement" for "your company". | `user-assisted` | Manual only. JobPilot opens the link, supplies files and text, and records the outcome. |
 | Greenhouse | Copilot fill of the hosted form; user reviews and submits | https://www.greenhouse.com/legal | 2026-11-01 | No clause found. | `unknown` | Vendor record: no clause either way. Product (D2): Copilot runs, recorded as "no clause found"; the user reviews and submits. A later Greenhouse objection ends it. |
@@ -164,7 +171,7 @@ JobPilot acts for the applicant, who holds no employer key. All three vendors be
 | Lever | User applies on the hosted form in their own browser | https://github.com/lever/postings-api | 2026-11-01 | "directing candidates to Lever's hosted application form is considered a best practice." | `user-assisted` | Manual only. The sentence addresses custom job sites and is no permission for tools. |
 | Lever | Copilot fill of the hosted form; user reviews and submits | https://github.com/lever/postings-api | 2026-11-01 | No clause on automated filling. The page advises "spam mitigations such as captchas". | `unknown` | Vendor record: no clause on filling. Product (D2): Copilot runs, recorded as "no clause found"; the user reviews and submits. CAPTCHAs always pause. |
 | Lever | Submit the hosted form with no human | https://github.com/lever/postings-api | 2026-11-01 | No clause found. | `unknown` | Autonomous refused. |
-| Ashby | Read public listings through Job Postings API | https://developers.ashbyhq.com/docs/public-job-posting-api | 2026-11-01 | "This API allows you to get data for all currently published Job Postings for your organization." | `unknown` | Off until Ashby answers. No key is needed, but the docs address the employer and say nothing of third-party readers. FR-5.4 ships as user-assisted import meanwhile. |
+| Ashby | Read public listings through Job Postings API | https://developers.ashbyhq.com/docs/public-job-posting-api | 2026-11-01 | "This API allows you to get data for all currently published Job Postings for your organization." | `silent-read` | Vendor silent on third-party readers; read under R1, personal use, a board the person names. No key is needed, but the docs address the employer and say nothing of third-party readers. FR-5.4 ships as a read-only connector under R1, and user-assisted import stays. |
 | Ashby | Submit through `applicationForm.submit` | https://developers.ashbyhq.com/reference/applicationformsubmit | 2026-11-01 | "Requires the candidatesWrite permission." | `blocked` | Employer API credential. No applicant path. |
 | Ashby | User applies on the hosted form in their own browser | https://developers.ashbyhq.com/docs/public-job-posting-api | 2026-11-01 | "URL for the Ashby page where candidates can apply for this job" | `user-assisted` | Manual only. |
 | Ashby | Copilot fill of the hosted form; user reviews and submits | https://developers.ashbyhq.com/docs/public-job-posting-api | 2026-11-01 | No clause on automated filling. | `unknown` | Vendor record: no clause on filling. Product (D2): Copilot runs, recorded as "no clause found"; the user reviews and submits. |
@@ -209,9 +216,9 @@ Re-evaluated with every verdict above and the [owner decisions](#owner-decisions
 | FR-3.17 Google | `unknown` for paid, `blocked` for free, Vertex AI unread. | Per D4: paid key direct. Free key refused for personal data. Vertex AI stays off until read. |
 | FR-3.18 OpenRouter | Account `allowed`, models take the origin vendor's row. | Per D4: OpenAI, Anthropic, and Google models eligible; other models stay `unknown`. |
 | FR-3.19 Compatible endpoints | Loopback only. | User-named loopback server. |
-| FR-5.2 Greenhouse | Read `unknown`. | User-assisted import. |
+| FR-5.2 Greenhouse | Read `silent-read` (R1, a controller ruling). | Read-only connector under R1, and user-assisted import. |
 | FR-5.3 Lever, FR-5.5 RemoteOK, FR-5.6 We Work Remotely | Read `allowed`. | Read-only connectors with attribution where required. |
-| FR-5.4 Ashby | Read `unknown`. | User-assisted import. |
+| FR-5.4 Ashby | Read `silent-read` (R1, a controller ruling). | Read-only connector under R1, and user-assisted import. |
 | FR-5.7 Company career pages | Automated read `unknown`. | User-assisted import. |
 | FR-5.8 Workday | Read `unknown`, workday.com and APIs `blocked`. | User-assisted import. |
 | FR-5.9 Indeed | Read `blocked`. No connector can exist. | User-assisted import. |
