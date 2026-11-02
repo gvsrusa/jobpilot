@@ -956,15 +956,21 @@ fn hurried() -> Limits {
     Limits::for_test(Duration::from_secs(5))
 }
 
+/// Retries, because a live step's heartbeat can land between the two statements.
 async fn age_and_reap(db: &Db) {
-    sqlx::query(
-        "UPDATE agent_runs SET heartbeat_at = \
-         strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-60 seconds')",
-    )
-    .execute(&db.pool)
-    .await
-    .unwrap();
-    assert_eq!(runner::reap_stale(db).await.unwrap(), 1);
+    for _ in 0..100 {
+        sqlx::query(
+            "UPDATE agent_runs SET heartbeat_at = \
+             strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-60 seconds')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        if runner::reap_stale(db).await.unwrap() == 1 {
+            return;
+        }
+    }
+    panic!("the run was never reaped");
 }
 
 async fn run_id(db: &Db) -> String {

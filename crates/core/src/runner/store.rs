@@ -326,7 +326,7 @@ pub(crate) async fn load(db: &Db, id: &str) -> Result<Stored> {
 }
 
 /// A person moves a `halted` run on, and the audit row lands with it. False when another
-/// handle got there first, which is what keeps a run to one resume.
+/// handle got there first. One writer after a resume comes from `generation`.
 async fn leave_halted(
     db: &Db,
     actor: &str,
