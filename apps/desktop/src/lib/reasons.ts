@@ -30,6 +30,15 @@ const REASONS: [word: string, text: string][] = [
     "The chosen model is not installed in Ollama. Download it on the AI screen, or choose another",
   ],
   [
+    "rate_limited",
+    "The AI provider is busy and asked to wait. Try again shortly, or write this one yourself.",
+  ],
+  ["auth_failed", "The AI provider refused the key. Check it on the AI screen."],
+  [
+    "quota_exhausted",
+    "The AI provider says your usage or credit has run out. Add credit with the vendor, then try again.",
+  ],
+  [
     "use_profile_by_country",
     "Work authorization is answered from your profile, for one country at a time. If this question asks something else, remove it and add it in other words",
   ],

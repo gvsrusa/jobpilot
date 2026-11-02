@@ -2,14 +2,13 @@
 //! when Ollama itself says it runs here: cloud models answer on the same address.
 //! Both the drafting and the embedding model are checked, because resume text goes to both.
 
-use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use reqwest::{Client, Response, StatusCode, Url};
+use reqwest::{Client, Response, StatusCode};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use super::net::{loopback_client, net, retry_after};
 use super::{
     Availability, BoxFuture, CancellationToken, Capability, Declaration, Prompt, Provider,
     ProviderId,
@@ -77,28 +76,7 @@ impl Ollama {
         drafting_model: Option<String>,
         embedding_model: Option<String>,
     ) -> Result<Ollama> {
-        let refused = || Error::Refused("not_loopback".into());
-        let parsed = Url::parse(url).map_err(|_| refused())?;
-        if parsed.scheme() != "http" {
-            return Err(refused());
-        }
-        let port = parsed.port_or_known_default().ok_or_else(refused)?;
-        let mut client = Client::builder()
-            .connect_timeout(Duration::from_secs(1))
-            .no_proxy()
-            // A loopback server must not be able to send us somewhere else.
-            .redirect(reqwest::redirect::Policy::none());
-        // `host_str` is canonical: the parser has already folded `127.1` and `0x7f.1` to dotted form.
-        match parsed.host_str() {
-            Some("127.0.0.1" | "[::1]") => {}
-            // The name is pinned to 127.0.0.1, so a hosts file cannot point it elsewhere.
-            Some("localhost") => {
-                let pinned = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-                client = client.resolve("localhost", pinned);
-            }
-            _ => return Err(refused()),
-        }
-        let client = client.build().map_err(net)?;
+        let (parsed, client) = loopback_client(url)?;
         Ok(Ollama {
             url: parsed.origin().ascii_serialization(),
             drafting_model: drafting_model.filter(|m| !m.is_empty()),
@@ -245,6 +223,14 @@ impl Ollama {
             .map_err(net)?;
         if response.status() == StatusCode::NOT_FOUND {
             return Err(Error::Refused("model_not_found".into()));
+        }
+        if matches!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+        ) {
+            let header = response.headers().get(reqwest::header::RETRY_AFTER);
+            let retry_after = retry_after(header.and_then(|value| value.to_str().ok()));
+            return Err(Error::RateLimited { retry_after });
         }
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -437,9 +423,4 @@ async fn cancellable<T>(work: impl Future<Output = T>, cancel: &CancellationToke
         () = cancelled => Err(Error::Cancelled),
         value = work => Ok(value),
     }
-}
-
-/// Connection and body errors are `Io`, which the router retries once.
-fn net(error: reqwest::Error) -> Error {
-    Error::Io(io::Error::other(error.without_url().to_string()))
 }

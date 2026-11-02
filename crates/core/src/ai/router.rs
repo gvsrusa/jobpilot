@@ -9,6 +9,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use super::claude_code::ClaudeCode;
+use super::net::MAX_RETRY_WAIT;
 use super::noai::NoAi;
 use super::ollama::{DEFAULT_URL, Ollama};
 use super::validate::validate;
@@ -24,6 +25,9 @@ use crate::settings;
 
 const CANCEL_POLL: Duration = Duration::from_millis(100);
 const NOT_LOGGED_IN: &str = "not_logged_in";
+const RATE_LIMITED: &str = "rate_limited";
+const AUTH_FAILED: &str = "auth_failed";
+const QUOTA_EXHAUSTED: &str = "quota_exhausted";
 const PROMPT_TOO_LARGE: &str = "prompt_too_large";
 const CONSENT: &str = "consent";
 const CONSENT_NEEDED: &str = "consent_needed";
@@ -364,10 +368,37 @@ impl Router {
             log(task, record).await?;
 
             // A timed-out or broken external attempt may already have spent the user's usage.
+            // A 429 spent nothing, so it may wait and retry, within the attempts the task has.
             match error {
+                Error::RateLimited { retry_after } if attempt < task.spec.attempts => {
+                    let wait = match (retry_after, is_external(&declaration)) {
+                        (Some(wait), _) if wait <= MAX_RETRY_WAIT => wait,
+                        (None, false) => Duration::from_secs(1),
+                        _ => return Ok(Step::Manual(RATE_LIMITED)),
+                    };
+                    let sleep = async {
+                        tokio::time::sleep(wait).await;
+                        Ok(())
+                    };
+                    if bounded(sleep, wait + CANCEL_POLL, task.cancel)
+                        .await
+                        .is_err()
+                    {
+                        log(task, row(&name, attempt, "cancelled", None, task.db).await?).await?;
+                        return Ok(Step::Cancelled);
+                    }
+                }
+                Error::RateLimited { .. } => return Ok(Step::Manual(RATE_LIMITED)),
                 Error::Timeout | Error::Io(_) if !is_external(&declaration) => {}
                 Error::Validation(_) if !validation_failed => validation_failed = true,
-                _ if reason == NOT_LOGGED_IN || reason == PROMPT_TOO_LARGE => {
+                _ if [
+                    NOT_LOGGED_IN,
+                    PROMPT_TOO_LARGE,
+                    AUTH_FAILED,
+                    QUOTA_EXHAUSTED,
+                ]
+                .contains(&reason) =>
+                {
                     return Ok(Step::Manual(reason));
                 }
                 _ => return Ok(Step::Next),
@@ -404,7 +435,8 @@ fn after_skip<T>(task: &Task<'_>, declaration: &Declaration, reason: &str) -> St
 /// what the user can grant here, then a provider that is simply not there right now.
 fn weight(reason: &str) -> u8 {
     match reason {
-        PROVIDER_UNAVAILABLE | NO_MODEL_SET | MODEL_NOT_INSTALLED => 0,
+        PROVIDER_UNAVAILABLE | NO_MODEL_SET | MODEL_NOT_INSTALLED | "no_key" | "no_api_model"
+        | "cli_too_old" => 0,
         CONSENT_NEEDED => 1,
         _ => 2,
     }

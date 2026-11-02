@@ -314,6 +314,9 @@ describe("resumes", () => {
     ["provider_unavailable", /cannot be reached/],
     ["no_model_set", /No local model is chosen/],
     ["model_not_installed", /not installed in Ollama/],
+    ["rate_limited", /busy and asked to wait/],
+    ["auth_failed", /refused the key/],
+    ["quota_exhausted", /usage or credit has run out/],
   ])("manual_required_%s_is_not_called_switched_off", async (reason, text) => {
     resumeBackend({
       resume_list: () => [],

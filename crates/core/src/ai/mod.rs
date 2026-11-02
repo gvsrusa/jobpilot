@@ -19,6 +19,7 @@ use ollama::OllamaStatus;
 
 pub mod claude_code;
 pub mod consent;
+pub mod net;
 pub mod noai;
 pub mod ollama;
 pub mod router;
@@ -39,6 +40,17 @@ pub const RUN_REASONS: &[&str] = &[
     "provider_unavailable",
     "no_model_set",
     "model_not_installed",
+    "rate_limited",
+    "auth_failed",
+    "quota_exhausted",
+    "model_refused",
+    "model_not_found",
+    "output_truncated",
+    "no_key",
+    "no_api_model",
+    "consent_suspended",
+    "cli_too_old",
+    "origin_refused",
 ];
 
 /// Absent capabilities are false: a declaration lists only what the provider proves.

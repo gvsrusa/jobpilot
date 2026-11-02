@@ -233,6 +233,19 @@ fn message(error: &Error) -> String {
         Error::ManualRequired(reason) if reason == "model_not_installed" => {
             "The chosen model is not installed in Ollama. Check `jobpilot ai models`.".into()
         }
+        Error::ManualRequired(reason) if reason == "rate_limited" => {
+            "The AI provider is busy and asked to wait. Try again shortly, or write this one \
+             yourself."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "auth_failed" => {
+            "The AI provider refused the key. Check it on the AI screen.".into()
+        }
+        Error::ManualRequired(reason) if reason == "quota_exhausted" => {
+            "The AI provider says your usage or credit has run out. Add credit with the vendor, \
+             then try again."
+                .into()
+        }
         Error::Refused(reason) if reason == "use_profile_by_country" => {
             "Work authorization is answered from your profile, for one country at a time. If \
              this question asks something else, remove it and add it in other words."
@@ -448,6 +461,18 @@ mod tests {
         );
         let gone = message(&Error::ManualRequired("model_not_installed".into()));
         assert!(gone.contains("jobpilot ai models"), "{gone}");
+    }
+
+    #[test]
+    fn hosted_failure_reasons_say_what_happened() {
+        for (reason, words) in [
+            ("rate_limited", "busy and asked to wait"),
+            ("auth_failed", "refused the key"),
+            ("quota_exhausted", "usage or credit has run out"),
+        ] {
+            let text = message(&Error::ManualRequired(reason.into()));
+            assert!(text.contains(words), "{reason}: {text}");
+        }
     }
 
     #[test]

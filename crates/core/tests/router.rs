@@ -31,6 +31,7 @@ enum Reply {
     Refused,
     TooLarge,
     Unavailable,
+    RateLimited(Option<Duration>),
     Hang,
     Vectors(Vec<Vec<f32>>),
 }
@@ -156,6 +157,7 @@ impl Provider for Mock {
                 Some(Reply::Refused) => Err(Error::Refused("not_allowed".into())),
                 Some(Reply::TooLarge) => Err(Error::Refused("prompt_too_large".into())),
                 Some(Reply::Unavailable) => Err(Error::Unavailable),
+                Some(Reply::RateLimited(retry_after)) => Err(Error::RateLimited { retry_after }),
                 Some(Reply::Hang) => {
                     let _guard = DropCount(self.counters.clone());
                     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1856,4 +1858,150 @@ async fn ollama_is_still_retried_after_a_timeout() {
     let outcome = parse_job(&router, &db).await;
 
     assert!(is_ok(&outcome, ProviderId::Ollama, 2), "{outcome:?}");
+}
+
+async fn with_claude_consent(db: &Db) {
+    let job_text = [DataCategory::JobText];
+    consent::give(db, CLAUDE, &job_text, "2026-11-01", "gui")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_429_with_retry_after_waits_then_retries_once() {
+    let (_tmp, db) = setup().await;
+    with_claude_consent(&db).await;
+    let secs = Some(Duration::from_secs(1));
+    let claude = Mock::claude(vec![Reply::RateLimited(secs), text(JOB)]);
+    let counters = claude.counters();
+    let router = Router::with_providers(vec![claude.boxed()]);
+
+    let clock = Instant::now();
+    let outcome = parse_job(&router, &db).await;
+
+    assert!(is_ok(&outcome, ProviderId::ClaudeCode, 2), "{outcome:?}");
+    assert!(clock.elapsed() >= Duration::from_millis(900));
+    assert_eq!(counters.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_long_retry_after_moves_on_at_once() {
+    let (_tmp, db) = setup().await;
+    with_claude_consent(&db).await;
+    let long = Some(Duration::from_secs(31));
+    let claude = Mock::claude(vec![Reply::RateLimited(long), text(JOB)]);
+    let counters = claude.counters();
+    let ollama = Mock::ollama(vec![text(JOB)]);
+    let router = Router::with_providers(vec![claude.boxed(), ollama.boxed()]);
+
+    let clock = Instant::now();
+    let outcome = parse_job(&router, &db).await;
+
+    assert!(clock.elapsed() < Duration::from_secs(2));
+    assert!(is_ok(&outcome, ProviderId::Ollama, 1), "{outcome:?}");
+    assert_eq!(counters.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_429_with_no_header_is_not_retried_on_an_external_provider() {
+    let (_tmp, db) = setup().await;
+    with_claude_consent(&db).await;
+    let claude = Mock::claude(vec![Reply::RateLimited(None), text(JOB)]);
+    let counters = claude.counters();
+    let router = Router::with_providers(vec![claude.boxed()]);
+
+    let outcome = parse_job(&router, &db).await;
+
+    assert_eq!(counters.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(outcome, manual("rate_limited"));
+    let first = rows(&db).await.remove(0);
+    assert_eq!(first.3.as_deref(), Some("rate_limited"));
+}
+
+#[tokio::test]
+async fn a_429_with_no_header_waits_a_second_and_retries_on_ollama() {
+    let (_tmp, db) = setup().await;
+    let ollama = Mock::ollama(vec![Reply::RateLimited(None), text(JOB)]);
+    let counters = ollama.counters();
+    let router = Router::with_providers(vec![ollama.boxed()]);
+
+    let clock = Instant::now();
+    let outcome = parse_job(&router, &db).await;
+
+    assert!(is_ok(&outcome, ProviderId::Ollama, 2), "{outcome:?}");
+    assert!(clock.elapsed() >= Duration::from_millis(900));
+    assert_eq!(counters.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_cancel_during_the_wait_ends_within_a_poll() {
+    let (_tmp, db) = setup().await;
+    with_claude_consent(&db).await;
+    let wait = Some(Duration::from_secs(20));
+    let claude = Mock::claude(vec![Reply::RateLimited(wait), text(JOB)]);
+    let counters = claude.counters();
+    let router = Router::with_providers(vec![claude.boxed()]);
+    let cancel = CancellationToken::new();
+    let stopper = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        stopper.cancel();
+    });
+
+    let clock = Instant::now();
+    let outcome = router
+        .run(&db, "gui", TaskType::ParseJob, prompt(), cancel)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, Outcome::Cancelled);
+    assert!(clock.elapsed() < Duration::from_secs(2));
+    assert_eq!(counters.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_pause_during_the_wait_stops_the_retry() {
+    let (_tmp, db) = setup().await;
+    with_claude_consent(&db).await;
+    let wait = Some(Duration::from_secs(1));
+    let claude = Mock::claude(vec![Reply::RateLimited(wait), text(JOB)]);
+    let counters = claude.counters();
+    let router = Router::with_providers(vec![claude.boxed()]);
+    let pool = db.pool.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        sqlx::query("INSERT INTO emergency_pause (id, set_at, set_by) VALUES ('me', 'now', 'gui')")
+            .execute(&pool)
+            .await
+            .unwrap();
+    });
+
+    let outcome = parse_job(&router, &db).await;
+
+    assert_eq!(outcome, Outcome::Cancelled);
+    assert_eq!(counters.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn classify_stays_one_attempt_on_a_429() {
+    let (_tmp, db) = setup().await;
+    with_claude_consent(&db).await;
+    let wait = Some(Duration::ZERO);
+    let claude = Mock::claude(vec![Reply::RateLimited(wait), text(JOB)]);
+    let counters = claude.counters();
+    let router = Router::with_providers(vec![claude.boxed()]);
+
+    let outcome = router
+        .run(
+            &db,
+            "gui",
+            TaskType::ClassifyAnswer,
+            prompt(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(counters.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(outcome, manual("rate_limited"));
 }
