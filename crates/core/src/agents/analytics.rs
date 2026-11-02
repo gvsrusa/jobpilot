@@ -79,8 +79,13 @@ impl Workflow for Analytics {
             match index {
                 0 => {
                     let figures = json(&analytics::volume(db).await?)?;
-                    // One statement makes the row and its first section, so a retried
-                    // step leaves no second row behind.
+                    if let Some(id) = ctx.saved("report") {
+                        // A retry after the row exists: write the section again.
+                        Self::merge(db, &id, "volume", &figures, false).await?;
+                        return Ok(StepOutput::default());
+                    }
+                    // One statement makes the row and its first section, so a failed
+                    // insert leaves no row to retry around.
                     let (id,): (String,) = sqlx::query_as(
                         "INSERT INTO reports (id, created_at, figures) VALUES \
                          (lower(hex(randomblob(16))), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \

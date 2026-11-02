@@ -70,7 +70,8 @@ pub(crate) async fn volume(db: &Db) -> Result<Volume> {
             .await?;
     let (recent,): (i64,) = sqlx::query_as(
         "SELECT count(*) FROM applications \
-         WHERE applied_on IS NOT NULL AND applied_on >= date('now', '-30 days')",
+         WHERE applied_on IS NOT NULL AND applied_on >= date('now', '-30 days') \
+         AND applied_on <= date('now')",
     )
     .fetch_one(&db.pool)
     .await?;
@@ -183,4 +184,20 @@ pub(crate) async fn finished(db: &Db, id: &str) -> Result<Report> {
             .await?;
     let (id, at, figures) = row.ok_or(Error::NotFound)?;
     report_from(id, at, &figures)
+}
+
+/// Removes unfinished rows no run can still finish: a failed or cancelled run leaves one that
+/// nobody deletes. A row named by a run still active or halted is kept, so a resume has it,
+/// and so is a row under five minutes old, which an active run may not have checkpointed yet.
+pub(crate) async fn drop_unfinished(db: &Db) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM reports WHERE complete = 0 \
+         AND created_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-5 minutes') \
+         AND id NOT IN (SELECT json_extract(checkpoint, '$.report') FROM agent_runs \
+           WHERE agent = 'analytics' AND json_extract(checkpoint, '$.report') IS NOT NULL \
+           AND state NOT IN ('completed','manual_required','refused','failed','cancelled'))",
+    )
+    .execute(&db.pool)
+    .await?;
+    Ok(())
 }

@@ -21,7 +21,7 @@ import {
   type Answer,
   type Question,
 } from "@/lib/ipc";
-import { formatDate, formatDay } from "@/lib/utils";
+import { formatDate, formatDateTime, formatDay } from "@/lib/utils";
 
 const NEW = "new";
 const EMPTY: ApplicationInput = {
@@ -70,7 +70,21 @@ function describe(event: ApplicationEvent): string {
 }
 
 const NO_DATA = "Not enough data yet";
-const percent = (rate: number | null) => (rate === null ? NO_DATA : `${Math.round(rate * 100)}%`);
+/** A rate that is not zero never reads 0%, and one under 1 never reads 100%. */
+function percent(rate: number | null): string {
+  if (rate === null) return NO_DATA;
+  const whole = Math.round(rate * 100);
+  if (rate > 0 && whole < 1) return "<1%";
+  if (rate < 1 && whole > 99) return ">99%";
+  return `${whole}%`;
+}
+
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+function median({ median_days_to_response: days, responses_counted: n }: Report["timing"]): string {
+  if (days === null) return NO_DATA;
+  return `${plural(Math.round(days * 10) / 10, "day")} (from ${plural(n, "response")})`;
+}
 
 /**
  * Counts and rates from the application store, built on request. The figures hold no text, so
@@ -91,12 +105,7 @@ function Summary() {
         ["Applied in the last 30 days", String(report.volume.applied_last_30_days)],
         ["Response rate", percent(report.funnel.response_rate)],
         ["Offer rate", percent(report.funnel.offer_rate)],
-        [
-          "Median days to a response",
-          report.timing.median_days_to_response === null
-            ? NO_DATA
-            : `${Math.round(report.timing.median_days_to_response * 10) / 10} days`,
-        ],
+        ["Median days to a response", median(report.timing)],
       ]
     : [];
   return (
@@ -108,7 +117,7 @@ function Summary() {
         <Button type="button" variant="outline" disabled={run.isPending} onClick={() => run.mutate()}>
           {run.isPending ? "Working..." : "Refresh"}
         </Button>
-        {report && <span className="text-sm text-muted-foreground">As of {formatDate(report.created_at)}</span>}
+        {report && <span className="text-sm text-muted-foreground">As of {formatDateTime(report.created_at)}</span>}
       </div>
       <ErrorAlert error={latest.error ?? run.error} />
       {latest.isSuccess && !report && (
@@ -345,7 +354,12 @@ export function ApplicationsView() {
     enabled: selected !== null && selected !== NEW,
   });
 
-  const refresh = () => client.invalidateQueries({ queryKey: ["applications"] });
+  // The summary is a report made earlier: asking for it again shows a newer one if there is one.
+  const refresh = () =>
+    Promise.all([
+      client.invalidateQueries({ queryKey: ["applications"] }),
+      client.invalidateQueries({ queryKey: ["analytics", "latest"] }),
+    ]);
   const open = (app: Application) => {
     setSelected(app.id);
     setForm(inputOf(app));

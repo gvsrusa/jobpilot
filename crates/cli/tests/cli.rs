@@ -1395,6 +1395,7 @@ fn analytics_report_after_applying_prints_a_rate() {
     let text = run(&home, &["analytics", "report"]);
     let text = String::from_utf8_lossy(&text.stdout);
     assert!(text.contains("Response rate: 0%"), "{text}");
+    assert!(text.contains("As of 20"), "{text}");
     assert!(
         text.contains("Median days to a response: not enough data yet"),
         "{text}"
@@ -1403,6 +1404,9 @@ fn analytics_report_after_applying_prints_a_rate() {
 
     let shown = String::from_utf8_lossy(&run(&home, &["analytics", "show"]).stdout).into_owned();
     assert!(shown.contains("Response rate: 0%"), "{shown}");
+    let latest = stdout_json(&run(&home, &["analytics", "show", "--json"]));
+    let at = latest["created_at"].as_str().unwrap();
+    assert!(shown.contains(&format!("As of {at}")), "{shown}");
     let runs = stdout_json(&run(&home, &["agents", "list", "--json"]));
     assert_eq!(runs[0]["agent"], "analytics");
 }

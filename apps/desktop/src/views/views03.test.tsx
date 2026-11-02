@@ -142,10 +142,74 @@ describe("applications summary", () => {
     await waitFor(() => expect(count(api, "analytics_run")).toBe(1));
     expect(await within(summary).findByText("25%")).toBeInTheDocument();
     expect(within(summary).getByText("0%")).toBeInTheDocument();
-    expect(within(summary).getByText("3.5 days")).toBeInTheDocument();
+    expect(within(summary).getByText("3.5 days (from 1 response)")).toBeInTheDocument();
     expect(within(summary).getByText("Total applications").nextSibling).toHaveTextContent("4");
     expect(within(summary).getByText("Applied: 3")).toBeInTheDocument();
     expect(within(summary).getByText("Rejected: 1")).toBeInTheDocument();
+  });
+
+  it("a_rate_never_rounds_to_an_end_it_has_not_reached", async () => {
+    backend({
+      analytics_latest: () =>
+        report({
+          funnel: { applied: 1000, responded: 2, interviews: 0, offers: 999, response_rate: 0.002, offer_rate: 0.999 },
+        }),
+    });
+    const { user } = renderApp();
+    await open(user);
+    const summary = await screen.findByRole("region", { name: "Summary" });
+    expect(await within(summary).findByText("<1%")).toBeInTheDocument();
+    expect(within(summary).getByText(">99%")).toBeInTheDocument();
+  });
+
+  it("the_median_names_its_sample_and_says_1_day", async () => {
+    backend({
+      analytics_latest: () => report({ timing: { median_days_to_response: 1, responses_counted: 1 } }),
+    });
+    const { user } = renderApp();
+    await open(user);
+    const summary = await screen.findByRole("region", { name: "Summary" });
+    expect(await within(summary).findByText("1 day (from 1 response)")).toBeInTheDocument();
+  });
+
+  it("the_median_pluralises_days_and_responses", async () => {
+    backend({
+      analytics_latest: () => report({ timing: { median_days_to_response: 3.5, responses_counted: 2 } }),
+    });
+    const { user } = renderApp();
+    await open(user);
+    const summary = await screen.findByRole("region", { name: "Summary" });
+    expect(await within(summary).findByText("3.5 days (from 2 responses)")).toBeInTheDocument();
+  });
+
+  it("the_report_time_shows_beside_its_date", async () => {
+    backend({ analytics_latest: () => report({ created_at: "2026-11-01T10:45:00Z" }) });
+    const { user } = renderApp();
+    await open(user);
+    const summary = await screen.findByRole("region", { name: "Summary" });
+    const expected = new Date("2026-11-01T10:45:00Z").toLocaleTimeString(undefined, {
+      hour: "numeric",
+      minute: "2-digit",
+    });
+    expect(await within(summary).findByText(new RegExp(`As of .*${expected}`))).toBeInTheDocument();
+  });
+
+  it("a_status_change_asks_for_the_summary_again", async () => {
+    const api = tracking();
+    const { user } = renderApp();
+    await open(user);
+    await user.click(screen.getByRole("button", { name: "Add application" }));
+    await user.type(screen.getByLabelText("Company"), "Acme");
+    await user.type(screen.getByLabelText("Role"), "Engineer");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await user.click(await screen.findByRole("button", { name: "Acme" }));
+    await screen.findByRole("region", { name: "Summary" });
+    await waitFor(() => expect(count(api, "analytics_latest")).toBeGreaterThan(0));
+    const before = count(api, "analytics_latest");
+    await user.selectOptions(await screen.findByLabelText("New status"), "applied");
+    await user.click(screen.getByRole("button", { name: "Set status" }));
+    await waitFor(() => expect(count(api, "app_set_status")).toBe(1));
+    await waitFor(() => expect(count(api, "analytics_latest")).toBeGreaterThan(before));
   });
 
   it("a_refused_refresh_shows_its_code", async () => {

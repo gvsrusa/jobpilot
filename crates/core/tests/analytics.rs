@@ -432,3 +432,131 @@ async fn a_person_runs_it_and_the_system_is_refused() {
     assert_eq!(error.code(), "refused");
     assert_eq!(reports_left(&db).await, 0);
 }
+
+#[tokio::test]
+async fn a_future_applied_date_is_not_in_the_last_30_days() {
+    let (_tmp, db) = setup().await;
+    let soon = add(&db, "A", "R", "").await;
+    go(&db, &soon.id, "applied").await;
+    date(&db, &soon.id, "2999-01-01", None).await;
+    let report = report(&db).await;
+    assert_eq!(report.funnel.applied, 1);
+    assert_eq!(report.volume.applied_last_30_days, 0);
+}
+
+#[tokio::test]
+async fn an_applied_event_counts_without_an_applied_date() {
+    let (_tmp, db) = setup().await;
+    let app = add(&db, "A", "R", "").await;
+    go(&db, &app.id, "applied").await;
+    go(&db, &app.id, "screening").await;
+    sqlx::query("UPDATE applications SET applied_on = NULL")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let report = report(&db).await;
+    assert_eq!(report.funnel.applied, 1);
+    assert_eq!(report.funnel.responded, 1);
+    assert_eq!(report.timing.responses_counted, 0, "no date, no gap");
+}
+
+/// Runs step 0 twice, as a retry after a failure past the insert would.
+struct StepZeroTwice;
+
+impl Workflow for StepZeroTwice {
+    fn agent(&self) -> Agent {
+        agent::Analytics.agent()
+    }
+
+    fn input(&self) -> RunInput {
+        agent::Analytics.input()
+    }
+
+    fn steps(&self) -> &'static [StepDef] {
+        agent::STEPS
+    }
+
+    fn step<'a>(&'a self, ctx: &'a Ctx<'a>, index: usize) -> BoxFuture<'a, Result<StepOutput>> {
+        Box::pin(async move {
+            if index == 0 {
+                agent::Analytics.step(ctx, 0).await?;
+            }
+            agent::Analytics.step(ctx, index).await
+        })
+    }
+
+    fn abandon<'a>(&'a self, db: &'a Db, saved: &'a Checkpoint) -> BoxFuture<'a, Result<()>> {
+        agent::Analytics.abandon(db, saved)
+    }
+}
+
+#[tokio::test]
+async fn a_retried_first_step_leaves_one_row() {
+    let (_tmp, db) = setup().await;
+    let done = runner::start(&db, "cli", &StepZeroTwice, token())
+        .await
+        .unwrap();
+    assert_eq!(done.state, RunState::Completed);
+    assert_eq!(reports_left(&db).await, 1);
+}
+
+async fn plant(db: &Db, id: &str, age: &str) {
+    sqlx::query(
+        "INSERT INTO reports (id, created_at, complete, figures) VALUES \
+         (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?), 0, '{}')",
+    )
+    .bind(id)
+    .bind(age)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_new_run_drops_what_a_failed_run_left() {
+    let (_tmp, db) = setup().await;
+    let orphan = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    plant(&db, orphan, "-1 hour").await;
+    // A run that failed, with the row in its checkpoint, owns nothing any more.
+    sqlx::query(
+        "INSERT INTO agent_runs (id, agent, state, actor, input, step, steps, checkpoint, \
+         heartbeat_at, created_at, finished_at) VALUES ('11111111111111111111111111111111', \
+         'analytics', 'failed', 'cli', '{\"kind\":\"analytics\"}', 1, 3, json_object('report', ?), \
+         strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'), \
+         strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+    )
+    .bind(orphan)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let kept = report(&db).await;
+    assert_eq!(reports_left(&db).await, 1);
+    assert_eq!(analytics::latest(&db).await.unwrap().unwrap().id, kept.id);
+}
+
+#[tokio::test]
+async fn a_new_run_keeps_the_row_of_a_halted_run_and_a_fresh_row() {
+    let (_tmp, db) = setup().await;
+    let halted = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let fresh = "cccccccccccccccccccccccccccccccc";
+    plant(&db, halted, "-1 hour").await;
+    plant(&db, fresh, "-1 second").await;
+    sqlx::query(
+        "INSERT INTO agent_runs (id, agent, state, actor, input, step, steps, checkpoint, \
+         heartbeat_at, created_at) VALUES ('22222222222222222222222222222222', \
+         'analytics', 'halted', 'cli', '{\"kind\":\"analytics\"}', 1, 3, json_object('report', ?), \
+         strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+    )
+    .bind(halted)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    report(&db).await;
+    let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM reports WHERE id IN (?, ?)")
+        .bind(halted)
+        .bind(fresh)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 2);
+}

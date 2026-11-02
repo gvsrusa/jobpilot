@@ -43,6 +43,8 @@ pub async fn set_status(
 /// Builds the figures from the application store and returns them. A cancel drops the
 /// report; a finished one stays until the next.
 pub async fn analytics_report(db: &Db, actor: &str, cancel: CancellationToken) -> Result<Report> {
+    runner::person(actor)?;
+    crate::analytics::drop_unfinished(db).await?;
     let saved = runner::start(db, actor, &Analytics, cancel)
         .await?
         .into_result()?;
