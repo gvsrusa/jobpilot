@@ -20,16 +20,17 @@
 - Owner direction: personal app; AI subscription policy is waived and never reopened in this plan. Security controls stay: agents have restricted permissions, sensitive answers need explicit confirmation (FR-8.8), nothing infers work authorization (FR-4.10), nothing fabricates (FR-7.12).
 - Migrations start at `0006`. Applied files are never edited. Each new table holding personal data carries a rule 7 comment saying how backup, export, and delete-all treat it. Final `schema_version` is 11.
 - **Seam check.** A task is done only when its feature is reachable from the GUI and the CLI. Each feature task ends with a CLI integration test, a Tauri command test through the mock runtime harness in `commands.rs`, and a view test. Reviewers reject a task whose core function has no adapter caller.
-- **Keychain.** Tests never touch the real keychain unless `#[ignore]`d. Read paths never call `crypto::state` or `crypto::unlocked`: a list shows a sealed row with an empty body, and status-like reads use `crypto::known_state` or `crypto::peek`. Only a seal, or an explicit reveal or use, asks the store. Gate logic runs before any decrypt, so refusal tests need no keychain: they seed a sealed row with `DataKey::from_bytes`.
-- **New ciphertext column.** `memory_answers.body_enc` joins every place the `ponytail:` comments in `crypto.rs` and `recovery.rs` name: `held_key_ids`, `sample_of`, both guards around `add_first_key`, `other_ciphertext`, and the clearing block in `discard_locked`.
+- **Keychain.** Tests never touch the real keychain unless `#[ignore]`d. `crypto::key_by_id` does not publish, so `db.key_state()` cannot show that a read stayed off the keychain, and `secrets::KEYCHAIN_CALLS` exists only in unit tests. So each read a test name says "asks the keychain nothing" is also called, with a sealed row seeded, inside `plain_work_makes_no_keychain_call` in `crypto.rs`, the one test that may read that count. Read paths never call `crypto::state` or `crypto::unlocked`: a list shows a sealed row with an empty body, and status-like reads use `crypto::known_state` or `crypto::peek`. Only a seal, or an explicit reveal or use, asks the store. Gate logic runs before any decrypt, so refusal tests need no keychain: they seed a sealed row with `DataKey::from_bytes`.
+- **New ciphertext column.** `memory_answers.body_enc` joins every place the `ponytail:` comments in `crypto.rs` and `recovery.rs` name: `held_key_ids`, `sample_of`, the checks in `add_first_key` and `reactivate`, `other_ciphertext`, and the clearing block in `discard_locked`.
 - **Windows.** Gate every `cfg(unix)` or `cfg(windows)` item on both sides. When a task touches a `cfg` item, a child process, or a Tauri menu, run the `x86_64-pc-windows-gnu` clippy recipe in `docs/development.md`. It type-checks only; CI is the Windows evidence.
 - **Panel.** Each new CLI command gets a row in the `PANEL` table in `crates/cli/src/main.rs` and, when refused, a `matches!` arm in `refused_in_panel`. Rule for this release: what its GUI twin confirms natively is refused, and a sensitive value never prints in the panel.
+- **Tauri commands.** Each new `#[tauri::command]` goes in `handler()`, in `ALLOWED_COMMANDS` in the `commands.rs` tests (`no_command_returns_a_key_or_recovery_bytes` compares the two), and in `ipc.ts` with types matching its Rust structs, with a `backend()` default in `test-utils.tsx` when a test needs one.
 - **GUI rules.** Text from outside the app and stored answers render as inert text, no anchors. Every control has a visible label and works by keyboard. Errors appear in `role="alert"` with their code. No `dangerouslySetInnerHTML`.
 - Execution logs, checkpoints, and audit rows hold ids, codes, and counts. Never prompts, outputs, posting text, answer text, or secrets (M-26).
 - Only a person (`gui` or `cli` actor) approves an answer, lowers a class, confirms a use, or clears the pause. `"system"` is refused by core, whatever the adapter does.
 - Tests use a temporary `JOBPILOT_HOME`. No test touches the owner's data root. No step takes a full-screen screenshot.
 - Ponytail rule: no abstraction without a second caller. Mark deliberate limits with a `ponytail:` comment naming the ceiling.
-- Every commit ends with a blank line and `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+- Every commit ends with a blank line and `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. The `git commit` lines below show the subject only: add this line to each.
 
 ## Dependency decisions
 
@@ -47,6 +48,8 @@ No new Rust or npm dependency. `tauri::menu` ships in `tauri` 2.12.5 with no fea
 | Starting a run while paused | `Err(Paused)` and no row. | "While set, no run starts." |
 | Status edits while paused | Refused with `paused`, because they run through the tracking agent. Editing fields and notes stays open. | Keeps one path for status. The copy says what to do. |
 | `waiting_for_human` | In the state `CHECK` list, never entered in 0.3. | No 0.3 agent pauses for a person, and 0.6 then needs no table rebuild. |
+| `memory refresh` | Only a person starts it: no timer, no startup, and no hook on adding a question. Before any Claude call it shows how many it will make, at most `CLASSIFY_BATCH` (20) per press, one attempt each. Resuming a halted refresh makes none. | Owner ruling. Classifying spends the owner's subscription. |
+| Restore and Claude Code | A restore that revokes external consent also sets `ai.enabled.claude_code` to false. With no consent to revoke the setting stays. | Owner ruling. The AI screen must not show Claude on and failing. |
 | Terminal panel on pause | A user-driven `claude` session is not stopped. A `jobpilot` command run inside the panel is, through the same poll. | The spec stops automation; that session is the user's own (M-14). |
 
 ## Review Focus
@@ -77,9 +80,9 @@ crates/core/src/agents/{mod,tracking}.rs                                        
 crates/core/src/agents/analytics.rs, analytics.rs                                     Task 7
 crates/core/src/agents/{draft,memory}.rs                                              Task 8
 crates/core/src/pause.rs                                                              Task 9
-crates/core/tests/{applications,memory,memory_use,memory_search,runner,agents,pause}.rs
+crates/core/tests/{applications,memory,memory_use,memory_search,runner,agents,analytics,pause}.rs
 crates/core/tests/injection/{15,16,17}_*.txt                                          Tasks 1, 8
-crates/cli/src/{apps,memory,agents,pause}.rs                                          Tasks 2 to 9
+crates/cli/src/{apps,memory,agents,analytics,pause}.rs                                Tasks 2 to 9
 apps/desktop/src-tauri/src/menu.rs                                                    Task 9
 apps/desktop/src/views/{ApplicationsView,MemoryView,AgentsView}.tsx                   Tasks 2, 3, 6
 apps/desktop/src/components/TitleBar.tsx, lib/pause.ts                                Task 9
@@ -92,13 +95,14 @@ docs, release notes, version bump                                               
 
 **Files:**
 - Modify: `crates/core/src/ai/{mod,router}.rs`, `crates/cli/src/main.rs`, `apps/desktop/src/lib/reasons.ts`
-- Modify: `crates/core/src/knowledge.rs`, `crates/core/src/embed.rs`, `crates/cli/src/profile.rs`, `apps/desktop/src-tauri/src/commands.rs`, `apps/desktop/src/lib/ipc.ts`, `apps/desktop/src/components/KnowledgeSection.tsx`, `apps/desktop/src/views/ResumesView.tsx`
+- Modify: `crates/core/src/knowledge.rs`, `crates/core/src/drafts.rs`, `crates/core/src/embed.rs`, `crates/cli/src/profile.rs`, `apps/desktop/src-tauri/src/commands.rs`, `apps/desktop/src/lib/ipc.ts`, `apps/desktop/src/components/{KnowledgeSection,CompareTable}.tsx`, `apps/desktop/src/views/ResumesView.tsx`
 - Modify: `crates/core/src/backup.rs`, `crates/core/src/parse.rs`, `crates/core/src/generate.rs`
 - Create: `crates/core/tests/injection/15_tool_use_request.txt`, `crates/core/tests/injection/16_exfiltrate_profile.txt`
-- Test: `crates/core/tests/{router,knowledge,backup,generate,injection}.rs`, `crates/cli/tests/cli.rs`, `apps/desktop/src/views/views02.test.tsx`
+- Modify: `crates/core/tests/injection/README.md`
+- Test: `crates/core/tests/{router,knowledge,drafts,backup,generate,injection}.rs`, `crates/cli/tests/cli.rs`, `apps/desktop/src/views/views02.test.tsx`
 
 **Interfaces:**
-- Produces: `RUN_REASONS` gains `no_model_set`, `model_not_installed`. `KnowledgeItem.locked` is replaced by `sealed: bool`. `knowledge::reveal(db: &Db, id: &str) -> Result<String>`. `parse::stock_heading_display(heading: &str) -> Option<String>`.
+- Produces: `RUN_REASONS` gains `no_model_set`, `model_not_installed`. `KnowledgeItem.locked` is replaced by `sealed: bool`. `knowledge::reveal(db: &Db, id: &str) -> Result<String>`. `knowledge::marked_bodies(db: &Db) -> Result<Vec<String>>`, `pub(crate)`. `parse::stock_heading_display(heading: &str) -> Option<String>`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -130,11 +134,18 @@ docs, release notes, version bump                                               
     assert_eq!(made.draft.doc.sections[0].heading, "Work Experience"); // model sent "work experience"
 }
 // injection.rs
-#[tokio::test] async fn a_reply_asking_for_a_tool_stores_nothing() { /* 15: extra `tool_use` key fails the schema */ }
-#[tokio::test] async fn an_exfiltration_url_stays_flagged_text() { /* 16: claim stored `no_evidence`, export refused */ }
+#[tokio::test] async fn a_reply_asking_for_a_tool_stores_nothing() {
+    // 15: the extra `tool_use` key fails the schema
+    assert!(drafts::list(&db, None).await.unwrap().is_empty());
+}
+#[tokio::test] async fn an_exfiltration_url_stays_flagged_text() {
+    // 16: the claim holding the URL cites no evidence
+    assert_eq!(claims[0].status, "no_evidence");
+    assert_eq!(export.unwrap_err().code(), "refused");
+}
 ```
 
-Also: `consent_hint_names_the_whole_command` in `crates/cli/src/main.rs` tests asserts the `consent_needed` message contains `jobpilot ai consent give claude_code --categories job_text,profile_basic,resume_text`. Also in `views02.test.tsx`: extend the `manual_required_%s` table with `no_model_set` and `model_not_installed`; add `ai_view_after_restore_shows_claude_off_and_asks_for_consent`, and `kb_show_reveals_a_sealed_item_on_request` (the list does not call `kb_reveal` until the Show press).
+Also: `a_marked_item_still_stops_export_with_no_key`, in `crates/core/tests/drafts.rs`: a seeded sealed item with no key entry, a draft holding generated text, `drafts::export` is a key error or `Err(Locked)`. Also: `consent_hint_names_the_whole_command` in `crates/cli/src/main.rs` tests asserts the `consent_needed` message contains `jobpilot ai consent give claude_code --categories job_text,profile_basic,resume_text`. Also in `views02.test.tsx`: extend the `manual_required_%s` table with `no_model_set` and `model_not_installed`; add `ai_view_after_restore_shows_claude_off_and_asks_for_consent`, and `kb_show_reveals_a_sealed_item_on_request` (the list does not call `kb_reveal` until the Show press).
 
 - [ ] **Step 2: Run them to verify they fail**
 
@@ -154,7 +165,7 @@ In `try_provider`, `Availability::Unavailable(why)` maps through `fn unavailable
 
 - [ ] **Step 5: Stop `kb_list` reading the keychain**
 
-`knowledge::list` calls nothing in `crypto`. A row with `body_enc` lists with `body: ""`, `sealed: true`. A marked row whose text was discarded lists `sealed: false`. Delete `key_or_none` if unused. `knowledge::reveal` opens one body with `crypto::key_by_id` and returns the key's own error when it cannot. Update `embed.rs`, `ResumesView`, `profile.rs`, and the ignored keychain tests in `crates/core/tests/knowledge.rs` to reveal.
+`knowledge::list` calls nothing in `crypto`. A row with `body_enc` lists with `body: ""`, `sealed: true`. A marked row whose text was discarded lists `sealed: false`. Delete `key_or_none` if unused. `knowledge::reveal` opens one body with `crypto::key_by_id` and returns the key's own error when it cannot. `drafts::sealed_text` read marked bodies through `list`, so it now calls `knowledge::marked_bodies`, which opens each one and returns the first key error, and asks no key with nothing sealed; otherwise claims stop being checked against marked text. `drafts::usable` and `embed.rs` test `sealed`. Update `ResumesView`, `CompareTable`, `profile.rs`, and the ignored keychain tests in `crates/core/tests/knowledge.rs` to reveal.
 
 Add Tauri `kb_reveal(id) -> String` and `ipc.kbReveal`. CLI `kb reveal <id>`, PANEL row `("kb reveal i", true)`. In `KnowledgeSection`, a sealed item shows "Sealed" and a `Show` button. A key error renders in `ErrorAlert`, and the existing "see Recovery" wording moves there.
 
@@ -272,7 +283,7 @@ CREATE INDEX application_events_by_application ON application_events (applicatio
 
 - `add_starts_saved_with_a_created_event`: status `saved`, one event of kind `created`.
 - `status_change_records_from_and_to_in_one_event`: `saved` to `applied` gives `from_status == Some("saved")`, `to_status == Some("applied")`.
-- `first_applied_sets_applied_on_and_a_later_one_keeps_it`: `on: Some("2026-10-02")` stored; a second move back to `applied` keeps it.
+- `first_applied_sets_applied_on_and_a_later_one_keeps_it`: `on: Some("2026-10-02")` stored; a second move back to `applied` keeps it. With `on: None` the first `applied` stores today's UTC date.
 - `the_same_status_twice_writes_no_event`.
 - `any_status_can_be_corrected`: `rejected` to `interviewing` is accepted and recorded.
 - `bad_input_is_refused`: empty company, company over 300 chars, status `ghosted`, `on: "02/10/2026"`, country `USA`, notes over 20,000 chars, link `javascript:x`, unknown job id: each `Err(Validation)`, nothing stored.
@@ -316,7 +327,7 @@ Commands, each through `state.work()`: `app_list(status)`, `app_get(id)`, `app_a
 `View` gains `"applications"`, `NAV` gains `Applications` (Ctrl/Cmd+7). `ApplicationsView`, heading "Applications":
 
 - Table: Company, Role, Status, Applied, Updated, as buttons opening the detail. Status filter select. Empty state: "No applications yet. Add the first one."
-- `Add application` form. Detail: the same fields, a status select with an optional date and note, history list, `Remove` through `ConfirmDialog`.
+- `Add application` form. Detail: the same fields, a status select with an optional date and note, an `Add note` field calling `app_note`, history list, `Remove` through `ConfirmDialog`.
 - `link` renders as plain selectable text labelled untrusted, never an anchor.
 - Focus order: filter, Add application, table, detail fields, status controls, Remove.
 
@@ -324,7 +335,7 @@ Commands, each through `state.work()`: `app_list(status)`, `app_get(id)`, `app_a
 
 - `crates/cli/tests/cli.rs`: `app_add_status_list_and_history_round_trip`, with `--json`, and `panel_runs_tracking_commands`.
 - `commands.rs` tests: `app_commands_reach_core`: add then set status through the harness, assert `app_history` holds two events.
-- `views03.test.tsx`: `applications_add_change_status_and_see_history`, `an_application_link_is_never_an_anchor`, `ctrl_7_opens_applications`.
+- `views03.test.tsx`: `applications_add_change_status_and_see_history` (an added note shows in the history too), `an_application_link_is_never_an_anchor`, `ctrl_7_opens_applications`.
 
 Run: `cargo test --workspace && pnpm typecheck && pnpm test`
 Expected: PASS.
@@ -352,7 +363,8 @@ git commit -m "feat: application tracking in core, CLI, and the Applications vie
 pub enum Class { Normal, Sensitive, Legal, WorkAuthorization } // derive order is the rank
 impl Class {
     pub fn as_str(self) -> &'static str;
-    /// Sensitive and Legal: the answer body is sealed.
+    /// Everything above Normal: the answer body is sealed. WorkAuthorization takes no new
+    /// answer, so there this covers a body left behind by a raise.
     pub fn sealed(self) -> bool;
 }
 #[derive(Debug, Clone, Serialize)]
@@ -393,11 +405,11 @@ pub fn classify(text: &str) -> Class;
 - [ ] **Step 1: Write the migration**
 
 ```sql
--- rule 7: questions and unsealed answers are Personal class, plain. A body in a Sensitive or
--- Legal class is Sensitive data: body = '' and body_enc holds JPK1 ciphertext (table
+-- rule 7: questions and unsealed answers are Personal class, plain. A body in any class above
+-- normal is Sensitive data: body = '' and body_enc holds JPK1 ciphertext (table
 -- memory_answers, column body_enc, row id = id). Backup copies ciphertext with the database.
--- data.json drops BLOB columns; memory_sealed_answers.json holds the plain text after the export
--- warning, when the key is unlocked. Delete-all removes them with the root.
+-- data.json drops BLOB columns and blanks a plain body under a sealed class; memory_sealed_answers.json
+-- holds the plain text after the export warning, when the key is unlocked. Delete-all removes them with the root.
 CREATE TABLE memory_questions (
   seq INTEGER PRIMARY KEY,
   id TEXT NOT NULL UNIQUE,
@@ -469,7 +481,8 @@ Bank:
 - `answers_are_never_evidence`: an approved normal answer is absent from `knowledge::evidence`.
 - `raise_never_lowers`: `raise_class(.., Class::Normal, "model")` on a Sensitive question returns `false`, class unchanged, `class_source` unchanged.
 - `raise_with_a_locked_key_hides_the_body_until_sealed`: raise a question with a plain answer; `raise_class` asks no key. The row is unapproved, `list` shows `body == ""`, `sealed == true`, the plain column still holds the text for `seal_pending`.
-- `key_state_counts_sealed_answers`: a seeded sealed answer makes `crypto::known_state` return `NotLoaded` rather than no-key-yet.
+- `key_state_counts_sealed_answers`: a seeded sealed answer with no `data_keys` row, as in `tests/crypto.rs`, makes `crypto::known_state` return `NotLoaded` rather than no-key-yet.
+- `a_raised_body_stays_out_of_data_json`: a canary body raised to Sensitive with no key is absent from `data.json`.
 - `export_without_sealed_answers_writes_an_empty_list`.
 
 Keychain, `#[ignore]`d:
@@ -507,15 +520,16 @@ Add a `ponytail:` note: these match words, so a paraphrase passes until the mode
 - [ ] **Step 5: Implement `memory`**
 
 - `add_question`: `normalize`, then at most 2,000 chars, `key` is `fold(text)` plus the country. Class from `rules::classify`, `class_source` `rules`, `source` `user`. A `country` is two letters, upper-cased, and comes only from the caller.
-- `add_answer` and `edit_answer`: at most 20,000 chars. If the question's class is `sealed()`, seal first under `crypto::MEMORY_AAD = ("memory_answers", "body_enc")`, and a key error stores nothing. `source_ref` names a knowledge item that must exist, and sets `source = 'knowledge'`.
+- `add_answer` and `edit_answer`: at most 20,000 chars. If the question's class is `sealed()`, seal first under `crypto::MEMORY_AAD = ("memory_answers", "body_enc")`, and a key error stores nothing. `source_ref` names a knowledge item that must exist, and sets `source = 'knowledge'`. Both return the row as `list` shows it, so no sealed-class body comes back.
 - `approve(true)` on a row with plain text under a sealed class calls `seal_pending` first, so the key error reaches the user.
 - `set_class`: person only. Raising seals every body and unapproves. Lowering opens each body. It asks for a key only when a body exists, and a key error changes nothing.
 - `raise_class`: returns `false` unless `class` outranks the stored class. In one transaction: set class and source, `approved = 0` on its answers, then audit `memory_class_raised`, actor `system`, detail `{ "agent": "career_memory", "from", "to" }`. It asks no key: the row is hidden at once, because `list` and `get` blank any body under a sealed class, whichever column holds it, and `seal_pending` seals it later.
 - `seal_pending`: answers where class is sealed and `body <> ''`. With none it returns 0 and asks no key; otherwise it returns the count, or the key's error.
+- `sealed` on an `Answer` is true when `body_enc` is set or a plain body waits under a sealed class. A body cleared by a discard lists `sealed: false` and empty, as a knowledge item does, so no `Show` leads nowhere.
 - `stale` computed as `julianday('now') - julianday(reviewed_at) > FRESH_DAYS`.
 - `reveal`: actor `gui` or `cli`, audit `answer_revealed`, target the answer id.
 
-Join `memory_answers` into each place in Global Constraints. In `transfer.rs`, `export_all` writes `memory_sealed_answers.json` through `write_private`, and `sensitive_plain` becomes the OR of both. `export_sealed` mirrors `profile::export_authorization`: with no sealed rows it asks nothing.
+Join `memory_answers` into each place in Global Constraints. In `transfer.rs`, `export_all` writes `memory_sealed_answers.json` through `write_private`, and `sensitive_plain` becomes the OR of both. `read_tables` blanks `body` on `memory_answers` rows under a sealed class, and `export_sealed` carries those too. `export_sealed` mirrors `profile::export_authorization`: with no sealed rows it asks nothing.
 
 - [ ] **Step 6: Run them to verify they pass**
 
@@ -545,7 +559,7 @@ Commands: `memory_list(class)`, `memory_get(questionId)`, `memory_add_question(t
 `NAV` gains `Memory` (Ctrl/Cmd+8), `View` gains `"memory"`. `MemoryView`, heading "Career memory":
 
 - Class filter, `Add question` form with an optional country.
-- Row: question as inert text, class badge, findings. Each answer shows the body, or "Sealed" with `Show`, then Approved or Waiting, Stale, Source, `Approve`, `Reviewed`, `Edit`, `Remove`.
+- Row: question as inert text, class badge, findings, a `Class` select calling `memory_set_class`, `Remove question`, and an `Add answer` form with an optional knowledge item as its source. Each answer shows the body, or "Sealed" with `Show`, then Approved or Waiting, Stale, Source, `Approve` or `Unapprove`, `Reviewed`, `Edit`, `Remove`.
 - A `work_authorization` row has no answer form. It reads "Answered from your profile, for one country at a time."
 - Empty state: "No questions yet. Add one you are often asked."
 
@@ -553,7 +567,7 @@ Commands: `memory_list(class)`, `memory_get(questionId)`, `memory_add_question(t
 
 - CLI: `memory_add_approve_and_list_round_trip`, `memory_refuses_an_answer_on_a_work_authorization_question`, panel refusal of `memory approve`.
 - Tauri: `memory_commands_reach_core`; `approving_a_sealed_class_answer_asks_natively` (`NativeHook.confirm = false` gives `confirmation_required` and leaves it unapproved).
-- View: `memory_add_question_then_answer_then_approve`, `a_sealed_answer_shows_only_on_request`, `work_authorization_row_has_no_answer_form`.
+- View: `memory_add_question_then_answer_then_approve`, `a_sealed_answer_shows_only_on_request`, `work_authorization_row_has_no_answer_form`, `class_select_and_remove_question_reach_their_commands`.
 
 Run: `cargo test --workspace && pnpm typecheck && pnpm test`
 Expected: PASS.
@@ -582,7 +596,7 @@ pub struct UsedAnswer { pub application_id: String, pub answer_id: String, pub c
 pub struct AppliedAnswer {
     pub answer_id: String, pub question: String, pub class: Class,
     pub confirmed_at: Option<String>, pub used_at: Option<String>,
-    /// The confirmation still matches the answer's version.
+    /// The confirmation still matches the answer's version, and the answer is not stale.
     pub current: bool,
 }
 #[derive(Debug, Clone, Serialize)]
@@ -612,8 +626,19 @@ Seed sealed rows with `DataKey::from_bytes`, so none of these touch the keychain
     let refused = memory::use_answer(&db, "cli", &answer, &second).await.unwrap_err();
     assert_eq!(refused.code(), "confirmation_required");
 }
-#[tokio::test] async fn editing_an_answer_voids_its_confirmation() { /* edit raw row version+1, approved=1 */ }
-#[tokio::test] async fn a_stale_sealed_answer_needs_a_fresh_confirmation() { /* confirmation row older than the boundary */ }
+#[tokio::test] async fn editing_an_answer_voids_its_confirmation() {
+    memory::confirm_use(&db, "cli", &answer, &application).await.unwrap();
+    // raw SQL, so no key is needed: version = version + 1, approved = 1
+    let refused = memory::use_answer(&db, "cli", &answer, &application).await.unwrap_err();
+    assert_eq!(refused.code(), "confirmation_required");
+}
+#[tokio::test] async fn a_stale_sealed_answer_needs_a_fresh_confirmation() {
+    memory::confirm_use(&db, "cli", &answer, &application).await.unwrap();
+    // raw SQL: reviewed_at = 181 days ago
+    let refused = memory::use_answer(&db, "cli", &answer, &application).await.unwrap_err();
+    assert_eq!(refused.code(), "confirmation_required");
+    assert!(!memory::application_answers(&db, &application).await.unwrap()[0].current);
+}
 ```
 
 Also:
@@ -656,13 +681,13 @@ Expected: PASS.
 - `memory_confirm_use(answerId, applicationId)` always opens `native::confirmed`, title "Confirm this answer", action "Confirm". The message names the class, company and role, and question text, says "You confirm this is true today", and adds "This answer has not been reviewed for over 180 days." when stale. It never holds the answer value.
 - `memory_use(answerId, applicationId)`, `memory_application_answers(applicationId)`, `memory_authorization(country)`.
 
-In the detail of `ApplicationsView`, section "Answers for this application": a picker over approved answers, and for each row:
+In the detail of `ApplicationsView`, section "Answers for this application": a picker over approved answers and over `work_authorization` questions, which have no answers to approve, and for each row:
 
 | State | Control |
 |---|---|
 | Normal | `Copy` |
-| Sensitive or legal, not confirmed or voided | `Confirm and copy` |
-| Confirmed and current | `Copy` |
+| Sensitive or legal, not `current` (never confirmed, voided, or stale) | `Confirm and copy` |
+| Sensitive or legal, `current` | `Copy` |
 
 The button runs confirm (when needed) then use, fills a read-only labelled field, then calls `navigator.clipboard.writeText`. A clipboard failure leaves the text in that field. `ConfirmationRequired` from a cancelled dialog shows nothing else and leaves no text. A `Work authorization` row asks for a country and shows the stated values or "Not stated by you", with a button that opens Profile. There is no suggested value and no input for it here.
 
@@ -747,7 +772,7 @@ Expected: FAIL, `search` not found.
 
 - [ ] **Step 4: Implement `memory::search`**
 
-`reindex`: delete the row with `rowid = seq`, then insert unless the class is `WorkAuthorization`. The `answer` column joins plain bodies only when the class is `Normal`. Call it inside each write transaction from Task 3: add or remove a question or answer, edit, set class, raise, seal. Raising to `WorkAuthorization` also deletes the question's vectors.
+`reindex`: delete the row with `rowid = seq`, then insert unless the class is `WorkAuthorization`. The `answer` column joins plain bodies only when the class is `Normal`. Call it inside each write transaction from Task 3: add or remove a question or answer, edit, set class, raise, seal. `remove_question` deletes the FTS row by `seq` before the question row goes, since `ON DELETE CASCADE` does not reach an FTS table. Raising to `WorkAuthorization` also deletes the question's vectors.
 
 `search`: an empty `fts_query` returns nothing. Try `router.embed`. On `Err(ManualRequired(_))`, or when no stored vector matches the model, use FTS with `bm25` order. Cosine over `memory_embeddings` joined to questions, `LIMIT VECTOR_CEILING`, same dims filter as `embed::search`. Each hit takes the newest approved answer of its question. `needs_confirmation` is true for a sealed class.
 
@@ -873,7 +898,7 @@ In `agents`:
 
 ```rust
 pub async fn set_status(db: &Db, actor: &str, application_id: &str, status: &str, on: Option<&str>, note: &str, cancel: CancellationToken) -> Result<Application>;
-pub async fn resume_run(db: &Db, actor: &str, run_id: &str, cancel: CancellationToken) -> Result<Finished>;
+pub async fn resume_run(db: &Db, router: &Router, actor: &str, run_id: &str, cancel: CancellationToken) -> Result<Finished>;
 pub async fn cancel_run(db: &Db, actor: &str, run_id: &str) -> Result<()>;
 ```
 
@@ -975,7 +1000,7 @@ Add `TaskType::ClassifyAnswer`, `crates/core/schemas/classify_answer.json`:
 }
 ```
 
-Its `TaskSpec`: `required: DRAFTING`, `categories: &[DataCategory::JobText]`, `attempts: 2`.
+Its `TaskSpec`: `required: DRAFTING`, `categories: &[DataCategory::JobText]`, `attempts: 1`, so a validation failure cannot make a second Claude call past the cap in Task 8.
 
 `execute` is shared by `start` and `resume`:
 
@@ -995,7 +1020,7 @@ Completed
 
 | Step result | State | Stored reason |
 |---|---|---|
-| `Err(ManualRequired(r))` | `manual_required` | `r` if in `RUN_REASONS` or `no_evidence`, else `manual_required` |
+| `Err(ManualRequired(r))` | `manual_required` | `r` if in `RUN_REASONS`, `no_ai`, or `no_evidence`, else `manual_required` |
 | `Err(Cancelled)` | `cancelled` | none |
 | `Err(Paused)` | `halted` | `paused` |
 | `Err(Refused(_))` | `refused` | the allow-listed word, else `refused` |
@@ -1006,7 +1031,7 @@ Make `router::run_reason` `pub(crate)`. Busy means `Error::Db(sqlx::Error::Datab
 
 `reap_stale`: active states with `heartbeat_at` older than 30 s move to `halted`, reason `interrupted`. `list`, `get`, and `start` call it.
 
-`agents::cancel_run`: an active run sets `cancel_requested`. A `halted` run moves to `cancelled` here, after running the workflow's `abandon`. A terminal run is `Err(Validation("this run has ended"))`. Audit `run_cancelled`, actor the person, detail `{ "agent" }`. `runner::resume` refuses unless `halted`, and audits `run_resumed`. `agents::resume_run` rebuilds the workflow from the stored `RunInput`; Tracking's note is not stored, so a resumed update carries an empty note.
+`agents::cancel_run`: an active run sets `cancel_requested`. A `halted` run moves to `cancelled` here, after running its `abandon`. It takes no router, because only `Analytics` overrides `abandon`, so it matches on the stored `RunInput` and rebuilds that one. A terminal run is `Err(Validation("this run has ended"))`. Audit `run_cancelled`, actor the person, detail `{ "agent" }`. `runner::resume` refuses unless `halted`, and audits `run_resumed`. `agents::resume_run` rebuilds the workflow from the stored `RunInput`, and adapters build the router with `Router::from_settings`; Tracking's note is not stored, so a resumed update carries an empty note.
 
 - [ ] **Step 5: Implement the tracking agent**
 
@@ -1021,7 +1046,7 @@ Expected: PASS.
 
 - [ ] **Step 7: Add the adapters**
 
-CLI `crates/cli/src/agents.rs`, `Command::Agents` with doc "Agent runs and their logs.": `agents list [--limit N]`, `agents show ID`, `agents log ID`, `agents cancel ID`, `agents resume ID`. PANEL: all five `false`.
+CLI `crates/cli/src/agents.rs`, `Command::Agents` with doc "Agent runs and their logs.": `agents list [--limit N]`, `agents show ID`, `agents log ID`, `agents cancel ID`, `agents resume ID`, the last through `with_ctrl_c`. PANEL: all five `false`.
 
 Tauri: `agents_list(limit)`, `agent_get(id)`, `agent_cancel(id)`, `agent_resume(id)`, the last under `state.ai.begin()`.
 
@@ -1162,6 +1187,10 @@ pub struct Classified { pub checked: usize, pub raised: usize, pub skipped: bool
 pub fn classify_prompt(question: &str) -> Prompt;
 pub async fn classify_pending(db: &Db, router: &Router, actor: &str, cancel: CancellationToken) -> Result<Classified>;
 pub const CLASSIFY_BATCH: usize = 20;
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RefreshPlan { pub pending: usize, pub claude_calls: usize }
+/// Reads only: starts no provider and asks no key.
+pub async fn refresh_plan(db: &Db, router: &Router) -> Result<RefreshPlan>;
 // agents
 pub async fn draft_resume(db: &Db, router: &Router, actor: &str, job_text_id: &str, export: Option<ExportChoice>, cancel: CancellationToken) -> Result<Generated>;
 pub async fn draft_cover_letter(db: &Db, router: &Router, actor: &str, job_text_id: &str, export: Option<ExportChoice>, cancel: CancellationToken) -> Result<Generated>;
@@ -1187,6 +1216,10 @@ pub async fn memory_refresh(db: &Db, router: &Router, actor: &str, cancel: Cance
 - `classify_prompt_holds_question_text_only`: answers and profile canaries absent, the question sits between the markers.
 - `classify_needs_no_tools_and_job_text_consent`: an external provider with `job_text` consent runs it, with none it is skipped, and one without `NoTools` is skipped.
 - `refresh_stops_at_the_batch_limit`: 21 pending, 20 checked.
+- `refresh_makes_at_most_twenty_claude_calls`: 25 pending and a scripted external provider: valid replies make exactly 20 calls, and bad JSON makes exactly 1, with no retry.
+- `refresh_plan_counts_claude_calls_and_calls_no_provider`: 25 pending gives `pending: 20`, `claude_calls: 20` with Claude on and `job_text` consent, `claude_calls: 0` without either; the provider's call count stays 0.
+- `resuming_a_refresh_makes_no_claude_call`: a refresh halted in `classify`, then `agents::resume_run`: provider call count unchanged, `embed` still runs.
+- `adding_a_question_starts_nothing`: `add_question` leaves `agent_runs` empty and the provider uncalled.
 
 In `crates/core/tests/injection.rs`: `a_steered_classifier_never_lowers_a_class` runs `17_relabel_question.txt`, which asks to treat a certification as a preference, with `MOCK_REPLY: {"class":"normal"}`: class stays `legal`.
 
@@ -1206,9 +1239,9 @@ One `DraftWorkflow { task, job_text_id, export, router, generated: Mutex<Option<
 | `draft` | `ReadResumeText, ReadProfileBasic, ReadJobText, Model(DraftResume), WriteDrafts` | Skips when `saved("draft")` is set. Calls `generate`, saves `draft`, returns provider and `spec(task).categories`. |
 | `render` | `ReadResumeText, WriteDrafts` | With `export`, unless claims are blocked, calls `drafts::export` to `db.paths().exports()`. A free path is not an option. |
 
-On a resumed run `generated` is rebuilt from `drafts::get` and `drafts::claims`. `agents::draft_resume` returns it after `Finished::into_result`. Add both cases to `resume_run`.
+On a resumed run `generated` is rebuilt from `drafts::get` and `drafts::claims`, with `provider` read back by matching `draft.provider` against `ProviderId`'s `Display` text, since a checkpoint holds ids only. `agents::draft_resume` returns it after `Finished::into_result`. Add both cases to `resume_run`.
 
-Switch `resume generate`, `letter generate`, `resume_generate`, and `letter_generate` to these. New flags `--export docx|pdf` and `--template`, default classic; the CLI still uses `with_ctrl_c`. Tauri: `resume_generate(jobTextId, export)`, `letter_generate(jobTextId, export)`, with `export: Option<ExportChoice>`, and `ipc.ts` gains `ExportChoice`, `exported: string | null`. `ResumesView` gains an "After drafting, export as" select: None, PDF, DOCX. On a result with `exported`, the path shows through `CopyPath`.
+Switch `resume generate`, `letter generate`, `resume_generate`, and `letter_generate` to these. New flags `--export docx|pdf` and `--template`, default classic; the CLI still uses `with_ctrl_c`. Tauri: `resume_generate(jobTextId, export)`, `letter_generate(jobTextId, export)`, with `export: Option<ExportChoice>`, and `ipc.ts` gains `ExportChoice`, `exported: string | null`. `ResumesView` gains an "After drafting, export as" select: None, PDF, DOCX, sent with the view's `template`. On a result with `exported`, the path shows through `CopyPath`.
 
 PANEL: `resume generate j --export pdf` and `letter generate j --export pdf` are `false`.
 
@@ -1218,7 +1251,9 @@ PANEL: `resume generate j --export pdf` and `letter generate j --export pdf` are
 
 `classify_pending`: up to `CLASSIFY_BATCH` questions, `classified_at IS NULL`, class below `WorkAuthorization`, oldest first. `Outcome::Ok` calls `raise_class(.., "model")` and sets `classified_at`. `ManualRequired` or `Failed` stops with `skipped: true` and leaves the rest. `Cancelled` is `Err(Cancelled)`. A class comes back only through the schema, then `raise_class`.
 
-`agents/memory.rs`, attempts 1, `stop_point` between items, and `save("question", id)` after each:
+`refresh_plan`: `pending` is the count `classify_pending` would take, at most `CLASSIFY_BATCH`. `claude_calls` is `pending` when `router.provider_ids()` holds `ClaudeCode` and `consent::active` covers `job_text`, else 0. It is an upper bound: with Ollama first and working, fewer happen, so the copy says "up to".
+
+`agents/memory.rs`, attempts 1. `classify_pending` and `index_missing` take no `Ctx`, so they stop between items through the token, and each step's checkpoint is the batch checkpoint. `classified_at` and the missing vectors say what is left. A workflow rebuilt by `resume_run` skips `classify` and reports `skipped: true`, so only a fresh press spends a Claude call:
 
 | Step | Needs | Does |
 |---|---|---|
@@ -1226,7 +1261,13 @@ PANEL: `resume generate j --export pdf` and `letter generate j --export pdf` are
 | `seal` | `ReadCareerMemory, ReadSensitive, WriteCareerMemory` | `seal_pending`, after classify so a raise seals in the same run. A key error is noted and the run continues: bodies stay hidden. |
 | `embed` | `ReadCareerMemory, EmbedLocal, WriteCareerMemory` | `index_missing`; `no_embedding_model` counts as zero. |
 
-Add the case to `resume_run`. `memory refresh` and `memory_refresh` now call `agents::memory_refresh`, and `MemoryView` shows "Checked {n}, raised {m}, indexed {k}", plus "No AI took this; classes come from the rules." when skipped.
+Add the case to `resume_run`. Nothing calls `agents::memory_refresh` except these two adapters: no timer, no startup, no hook on a write.
+
+`memory refresh` and `memory_refresh` now call `agents::memory_refresh`, after `refresh_plan`:
+
+- CLI: with `claude_calls` above 0 and no `--yes`, it prints "This will make up to {n} Claude calls, limit 20. Run `jobpilot memory refresh --yes` to go ahead.", with `claude_calls` in JSON, exits 0, and starts no run. With 0 it runs at once. PANEL: `memory refresh` stays `false`, `memory refresh --yes` is `true`, with a `matches!` arm on `yes: true`.
+- Tauri: `memory_refresh_plan() -> RefreshPlan`. `memory_refresh` re-reads the plan and, with `claude_calls` above 0, opens `native::confirmed`, title "Refresh career memory", action "Refresh", message "This will make up to {n} Claude calls, limit 20.", dropping `work` first.
+- `MemoryView` shows the count from `memory_refresh_plan` beside `Refresh index` before the press, runs only on that press, and shows "Checked {n}, raised {m}, indexed {k}", plus "No AI took this; classes come from the rules." when skipped.
 
 - [ ] **Step 5: Run them to verify they pass**
 
@@ -1235,9 +1276,9 @@ Expected: PASS, including every existing `generate` test, since `generate::resum
 
 - [ ] **Step 6: Seam check**
 
-- CLI: `resume_generate_appears_in_agents_list` (mock `claude`, wrapper per OS), `resume_generate_export_writes_to_the_exports_folder`, `memory_refresh_with_no_ai_reports_skipped`.
-- Tauri: `resume_generate_runs_through_the_agent`: `agents_list` shows a `resume` run after it.
-- View: every existing `views02` generate test still passes; `export_choice_reaches_resume_generate`, `refresh_says_when_no_ai_took_it`.
+- CLI: `resume_generate_appears_in_agents_list` (mock `claude`, wrapper per OS), `resume_generate_export_writes_to_the_exports_folder`, `memory_refresh_with_no_ai_reports_skipped`, `memory_refresh_prints_the_count_and_waits_for_yes`.
+- Tauri: `resume_generate_runs_through_the_agent`: `agents_list` shows a `resume` run after it. `memory_refresh_names_the_count_natively`: `NativeHook.confirm = false` gives `confirmation_required`, no run row, and `NativeHook.asked` holds the count.
+- View: every existing `views02` generate test still passes; `export_choice_reaches_resume_generate`, `refresh_says_when_no_ai_took_it`, `refresh_shows_the_claude_count_before_the_press`.
 
 Run: `cargo test --workspace && pnpm typecheck && pnpm test`, then the Windows recipe.
 Expected: PASS.
@@ -1253,7 +1294,7 @@ git commit -m "feat: resume, cover letter, and career memory agents on the runne
 
 **Files:**
 - Create: `crates/core/migrations/0011_emergency_pause.sql`, `crates/core/src/pause.rs`, `crates/core/tests/pause.rs`, `crates/cli/src/pause.rs`, `apps/desktop/src-tauri/src/menu.rs`, `apps/desktop/src/components/TitleBar.tsx`, `apps/desktop/src/lib/pause.ts`, `apps/desktop/src/App.pause.test.tsx`
-- Modify: `crates/core/src/{lib,backup}.rs`, `crates/core/src/runner/mod.rs`, `crates/core/src/ai/{router,ollama}.rs`, `crates/core/tests/backup.rs`, `crates/cli/src/{main,ai,data,resume,memory}.rs`, `crates/cli/tests/cli.rs`, `apps/desktop/src-tauri/src/{commands,lib}.rs`, `apps/desktop/src/lib/ipc.ts`, `apps/desktop/src/App.tsx`, `apps/desktop/src/test-utils.tsx`
+- Modify: `crates/core/src/{lib,backup}.rs`, `crates/core/src/runner/mod.rs`, `crates/core/src/ai/{router,ollama}.rs`, `crates/core/tests/backup.rs`, `crates/cli/src/{main,ai,agents,data,resume,memory}.rs`, `crates/cli/tests/cli.rs`, `apps/desktop/src-tauri/src/{commands,lib}.rs`, `apps/desktop/src/lib/ipc.ts`, `apps/desktop/src/App.tsx`, `apps/desktop/src/test-utils.tsx`
 
 **Interfaces:**
 - Consumes: `runner::{reap_stale, RunState}`, `audit::record_to`, `Error::Paused`, `InFlight::cancel`, `native::confirmed`.
@@ -1314,7 +1355,13 @@ CREATE TABLE emergency_pause (
     let restored = backup::restore(db, &earlier, "cli").await.unwrap().db;
     assert!(pause::is_set(&restored).await.unwrap());
 }
-#[tokio::test] async fn restoring_a_paused_backup_stays_paused() { /* backup taken during it */ }
+#[tokio::test] async fn restoring_a_paused_backup_stays_paused() {
+    pause::set(&db, "cli").await.unwrap();
+    let during = backup::create(&db, "cli").await.unwrap().path;
+    pause::clear(&db, "cli").await.unwrap();
+    let restored = backup::restore(db, &during, "cli").await.unwrap().db;
+    assert!(pause::is_set(&restored).await.unwrap());
+}
 ```
 
 `crates/cli/tests/cli.rs`:
@@ -1351,7 +1398,7 @@ Expected: PASS.
 `commands.rs`:
 
 - `pause_set`: fires `state.ai.cancel()` and `state.pull.cancel()` first, always, then `pause::set` through `state.db.read()`, not `work()`, so it never queues behind the gate. With no handle it returns `Err(Unavailable)` after firing the tokens.
-- `pause_clear`: `native::confirmed(&app, "Clear emergency pause", "Runs stay halted until you resume each one.", "Clear")`, with no lock across the dialog.
+- `pause_clear`: `native::confirmed(&app, "Clear emergency pause", "Runs stay halted until you resume each one.".into(), "Clear")`, with no lock across the dialog.
 - `pause_status`: `Unavailable` with no handle.
 
 `menu.rs`:
@@ -1381,7 +1428,7 @@ Frontend:
 - `pause_set_in_recovery_fires_tokens_and_reports_unavailable`.
 - `pause_clear_asks_natively_and_stays_set_when_refused`.
 - `the_menu_item_uses_the_shared_pause_path`: call `on_event`'s inner function on the mock app.
-- `menu_has_the_pause_item_and_accelerator` asserts the constants, and `build` on the mock runtime.
+- `menu_has_the_pause_item_and_accelerator`: `build` on the mock runtime gives a `Safety` submenu holding the item `PAUSE_ID`, and `PAUSE_ACCELERATOR` equals `CmdOrCtrl+Shift+H`.
 
 `App.pause.test.tsx`:
 
@@ -1426,7 +1473,10 @@ git commit -m "feat: emergency pause from every screen, the native menu, and the
     assert_eq!(db.schema_version().await.unwrap(), 11);
     // every seeded row reads back, the new tables are empty, and a `pre-migrate-5-*` folder exists
 }
-#[tokio::test] async fn a_fresh_database_is_schema_11() { /* ... */ }
+#[tokio::test] async fn a_fresh_database_is_schema_11() {
+    assert_eq!(db.schema_version().await.unwrap(), 11);
+    assert_eq!(app_schema_version(), 11);
+}
 ```
 
 Run: `cargo test -p jobpilot-core --test db a_0_2`. Expected: PASS once the cut migrator is written; a failure here is a real migration bug, so fix it forward in a new file.
@@ -1438,10 +1488,10 @@ Run: `cargo test -p jobpilot-core --test db a_0_2`. Expected: PASS once the cut 
 | File | Change |
 |---|---|
 | `docs/wireframes.md` | Screens 16 Applications, 17 Career memory, 18 Agents, in the file's format. Release map rows. Navigation block. Keyboard table: `Ctrl/Cmd+Shift+H` Emergency pause on every screen; Ctrl+1 to 9. Screen 2: title bar, focus order begins with Emergency pause. Note that Ctrl+0 is the last free number for Jobs in 0.5. |
-| `docs/agents.md` | Header note that 0.3 is built. Section 7: `interrupted` under Halted, `waiting_for_human` reserved. Section 8: command names, `pause set`, `pause clear`, the shortcut, the Safety menu, the 250 ms poll, restore keeps the flag, status edits refused while paused. |
+| `docs/agents.md` | Header note that 0.3 is built. Section 4: career memory's `classify_answer` is one attempt, 20 per refresh, started only by a person. Section 7: `interrupted` under Halted, `waiting_for_human` reserved. Section 8: command names, `pause set`, `pause clear`, the shortcut, the Safety menu, the 250 ms poll, restore keeps the flag, status edits refused while paused. |
 | `docs/database-schema.md` | New section 3 "Release 0.3 tables" with each migration's class and handling. Renumber migration rules. `schema_version` 11. Section on proposed entities drops `application`, `answer`, `agent_run`. |
 | `docs/architecture.md` | Modules `applications`, `memory`, `runner`, `agents`, `analytics`, `pause`. CLI 0.3 surface. Adapter: `menu.rs`, pause watcher. Three new views, `TitleBar`. |
-| `docs/ai-providers.md` | "As built": `classify_answer` task, new reasons `no_model_set`, `model_not_installed`. |
+| `docs/ai-providers.md` | "As built": `classify_answer` task, one attempt, at most 20 per refresh, new reasons `no_model_set`, `model_not_installed`. |
 | `docs/security/threat-model.md` | M-05, M-23, M-24 to M-28 statuses with the tests that pin them. M-23: tool-use and exfiltration files exist, replies are still scripted. Residual risks: rule words miss a paraphrased sensitive question; the panel's own `claude` session is not stopped by pause. |
 | `docs/development.md` | Last migration `0011`. The test list for keychain work. |
 | `docs/milestones.md` | Mark 0.3 built, add "0.3 gate record" with the five gates, results from Step 5, and "Exit tests not proven end to end". |
@@ -1498,7 +1548,7 @@ Expected: schema 11, version 0.3.0, no key yet, `paused` no.
 
 - [ ] **Step 2: Build the candidate data**
 
-Run with `--json` where an id is needed: `profile set --name N --email E`, `kb add experience`, `kb add skill`, `job paste "Platform Dev" --file <temp posting>`.
+Run with `--json` where an id is needed: `profile set --name N --email E`, `kb add experience <text>`, `kb add skill <text>`, `job paste "Platform Dev" --file <temp posting>`.
 
 - [ ] **Step 3: Career memory, with the keychain**
 
@@ -1522,7 +1572,7 @@ Expected: `0`.
 
 - [ ] **Step 6: Pause and cancel, without a second subscription call**
 
-Point `JOBPILOT_CLAUDE_BIN` at the mock with `MOCK_CLAUDE_SLEEP=30`. In one terminal run `resume generate`. In a second run `pause set`. Expect the first to end `error[paused]` within 5 s, the run `halted`, and an audit row. `pause clear`, then `agents cancel <run>`: expect `cancelled`. Run another with `pause set` first: expect `paused` and no new row.
+The app gives `claude` a scrubbed environment, so point `JOBPILOT_CLAUDE_BIN` at a wrapper script that exports `MOCK_CLAUDE_SLEEP=30` and execs `crates/core/tests/mock-claude/claude`, as `crates/cli/tests/cli.rs` does. In one terminal run `resume generate`. In a second run `pause set`. Expect the first to end `error[paused]` within 5 s, the run `halted`, and an audit row. `pause clear`, then `agents cancel <run>`: expect `cancelled`. Run another with `pause set` first: expect `paused` and no new row.
 
 - [ ] **Step 7: Restore, export, upgrade**
 
@@ -1530,7 +1580,7 @@ Point `JOBPILOT_CLAUDE_BIN` at the mock with `MOCK_CLAUDE_SLEEP=30`. In one term
 
 - [ ] **Step 8: The GUI, once**
 
-Launch the release app with `JOBPILOT_HOME` on the same temporary root. Check these by keyboard: Tab from the top lands on Emergency pause; Ctrl/Cmd+Shift+H with focus in the terminal panel pauses; the Safety menu item pauses; `Clear pause` shows a native dialog; Ctrl+7, 8, 9 open their views and show the CLI's data. Capture only a window or element screenshot if evidence is needed.
+Launch the release app with `JOBPILOT_HOME` on the same temporary root. Check these by keyboard: Tab from the top lands on Emergency pause; Ctrl/Cmd+Shift+H with focus in the terminal panel pauses; the Safety menu item pauses; `Clear pause` shows a native dialog; Ctrl+7, 8, 9 open their views and show the CLI's data. Capture only a window or element screenshot if evidence is needed. The macOS menu bar and a native dialog fall outside that, so prove those two without any capture: drive them through System Events accessibility (`osascript`), and read `pause status` and the audit rows. If accessibility is not granted, record both as unproven; do not take a full-screen shot.
 
 - [ ] **Step 9: Clean up and record**
 
