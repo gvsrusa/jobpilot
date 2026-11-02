@@ -3268,6 +3268,23 @@ fn job_analyze_ai_without_yes_states_calls_and_stops() {
     );
 }
 
+#[test]
+fn job_analyze_ai_with_no_approved_evidence_says_what_to_do() {
+    let (_dir, home) = fresh_home();
+    let bin = fresh_claude(&home);
+    let job = paste(&home, "Rust dev", &[], "Remote role using Rust.");
+    let id = job["id"].as_str().unwrap();
+    let env = [("JOBPILOT_CLAUDE_BIN", bin.as_str())];
+    let text = stdout_of(&run_env(
+        &home,
+        &["job", "analyze", id, "--ai", "--yes"],
+        &env,
+    ));
+    assert!(!text.contains("no_evidence"), "{text}");
+    assert!(text.contains("jobpilot kb add"), "{text}");
+    assert!(text.contains("jobpilot kb approve"), "{text}");
+}
+
 /// A mock claude that is on and consented. The plan only counts: nothing here runs it.
 fn fresh_claude(home: &Path) -> String {
     let bin = claude_saying(home, &serde_json::json!({}));

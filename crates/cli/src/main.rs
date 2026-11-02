@@ -293,6 +293,17 @@ fn message(error: &Error) -> String {
         Error::Paused => "Emergency pause is on, so nothing automated runs. Clear it with \
                           `jobpilot pause clear` in an ordinary terminal, or from the title bar."
             .into(),
+        Error::ManualRequired(reason) if reason == "no_evidence" => {
+            "There is no approved knowledge to work from. Add an item with `jobpilot kb add \
+             <kind> <text>`, approve it with `jobpilot kb approve <id>` (`jobpilot kb list` \
+             shows the ids), then run this again."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "no_ai" => {
+            "No AI provider is on, so this needs doing by hand. Turn one on with `jobpilot ai \
+             enable <provider>`, then run this again."
+                .into()
+        }
         Error::ManualRequired(reason) if reason == "not_logged_in" => {
             "This CLI is not signed in. Run it once in your own terminal to sign in, then try \
              again."
@@ -639,6 +650,15 @@ mod tests {
             line.strip_prefix(path)
                 .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
         })
+    }
+
+    #[test]
+    fn no_evidence_and_no_ai_say_what_to_do() {
+        let evidence = message(&Error::ManualRequired("no_evidence".into()));
+        assert!(evidence.contains("jobpilot kb add") && evidence.contains("jobpilot kb approve"));
+        let none = message(&Error::ManualRequired("no_ai".into()));
+        assert!(none.contains("jobpilot ai enable"), "{none}");
+        assert!(!none.contains("no_ai") && !evidence.contains("no_evidence"));
     }
 
     #[test]

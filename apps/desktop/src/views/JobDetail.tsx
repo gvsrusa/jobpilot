@@ -181,7 +181,10 @@ export function JobDetailView({ id, onBack }: { id: string; onBack(): void }) {
               <span>{`Score ${job.score === null ? "--" : `${job.score} / 100`}`}</span>
               {stopped && (
                 <span role="alert" className="text-sm text-destructive">
-                  AI evaluation stopped. The rules score stands. <span className="font-mono text-xs">{`code: ${stopped}`}</span>
+                  AI evaluation stopped. The rules score stands.{" "}
+                  {stopped === "no_evidence" &&
+                    "Add a knowledge item and approve it in the Knowledge section of the Resumes screen, then try again. "}
+                  <span className="font-mono text-xs">{`code: ${stopped}`}</span>
                 </span>
               )}
             </div>

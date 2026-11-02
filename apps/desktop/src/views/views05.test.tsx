@@ -418,6 +418,16 @@ describe("Job detail", () => {
     expect(screen.getByText("Scored by: rules.")).toBeInTheDocument();
   });
 
+  it("says what to do when there is no approved evidence, not only the code", async () => {
+    const { user } = await openDetail(job(), {}, {
+      jobs_analyze: () => ({ scored: 1, parsed: 0, evaluated: 0, dropped: 0, reason: "no_evidence" }),
+    });
+    await user.click(screen.getByRole("button", { name: "Add AI evaluation" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Add a knowledge item and approve it in the Knowledge section of the Resumes screen");
+    expect(alert).toHaveTextContent("The rules score stands.");
+  });
+
   it("hides Add AI evaluation with no eligible provider", async () => {
     await openDetail(job(), {}, { ai_status: () => AI_OFF });
     expect(screen.queryByRole("button", { name: "Add AI evaluation" })).toBeNull();
