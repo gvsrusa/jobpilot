@@ -2,16 +2,17 @@
 
 JobPilot AI is a personal, non-commercial, open-source, local-first desktop application for international job seekers. The long-term goal covers the job-search lifecycle: discover, analyze, match, personalize, apply, track, improve. This is one person's project, not a product with support or a roadmap guarantee.
 
-Your data stays on your machine. There are no mandatory API keys, no API credits, no hosted backend, and no proprietary cloud account. The only network use in 0.4 is a local Ollama server on this machine, the `claude` and optional `gemini` programs you already have installed, and, only if you add your own key and consent, a hosted provider's API (OpenAI, Anthropic, Google, or OpenRouter) or a server you name on your own computer. Every one of these is off until you turn it on.
+Your data stays on your machine. There are no mandatory API keys, no API credits, no hosted backend, and no proprietary cloud account. The network use in 0.5 is a local Ollama server on this machine, the `claude` and optional `gemini` programs you already have installed, and, only if you add your own key and consent, a hosted provider's API (OpenAI, Anthropic, Google, or OpenRouter) or a server you name on your own computer. Release 0.5 adds one more: when you press Fetch, JobPilot reads a job source's public listings (see below). Every one of these is off until you turn it on or press it.
 
-## What works today (0.4)
+## What works today (0.5)
 
-Release 0.1 is the foundation. Release 0.2 adds your candidate profile and a first resume tool. Release 0.3 adds application tracking, career memory, a workflow runner with agent logs, a small analytics report, and an emergency pause. Release 0.4 adds more AI backends, all optional and all behind your consent. The 0.4 build is a candidate: its tests pass, but the hosted APIs and the Gemini CLI were checked against local fakes and documents, and several things were never run by a person (see the [0.4 release notes](docs/releases/0.4.0.md), the [0.3 release notes](docs/releases/0.3.0.md), and the [0.2 release notes](docs/releases/0.2.0.md)).
+Release 0.1 is the foundation. Release 0.2 adds your candidate profile and a first resume tool. Release 0.3 adds application tracking, career memory, a workflow runner with agent logs, a small analytics report, and an emergency pause. Release 0.4 adds more AI backends, all optional and all behind your consent. Release 0.5 adds job discovery and a job store with a score you can read. The 0.5 build is a candidate: its tests pass, but the job sources were checked against recorded shapes, the hosted APIs and the Gemini CLI against local fakes and documents, and several things were never run by a person (see the [0.5 release notes](docs/releases/0.5.0.md), the [0.4 release notes](docs/releases/0.4.0.md), the [0.3 release notes](docs/releases/0.3.0.md), and the [0.2 release notes](docs/releases/0.2.0.md)).
 
-- Desktop app with status, documents, data, recovery, profile, resumes, AI, applications, memory, and agents views (Ctrl/Cmd+1 to 9), and a terminal panel (Ctrl+` shows it, F6 leaves it).
+- Desktop app with status, documents, data, recovery, profile, resumes, AI, applications, memory, and agents views (Ctrl/Cmd+1 to 9), a Jobs view (Ctrl/Cmd+0), and a terminal panel (Ctrl+` shows it, F6 leaves it).
 - Applications you track by hand: status, history, and notes, offline. A summary of counts and rates on request.
 - Career memory: questions you are asked again and again, with answers you approve. A sensitive or legal answer is sealed, and used only after you confirm it for one application. Work authorization is read from your profile by exact country and never guessed.
 - Emergency pause: the red button in the title bar, the Safety menu, `jobpilot pause set`, and `Ctrl/Cmd+Shift+H`. It stops every run and model call, in the app and the CLI. On a Mac the key may not fire while the web view is hung; use the menu or the CLI.
+- Jobs (Ctrl/Cmd+0, and `jobpilot job ...`): Fetch reads the public listings of Lever, RemoteOK, We Work Remotely, Greenhouse, and Ashby, only when you press it and only within a stored rate limit. Greenhouse and Ashby read under a ruling the project's controller made, because their vendors say nothing about third-party readers; it is not an owner decision (see the [policy register](docs/policy-register.md)). Workday, Indeed, LinkedIn, and a company's own page are never read: you paste the posting. Jobs are scored by rules you can read (skills 40, seniority 20, location 20, pay 20), and a criterion that cannot be compared is left out, never counted against a job. A model can add a separate, labelled evaluation. It never changes the score.
 - Local SQLite database with versioned migrations, document storage, and full-text search.
 - Backup, restore, export, and delete-all of your data, with an audit log.
 - A profile with several countries, cities, currencies, languages, and work modes. Work authorization is stored as you state it, encrypted, and never inferred. A recovery key file lets you reopen encrypted fields if your keychain is lost.
@@ -33,7 +34,7 @@ Gemini CLI note: the CLI keeps a transcript of every prompt under `~/.gemini/tmp
 5. In Knowledge, read the imported lines. Mark anything about visas, citizenship, or pay as sensitive, then use Approve all from this resume, or approve line by line. A draft can only use approved lines.
 6. Choose Paste a job posting, then Generate. Check each line against its evidence, then export.
 
-Not built yet: job discovery, matching, and application automation. Memory refresh spends paid or subscription usage and only runs when you press it; it states the most calls it can make first. See [milestones](docs/milestones.md).
+Not built yet: application automation. Memory refresh spends paid or subscription usage and only runs when you press it; it states the most calls it can make first. See [milestones](docs/milestones.md).
 
 ## Installing (unsigned)
 
@@ -54,7 +55,8 @@ See [docs/development.md](docs/development.md) and [CONTRIBUTING.md](CONTRIBUTIN
 - [Architecture and foundation plan](docs/superpowers/plans/2026-11-01-jobpilot-architecture-and-foundation.md)
 - [PRD](docs/prd.md)
 - [Milestones](docs/milestones.md)
-- [Connector SDK (stub)](docs/connector-sdk.md)
+- [Connector SDK](docs/connector-sdk.md)
+- [Release notes 0.5.0](docs/releases/0.5.0.md)
 - [Release notes 0.4.0](docs/releases/0.4.0.md)
 - [Release notes 0.3.0](docs/releases/0.3.0.md)
 - [Release notes 0.2.0](docs/releases/0.2.0.md)

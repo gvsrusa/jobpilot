@@ -1,6 +1,6 @@
 # JobPilot AI: Database Schema
 
-Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md), [PRD](prd.md), [architecture](architecture.md). Requirement IDs (`FR-<section>.<n>`) come from the PRD. Sections 1 (release 0.1), 2 (release 0.2), 3 (release 0.3), and 3a (release 0.4) are implemented; section 5 is still a proposal. `schema_version` is 12 on a fresh database, and migration `0012` is the last.
+Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md), [PRD](prd.md), [architecture](architecture.md). Requirement IDs (`FR-<section>.<n>`) come from the PRD. Sections 1 (release 0.1), 2 (release 0.2), 3 (release 0.3), 3a (release 0.4), and 3b (release 0.5) are implemented; section 5 is still a proposal. `schema_version` is 15 on a fresh database, and migration `0015` is the last.
 
 The database is SQLite accessed through SQLx (FR-2.1) and managed by versioned migrations (FR-2.5). It lives at `<data root>/jobpilot.db`, in WAL mode with foreign keys on. Full-text search uses FTS5 (FR-2.2).
 
@@ -251,6 +251,28 @@ One migration, `0012_consent_register_row.sql`, adds a column to the 0.2 `consen
 
 Everything else 0.4 stores uses existing places and adds no table: the settings `ai.model.<provider>`, `ai.endpoint.url`, `ai.model.endpoint`, `ai.gemini_path`, and `ai.codex_path` (all under the `ai.` prefix), the `ai.enabled` and `ai.order` lists, and `secret_index` rows named `ai-key-<provider>` that hold only the name. A key value is never in the database. `a_fresh_database_is_schema_12` and `a_0_3_database_upgrades_to_0_4` pin the version and the upgrade from a schema 11 database.
 
+## 3b. Release 0.5 tables (decided, shipped)
+
+Migrations `0013` to `0015` add the job store, on top of the 0.4 tables. Each file opens with its rule 7 note. `schema_version` is 15 on a fresh database, and a 0.4 database (version 12) opens at 15 after a `pre-migrate-12-*` snapshot (`a_fresh_database_is_schema_15` and `a_0_4_database_upgrades_to_0_5` in `crates/core/tests/db.rs`).
+
+| Migration | Tables | Class and handling (rule 7) |
+|---|---|---|
+| `0013_jobs.sql` | `companies`, `job_sources`, `jobs`, `jobs_fts`, `match_results`, `company_notes`, `connector_limits` | `jobs`, `companies`, `job_sources` and `company_notes` hold a posting's fields or a pasted note: Untrusted or Personal, plain. `match_results` holds a score and its explanation, which never holds an authorization value. Backup copies all of them with the database, export writes them, and delete-all removes them with the root. `jobs_fts` is derived (rowid = `jobs.seq`) and rebuilt from `jobs` and `job_texts`; export skips it as an FTS table. `connector_limits` holds counters and times only, no text, and is exported. |
+| `0014_job_text_versions.sql` | `job_texts.version_of` | A job id only, no text, so a job's older texts can be found and removed with it. `job_texts` is already Untrusted plain text in backup, export, and delete-all. A text no job has revised has none. |
+| `0015_run_log_dropped.sql` | `agent_run_log.dropped` | A count only: model output the checks cut (a strength with no evidence, a skill that states a right to work). It holds no text, and `agent_run_log` is already in backup, export, and delete-all. |
+
+`0013` also gives every existing `job_texts` row a `jobs` row with the same id and connector `import`, so a draft's `job_text_id` still finds its job and old pasted postings appear in the list. Their search rows are backfilled.
+
+Rows of note:
+
+- `jobs` is unique on `(connector, board, external_id)`. `fields_by` says who set the parsed fields: `none`, `connector`, `rules`, `model`, or `user`. On a revised posting only `user` fields stay; model fields were read from the old text and reset. `dedupe_key` and `duplicate_of` group the same job on several sources, and `not_duplicate` records a person's split, which a later fetch keeps.
+- `jobs.pay_period` is null when the source states none. Nothing guesses it. A pay read from posting text with no stated period is taken as a year only at 20,000 or more; from 1,000 to 20,000 the period stays null, and less is no pay.
+- `jobs.company_id` is null when a source names no company. Add to tracker in the desktop app stores "Company not stated" for such a job.
+- `job_sources.cursor` is the page a fetch reached, so a resumed run continues from it. A checkpoint holds ids only, never a page cursor.
+- `match_results.score` is rules only. `semantic` holds the model's separate evaluation and never changes the score. An unknown value is never a mismatch: the criterion is not compared.
+- `company_notes.origin` is `pasted` (a person's) or `model` (a summarized fact whose source id is in `source_ref`).
+- `connector_limits` is keyed by `(connector, host)`. It is what makes a rate limit survive a restart and apply to the GUI and CLI together.
+
 ## 4. Migration rules
 
 1. Forward only. There are no down migrations. Recovery from a bad migration is a restore from the snapshot.
@@ -292,4 +314,4 @@ Proposed entities and their planned release:
 | candidate | 0.2, built | Shipped as `profile` and `work_authorization` (section 2). |
 | resume | 0.2, built | Shipped as `knowledge_items`, `drafts`, and `claims` (section 2). |
 | application, answer, agent_run | 0.3, built | Shipped as `applications` and `application_events`, `memory_questions` and `memory_answers`, and `agent_runs` and `agent_run_log` (section 3). |
-| job, connector | 0.5 | Connector declarations and discovered jobs (FR-5, FR-6). |
+| job, connector | 0.5, built | Shipped as `jobs`, `companies`, `job_sources`, `match_results`, `company_notes`, and `connector_limits` (section 3b). Connector declarations live in code, not in the database. |

@@ -1,6 +1,6 @@
 # JobPilot AI: Milestone Plan
 
-Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) and [PRD](prd.md). Requirement IDs are `FR-<section>.<n>` from the PRD. Releases 0.1 to 0.4 are built; 0.5 onward are plans.
+Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) and [PRD](prd.md). Requirement IDs are `FR-<section>.<n>` from the PRD. Releases 0.1 to 0.5 are built; 0.6 onward are plans.
 
 ## Process
 
@@ -158,13 +158,13 @@ Exit tests not proven end to end:
 - "Blocks any external call until consent is given, and shows what will be sent": proven by core, CLI, and Tauri-harness tests. No person drove the native dialogs unless a Task 11 row says so.
 ## Release 0.5: International job discovery and intelligence
 
-Scope: connector SDK, read-only discovery, job intelligence (spec section 6).
+Scope: connector SDK, read-only discovery, job intelligence (spec section 6). **Built.** The gate record follows the exit tests. Five sources read: Lever, RemoteOK, and We Work Remotely on `allowed` rows, and Greenhouse and Ashby under ruling R1 (`silent-read`, a controller ruling and not an owner decision). Workday, Indeed, LinkedIn, and company career pages take a pasted posting only.
 
 Requirements: FR-3.20, FR-5.1 to FR-5.18, FR-6.1 to FR-6.12, FR-10.5, FR-10.6, FR-11.1, FR-11.2, FR-11.8, FR-13.5.
 
 Exit tests:
 - The connector SDK defines operations, automation capabilities, rate limits, and policy-review status; connectors cannot register without them.
-- A read-only connector exists for each source in FR-5.2 to FR-5.9 whose register read verdict is `allowed`, and respects rate limits and permitted access. A source at `unknown` or `blocked` has no read connector, a test proves it is refused, and its postings enter through user-assisted import. LinkedIn is user-assisted or authorized access only.
+- A read connector runs for a source whose register read verdict is `allowed` or `silent-read`, and respects rate limits and permitted access. At `unknown` or `blocked` none runs, a test proves the refusal (`the_gate_refuses_by_status_with_its_own_code`, `an_unknown_row_sends_nothing`), and the postings enter through user-assisted import. LinkedIn is user-assisted or authorized access only.
 - Tests confirm no CAPTCHA bypass, MFA bypass, or access-control circumvention.
 - Job description parsing, duplicate detection, weighted match scores, missing skills, seniority, compensation, and location matching work, with explainable output.
 - CLI job search and job analysis commands (FR-10.5, 10.6) call the same services as the GUI.
@@ -172,6 +172,24 @@ Exit tests:
 - Objective filters are deterministic; semantic evaluation runs only when an AI backend is configured.
 
 Gates: all five apply. Build includes the connector SDK; migrations add jobs, companies, and match tables; Windows and macOS means connector tests and the job CLI commands pass on both.
+### 0.5 gate record
+
+Details and the full lists are in [release 0.5.0](releases/0.5.0.md). Rows marked `PLACEHOLDER_TASK_15_*` are filled by the controller after a real run on a temporary root, and a row that still shows a placeholder was not run.
+
+| Gate | Result |
+|---|---|
+| 1. Build | `PLACEHOLDER_TASK_15_BUILD` (the figures from the Task 14 run are in the [release note](releases/0.5.0.md#tests)) |
+| 2. Tests | Local macOS: see [release 0.5.0](releases/0.5.0.md#tests). Keychain suites: `PLACEHOLDER_TASK_15_KEYCHAIN`. |
+| 3. Migrations | `a_fresh_database_is_schema_15` and `a_0_4_database_upgrades_to_0_5` (figures in the release note). An upgrade of a database made by the real 0.4 binary: `PLACEHOLDER_TASK_15_UPGRADE`. |
+| 4. Windows and macOS | `PLACEHOLDER_TASK_15_CI`. CI runs no job source, and `job_open` and a live fetch are not run on Windows by anyone. |
+| 5. Docs and risks | Updated: connector SDK (rewritten from a stub), policy register (site rows only; no AI provider row and no owner decision line), agents, architecture, database schema, AI providers, threat model, wireframes (screens 8 and 9), development guide, PRD, README, changelog, and the release note. Risks are in the release note. |
+
+Exit tests not proven end to end:
+- "A read connector runs for a source whose register read verdict is `allowed` or `silent-read`": proven against recorded shapes and a loopback fake. A live read of each source is `PLACEHOLDER_TASK_15_LIVE`.
+- "Semantic evaluation runs only when an AI backend is configured": proven with scripted model replies. A real model call is `PLACEHOLDER_TASK_15_MODEL`.
+- The Greenhouse and Ashby reads rest on ruling R1, which the owner has not been asked about.
+- "Windows and macOS: connector tests and the job CLI commands pass on both" rests on the CI run recorded in the Windows row. Nobody used the Jobs screen on Windows.
+
 ## Release 0.6: Browser automation
 
 Scope: Playwright runtime, permissions engine, Manual and Copilot modes, and the Claude Code apply mode (owner decision of 2026-11-01, below). Per D2, Copilot runs on a site where no clause forbids it, recorded as "no clause found" (Greenhouse, Lever, Ashby); a site row that is `blocked` stays blocked. Autonomous mode is default-off and ships only for connectors that pass policy review.

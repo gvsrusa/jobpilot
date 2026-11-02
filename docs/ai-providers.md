@@ -55,9 +55,9 @@ A declaration also states context limit, default timeout, sign-in method, and wh
 
 Tasks with `job_text` or `company_text` require `no_tools`. Ollama declares it from 0.2, because no tool is offered through its API call.
 
-Policy status is the register's four verdicts, used by both providers and connectors (FR-5.14): `allowed`, `user-assisted`, `blocked`, `unknown`. For connectors and sites, `unknown` behaves as `blocked`, except Copilot fill on a row recording "no clause found" (D2). For AI providers, eligibility follows the register's [owner decisions](policy-register.md#owner-decisions-2026-11-01). The status is read from the register at build time for the row matching the provider, sign-in method, model origin, and automation mode. A user cannot override a site row that is `blocked`, or a provider the owner decisions leave ineligible, in settings.
+Policy status is the register's five verdicts, used by both providers and connectors (FR-5.14): `allowed`, `silent-read`, `user-assisted`, `blocked`, `unknown`. `silent-read` is never used for a provider. It is set on two site rows only, the Greenhouse and Ashby reads, under controller ruling R1 (not an owner decision). For connectors and sites, `unknown` behaves as `blocked`, except Copilot fill on a row recording "no clause found" (D2). For AI providers, eligibility follows the register's [owner decisions](policy-register.md#owner-decisions-2026-11-01). The status is read from the register at build time for the row matching the provider, sign-in method, model origin, and automation mode. A user cannot override a site row that is `blocked`, or a provider the owner decisions leave ineligible, in settings.
 
-Connector automation modes follow from status, row by row: an `allowed` read row means a read-only connector; `user-assisted` means Manual only; Copilot fill needs its own `allowed` row or, under D2, a row recording "no clause found"; `blocked` means none of these, and `unknown` means none except that Copilot case. Autonomous mode additionally needs verified permission and explicit user authorization (FR-9.6), is default off, and no row grants it today.
+Connector automation modes follow from status, row by row: an `allowed` or `silent-read` read row means a read-only connector; `user-assisted` means Manual only; Copilot fill needs its own `allowed` row or, under D2, a row recording "no clause found"; `blocked` means none of these, and `unknown` means none except that Copilot case. Autonomous mode additionally needs verified permission and explicit user authorization (FR-9.6), is default off, and no row grants it today.
 
 ## TaskRouter contract
 
@@ -119,7 +119,7 @@ The names below are the Rust names in `crates/core/src/ai/`. The vocabulary abov
 | Contract term | 0.2 code |
 |---|---|
 | `TaskRouter` | `Router` (`router.rs`). `Router::from_settings(&Db)` builds it from the user's order and enabled flags; `run(db, task, prompt, cancel)` and `embed(...)` take the `Db`, so the router holds none. |
-| Task types | `TaskType::{ParseJob, DraftResume, DraftCoverLetter, ClassifyAnswer, Embed}` with one `TaskSpec` each (`mod.rs`). `ClassifyAnswer` arrived in 0.3. `semantic_match` and `map_form_field` have no task yet. |
+| Task types | `TaskType::{ParseJob, DraftResume, DraftCoverLetter, ClassifyAnswer, Embed}` with one `TaskSpec` each (`mod.rs`). `ClassifyAnswer` arrived in 0.3, and `SemanticMatch` and `SummarizeCompany` in 0.5 (see [As built in 0.5](#as-built-in-05)). `map_form_field` has no task yet. |
 | Provider | trait `Provider` (`declaration`, `available`, `complete`, `embed`). Implementations: `Ollama`, `ClaudeCode`, `NoAi`. `ProviderId` has exactly those three variants, so a provider the owner decisions leave out has no way in. |
 | Results | `Outcome::{Ok, ManualRequired, Cancelled, Failed}`. |
 | Cancellation | one `CancellationToken` type, polled every 100 ms. Revoking consent, Ctrl-C, and app exit fire it, and a dropped attempt kills its child. |
@@ -343,3 +343,23 @@ The run path and these flags are unverified: nothing reaches Codex while every t
 A free Gemini key cannot be told from a paid one (the docs name no marker), so the attestation is the only honest gate; a wrong one sends personal data under free-tier terms, and the owner accepts that. Fallback never widens consent. A restore revokes every external consent. A suspended record skips the provider with `consent_suspended`, and the AI screen explains it in an alert with one `Review consent...` button.
 
 **Refresh ceiling.** `memory::refresh_plan` returns `pending` (at most 20 questions, `CLASSIFY_BATCH`) and `external_calls`, which is `pending` times the external providers that declare `no_tools` and hold an active consent covering `job_text`. A reply that fails goes on to the next provider, so each can be asked once per question. The GUI dialog and the CLI text state `external_calls`, with the 20-question limit given separately.
+
+## As built in 0.5
+
+Two task types arrive with job intelligence. Both are in `crates/core/src/ai/mod.rs`, both require `structured_output` and `no_tools`, and both carry untrusted text. A provider needs an active consent that covers every category in the table.
+
+| Task | Categories | Schema | Attempts | Reply |
+|---|---|---|---|---|
+| `semantic_match` | `job_text`, `resume_text` | `schemas/semantic_match.json` | 2 | `fit` (a whole number), `summary`, `strengths` (each a `text` and its `evidence_ids`), `gaps`. |
+| `summarize_company` | `company_text`, `job_text` | `schemas/summarize_company.json` | 2 | `facts` (each a `text` and a `source`), `gaps`. |
+
+`parse_job` is unchanged in shape and still uses `job_text` and 2 attempts. In 0.5 the matching agent calls it.
+
+What Rust does with each reply, because model output is data:
+
+- **`semantic_match`.** `fit` outside 0 to 100 is a validation failure and is asked for again. A strength stays only when `check_claims` finds a real, usable evidence id on each of its ids, after ids are stripped from the prose. A summary or gap that states work authorization is blanked or dropped. Each cut is counted in `dropped`. The result is shown as a separate "AI evaluation". It never changes the score, a filter, or the order.
+- **`summarize_company`.** A fact stays only when its `source` names a listed source, its text is short and fresh, states no work authorization, and its words are held by that source. Rust stores the source id, not the model's label. Anything else is dropped and counted.
+- **`parse_job`.** A model never sets pay: only the deterministic parser does. A model sets `work_mode` or seniority only when the word is in the posting and is not negated. It never sets `country`, `title`, or `company`.
+- **Truncation and bad replies.** `unusable_reply` and `output_truncated` end the task as `manual_required`. The rules score and any earlier summary stay.
+- **Ceiling.** An AI press states its most calls first: the external providers that declare `no_tools` and hold a consent covering the task's categories, times the task's attempts. The matching press covers at most 20 jobs (`MATCH_BATCH`).
+- **Run log.** `agent_run_log.dropped` (migration 0015) counts the values Rust dropped from model output. It holds a number, never text.
