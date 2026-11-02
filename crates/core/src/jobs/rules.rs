@@ -215,6 +215,11 @@ pub fn mentions_authorization(text: &str) -> bool {
     crate::drafts::states_authorization(super::capped(text))
 }
 
+/// Whether a skill name is really a right-to-work term, which no score may compare.
+pub fn names_right_to_work(skill: &str) -> bool {
+    mentions_authorization(skill)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fields {
     pub country: Option<String>,

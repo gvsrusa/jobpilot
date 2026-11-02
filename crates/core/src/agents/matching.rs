@@ -16,7 +16,7 @@ use crate::ai::{
 use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::jobs::semantic::{
-    check_fit, keep_grounded, mrg_parsed, needs_parsing, parse_job_prompt, semantic_prompt,
+    check_fit, keep_grounded, merge_parsed, needs_parsing, parse_job_prompt, semantic_prompt,
     store_parsed, store_semantic,
 };
 use crate::jobs::{self, JobFilter, score};
@@ -177,7 +177,7 @@ impl<'r> MatchingWorkflow<'r> {
                 }
             };
             ctx.stop_point()?;
-            let fields = mrg_parsed(&job, &posting, &output);
+            let fields = merge_parsed(&job, &posting, &output);
             match store_parsed(db, id, &fields).await {
                 Ok(()) => self.note(|done| done.parsed += usize::from(!fields.is_empty())),
                 Err(Error::NotFound) => continue,
@@ -374,9 +374,9 @@ pub async fn match_jobs(
 }
 
 /// What a press with `ai` would spend, at most: each job, times each external provider that
-/// declares `NoTools` and holds an active consent, times each of the two tasks that consent
-/// covers. Reads only: it starts no provider and asks no key. A reply that fails goes on to
-/// the next provider, and a task retries once, so fewer calls happen when the first works.
+/// declares `NoTools` and holds an active consent, times the attempts of each of the two
+/// tasks that consent covers. Reads only: it starts no provider and asks no key. Fewer calls
+/// happen when the first reply works.
 pub async fn match_plan(db: &Db, router: &Router, job_ids: &[String]) -> Result<AiPlan> {
     let ids = checked_ids(db, job_ids.to_vec(), true).await?;
     let tasks = [TaskType::ParseJob, TaskType::SemanticMatch];
@@ -394,7 +394,8 @@ pub async fn match_plan(db: &Db, router: &Router, job_ids: &[String]) -> Result<
             per_job += tasks
                 .iter()
                 .filter(|task| covers(spec(**task).categories))
-                .count();
+                .map(|task| spec(*task).attempts as usize)
+                .sum::<usize>();
         }
     }
     Ok(AiPlan {

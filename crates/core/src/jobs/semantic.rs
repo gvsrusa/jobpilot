@@ -12,7 +12,7 @@ use super::rules::{Seniority, seniority_of};
 use super::{Job, PayPeriod, PayRange};
 use crate::ai::{Prompt, TaskType, spec};
 use crate::db::Db;
-use crate::drafts::{self, ClaimInput, check_claims, states_authorization};
+use crate::drafts::{ClaimInput, check_claims, states_authorization};
 use crate::error::{Error, Result};
 use crate::generate::{
     CLOSE, MIN_EVIDENCE_BYTES, OPEN, PROMPT_BYTES, neutralise, ranked_lines, strip_ids,
@@ -44,6 +44,8 @@ pub struct ParsedFields {
     pub skills: Vec<String>,
     pub seniority: Option<Seniority>,
     pub pay: Option<PayRange>,
+    /// Skills cut for stating work authorization.
+    pub dropped: usize,
 }
 
 impl ParsedFields {
@@ -105,7 +107,13 @@ pub fn semantic_prompt(evidence: &[KnowledgeItem], posting: &JobText) -> Prompt 
     let room = PROMPT_BYTES
         .saturating_sub(base + job.len())
         .max(MIN_EVIDENCE_BYTES);
-    let cited = neutralise(&ranked_lines(evidence, &job, room).join("\n"));
+    // A line that states work authorization is never sent, even one the person typed.
+    let sendable: Vec<KnowledgeItem> = evidence
+        .iter()
+        .filter(|item| !states_authorization(&item.body))
+        .cloned()
+        .collect();
+    let cited = neutralise(&ranked_lines(&sendable, &job, room).join("\n"));
     let left = PROMPT_BYTES.saturating_sub(base + cited.len());
     Prompt {
         user: frame(&cited, cut(&job, left)),
@@ -169,10 +177,25 @@ pub fn keep_grounded(output: &Value, evidence: &[KnowledgeItem]) -> Result<Seman
         })
         .collect();
     let judged = check_claims(&claims, evidence);
+    // `check_claims` lets a person's own words stand; here nothing may state authorization, and
+    // nothing may rest on a line that does.
+    let stating: Vec<&str> = evidence
+        .iter()
+        .filter(|item| states_authorization(&item.body))
+        .map(|item| item.id.as_str())
+        .collect();
     let mut dropped = 0;
     let mut strengths = Vec::new();
     for (claim, judged) in claims.into_iter().zip(judged) {
-        if judged.status == "ok" && !claim.text.is_empty() {
+        let rests_on_one = claim
+            .evidence_ids
+            .iter()
+            .any(|id| stating.contains(&id.as_str()));
+        if judged.status == "ok"
+            && !claim.text.is_empty()
+            && !rests_on_one
+            && !states_authorization(&claim.text)
+        {
             strengths.push(claim);
         } else {
             dropped += 1;
@@ -210,13 +233,24 @@ struct ParseReply {
     compensation: String,
 }
 
-/// Whether `skill` stands in `text` as a whole word, without regard to case.
-fn stands_in(skill: &str, text: &str) -> bool {
-    let (skill, text) = (skill.to_lowercase(), text.to_lowercase());
+/// Lower case, with every run of white space one space.
+fn squash(text: &str) -> String {
+    text.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether `needle` stands in `text` as a whole word, without regard to case or spacing.
+/// Symbols count, so `$70,000` is not `70,000`, and a letter or digit on either side means it
+/// is part of a longer word or figure. An empty needle stands nowhere.
+fn stands_in(needle: &str, text: &str) -> bool {
+    let (needle, text) = (squash(needle), squash(text));
     let edge = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric());
-    text.match_indices(&skill).any(|(at, found)| {
-        edge(text[..at].chars().next_back()) && edge(text[at + found.len()..].chars().next())
-    })
+    !needle.is_empty()
+        && text.match_indices(&needle).any(|(at, found)| {
+            edge(text[..at].chars().next_back()) && edge(text[at + found.len()..].chars().next())
+        })
 }
 
 /// Whether a job has no usable field yet, so a model may be asked. A job a person set, or a
@@ -233,33 +267,42 @@ pub fn needs_parsing(job: &Job) -> bool {
 /// skill stays only when the posting names it. A seniority maps through
 /// [`seniority_of`], and pay is read by [`parse_pay`] from text that stands in the posting.
 /// Title, company, location, and country are the connector's and are never read here.
-pub fn mrg_parsed(job: &Job, posting: &JobText, output: &Value) -> ParsedFields {
+pub fn merge_parsed(job: &Job, posting: &JobText, output: &Value) -> ParsedFields {
     let Ok(reply) = serde_json::from_value::<ParseReply>(output.clone()) else {
         return ParsedFields::default();
     };
+    // A model may set these two only with the posting's own word: a mode that hides a job from
+    // a filter, or a level that moves a score, is never a guess.
+    let said = |word: &str| stands_in(word, &posting.normalized);
     let work_mode = match reply.remote.as_str() {
-        "remote" => Some("remote"),
-        "hybrid" => Some("hybrid"),
-        "onsite" => Some("onsite"),
+        "remote" if said("remote") => Some("remote"),
+        "hybrid" if said("hybrid") => Some("hybrid"),
+        "onsite" if said("onsite") || said("on-site") || said("on site") => Some("onsite"),
         _ => None,
     };
+    let seniority = Some(reply.seniority.as_str())
+        .filter(|word| said(word))
+        .and_then(|word| seniority_of(word, ""));
     let mut skills: Vec<String> = Vec::new();
+    let mut dropped = 0;
     for skill in reply.skills.iter().map(|skill| skill.trim()) {
+        if states_authorization(skill) {
+            dropped += 1;
+            continue;
+        }
         let fresh = !skills.iter().any(|kept| kept.eq_ignore_ascii_case(skill));
         if fresh
-            && !skill.is_empty()
             && skill.chars().count() <= SKILL_CHARS
             && skills.len() < SKILL_LIMIT
-            && stands_in(skill, &posting.normalized)
+            && said(skill)
         {
             skills.push(skill.to_owned());
         }
     }
-    let pay = {
-        let stated = drafts::fold(&reply.compensation);
-        let found = !stated.is_empty() && drafts::fold(&posting.normalized).contains(&stated);
-        found.then(|| parse_pay(&reply.compensation)).flatten()
-    };
+    // The figure and its symbol or code must stand in the posting as written.
+    let pay = said(&reply.compensation)
+        .then(|| parse_pay(&reply.compensation))
+        .flatten();
     ParsedFields {
         work_mode: work_mode.filter(|_| job.work_mode.is_none()),
         skills: if job.skills.is_empty() {
@@ -267,13 +310,14 @@ pub fn mrg_parsed(job: &Job, posting: &JobText, output: &Value) -> ParsedFields 
         } else {
             Vec::new()
         },
-        seniority: seniority_of(&reply.seniority, "").filter(|_| job.seniority.is_none()),
+        seniority: seniority.filter(|_| job.seniority.is_none()),
         pay: pay.filter(|_| job.pay.is_none()),
+        dropped,
     }
 }
 
 /// Fills blanks only, and only on a job whose fields are the rules', the connector's, or
-/// none. `fields_by` becomes `model` from `none` or `rules`; a connector's job stays its own.
+/// none. Such a job becomes the model's, so a person's or an earlier model's is never touched.
 pub async fn store_parsed(db: &Db, job_id: &str, fields: &ParsedFields) -> Result<()> {
     if fields.is_empty() {
         return Ok(());
@@ -293,7 +337,7 @@ pub async fn store_parsed(db: &Db, job_id: &str, fields: &ParsedFields) -> Resul
                                  ELSE pay_currency END, \
              pay_period = CASE WHEN pay_min IS NULL AND pay_max IS NULL THEN ?8 \
                                ELSE pay_period END, \
-             fields_by = CASE WHEN fields_by IN ('none','rules') THEN 'model' ELSE fields_by END \
+             fields_by = 'model' \
          WHERE id = ?1 AND fields_by IN ('none','connector','rules')",
     )
     .bind(job_id)

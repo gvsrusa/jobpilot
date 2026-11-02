@@ -15,8 +15,10 @@ use jobpilot_core::ai::{
     Availability, BYTES_PER_TOKEN, BoxFuture, CancellationToken, Capability, DataCategory,
     Declaration, Prompt, Provider, ProviderId, TaskType, consent, spec,
 };
+use jobpilot_core::jobs::score::{Candidate, score};
 use jobpilot_core::jobs::semantic::{
-    check_fit, keep_grounded, mrg_parsed, parse_job_prompt, semantic_prompt,
+    check_fit, keep_grounded, merge_parsed, needs_parsing, parse_job_prompt, semantic_prompt,
+    store_parsed,
 };
 use jobpilot_core::jobs::{self, JobFilter, PastedJob};
 use jobpilot_core::knowledge::{self, JobText, KnowledgeItem};
@@ -29,6 +31,8 @@ use tempfile::TempDir;
 const OPEN: &str = "<<<UNTRUSTED_POSTING>>>";
 const CLOSE: &str = "<<<END_UNTRUSTED_POSTING>>>";
 const CLAUDE: &str = "claude_code/cli_login";
+/// Not the rules' score for the fixture job (100), so a leak of it into the score shows.
+const FIT: i64 = 37;
 const BULLET: &str = "Built Rust services that handle payments";
 const POSTING: &str = "We need a Rust engineer to build payment services.";
 
@@ -68,6 +72,8 @@ struct Script {
     replies: Mutex<VecDeque<Result<String>>>,
     calls: Arc<AtomicUsize>,
     seen: Arc<Mutex<Vec<String>>>,
+    /// Fired during the call, as a press on Stop while the model works.
+    cancel_in_call: Option<CancellationToken>,
 }
 
 #[derive(Clone)]
@@ -91,6 +97,7 @@ fn script(id: ProviderId, replies: Vec<Result<String>>) -> (Script, Handles) {
         replies: Mutex::new(replies.into()),
         calls: calls.clone(),
         seen: seen.clone(),
+        cancel_in_call: None,
     };
     (provider, Handles { calls, seen })
 }
@@ -125,6 +132,9 @@ impl Provider for Script {
         _cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<String>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(cancel) = &self.cancel_in_call {
+            cancel.cancel();
+        }
         self.seen
             .lock()
             .unwrap()
@@ -203,7 +213,7 @@ fn semantic_reply(fit: i64, summary: &str, strengths: &[(&str, &[&str])], gaps: 
 
 fn good_reply(id: &str) -> String {
     semantic_reply(
-        100,
+        FIT,
         "A close match",
         &[("Built payment services in Rust", &[id])],
         &["No Go experience"],
@@ -622,7 +632,8 @@ async fn the_model_cannot_move_the_score_or_a_filter() {
         .unwrap()
         .semantic
         .unwrap();
-    assert_eq!(shown.fit, 100, "shown, never used");
+    assert_eq!(i64::from(shown.fit), FIT, "shown, never used");
+    assert_ne!(before.0, Some(FIT), "the fixture must tell the two apart");
     assert_eq!(shown.strengths.len(), 1);
     assert_eq!(shown.gaps, ["No Go experience"]);
     assert_eq!((shown.provider.as_str(), shown.dropped), ("ollama", 0));
@@ -669,6 +680,9 @@ async fn an_external_provider_needs_consent_for_both_categories() {
 }
 
 /// A posting no rule reads anything from, so a model may fill its blanks.
+/// The same, saying it is hybrid and wants a senior hand.
+const BARE_WORDS: &str =
+    "Come and work with our friendly crew in a hybrid setup. We want a senior hand with Glazing.";
 const BARE: &str = "Come and work with our friendly crew. We value Glazing and kindness.";
 
 fn parse_reply(skills: &[&str], location: &str) -> String {
@@ -682,7 +696,7 @@ fn parse_reply(skills: &[&str], location: &str) -> String {
 #[tokio::test]
 async fn parse_job_fills_blanks_and_cannot_add_a_skill_the_posting_lacks() {
     let (_tmp, db) = open().await;
-    let job = paste(&db, "Potter", BARE).await;
+    let job = paste(&db, "Potter", BARE_WORDS).await;
     assert!(job.skills.is_empty() && job.work_mode.is_none() && job.seniority.is_none());
     let (provider, handles) = script(
         ProviderId::Ollama,
@@ -741,7 +755,7 @@ async fn parse_job_never_sets_country() {
     let posting = knowledge::get_job_text(&db, &job.job_text_id)
         .await
         .unwrap();
-    let parsed = mrg_parsed(&job, &posting, &reply);
+    let parsed = merge_parsed(&job, &posting, &reply);
     assert_eq!(parsed.skills, ["Glazing"]);
 }
 
@@ -760,9 +774,9 @@ async fn parse_job_reads_pay_only_from_text_in_the_posting_and_leaves_filled_fie
     assert!(job.pay.is_some(), "the rules read it first");
     let mut blank = job.clone();
     blank.pay = None;
-    let found = mrg_parsed(&blank, &posting, &said("EUR 70,000 a year"));
+    let found = merge_parsed(&blank, &posting, &said("EUR 70,000 a year"));
     assert_eq!(found.pay.as_ref().and_then(|p| p.min), Some(70_000));
-    let invented = mrg_parsed(&blank, &posting, &said("EUR 250,000 a year"));
+    let invented = merge_parsed(&blank, &posting, &said("EUR 250,000 a year"));
     assert!(invented.pay.is_none(), "not in the posting");
 
     // A field the job has is not touched.
@@ -772,7 +786,7 @@ async fn parse_job_reads_pay_only_from_text_in_the_posting_and_leaves_filled_fie
     filled.skills = vec!["Rust".into()];
     let reply = json!({"title": "", "company": "", "location": "", "remote": "remote",
         "skills": ["Glazing"], "seniority": "senior", "compensation": ""});
-    let parsed = mrg_parsed(&filled, &posting, &reply);
+    let parsed = merge_parsed(&filled, &posting, &reply);
     assert!(parsed.is_empty(), "{parsed:?}");
 }
 
@@ -828,11 +842,17 @@ async fn the_plan_states_the_most_calls() {
 
     consent_to(&w.db, &[DataCategory::JobText]).await;
     let parse_only = plan(router_of(script(ProviderId::ClaudeCode, vec![]).0)).await;
-    assert_eq!(parse_only.external_calls, 2, "2 jobs, parse_job only");
+    assert_eq!(
+        parse_only.external_calls, 4,
+        "2 jobs * 2 attempts, parse_job only"
+    );
 
     consent_to(&w.db, &[DataCategory::JobText, DataCategory::ResumeText]).await;
     let both = plan(router_of(script(ProviderId::ClaudeCode, vec![]).0)).await;
-    assert_eq!(both.external_calls, 4, "2 jobs * 1 provider * 2 tasks");
+    assert_eq!(
+        both.external_calls, 8,
+        "2 jobs * 1 provider * 2 tasks * 2 attempts"
+    );
 
     let local = plan(router_of(script(ProviderId::Ollama, vec![]).0)).await;
     assert_eq!(local.external_calls, 0, "local data stays");
@@ -969,4 +989,400 @@ async fn a_run_row_holds_no_prompt_or_reply_text() {
         summary,
         "the evaluation itself is stored with the score"
     );
+}
+
+// ---- review fixes -----------------------------------------------------------------------
+
+fn said(remote: &str, skills: &[&str], seniority: &str, pay: &str) -> Value {
+    json!({"title": "", "company": "", "location": "", "remote": remote, "skills": skills,
+           "seniority": seniority, "compensation": pay})
+}
+
+async fn blank_job(db: &Db, text: &str) -> (jobs::Job, JobText) {
+    let job = paste(db, "Potter", text).await;
+    let posting = knowledge::get_job_text(db, &job.job_text_id).await.unwrap();
+    (job, posting)
+}
+
+#[tokio::test]
+async fn a_skill_stating_authorization_is_dropped_and_counted_and_never_scored() {
+    let (_tmp, db) = open().await;
+    let (job, posting) = blank_job(&db, "US citizen only. Glazing and Kilns wanted.").await;
+    let parsed = merge_parsed(
+        &job,
+        &posting,
+        &said("", &["US citizen", "Glazing"], "", ""),
+    );
+    assert_eq!(parsed.skills, ["Glazing"]);
+    assert_eq!(parsed.dropped, 1);
+
+    // A stored one (a connector's tag) is left out of the score too.
+    let mut stored = job.clone();
+    stored.skills = vec!["Rust".into(), "US citizen".into(), "Work visa".into()];
+    let me = Candidate {
+        skills: vec!["Rust".into()],
+        ..Candidate::default()
+    };
+    let explained = score(&stored, &me);
+    assert_eq!(explained.matched_skills, ["Rust"]);
+    assert!(explained.missing_skills.is_empty(), "{explained:?}");
+    assert_eq!(explained.score, Some(100));
+}
+
+#[tokio::test]
+async fn pay_needs_its_symbol_and_whole_figures_in_the_posting() {
+    let (_tmp, db) = open().await;
+    let pay_of = async |text: &str, claimed: &str| {
+        let (job, posting) = blank_job(&db, text).await;
+        let mut blank = job.clone();
+        blank.pay = None;
+        merge_parsed(&blank, &posting, &said("", &[], "", claimed)).pay
+    };
+    let found = pay_of("The pay is $70,000 a year.", "$70,000 a year")
+        .await
+        .unwrap();
+    assert_eq!(
+        (found.min, found.currency.as_deref()),
+        (Some(70_000), Some("USD"))
+    );
+    assert!(
+        pay_of("We will fire 70,000 pots a year.", "$70,000 a year")
+            .await
+            .is_none()
+    );
+    assert!(
+        pay_of("The pay is $170,000 a year.", "$70,000 a year")
+            .await
+            .is_none()
+    );
+    assert!(
+        pay_of("The pay is 170,000 EUR a year.", "70,000 EUR a year")
+            .await
+            .is_none()
+    );
+    assert!(
+        pay_of("The pay is $70,000 a year.", "EUR 70,000 a year")
+            .await
+            .is_none()
+    );
+    // Spacing in the posting does not matter.
+    assert!(
+        pay_of("Pay:\n  $70,000   a\nyear.", "$70,000 a year")
+            .await
+            .is_some()
+    );
+    assert!(pay_of("The pay is $70,000 a year.", "").await.is_none());
+}
+
+#[tokio::test]
+async fn work_mode_and_seniority_need_the_posting_to_say_the_word() {
+    let (_tmp, db) = open().await;
+    let (job, bare) = blank_job(&db, BARE).await;
+    let ungrounded = merge_parsed(&job, &bare, &said("onsite", &["Glazing"], "senior", ""));
+    assert_eq!((ungrounded.work_mode, ungrounded.seniority), (None, None));
+    assert_eq!(ungrounded.skills, ["Glazing"], "the rest is kept");
+
+    let (job, said_it) = blank_job(&db, BARE_WORDS).await;
+    let grounded = merge_parsed(&job, &said_it, &said("hybrid", &[], "senior", ""));
+    assert_eq!(grounded.work_mode, Some("hybrid"));
+    assert_eq!(grounded.seniority.map(|s| s.as_str()), Some("senior"));
+    // Another word than the posting's is still unknown.
+    let wrong = merge_parsed(&job, &said_it, &said("remote", &[], "junior", ""));
+    assert_eq!((wrong.work_mode, wrong.seniority), (None, None));
+
+    let (job, spelled) = blank_job(&db, "Work on-site with our crew. Glazing.").await;
+    let onsite = merge_parsed(&job, &spelled, &said("onsite", &[], "", ""));
+    assert_eq!(onsite.work_mode, Some("onsite"));
+}
+
+async fn set_by(db: &Db, id: &str, by: &str) {
+    sqlx::query("UPDATE jobs SET fields_by = ? WHERE id = ?")
+        .bind(by)
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_model_fill_marks_even_a_connector_job_as_the_models() {
+    let (_tmp, db) = open().await;
+    let (job, posting) = blank_job(&db, BARE_WORDS).await;
+    set_by(&db, &job.id, "connector").await;
+    let fields = merge_parsed(&job, &posting, &said("hybrid", &["Glazing"], "", ""));
+    store_parsed(&db, &job.id, &fields).await.unwrap();
+    assert_eq!(jobs::get(&db, &job.id).await.unwrap().fields_by, "model");
+}
+
+#[tokio::test]
+async fn needs_parsing_asks_only_for_a_job_with_nothing_filled_that_no_one_set() {
+    let (_tmp, db) = open().await;
+    let (job, _) = blank_job(&db, BARE).await;
+    assert!(needs_parsing(&job));
+    for by in ["none", "rules", "connector"] {
+        let mut j = job.clone();
+        j.fields_by = by.into();
+        assert!(needs_parsing(&j), "{by}");
+    }
+    for by in ["user", "model"] {
+        let mut j = job.clone();
+        j.fields_by = by.into();
+        assert!(!needs_parsing(&j), "{by}");
+    }
+    let filled: [fn(&mut jobs::Job); 4] = [
+        |j| j.work_mode = Some("remote".into()),
+        |j| j.skills = vec!["Rust".into()],
+        |j| j.seniority = Some("senior".into()),
+        |j| {
+            j.pay = Some(jobs::PayRange {
+                min: Some(1),
+                max: Some(2),
+                currency: Some("USD".into()),
+                period: None,
+            })
+        },
+    ];
+    for fill in filled {
+        let mut j = job.clone();
+        fill(&mut j);
+        assert!(!needs_parsing(&j));
+    }
+}
+
+#[tokio::test]
+async fn store_parsed_never_overwrites_what_a_person_or_the_job_already_has() {
+    let (_tmp, db) = open().await;
+    let (job, posting) = blank_job(&db, BARE_WORDS).await;
+    let fields = merge_parsed(&job, &posting, &said("hybrid", &["Glazing"], "senior", ""));
+    assert!(!fields.is_empty());
+    for by in ["user", "model"] {
+        set_by(&db, &job.id, by).await;
+        store_parsed(&db, &job.id, &fields).await.unwrap();
+        let after = jobs::get(&db, &job.id).await.unwrap();
+        assert!(after.work_mode.is_none() && after.skills.is_empty(), "{by}");
+        assert_eq!((after.seniority, after.fields_by.as_str()), (None, by));
+    }
+    // Fields already there stay, whatever the fill says.
+    set_by(&db, &job.id, "rules").await;
+    sqlx::query(
+        "UPDATE jobs SET work_mode = 'remote', seniority = 'junior', skills = '[\"Rust\"]', \
+         pay_min = 5, pay_max = 6, pay_currency = 'EUR', pay_period = 'year' WHERE id = ?",
+    )
+    .bind(&job.id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let all = jobpilot_core::jobs::semantic::ParsedFields {
+        work_mode: Some("hybrid"),
+        skills: vec!["Glazing".into()],
+        seniority: Some(jobpilot_core::jobs::rules::Seniority::Senior),
+        pay: Some(jobs::PayRange {
+            min: Some(70_000),
+            max: Some(80_000),
+            currency: Some("USD".into()),
+            period: Some(jobs::PayPeriod::Month),
+        }),
+        dropped: 0,
+    };
+    store_parsed(&db, &job.id, &all).await.unwrap();
+    let after = jobs::get(&db, &job.id).await.unwrap();
+    assert_eq!(after.work_mode.as_deref(), Some("remote"));
+    assert_eq!(after.seniority.as_deref(), Some("junior"));
+    assert_eq!(after.skills, ["Rust"]);
+    let pay = after.pay.unwrap();
+    assert_eq!(
+        (pay.min, pay.max, pay.currency.as_deref()),
+        (Some(5), Some(6), Some("EUR"))
+    );
+    assert_eq!(pay.period, Some(jobs::PayPeriod::Year));
+    assert_eq!(after.fields_by, "model", "it still counts as read");
+    assert_eq!(
+        store_parsed(&db, "missing", &all).await.unwrap_err().code(),
+        "not_found"
+    );
+}
+
+#[tokio::test]
+async fn a_user_entered_authorization_line_is_not_sent_and_cannot_be_a_strength() {
+    let line = "Authorized to work in the United States";
+    let mut known = evidence();
+    known.push(item("e2", line));
+    let p = semantic_prompt(&known, &posting(POSTING));
+    assert!(!p.user.contains("Authorized"), "kept out of the prompt");
+    assert!(p.user.contains(BULLET));
+
+    // Citing it, or quoting it with a good id, keeps nothing.
+    let reply: Value = serde_json::from_str(&semantic_reply(
+        50,
+        "ok",
+        &[
+            ("Built payment services", &["e2"]),
+            (line, &["e2"]),
+            (line, &["e1"]),
+            ("Built payment services", &["e1"]),
+        ],
+        &[],
+    ))
+    .unwrap();
+    let kept = keep_grounded(&reply, &known).unwrap();
+    assert_eq!(kept.strengths.len(), 1);
+    assert_eq!(kept.strengths[0].evidence_ids, ["e1"]);
+    assert_eq!(kept.dropped, 3);
+}
+
+#[tokio::test]
+async fn a_failed_model_call_ends_the_step_and_asks_no_more_jobs() {
+    let w = world().await;
+    let second = paste(&w.db, "Engineer II", "We need a Rust engineer too.").await;
+    let ids = vec![w.job.id.clone(), second.id.clone()];
+    matched(&w, &Router::with_providers(vec![]), false).await;
+    let ask = async |reply: Vec<Result<String>>, ids: &[String]| {
+        let (provider, handles) = script(ProviderId::Ollama, reply);
+        let req = MatchRequest {
+            job_ids: ids.to_vec(),
+            ai: true,
+        };
+        let report = match_jobs(&w.db, &router_of(provider), "cli", req, token())
+            .await
+            .unwrap();
+        (report, handles.calls())
+    };
+    // Semantic: the first job fails, so the second is never sent.
+    let (report, calls) = ask(vec![Err(Error::Failed("output_truncated".into()))], &ids).await;
+    assert_eq!((calls, report.evaluated), (1, 0));
+    assert_eq!(report.reason.as_deref(), Some("output_truncated"));
+    // The same for a reply that cannot be used.
+    let bad = || Ok("not json".to_string());
+    let (report, calls) = ask(vec![bad(), bad()], &ids).await;
+    assert_eq!(
+        (calls, report.reason.as_deref()),
+        (2, Some("unusable_reply"))
+    );
+
+    // Parse: two bare jobs, the first call fails, the second is never sent.
+    let one = paste(&w.db, "Potter", BARE).await;
+    let two = paste(&w.db, "Potter II", "Come work with our other crew. Kilns.").await;
+    let both = vec![one.id.clone(), two.id.clone()];
+    let (report, calls) = ask(vec![Err(Error::Failed("output_truncated".into()))], &both).await;
+    assert_eq!(report.parsed, 0);
+    assert_eq!(report.reason.as_deref(), Some("output_truncated"));
+    assert_eq!(calls, 2, "one parse call, then one semantic call");
+    assert!(jobs::get(&w.db, &two.id).await.unwrap().skills.is_empty());
+}
+
+#[tokio::test]
+async fn a_cancel_in_a_model_call_ends_the_run_and_stores_nothing() {
+    let (_tmp, db) = open().await;
+    knowledge::add(&db, "experience", BULLET, "user", None)
+        .await
+        .unwrap();
+    let bare = paste(&db, "Potter", BARE_WORDS).await;
+    let run = async |job: &jobs::Job, reply: String| {
+        let cancel = token();
+        let (mut provider, _) = script(ProviderId::Ollama, vec![Ok(reply)]);
+        provider.cancel_in_call = Some(cancel.clone());
+        let req = MatchRequest {
+            job_ids: vec![job.id.clone()],
+            ai: true,
+        };
+        match_jobs(&db, &router_of(provider), "cli", req, cancel).await
+    };
+    let error = run(&bare, parse_reply(&["Glazing"], "")).await.unwrap_err();
+    assert_eq!(error.code(), "cancelled");
+    let after = jobs::get(&db, &bare.id).await.unwrap();
+    assert!(after.skills.is_empty() && after.fields_by != "model");
+    assert_eq!(count(&db, "SELECT count(*) FROM match_results").await, 0);
+
+    // The semantic call: fields are filled already, so only that call is made.
+    let filled = paste(&db, "Engineer", POSTING).await;
+    let item = knowledge::evidence(&db).await.unwrap().remove(0);
+    let error = run(&filled, good_reply(&item.id)).await.unwrap_err();
+    assert_eq!(error.code(), "cancelled");
+    assert!(
+        jobs::detail(&db, &filled.id)
+            .await
+            .unwrap()
+            .semantic
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn each_job_is_checkpointed_by_its_id() {
+    let w = world().await;
+    let router = Router::with_providers(vec![]);
+    let workflow = MatchingWorkflow::new(&router, vec![w.job.id.clone()], false, false);
+    let done = runner::start(&w.db, "cli", &workflow, token())
+        .await
+        .unwrap();
+    assert_eq!(done.saved.get("job"), Some(w.job.id.as_str()));
+    assert_eq!(done.saved.get("result"), Some(w.job.id.as_str()));
+
+    let (provider, _) = script(ProviderId::Ollama, vec![Ok(good_reply(&w.item.id))]);
+    let router = router_of(provider);
+    let ai = MatchingWorkflow::new(&router, vec![w.job.id.clone()], true, false);
+    let done = runner::start(&w.db, "cli", &ai, token()).await.unwrap();
+    assert_eq!(done.saved.get("job"), Some(w.job.id.as_str()));
+    assert_eq!(done.saved.get("result"), Some(w.job.id.as_str()));
+}
+
+#[tokio::test]
+async fn a_pause_between_jobs_stops_the_score_step() {
+    let w = world().await;
+    let other = paste(&w.db, "Designer", "We need a Figma designer.").await;
+    let router = Router::with_providers(vec![]);
+    let cancel = token();
+    cancel.cancel();
+    let req = MatchRequest {
+        job_ids: vec![w.job.id.clone(), other.id.clone()],
+        ai: false,
+    };
+    let error = match_jobs(&w.db, &router, "cli", req, cancel)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "cancelled");
+    assert_eq!(count(&w.db, "SELECT count(*) FROM match_results").await, 0);
+}
+
+#[tokio::test]
+async fn skills_match_whole_words_and_are_capped() {
+    let (_tmp, db) = open().await;
+    let (job, posting) = blank_job(
+        &db,
+        "Trust matters. Rusty tools. Go! C++ and Node.js; Kilns",
+    )
+    .await;
+    let mut job = job;
+    job.skills.clear();
+    let kept = |skills: &[&str], text: &JobText| {
+        merge_parsed(&job, text, &said("", skills, "", "")).skills
+    };
+    assert!(
+        kept(&["Rust"], &posting).is_empty(),
+        "inside Trust and Rusty"
+    );
+    assert_eq!(kept(&["Go", "C++", "Node.js", "Kilns"], &posting).len(), 4);
+    // Both edges of the text count as edges.
+    let edge = posting_of("Kilns and Glazing");
+    assert_eq!(kept(&["Kilns", "Glazing"], &edge), ["Kilns", "Glazing"]);
+    assert!(kept(&["Kiln"], &edge).is_empty());
+    assert!(kept(&["lns"], &edge).is_empty());
+    // Case, spaces, repeats, and the empty name.
+    assert_eq!(kept(&["  kilns ", "KILNS", "", "  "], &edge), ["kilns"]);
+
+    let many: Vec<String> = (0..40).map(|n| format!("skill{n}")).collect();
+    let text = posting_of(&many.join(" "));
+    let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+    assert_eq!(kept(&refs, &text).len(), 30);
+    let sixty = "x".repeat(60);
+    let long = posting_of(&format!("{sixty} {sixty}y"));
+    assert_eq!(kept(&[&sixty], &long).len(), 1);
+    assert!(
+        kept(&[&format!("{sixty}y")], &long).is_empty(),
+        "61 characters"
+    );
+}
+
+fn posting_of(text: &str) -> JobText {
+    posting(text)
 }

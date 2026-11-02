@@ -114,8 +114,14 @@ fn skills_row(
     missing: &mut Vec<String>,
 ) -> Row {
     let weight = weight_of(Criterion::Skills);
-    if job.skills.is_empty() || me.skills.is_empty() {
-        let why = if job.skills.is_empty() {
+    // The right to work is never scored, so a skill that names it is not compared.
+    let named: Vec<&String> = job
+        .skills
+        .iter()
+        .filter(|skill| !rules::names_right_to_work(skill))
+        .collect();
+    if named.is_empty() || me.skills.is_empty() {
+        let why = if named.is_empty() {
             "the posting names no skill"
         } else {
             "you have no skills on file"
@@ -127,7 +133,7 @@ fn skills_row(
             note: format!("not compared: {why}"),
         };
     }
-    for skill in &job.skills {
+    for skill in named {
         let has = me.skills.iter().any(|s| s.eq_ignore_ascii_case(skill));
         if has {
             matched.push(skill.clone());
