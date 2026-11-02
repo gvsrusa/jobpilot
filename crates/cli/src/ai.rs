@@ -9,7 +9,7 @@ use jobpilot_core::ai::router::{Router, ollama_from_settings};
 use jobpilot_core::ai::{
     self, CancellationToken, DataCategory, Sharing, TaskType, consent, register,
 };
-use jobpilot_core::ai::{api, claude_code};
+use jobpilot_core::ai::{api, child, claude_code};
 use jobpilot_core::secrets::{self, Zeroizing};
 use jobpilot_core::{Db, Error, Result, embed, generate, pause};
 use serde_json::json;
@@ -78,6 +78,12 @@ pub enum AiCommand {
     },
     /// Where the `claude` program is, when it cannot be found by itself. Empty clears it.
     ClaudePath {
+        path: String,
+    },
+    /// Where the `gemini` or `codex` program is, when it cannot be found by itself. Empty clears it.
+    CliPath {
+        #[arg(value_enum)]
+        provider: ProviderArg,
         path: String,
     },
     #[command(subcommand)]
@@ -323,6 +329,20 @@ pub async fn ai(db: &Db, command: AiCommand) -> Result<Output> {
             out(
                 json!({ "claude_path": path }),
                 format!("claude_path: {path}"),
+            )
+        }
+        AiCommand::CliPath { provider, path } => {
+            let name = provider.name();
+            let Some(spec) = child::spec_for(name) else {
+                return Err(Error::Validation(
+                    "a program path is for gemini_cli or codex_cli".into(),
+                ));
+            };
+            let path = path.trim();
+            child::set_cli_path(db, name, path).await?;
+            out(
+                json!({ format!("{name}_path"): path }),
+                format!("{}: {path}", spec.setting),
             )
         }
         AiCommand::Enable { provider } => toggle(db, provider, true).await,

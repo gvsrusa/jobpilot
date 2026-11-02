@@ -1301,7 +1301,9 @@ async fn availability_comes_from_settings_and_the_index_alone() {
     assert_eq!(row("openrouter").reason.as_deref(), Some("no_api_model"));
     assert_eq!(row("endpoint").reason.as_deref(), Some("no_endpoint"));
     assert_eq!(row("anthropic").reason.as_deref(), Some("no_api_model"));
-    assert_eq!(row("gemini_cli").reason.as_deref(), Some("not_built"));
+    // A CLI row is found or not by its folders and never started while it is off (decision 28),
+    // so what it says depends on the machine: only "not built" is gone.
+    assert_ne!(row("gemini_cli").reason.as_deref(), Some("not_built"));
 }
 
 #[tokio::test]

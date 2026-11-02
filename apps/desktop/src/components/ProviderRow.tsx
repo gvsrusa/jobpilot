@@ -14,6 +14,9 @@ const UNAVAILABLE: Record<string, string> = {
   no_key: "no key stored",
   no_api_model: "no model chosen",
   no_endpoint: "no address set",
+  not_installed: "not installed",
+  version_failed: "did not answer --version",
+  no_answer: "did not answer in time",
 };
 
 /** An AI-screen change. The row and any alert stay up while the status refreshes. */
@@ -109,6 +112,30 @@ function EndpointControls({ row }: { row: ExternalStatus }) {
   );
 }
 
+/** The program a CLI row runs. Rust opens the picker and checks the name: only the provider crosses. */
+function CliControls({ row }: { row: ExternalStatus }) {
+  const program = row.name.replace(/_cli$/, "");
+  const choose = useRowAction(() => ipc.aiSetCliPath(row.name));
+  const clear = useRowAction(() => ipc.aiClearCliPath(row.name));
+  return (
+    <div className="grid gap-2">
+      <div className="flex flex-wrap items-center gap-3">
+        {!row.path && (
+          <Button size="sm" variant="outline" disabled={choose.isPending} onClick={() => choose.mutate(undefined)}>
+            {`Choose ${program}...`}
+          </Button>
+        )}
+        {row.path && (
+          <Button size="sm" variant="outline" disabled={clear.isPending} onClick={() => clear.mutate(undefined)}>
+            Use automatic
+          </Button>
+        )}
+      </div>
+      <ErrorAlert error={choose.error ?? clear.error} />
+    </div>
+  );
+}
+
 /** Stored or not, and the two actions. Rust does both: no key passes through this screen. */
 function KeyControls({ row }: { row: ExternalStatus }) {
   const client = useQueryClient();
@@ -169,6 +196,7 @@ export function ProviderRow(props: {
       </div>
       {row.suspended && <p role="alert">{row.kind === "endpoint" ? ENDPOINT_SUSPENDED : SUSPENDED}</p>}
       {row.kind === "endpoint" && <EndpointControls row={row} />}
+      {row.kind === "cli" && <CliControls row={row} />}
       {row.kind !== "cli" && <ModelControls row={row} />}
       {row.kind !== "cli" && <KeyControls row={row} />}
       {row.name === "google" && <p className="text-muted-foreground">Free keys are not supported.</p>}

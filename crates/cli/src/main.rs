@@ -102,6 +102,7 @@ impl Command {
             Command::Backup(BackupCommand::Restore { .. })
                 | Command::Ai(
                     AiCommand::ClaudePath { .. }
+                        | AiCommand::CliPath { .. }
                         | AiCommand::Consent(ConsentCommand::Give { .. })
                         | AiCommand::Key(_)
                         | AiCommand::Model { .. }
@@ -490,6 +491,7 @@ mod tests {
         ("ai enable claude_code", true),
         ("ai disable claude_code", true),
         ("ai claude-path /c", true),
+        ("ai cli-path gemini_cli /c", true),
         ("ai enable openai", true),
         ("ai disable openai", true),
         ("ai order openai", true),

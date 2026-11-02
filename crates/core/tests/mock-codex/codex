@@ -1,0 +1,14 @@
+#!/bin/sh
+# Stands in for the real `codex` in tests. Never reaches a network.
+if [ "$1" = "--version" ]; then
+    echo "0.0.0 (mock)"
+    exit "${MOCK_CODEX_VERSION_EXIT:-0}"
+fi
+if [ -n "$MOCK_CODEX_ARGS" ]; then
+    : > "$MOCK_CODEX_ARGS"
+    for arg in "$@"; do
+        printf '%s\n' "$arg" >> "$MOCK_CODEX_ARGS"
+    done
+fi
+[ -n "$MOCK_CODEX_STDIN" ] && cat > "$MOCK_CODEX_STDIN"
+exit "${MOCK_CODEX_EXIT:-0}"

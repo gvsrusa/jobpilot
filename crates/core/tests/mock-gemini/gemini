@@ -1,0 +1,14 @@
+#!/bin/sh
+# Stands in for the real `gemini` in tests. Never reaches a network.
+if [ "$1" = "--version" ]; then
+    echo "0.0.0 (mock)"
+    exit "${MOCK_GEMINI_VERSION_EXIT:-0}"
+fi
+if [ -n "$MOCK_GEMINI_ARGS" ]; then
+    : > "$MOCK_GEMINI_ARGS"
+    for arg in "$@"; do
+        printf '%s\n' "$arg" >> "$MOCK_GEMINI_ARGS"
+    done
+fi
+[ -n "$MOCK_GEMINI_STDIN" ] && cat > "$MOCK_GEMINI_STDIN"
+exit "${MOCK_GEMINI_EXIT:-0}"

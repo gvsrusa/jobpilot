@@ -602,6 +602,10 @@ export const ipc = {
   aiSetClaudePath: () => invoke<void>("ai_set_claude_path"),
   /** Back to finding `claude` by itself. Rust confirms in a native dialog. */
   aiClearClaudePath: () => invoke<void>("ai_clear_claude_path"),
+  /** Rust opens the picker for the `gemini` or `codex` program: only the provider crosses. */
+  aiSetCliPath: (provider: Provider) => invoke<void>("ai_set_cli_path", { provider }),
+  /** Back to finding the program by itself. Rust confirms in a native dialog. */
+  aiClearCliPath: (provider: Provider) => invoke<void>("ai_clear_cli_path", { provider }),
   /** Rust confirms in a native dialog. */
   aiSetOllamaUrl: (url: string) => invoke<void>("ai_set_ollama_url", { url }),
   /** Rust confirms in a native dialog. */

@@ -17,7 +17,7 @@ use jobpilot_core::ai::router::{Router, ollama_from_settings};
 use jobpilot_core::ai::{
     self, AiStatus, CancellationToken, DataCategory, Sharing, TaskType, consent,
 };
-use jobpilot_core::ai::{api, claude_code};
+use jobpilot_core::ai::{api, child, claude_code};
 use jobpilot_core::analytics::{self, Report};
 use jobpilot_core::applications::{self, Application, ApplicationEvent, ApplicationInput};
 use jobpilot_core::audit::{self, AuditEntry};
@@ -148,6 +148,8 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         ai_enable,
         ai_set_claude_path,
         ai_clear_claude_path,
+        ai_set_cli_path,
+        ai_clear_cli_path,
         ai_set_ollama_url,
         ai_set_api_model,
         ai_set_endpoint,
@@ -1079,6 +1081,57 @@ pub async fn ai_clear_claude_path<R: Runtime>(
     native::confirmed(&app, "Claude Code program", message, "Clear").await?;
     let db = state.work().await?;
     settings::set(&db, claude_code::PATH_SETTING, &json!("")).await
+}
+
+/// The program that runs as the Gemini or Codex CLI. The picker is the confirmation, as for
+/// Claude: the webview names the provider and never a path.
+#[tauri::command]
+pub async fn ai_set_cli_path<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    provider: String,
+) -> Result<()> {
+    drop(state.work().await?);
+    let spec = child::spec_for(&provider)
+        .ok_or_else(|| Error::Validation("choose a program for gemini_cli or codex_cli".into()))?;
+    let dialog = FileDialog {
+        title: &format!("Choose the {} program", spec.program),
+        filter: "Program",
+        extensions: &[],
+        file_name: None,
+    };
+    let path = native::open_file(&app, dialog).await?;
+    if !(path.is_absolute() && child::accepts_name(&path, spec, cfg!(windows))) {
+        return Err(Error::Validation(format!(
+            "choose a program named {}",
+            spec.program
+        )));
+    }
+    let path = path
+        .to_str()
+        .ok_or_else(|| Error::Validation("this path cannot be stored".into()))?;
+    let db = state.work().await?;
+    child::set_cli_path(&db, &provider, path).await
+}
+
+/// Back to finding the program by itself, which changes what runs, so it is confirmed too.
+#[tauri::command]
+pub async fn ai_clear_cli_path<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    provider: String,
+) -> Result<()> {
+    let spec = child::spec_for(&provider)
+        .ok_or_else(|| Error::Validation("choose a program for gemini_cli or codex_cli".into()))?;
+    let stored = settings::get(&*state.work().await?, spec.setting).await?;
+    let stored = stored.as_ref().and_then(Value::as_str).unwrap_or_default();
+    let message = format!(
+        "Stop using this program as {}, and find {} automatically?\n\n{stored}",
+        spec.program, spec.program
+    );
+    native::confirmed(&app, "Provider program", message, "Clear").await?;
+    let db = state.work().await?;
+    child::set_cli_path(&db, &provider, "").await
 }
 
 /// Where Ollama listens. Core refuses anything off this machine (M-21) before anyone is
@@ -2651,6 +2704,8 @@ mod tests {
         "ai_enable",
         "ai_set_claude_path",
         "ai_clear_claude_path",
+        "ai_set_cli_path",
+        "ai_clear_cli_path",
         "ai_set_ollama_url",
         "ai_set_api_model",
         "ai_set_endpoint",
@@ -3248,6 +3303,8 @@ mod tests {
         let h = ready();
         for key in [
             "ai.claude_path",
+            "ai.gemini_path",
+            "ai.codex_path",
             "ai.ollama_url",
             "ai.enabled",
             "ai.order",
@@ -3301,6 +3358,76 @@ mod tests {
 
         h.answer(true);
         h.ok("ai_clear_claude_path", json!({}));
+        assert_eq!(h.ok("settings_get", key), "");
+    }
+
+    #[test]
+    fn cli_picker_refuses_another_program() {
+        let h = ready();
+        let key = |provider: &str| {
+            let setting = if provider == "gemini_cli" {
+                "ai.gemini_path"
+            } else {
+                "ai.codex_path"
+            };
+            json!({ "key": setting })
+        };
+        // The picker is closed: no path from the webview stands in for it.
+        let args = json!({ "provider": "gemini_cli", "path": "/tmp/evil/gemini" });
+        assert_eq!(h.code("ai_set_cli_path", args), "cancelled");
+
+        for (provider, name) in [
+            ("gemini_cli", "codex"),
+            ("gemini_cli", "sh"),
+            ("gemini_cli", "gemini-evil"),
+            ("codex_cli", "gemini"),
+        ] {
+            h.pick(&h._tmp.path().join(name));
+            assert_eq!(
+                h.code("ai_set_cli_path", json!({ "provider": provider })),
+                "validation",
+                "{provider} {name}"
+            );
+            assert_eq!(h.ok("settings_get", key(provider)), Value::Null);
+        }
+        // Not a program provider at all: refused before any picker opens.
+        h.pick(&h._tmp.path().join("claude"));
+        assert_eq!(
+            h.code("ai_set_cli_path", json!({ "provider": "claude_code" })),
+            "validation"
+        );
+        assert_eq!(
+            h.code("ai_clear_cli_path", json!({ "provider": "openai" })),
+            "validation"
+        );
+    }
+
+    /// What the macOS panel returns for npm's `gemini` link.
+    #[test]
+    fn cli_picker_accepts_a_resolved_npm_entry() {
+        let h = ready();
+        let entry = h
+            ._tmp
+            .path()
+            .join("lib/node_modules/@google/gemini-cli/bundle/gemini.js");
+        h.pick(&entry);
+        h.ok("ai_set_cli_path", json!({ "provider": "gemini_cli" }));
+        let key = json!({ "key": "ai.gemini_path" });
+        assert_eq!(h.ok("settings_get", key.clone()), json!(entry));
+
+        let plain = h._tmp.path().join("gemini");
+        h.pick(&plain);
+        h.ok("ai_set_cli_path", json!({ "provider": "gemini_cli" }));
+        assert_eq!(h.ok("settings_get", key.clone()), json!(plain));
+
+        // Clearing changes what runs, so a native dialog confirms it.
+        h.answer(false);
+        let code = h.code("ai_clear_cli_path", json!({ "provider": "gemini_cli" }));
+        assert_eq!(code, "confirmation_required");
+        assert!(h.asked().last().unwrap().contains(plain.to_str().unwrap()));
+        assert_eq!(h.ok("settings_get", key.clone()), json!(plain));
+        h.answer(true);
+        h.ok("ai_clear_cli_path", json!({ "provider": "gemini_cli" }));
         assert_eq!(h.ok("settings_get", key), "");
     }
 

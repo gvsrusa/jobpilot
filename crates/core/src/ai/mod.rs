@@ -21,6 +21,7 @@ use ollama::OllamaStatus;
 use register::ProviderKind;
 
 pub mod api;
+pub mod child;
 pub mod claude_code;
 pub mod consent;
 pub mod net;
@@ -421,6 +422,7 @@ pub async fn sharing(db: &Db, name: &str) -> Result<Sharing> {
             .ok()
             .map(|claude| claude.path().display().to_string()),
         ProviderId::Endpoint => api::endpoint_address(db).await?,
+        ProviderId::GeminiCli | ProviderId::CodexCli => cli_path(db, info.name).await,
         _ => None,
     };
     Ok(Sharing {
@@ -474,12 +476,47 @@ pub(crate) async fn provider_settings(db: &Db) -> Result<(Vec<String>, serde_jso
     Ok((order, enabled))
 }
 
+/// Where a CLI provider's program is, by the shared discovery.
+async fn cli_path(db: &Db, name: &str) -> Option<String> {
+    let spec = child::spec_for(name)?;
+    let found = child::find_cli(spec, Some(db)).await.ok()?;
+    Some(found.display().to_string())
+}
+
+/// Decision 28: a CLI that is off is found but never started, because `status` runs on every
+/// refresh of the AI screen and a Node CLI takes seconds to start. Only an enabled one gets
+/// the `--version` probe.
+async fn cli_availability(
+    db: &Db,
+    info: &register::ProviderInfo,
+    enabled: bool,
+) -> (bool, Option<String>) {
+    let Some(spec) = child::spec_for(info.name) else {
+        return (false, Some("not_built".into()));
+    };
+    let Ok(bin) = child::find_cli(spec, Some(db)).await else {
+        return (false, Some("not_installed".into()));
+    };
+    if !enabled {
+        return (true, None);
+    }
+    match child::version_of(&bin, child::child_env(spec.extra_env)).await {
+        Ok(_) => (true, None),
+        Err(why) => (false, Some(why.into())),
+    }
+}
+
 /// A provider row's availability, by the same checks routing uses. Opens no socket.
-// ponytail: a row reads `not_built` until its adapter lands, Tasks 6 to 8.
+// ponytail: an API row reads `not_built` until its adapter lands; the CLI rows are checked
+// here, and their adapters come in Tasks 7 and 8.
 async fn row_availability(
     db: &Db,
     info: &register::ProviderInfo,
+    enabled: bool,
 ) -> Result<(bool, Option<String>)> {
+    if info.kind == ProviderKind::Cli {
+        return Ok(cli_availability(db, info, enabled).await);
+    }
     Ok(match ApiProvider::from_settings(db, info.name).await? {
         Some(provider) => match provider.available().await {
             Availability::Available => (true, None),
@@ -493,6 +530,7 @@ async fn row_availability(
 /// Every external provider but Claude Code, from the table.
 async fn external_status(db: &Db) -> Result<Vec<ExternalStatus>> {
     let stored = secrets::names(db).await?;
+    let (_, enabled) = provider_settings(db).await?;
     let mut rows = Vec::new();
     for info in register::PROVIDERS {
         if info.id == ProviderId::ClaudeCode {
@@ -500,10 +538,11 @@ async fn external_status(db: &Db) -> Result<Vec<ExternalStatus>> {
         }
         let state = consent::state(db, &info.id.to_string()).await?;
         let suspended = matches!(state, ConsentState::Suspended(_));
-        let (available, reason) = row_availability(db, info).await?;
+        let (available, reason) = row_availability(db, info, enabled[info.name] == true).await?;
         let model = text_setting(db, &format!("ai.model.{}", info.name)).await?;
         let path = match info.kind {
             ProviderKind::Endpoint => api::endpoint_address(db).await?,
+            ProviderKind::Cli => cli_path(db, info.name).await,
             _ => None,
         };
         rows.push(ExternalStatus {

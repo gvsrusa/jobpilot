@@ -2366,3 +2366,63 @@ fn key_remove_with_no_key_is_not_found() {
     let text = stderr_text(&refused);
     assert!(text.starts_with("error[not_found]"), "{text}");
 }
+
+/// The test names the stored value by reading the data folder back through `ai status`.
+fn cli_row(home: &Path, name: &str) -> serde_json::Value {
+    let status = stdout_json(&run(home, &["ai", "status", "--json"]));
+    status["external"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == name)
+        .cloned()
+        .unwrap()
+}
+
+#[test]
+fn cli_path_refuses_another_program() {
+    let (dir, home) = fresh_home();
+    let program = if cfg!(windows) {
+        "gemini.cmd"
+    } else {
+        "gemini"
+    };
+    let mock = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../core/tests/mock-gemini")
+        .join(program);
+    // Another program, a relative path, and another provider's name are all refused.
+    for (provider, path) in [
+        ("gemini_cli", "/bin/sh"),
+        ("gemini_cli", "gemini"),
+        ("gemini_cli", "/x/gemini-evil"),
+        ("codex_cli", mock.to_str().unwrap()),
+        ("claude_code", mock.to_str().unwrap()),
+        ("openai", mock.to_str().unwrap()),
+    ] {
+        let out = run(&home, &["ai", "cli-path", provider, path]);
+        assert!(!out.status.success(), "{provider} {path}");
+    }
+    let refused = run(&home, &["ai", "cli-path", "gemini_cli", "/bin/sh"]);
+    let message = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(
+        message.contains("full path to a program named gemini"),
+        "{message}"
+    );
+
+    // The right program is stored and shows on the row; an empty path clears it.
+    let set = run(
+        &home,
+        &[
+            "ai",
+            "cli-path",
+            "gemini_cli",
+            mock.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(stdout_json(&set)["gemini_cli_path"], mock.to_str().unwrap());
+    assert_eq!(cli_row(&home, "gemini_cli")["path"], mock.to_str().unwrap());
+    let cleared = run(&home, &["ai", "cli-path", "gemini_cli", "", "--json"]);
+    assert_eq!(stdout_json(&cleared)["gemini_cli_path"], "");
+    drop(dir);
+}

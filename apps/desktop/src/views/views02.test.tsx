@@ -886,6 +886,46 @@ describe("ai", () => {
     expect(dialog.queryByText(/Job text goes to/)).toBeNull();
   });
 
+  it("a_missing_cli_shows_unavailable_and_a_chooser", async () => {
+    const b = backend({
+      ai_status: () =>
+        aiWith({
+          external: [external({ name: "gemini_cli", label: "Gemini CLI", kind: "cli", reason: "not_installed" })],
+        }),
+      ai_set_cli_path: () => undefined,
+      ai_clear_cli_path: () => undefined,
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "Gemini CLI" }));
+    expect(row.getByText("Unavailable: not installed")).toBeInTheDocument();
+    expect(row.queryByRole("button", { name: /Use automatic/ })).toBeNull();
+    await user.click(row.getByRole("button", { name: "Choose gemini..." }));
+    await waitFor(() => expect(count(b, "ai_set_cli_path")).toBe(1));
+    // Only the provider name crosses: the picker is Rust's.
+    expect(b.calls.find((c) => c.cmd === "ai_set_cli_path")?.args).toEqual({ provider: "gemini_cli" });
+  });
+
+  it("a_found_cli_shows_its_path_and_goes_back_to_automatic", async () => {
+    const b = backend({
+      ai_status: () =>
+        aiWith({
+          external: [
+            external({ name: "codex_cli", label: "Codex CLI", kind: "cli", available: true, reason: null, path: "/opt/codex" }),
+          ],
+        }),
+      ai_clear_cli_path: () => undefined,
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "Codex CLI" }));
+    expect(row.getByText("/opt/codex")).toBeInTheDocument();
+    expect(row.queryByRole("button", { name: "Choose codex..." })).toBeNull();
+    await user.click(row.getByRole("button", { name: "Use automatic" }));
+    await waitFor(() => expect(count(b, "ai_clear_cli_path")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_clear_cli_path")?.args).toEqual({ provider: "codex_cli" });
+  });
+
   const keyRow = async (user: ReturnType<typeof renderApp>["user"]) => {
     await go(user, "AI", /AI/);
     return within(await screen.findByRole("listitem", { name: "OpenAI" }));

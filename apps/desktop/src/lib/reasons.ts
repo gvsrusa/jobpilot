@@ -42,6 +42,10 @@ const REASONS: [word: string, text: string][] = [
     "The chosen model is not installed in Ollama. Download it on the AI screen, or choose another",
   ],
   [
+    "cli_error",
+    "The AI program failed or answered in a way JobPilot could not use. Check it on the AI screen, or write this one yourself.",
+  ],
+  [
     "rate_limited",
     "The AI provider is busy and asked to wait. Try again shortly, or write this one yourself.",
   ],

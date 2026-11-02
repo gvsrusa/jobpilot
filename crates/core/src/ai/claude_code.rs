@@ -6,13 +6,13 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Stdio};
+use std::process::ExitStatus;
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 
+use super::child::{self, ChildRun, KillTree, is_program};
 use super::validate::MAX_OUTPUT_BYTES;
 use super::{
     Availability, BoxFuture, CancellationToken, Capability, Declaration, Prompt, Provider,
@@ -29,28 +29,10 @@ const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 /// The CLI's own text: `Not logged in · Please run /login`.
 const NOT_LOGGED_IN: &str = "Not logged in";
 
-/// Copied from the parent; everything else is dropped, API keys and tokens above all.
-/// `USER` is the keychain account and the two config-dir names decide the keychain service,
-/// so the login breaks without them (read from the CLI's 2.1.316 source).
-const ALLOWED_ENV: &[&str] = &[
-    "PATH",
-    "HOME",
-    "USERPROFILE",
-    "APPDATA",
-    "LOCALAPPDATA",
-    "TEMP",
-    "TMP",
-    "SystemRoot",
-    "ComSpec",
-    "LANG",
-    "LC_ALL",
-    "TERM",
-    "XDG_CONFIG_HOME",
-    "USER",
-    "TMPDIR",
-    "CLAUDE_CONFIG_DIR",
-    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
-];
+/// On top of the shared list: `USER` is the keychain account and the two config-dir names
+/// decide the keychain service, so the login breaks without them (read from the CLI's
+/// 2.1.316 source).
+const CLAUDE_ENV: &[&str] = &["CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR"];
 
 pub struct ClaudeCode {
     bin: PathBuf,
@@ -133,10 +115,7 @@ impl ClaudeCode {
     }
 
     pub fn child_env() -> Vec<(String, String)> {
-        let copied = ALLOWED_ENV.iter();
-        copied
-            .filter_map(|name| Some(((*name).to_string(), std::env::var(name).ok()?)))
-            .collect()
+        child::child_env(CLAUDE_ENV)
     }
 
     fn is_batch(&self) -> bool {
@@ -144,56 +123,23 @@ impl ClaudeCode {
         extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
     }
 
-    /// The child leads a process group of its own (macOS), so `KillTree` reaches what it
-    /// started. Stderr is never read, so there is no pipe to drain and nothing to leak.
     fn command(&self, cwd: &Path) -> Command {
-        let mut command = Command::new(&self.bin);
-        command
-            .env_clear()
-            .envs(ClaudeCode::child_env())
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        command.process_group(0);
-        #[cfg(windows)]
-        command.creation_flags(CREATE_NO_WINDOW);
-        command
+        child::command(&self.bin, &ClaudeCode::child_env(), cwd)
     }
 
     async fn run(&self, prompt: &Prompt) -> Result<String> {
         // Dropped last, once `tree` and `child` are gone: Windows keeps a live cwd in use.
         let dir = tempfile::tempdir()?;
-        let mut command = self.command(dir.path());
-        command
-            .args(self.argv(prompt.schema, &prompt.system))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped());
-        let mut child = command.spawn()?;
-        let tree = KillTree::of(&child);
-        let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-            return Err(Error::Failed("no_pipes".into()));
+        let run = ChildRun {
+            bin: &self.bin,
+            args: self.argv(prompt.schema, &prompt.system),
+            env: ClaudeCode::child_env(),
+            cwd: dir.path(),
+            stdin: prompt.user.as_bytes(),
+            limit: MAX_OUTPUT_BYTES as u64,
         };
-
-        // Together: a child that writes before it has read everything must not stall us.
-        let write = async move {
-            // A child that stops reading says why in its exit status and stdout.
-            let _ = stdin.write_all(prompt.user.as_bytes()).await;
-        };
-        let limit = MAX_OUTPUT_BYTES as u64;
-        let mut output = Vec::new();
-        let mut capped = stdout.take(limit + 1);
-        let read = capped.read_to_end(&mut output);
-        let ((), read) = tokio::join!(write, read);
-        read?;
-        if output.len() as u64 > limit {
-            return Err(Error::TooLarge { limit });
-        }
-        let status = child.wait().await?;
-        tree.disarm();
-        read_reply(&output, status)
+        let output = child::run_piped(run).await?;
+        read_reply(&output.stdout, output.status)
     }
 }
 
@@ -316,90 +262,12 @@ fn read_reply(stdout: &[u8], status: ExitStatus) -> Result<String> {
     }
 }
 
-/// Ends the child and everything it started when dropped armed: `kill_on_drop` reaches the
-/// direct child only, and a `.cmd` shim or a helper would live on. It must drop before the
-/// `Child`, which `run` gets by declaring it later: on Windows the tree walk starts from a
-/// live parent, and on macOS the pid must not have been reaped and reused.
-// ponytail: nothing kills the child if the app dies without dropping this. The 60 s limit
-// lives in the router, so it dies too, and `process_group(0)` also hides the child from a
-// terminal Ctrl-C. The ceiling is the CLI's own run, which this app does not bound; broken
-// pipes are all it notices. A Windows job object and a macOS watchdog would close that.
-struct KillTree(Option<u32>);
-
-impl KillTree {
-    fn of(child: &Child) -> KillTree {
-        KillTree(child.id())
-    }
-
-    /// The child was waited for, so its pid is no longer ours to signal.
-    fn disarm(mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for KillTree {
-    fn drop(&mut self) {
-        if let Some(pid) = self.0 {
-            kill_tree(pid);
-        }
-    }
-}
-
-#[cfg(unix)]
-fn kill_tree(pid: u32) {
-    if let Ok(group) = i32::try_from(pid) {
-        // SAFETY: no pointers. `group` is the group `process_group(0)` made for this child,
-        // and the child is unreaped, so the id cannot have been reused.
-        unsafe { libc::killpg(group, libc::SIGKILL) };
-    }
-}
-
-// ponytail: blocks the runtime thread for the taskkill run, on cancel and timeout only. It
-// has to finish first, because `kill_on_drop` then ends the parent the walk starts from.
-#[cfg(windows)]
-fn kill_tree(pid: u32) {
-    use std::os::windows::process::CommandExt;
-    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-    let _ = std::process::Command::new(PathBuf::from(root).join(r"System32\taskkill.exe"))
-        .args(["/T", "/F", "/PID", &pid.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .status();
-}
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-#[cfg(unix)]
-const BIN_NAMES: &[&str] = &["claude"];
-// The native binary first: cmd.exe caps a command line at 8191 characters, the .exe does not.
-#[cfg(windows)]
-const BIN_NAMES: &[&str] = &["claude.exe", "claude.cmd"];
-
-#[cfg(unix)]
-fn is_program(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    path.metadata()
-        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(windows)]
-fn is_program(path: &Path) -> bool {
-    path.is_file()
-}
-
 /// The setting that names the `claude` binary when discovery cannot find it.
 pub const PATH_SETTING: &str = "ai.claude_path";
-#[cfg(unix)]
-const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A relative entry would run whatever sits in the working directory.
 pub fn absolute_dirs(path: &std::ffi::OsStr) -> Vec<PathBuf> {
-    std::env::split_paths(path)
-        .filter(|entry| entry.is_absolute())
-        .collect()
+    child::absolute_dirs(path)
 }
 
 pub fn not_found() -> String {
@@ -523,33 +391,14 @@ pub fn fallback_dirs(home: Option<PathBuf>) -> Vec<PathBuf> {
 }
 
 pub fn search(dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
-    dirs.into_iter()
-        .flat_map(|dir| BIN_NAMES.iter().map(move |name| dir.join(name)))
-        .find(|candidate| is_program(candidate))
+    child::search(dirs, &child::bin_names("claude", cfg!(windows)))
 }
 
 /// Asks the owner's login shell where `claude` is: a fixed command, never user input. The
 /// shell's startup files may print noise, so the last absolute line is the answer.
 #[cfg(unix)]
 pub async fn login_shell_lookup(shell: &std::ffi::OsStr) -> Option<PathBuf> {
-    let shell = Path::new(shell);
-    if !shell.is_absolute() {
-        return None;
-    }
-    let lookup = Command::new(shell)
-        .args(["-l", "-c", "command -v claude"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    let output = tokio::time::timeout(LOGIN_SHELL_TIMEOUT, lookup)
-        .await
-        .ok()?
-        .ok()?;
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(|line| PathBuf::from(line.trim()))
-        .rfind(|path| path.is_absolute() && has_claude_name(path) && is_program(path))
+    child::login_shell_lookup(shell, "claude", &has_claude_name).await
 }
 
 #[cfg(test)]
