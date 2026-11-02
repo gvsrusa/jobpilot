@@ -106,9 +106,15 @@ impl<'r> ResearchWorkflow<'r> {
         let asked = asked_since(db, &since, TaskType::SummarizeCompany).await;
         result?;
         let (provider, categories) = asked?;
+        let dropped = self
+            .done
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .dropped;
         Ok(StepOutput {
             provider,
             categories,
+            dropped,
         })
     }
 
