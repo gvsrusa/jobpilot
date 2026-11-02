@@ -1507,3 +1507,112 @@ async fn marked_text_and_authorization_notes_stay_out_of_generated_text() {
     knowledge::mark_sensitive(&db, &late, true).await.unwrap();
     assert!(blocked(&export(&db, &paths, &draft.id).await));
 }
+
+// ---- a statement across lines -----------------------------------------------------------
+
+const STATED: &str = "authorization_statement";
+
+fn entry_doc(title: &str, subtitle: &str, dates: &str, bullets: &[&str]) -> ResumeDoc {
+    let mut body = doc(bullets);
+    let entry = &mut body.sections[0].entries[0];
+    entry.title = title.into();
+    entry.subtitle = subtitle.into();
+    entry.dates = dates.into();
+    body
+}
+
+async fn every_template_refuses(db: &Db, paths: &AppPaths, draft_id: &str) {
+    for template in [Template::Classic, Template::Compact] {
+        let exported = drafts::export(
+            db,
+            draft_id,
+            template,
+            ExportFormat::Docx,
+            &paths.exports(),
+            "cli",
+        )
+        .await;
+        assert!(blocked(&exported), "{exported:?}");
+    }
+    assert_eq!(exported_files(paths), 0);
+}
+
+#[tokio::test]
+async fn a_statement_over_three_fields_of_an_entry_is_flagged() {
+    let (_tmp, paths, db) = setup().await;
+    let id = user_item(&db, "Shipped the compiler").await;
+
+    let body = entry_doc("authorized", "to", "work", &[]);
+    let draft = generate_doc(&db, body, &id).await.unwrap();
+
+    assert_eq!(statuses(&db, &draft.id).await, [STATED; 3]);
+    every_template_refuses(&db, &paths, &draft.id).await;
+}
+
+#[tokio::test]
+async fn a_statement_compact_prints_on_one_row_flags_only_its_lines() {
+    let (_tmp, paths, db) = setup().await;
+    let id = user_item(&db, "Shipped the compiler").await;
+
+    // `lines` has the subtitle between these two; Compact prints them side by side.
+    let body = entry_doc(
+        "Authorized to",
+        "Acme",
+        "work in the United States",
+        &["Shipped the compiler"],
+    );
+    let draft = generate_doc(&db, body, &id).await.unwrap();
+
+    assert_eq!(statuses(&db, &draft.id).await, [STATED, "ok", STATED, "ok"]);
+    every_template_refuses(&db, &paths, &draft.id).await;
+}
+
+#[tokio::test]
+async fn compact_reads_a_statement_from_the_dates_into_the_subtitle() {
+    let (_tmp, _paths, db) = setup().await;
+    let id = user_item(&db, "Shipped the compiler").await;
+
+    let body = entry_doc("Engineer", "work in Portugal", "Authorized to", &[]);
+    let draft = generate_doc(&db, body, &id).await.unwrap();
+
+    assert_eq!(statuses(&db, &draft.id).await, ["ok", STATED, STATED]);
+}
+
+#[test]
+fn a_statement_over_any_neighbouring_lines_flags_those_lines_alone() {
+    let evidence = [item("e", "x", "user", true, false)];
+    let flag = |texts: &[&str]| -> Vec<String> {
+        let claims: Vec<ClaimInput> = texts.iter().map(|t| input(t, &["e"])).collect();
+        let checked = check_claims(&claims, &evidence);
+        checked.into_iter().map(|claim| claim.status).collect()
+    };
+    assert_eq!(
+        flag(&["Rust", "authorized", "to", "work", "Go"]),
+        ["ok", STATED, STATED, STATED, "ok"]
+    );
+    assert_eq!(
+        flag(&["able", "to", "work", "in", "Portugal", "Go"]),
+        [STATED, STATED, STATED, STATED, STATED, "ok"]
+    );
+    // The same words held apart by what lies between them.
+    assert_eq!(
+        flag(&["Authorized", "payments to", "work orders", "in Rust"]),
+        ["ok"; 4]
+    );
+}
+
+#[tokio::test]
+async fn an_ordinary_entry_is_not_flagged() {
+    let (_tmp, _paths, db) = setup().await;
+    let id = user_item(&db, "Shipped the compiler").await;
+
+    let body = entry_doc(
+        "Engineer",
+        "Acme",
+        "2019 to 2024",
+        &["Able to work in a team", "Authorized payments"],
+    );
+    let draft = generate_doc(&db, body, &id).await.unwrap();
+
+    assert_eq!(statuses(&db, &draft.id).await, ["ok"; 5]);
+}

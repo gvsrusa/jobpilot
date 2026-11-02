@@ -137,19 +137,19 @@ fn resume_parts(
         contact: contact(basic),
         ..ResumeDoc::default()
     };
-    let spoken = |line: &ClaimInput| !line.text.is_empty();
+    let has_text = |line: &ClaimInput| !line.text.is_empty();
     let stripped = |line: ClaimInput| ClaimInput {
-        text: strip_ids(&line.text, ids),
+        text: spoken(&line.text, ids),
         evidence_ids: line.evidence_ids,
     };
-    claims.extend(summary.into_iter().map(stripped).filter(spoken));
+    claims.extend(summary.into_iter().map(stripped).filter(has_text));
     doc.summary = claims.iter().map(|claim| claim.text.clone()).collect();
     for section in sections {
         let mut entries = Vec::new();
         for entry in section.entries {
-            let title = strip_ids(&entry.title, ids);
-            let subtitle = strip_ids(&entry.subtitle, ids);
-            let dates = strip_ids(&entry.dates, ids);
+            let title = spoken(&entry.title, ids);
+            let subtitle = spoken(&entry.subtitle, ids);
+            let dates = spoken(&entry.dates, ids);
             let fields = [&title, &subtitle, &dates];
             for field in fields.into_iter().filter(|field| !field.is_empty()) {
                 claims.push(ClaimInput {
@@ -158,7 +158,7 @@ fn resume_parts(
                 });
             }
             let first = claims.len();
-            claims.extend(entry.bullets.into_iter().map(stripped).filter(spoken));
+            claims.extend(entry.bullets.into_iter().map(stripped).filter(has_text));
             entries.push(Entry {
                 bullets: claims[first..].iter().map(|c| c.text.clone()).collect(),
                 title,
@@ -208,7 +208,7 @@ fn letter_parts(
     let paragraphs: Vec<ClaimInput> = paragraphs
         .into_iter()
         .map(|paragraph| ClaimInput {
-            text: strip_ids(&paragraph.text, ids),
+            text: spoken(&paragraph.text, ids),
             evidence_ids: paragraph.evidence_ids,
         })
         .filter(|paragraph| !paragraph.text.is_empty())
@@ -223,6 +223,39 @@ fn letter_parts(
 fn is_id(token: &str, known: &[String]) -> bool {
     let shaped = token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit());
     shaped || known.iter().any(|id| id == token)
+}
+
+/// What a line of the reply says once its citations are out, or nothing when no letter or digit
+/// is left: such a line would print as a mark and carry a citation for it.
+fn spoken(text: &str, known: &[String]) -> String {
+    let line = strip_remnants(&strip_ids(text, known));
+    if line.chars().any(char::is_alphanumeric) {
+        line
+    } else {
+        String::new()
+    }
+}
+
+/// `(evidence: id)` with its ids gone leaves `(evidence:)`, which says nothing. Other
+/// parentheses stay.
+fn strip_remnants(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('(') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find(')') else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        if drafts::fold(&after[..close]) == "evidence" {
+            rest = close_gap(&mut out, &after[close + 1..]);
+        } else {
+            out.push('(');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// A line with the ids a model wrote into its prose taken out, which gemma4 does in letters:

@@ -26,7 +26,7 @@ use crate::error::{Error, Result};
 use crate::knowledge::{self, KnowledgeItem, is_invisible};
 use crate::parse::{KNOWN_HEADINGS, SUMMARY_HEADINGS};
 use crate::profile;
-use crate::render::{Entry, ResumeDoc, Template, lines, to_docx, to_pdf};
+use crate::render::{Entry, ResumeDoc, Template, compact_order, lines, to_docx, to_pdf};
 
 const TITLE_LIMIT: usize = 300;
 const SLUG_CHARS: usize = 60;
@@ -357,16 +357,43 @@ fn names_a_place(words: &[&str], lower: &[String], cased: bool) -> bool {
     !the && cased && capitalized && !NOT_PLACES.contains(&first.as_str())
 }
 
-/// For each line, whether `hit` holds for it, or for it and its neighbour read as one line,
-/// which is how they sit on the page. Only a statement neither half makes alone marks both:
-/// a line that makes one itself does not taint the line beside it.
-fn hits_by_line(texts: &[&str], hit: impl Fn(&str) -> bool) -> Vec<bool> {
-    let alone: Vec<bool> = texts.iter().map(|text| hit(text)).collect();
-    let mut found = alone.clone();
-    for i in 1..texts.len() {
-        if !alone[i - 1] && !alone[i] && hit(&format!("{} {}", texts[i - 1], texts[i])) {
-            found[i - 1] = true;
-            found[i] = true;
+/// Line indexes in each order a reader meets them: as stored, and as Compact prints them when
+/// these are the document's lines. A list that is not is refused at export anyway.
+fn print_orders(doc: &ResumeDoc, claims: &[ClaimInput]) -> Vec<Vec<usize>> {
+    let mut orders = vec![(0..claims.len()).collect()];
+    if claims.iter().map(|c| &c.text).eq(lines(doc).iter()) {
+        orders.push(compact_order(doc));
+    }
+    orders
+}
+
+/// For each line, whether `hit` holds for the fewest neighbouring lines that make it, in any of
+/// `orders`. Each order is read whole first, so a clean document costs one read per order. The
+/// window then slides, which marks those lines and no others: a line that makes a statement
+/// itself does not taint the line beside it.
+fn hits_by_line(texts: &[&str], orders: &[Vec<usize>], hit: impl Fn(&str) -> bool) -> Vec<bool> {
+    let mut found = vec![false; texts.len()];
+    for order in orders {
+        let read = |span: &[usize]| {
+            let span: Vec<&str> = span.iter().map(|&line| texts[line]).collect();
+            hit(&span.join(" "))
+        };
+        if !read(order) {
+            continue;
+        }
+        let (mut start, mut end) = (0, 0);
+        while end < order.len() {
+            if !read(&order[start..=end]) {
+                end += 1;
+                continue;
+            }
+            if start == end || !read(&order[start + 1..=end]) {
+                for &line in &order[start..=end] {
+                    found[line] = true;
+                }
+            }
+            start += 1;
+            end = end.max(start);
         }
     }
     found
@@ -388,19 +415,28 @@ fn user_entered(text: &str, evidence: &[KnowledgeItem]) -> bool {
 /// `evidence` (approved, unmarked, user or approved-parsed). Any claim text matching the
 /// authorization patterns gets status `authorization_statement` unless the same sentence
 /// (case-folded, whitespace-collapsed) is the body of an evidence item the user entered
-/// (`source = 'user'`). A statement split across two neighbouring claims flags both. That
-/// status comes first, so an uncited statement is reported as what it is. Items in `evidence`
-/// that are not usable count for nothing. Each `id` is empty.
+/// (`source = 'user'`). A statement split across neighbouring claims flags each claim it
+/// spans. That status comes first, so an uncited statement is reported as what it is. Items in
+/// `evidence` that are not usable count for nothing. Each `id` is empty.
 // ponytail: proves only that cited ids are real evidence, not that the evidence supports the
 // wording (threat path 11); the compare screen is the second gate.
 pub fn check_claims(claims: &[ClaimInput], evidence: &[KnowledgeItem]) -> Vec<Claim> {
+    check_read(claims, evidence, &[(0..claims.len()).collect()])
+}
+
+/// [`check_claims`], with a split statement looked for in each of `orders`.
+fn check_read(
+    claims: &[ClaimInput],
+    evidence: &[KnowledgeItem],
+    orders: &[Vec<usize>],
+) -> Vec<Claim> {
     let known: HashSet<&str> = evidence
         .iter()
         .filter(|e| usable(e))
         .map(|e| e.id.as_str())
         .collect();
     let texts: Vec<&str> = claims.iter().map(|claim| claim.text.as_str()).collect();
-    let stated = hits_by_line(&texts, states_authorization);
+    let stated = hits_by_line(&texts, orders, states_authorization);
     let status = |claim: &ClaimInput, stated: bool| {
         if stated && !user_entered(&claim.text, evidence) {
             "authorization_statement"
@@ -464,11 +500,16 @@ fn holds(text: &str, sealed: &[String]) -> bool {
 
 /// A note is a statement about authorization; a marked text is at least not evidence. The
 /// exemption is the one [`check_claims`] gives: the user typed this very sentence as evidence.
-fn flag_sealed(claims: &mut [Claim], evidence: &[KnowledgeItem], sealed: &Sealed) {
+fn flag_sealed(
+    claims: &mut [Claim],
+    evidence: &[KnowledgeItem],
+    sealed: &Sealed,
+    orders: &[Vec<usize>],
+) {
     let texts: Vec<String> = claims.iter().map(|claim| claim.text.clone()).collect();
     let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
-    let notes = hits_by_line(&texts, |text| holds(text, &sealed.notes));
-    let marked = hits_by_line(&texts, |text| holds(text, &sealed.marked));
+    let notes = hits_by_line(&texts, orders, |text| holds(text, &sealed.notes));
+    let marked = hits_by_line(&texts, orders, |text| holds(text, &sealed.marked));
     for ((claim, note), mark) in claims.iter_mut().zip(notes).zip(marked) {
         if user_entered(&claim.text, evidence) {
             continue;
@@ -507,11 +548,12 @@ async fn readable_sealed_text(db: &Db, when_locked: WhenLocked) -> Result<Sealed
     }
 }
 
-async fn review(db: &Db, inputs: &[ClaimInput]) -> Result<Vec<Claim>> {
+async fn review(db: &Db, doc: &ResumeDoc, inputs: &[ClaimInput]) -> Result<Vec<Claim>> {
     let evidence = knowledge::evidence(db).await?;
-    let mut claims = check_claims(inputs, &evidence);
+    let orders = print_orders(doc, inputs);
+    let mut claims = check_read(inputs, &evidence, &orders);
     let sealed = readable_sealed_text(db, WhenLocked::Proceed).await?;
-    flag_sealed(&mut claims, &evidence, &sealed);
+    flag_sealed(&mut claims, &evidence, &sealed, &orders);
     Ok(claims)
 }
 
@@ -802,7 +844,7 @@ pub(crate) async fn create_version_for(
                 return Err(bad("the user's own edit is saved with save_manual"));
             }
             check_generated(db, &doc, &claims).await?;
-            review(db, &claims).await?
+            review(db, &doc, &claims).await?
         }
         _ => return Err(bad("an origin is uploaded, generated, or edited")),
     };
@@ -893,7 +935,8 @@ pub async fn claims(db: &Db, draft_id: &str) -> Result<Vec<Claim>> {
     if claims.is_empty() {
         return Ok(claims);
     }
-    let live = review(db, &inputs_of(&claims)).await?;
+    let doc = get(db, draft_id).await?.doc;
+    let live = review(db, &doc, &inputs_of(&claims)).await?;
     for (claim, live) in claims.iter_mut().zip(live) {
         if claim.status == "ok" {
             claim.status = live.status;
@@ -1028,7 +1071,7 @@ pub async fn save_manual(
                     text: line,
                 })
                 .collect();
-            review(db, &inputs).await?
+            review(db, &doc, &inputs).await?
         }
         _ => Vec::new(),
     };
@@ -1254,7 +1297,7 @@ mod tests {
 
     fn flagged(text: &str, status: &str, evidence: &[KnowledgeItem], s: &Sealed) -> String {
         let mut claims = [claim(text, status)];
-        flag_sealed(&mut claims, evidence, s);
+        flag_sealed(&mut claims, evidence, s, &[vec![0]]);
         claims[0].status.clone()
     }
 
@@ -1348,7 +1391,7 @@ mod tests {
         let s = sealed(&["Residence card D7"], &["Treated for a rare condition"]);
         let flag = |texts: [&str; 3]| {
             let mut claims = texts.map(|text| claim(text, "ok"));
-            flag_sealed(&mut claims, &[], &s);
+            flag_sealed(&mut claims, &[], &s, &[vec![0, 1, 2]]);
             claims.map(|c| c.status)
         };
         assert_eq!(
@@ -1364,10 +1407,22 @@ mod tests {
     #[test]
     fn one_line_stating_something_does_not_taint_its_neighbour() {
         let hit = |text: &str| text.contains("visa");
-        assert_eq!(hits_by_line(&["a visa", "b"], hit), [true, false]);
-        assert_eq!(hits_by_line(&["vi", "sa"], |t| t == "vi sa"), [true, true]);
-        assert_eq!(hits_by_line(&["a"], hit), [false]);
-        assert!(hits_by_line(&[], hit).is_empty());
+        let flat = |n: usize| vec![(0..n).collect::<Vec<usize>>()];
+        assert_eq!(hits_by_line(&["a visa", "b"], &flat(2), hit), [true, false]);
+        let split = |t: &str| t.contains("vi sa");
+        assert_eq!(hits_by_line(&["vi", "sa"], &flat(2), split), [true, true]);
+        assert_eq!(hits_by_line(&["a"], &flat(1), hit), [false]);
+        assert!(hits_by_line(&[], &flat(0), hit).is_empty());
+    }
+
+    #[test]
+    fn a_statement_is_marked_in_the_order_that_makes_it() {
+        let hit = |text: &str| text.contains("a b");
+        let orders = [vec![0, 1, 2], vec![0, 2, 1]];
+        assert_eq!(
+            hits_by_line(&["a", "x", "b"], &orders, hit),
+            [true, false, true]
+        );
     }
 
     #[test]

@@ -75,6 +75,24 @@ pub fn lines(doc: &ResumeDoc) -> Vec<String> {
     out
 }
 
+/// Indexes into [`lines`] in the order Compact prints them: the dates share the title's row, so
+/// they come before the subtitle.
+pub(crate) fn compact_order(doc: &ResumeDoc) -> Vec<usize> {
+    let summary = doc.summary.iter().filter(|s| !s.is_empty()).count();
+    let mut order: Vec<usize> = (0..summary).collect();
+    for entry in doc.sections.iter().flat_map(|s| &s.entries) {
+        let fields = [&entry.title, &entry.subtitle, &entry.dates];
+        let head = fields.iter().filter(|field| !field.is_empty()).count();
+        let bullets = entry.bullets.iter().filter(|b| !b.is_empty()).count();
+        let at = order.len();
+        order.extend(at..at + head + bullets);
+        if !entry.subtitle.is_empty() && !entry.dates.is_empty() {
+            order.swap(at + head - 2, at + head - 1);
+        }
+    }
+    order
+}
+
 /// A cover letter is the paragraphs in `summary`; it has no sections.
 pub fn cover_letter_doc(name: &str, contact: &[String], paragraphs: &[String]) -> ResumeDoc {
     ResumeDoc {

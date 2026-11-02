@@ -3,6 +3,7 @@
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -191,7 +192,8 @@ impl Router {
     }
 
     /// `run`, with `check` as part of each attempt after the schema: its `Err(Validation)` is
-    /// a validation failure like the schema's, so it retries and is logged the same way.
+    /// a validation failure like the schema's, so it retries and is logged the same way. Any
+    /// other `Err` ends the task with that error: the check did not run, so no reply is judged.
     pub async fn run_checked<Check: Future<Output = Result<()>>>(
         &self,
         db: &Db,
@@ -251,12 +253,19 @@ impl Router {
             let provider = provider.as_ref();
             // Set by a reply, so a provider's own `Validation` is not blamed on its output.
             let unusable = AtomicBool::new(false);
+            // A check that could not run, which blames neither the reply nor the provider.
+            let broken = Mutex::new(None);
             let call = || async {
                 let raw = provider.complete(&prompt, cancel.clone()).await?;
                 let checked = async {
                     let output = validate(spec.schema, &raw)?;
-                    check(output.clone()).await?;
-                    Ok(output)
+                    match check(output.clone()).await {
+                        Err(error) if !matches!(error, Error::Validation(_)) => {
+                            *broken.lock().unwrap() = Some(error);
+                            Err(Error::Failed("the check did not run".into()))
+                        }
+                        checked => checked.map(|()| output),
+                    }
                 };
                 let checked = checked.await;
                 if matches!(checked, Err(Error::Validation(_))) {
@@ -265,6 +274,11 @@ impl Router {
                 checked
             };
             let step = self.try_provider(&task, provider, call).await?;
+            if !matches!(step, Step::Cancelled)
+                && let Some(error) = broken.lock().unwrap().take()
+            {
+                return Err(error);
+            }
             let step = match step {
                 Step::Next if unusable.load(Ordering::Relaxed) => Step::Manual(UNUSABLE_REPLY),
                 step => step,

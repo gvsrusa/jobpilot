@@ -1353,3 +1353,92 @@ async fn cover_letter_paragraphs_each_carry_evidence() {
         spec(TaskType::DraftCoverLetter).schema
     );
 }
+
+/// Stripping can leave nothing to read. Such a line is no line at all: not on the page, and not
+/// a claim carrying a citation for it.
+#[tokio::test]
+async fn a_line_with_nothing_left_to_read_is_dropped_with_its_claim() {
+    let w = world().await;
+    let id = w.item.id.as_str();
+    let line = |text: String| json!({"text": text, "evidence_ids": [id]});
+    let reply = json!({
+        "summary": [
+            line(format!("[{id}].")),
+            line(format!("(evidence: {id})")),
+            line(" ".into()),
+            line(format!("(Evidence: [{id}], {id})")),
+        ],
+        "sections": [{"heading": "experience", "entries": [{
+            "title": format!("[{id}]."), "subtitle": " ", "dates": format!("(evidence: {id})"),
+            "evidence_ids": [id],
+            "bullets": [
+                line(format!("{BULLET} (evidence: {id}).")),
+                line("--".into()),
+                line("Reads (evidence for) the rest".into()),
+            ],
+        }]}],
+    });
+    let (router, _) = router(vec![reply]);
+
+    let made = generate::resume(&w.db, &router, "gui", &w.job.id, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let claims = drafts::claims(&w.db, &made.draft.id).await.unwrap();
+    let texts: Vec<&str> = claims.iter().map(|c| c.text.as_str()).collect();
+    let wanted = [
+        format!("{BULLET}."),
+        "Reads (evidence for) the rest".to_string(),
+    ];
+    assert_eq!(texts, wanted);
+    assert_eq!(lines(&made.draft.doc), wanted);
+    let entry = &made.draft.doc.sections[0].entries[0];
+    let fields = (&*entry.title, &*entry.subtitle, &*entry.dates);
+    assert_eq!(fields, ("", "", ""));
+}
+
+#[tokio::test]
+async fn a_paragraph_with_nothing_left_to_read_is_dropped_with_its_claim() {
+    let w = world().await;
+    let id = w.item.id.as_str();
+    let (router, _) = router(vec![json!({"paragraphs": [
+        paragraph(&format!("[{id}]."), &[id]),
+        paragraph(&format!("(evidence: {id})"), &[id]),
+        paragraph(" ", &[id]),
+        paragraph(BULLET, &[id]),
+    ]})]);
+
+    let made = generate::cover_letter(&w.db, &router, "gui", &w.job.id, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let claims = drafts::claims(&w.db, &made.draft.id).await.unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].text, BULLET);
+    assert_eq!(lines(&made.draft.doc), [BULLET]);
+}
+
+/// A check that cannot run says nothing about the reply or the provider, so the task ends with
+/// that error: no other provider is called, and no manual fallback hides it.
+#[tokio::test]
+async fn a_check_that_cannot_run_ends_the_task_with_its_error() {
+    let w = world().await;
+    let id = w.item.id.as_str();
+    drafts::save_manual(&w.db, "resume", None, Default::default())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE drafts SET body = 'not a document'")
+        .execute(&w.db.pool)
+        .await
+        .unwrap();
+    let valid = reply_citing(&[(BULLET, &[id])]);
+    let (first, tried) = Mock::new(ProviderId::Ollama, true, vec![valid.clone()]);
+    let (second, next) = Mock::new(ProviderId::Ollama, true, vec![valid]);
+    let router = Router::with_providers(vec![Box::new(first), Box::new(second)]);
+
+    let made = generate::resume(&w.db, &router, "gui", &w.job.id, CancellationToken::new()).await;
+
+    assert!(matches!(made, Err(Error::Db(_))), "{made:?}");
+    assert_eq!(tried.prompts.lock().unwrap().len(), 1);
+    assert!(next.prompts.lock().unwrap().is_empty());
+}

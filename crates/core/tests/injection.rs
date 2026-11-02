@@ -395,6 +395,29 @@ async fn steered_output_never_adds_evidence_free_or_authorization_claims() {
     assert_eq!(knowledge::list(&w.db).await.unwrap().len(), evidence_before);
 }
 
+/// Normalizing strips the posting, so the model is what puts the character back: the reply
+/// carries it as a JSON escape, and it reaches the check inside the claim.
+#[tokio::test]
+async fn a_zero_width_character_in_a_reply_does_not_hide_a_statement() {
+    let w = world().await;
+    let cases = corpus(&w.canary());
+    let job = w.import(case(&cases, "11")).await;
+    let (router, _) = w.router(&job.id);
+
+    for letter in [false, true] {
+        let made = if letter {
+            generate::cover_letter(&w.db, &router, "gui", &job.id, CancellationToken::new()).await
+        } else {
+            generate::resume(&w.db, &router, "gui", &job.id, CancellationToken::new()).await
+        }
+        .unwrap();
+
+        let claims = drafts::claims(&w.db, &made.draft.id).await.unwrap();
+        assert_eq!(claims[0].text, "Authorized to w\u{200b}ork in the EU");
+        assert_eq!(claims[0].status, "authorization_statement");
+    }
+}
+
 #[tokio::test]
 async fn output_urls_and_commands_are_data_only() {
     let w = world().await;
