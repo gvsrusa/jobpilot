@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde_json::json;
 
+use super::api::ApiProvider;
 use super::claude_code::ClaudeCode;
 use super::consent::ConsentState;
 use super::net::MAX_RETRY_WAIT;
@@ -28,6 +29,9 @@ const CANCEL_POLL: Duration = Duration::from_millis(100);
 const NOT_LOGGED_IN: &str = "not_logged_in";
 const RATE_LIMITED: &str = "rate_limited";
 const AUTH_FAILED: &str = "auth_failed";
+const NO_KEY: &str = "no_key";
+const NO_API_MODEL: &str = "no_api_model";
+const ORIGIN_REFUSED: &str = "origin_refused";
 const QUOTA_EXHAUSTED: &str = "quota_exhausted";
 const PROMPT_TOO_LARGE: &str = "prompt_too_large";
 const CONSENT: &str = "consent";
@@ -38,6 +42,9 @@ const NO_MODEL_SET: &str = "no_model_set";
 const MODEL_NOT_INSTALLED: &str = "model_not_installed";
 const OLLAMA: &str = "ollama";
 const CLAUDE_CODE: &str = "claude_code";
+const OPENAI: &str = "openai";
+const OPENROUTER: &str = "openrouter";
+const ENDPOINT: &str = "endpoint";
 
 /// Providers in user order. No-AI is not in the list: it runs last, outside the checks.
 /// Holds no `Db`, so build one per call and nothing blocks a restore.
@@ -81,7 +88,8 @@ enum Step<T> {
 impl Router {
     /// Settings: `ai.order` (`["ollama","claude_code"]`, default `["ollama"]`) and `ai.enabled`
     /// (`{ollama: bool, claude_code: bool}`), as [`provider_settings`] reads them, then
-    /// `ai.ollama_url`, `ai.drafting_model`, `ai.embedding_model`.
+    /// `ai.ollama_url`, `ai.drafting_model`, `ai.embedding_model`, `ai.model.<name>`,
+    /// `ai.endpoint.url`.
     /// Spawns nothing and opens no socket: availability is checked when a task runs.
     pub async fn from_settings(db: &Db) -> Result<Router> {
         let (order, enabled) = provider_settings(db).await?;
@@ -101,6 +109,12 @@ impl Router {
                         .await
                         .unwrap_or_else(|_| ClaudeCode::with_binary(PathBuf::new(), None));
                     providers.push(Box::new(claude));
+                }
+                OPENAI | OPENROUTER | ENDPOINT => {
+                    match ApiProvider::from_settings(db, name).await? {
+                        Some(provider) => providers.push(Box::new(provider)),
+                        None => eprintln!("{name}: no usable address, provider left out"),
+                    }
                 }
                 _ => {}
             }
@@ -398,6 +412,8 @@ impl Router {
                     PROMPT_TOO_LARGE,
                     AUTH_FAILED,
                     QUOTA_EXHAUSTED,
+                    NO_KEY,
+                    ORIGIN_REFUSED,
                 ]
                 .contains(&reason) =>
                 {
@@ -438,19 +454,21 @@ fn after_skip<T>(task: &Task<'_>, declaration: &Declaration, reason: &str) -> St
 /// what the user can grant here, then a provider that is simply not there right now.
 fn weight(reason: &str) -> u8 {
     match reason {
-        PROVIDER_UNAVAILABLE | NO_MODEL_SET | MODEL_NOT_INSTALLED | "no_key" | "no_api_model"
+        PROVIDER_UNAVAILABLE | NO_MODEL_SET | MODEL_NOT_INSTALLED | NO_KEY | NO_API_MODEL
         | "cli_too_old" => 0,
         CONSENT_NEEDED | CONSENT_SUSPENDED => 1,
         _ => 2,
     }
 }
 
-/// The words an Ollama probe gives for what is missing, in the user's terms. Anything else
-/// is the generic reason, so provider text never leaves.
+/// The words a probe gives for what is missing, in the user's terms. Anything else is the
+/// generic reason, so provider text never leaves.
 fn unavailable_reason(why: &str) -> &'static str {
     match why {
         "no_model" => NO_MODEL_SET,
         "model_missing" => MODEL_NOT_INSTALLED,
+        NO_KEY => NO_KEY,
+        NO_API_MODEL => NO_API_MODEL,
         _ => PROVIDER_UNAVAILABLE,
     }
 }

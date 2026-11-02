@@ -4,12 +4,12 @@ use std::future::Future;
 use std::io::{BufRead, IsTerminal};
 
 use clap::{Subcommand, ValueEnum};
-use jobpilot_core::ai::claude_code;
 use jobpilot_core::ai::ollama::{Ollama, OllamaStatus};
 use jobpilot_core::ai::router::{Router, ollama_from_settings};
 use jobpilot_core::ai::{
     self, CancellationToken, DataCategory, Sharing, TaskType, consent, register,
 };
+use jobpilot_core::ai::{api, claude_code};
 use jobpilot_core::secrets::{self, Zeroizing};
 use jobpilot_core::{Db, Error, Result, embed, generate, pause};
 use serde_json::json;
@@ -85,6 +85,15 @@ pub enum AiCommand {
     /// Provider API keys, kept in the system keychain.
     #[command(subcommand)]
     Key(KeyCommand),
+    /// The model id an API provider or the endpoint uses, as its vendor spells it.
+    Model {
+        provider: ProviderArg,
+        model: String,
+    },
+    /// The address of a server you run on this computer. Empty clears it and its model.
+    Endpoint {
+        url: String,
+    },
     /// Embed knowledge items that have no vector yet.
     Index,
 }
@@ -378,6 +387,23 @@ pub async fn ai(db: &Db, command: AiCommand) -> Result<Output> {
                 json!({ "key_removed": name }),
                 format!("key removed for {name}"),
             )
+        }
+        AiCommand::Model { provider, model } => {
+            api::set_model(db, provider.name(), &model).await?;
+            let name = provider.name();
+            out(
+                json!({ "provider": name, "model": model }),
+                format!("{name} model: {model}"),
+            )
+        }
+        AiCommand::Endpoint { url } => {
+            api::set_endpoint(db, &url).await?;
+            let address = api::endpoint_address(db).await?;
+            let text = match &address {
+                Some(url) => format!("endpoint: {url}"),
+                None => "endpoint cleared".into(),
+            };
+            out(json!({ "endpoint": address }), text)
         }
         AiCommand::Index => {
             let router = Router::from_settings(db).await?;

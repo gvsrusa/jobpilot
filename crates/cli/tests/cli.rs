@@ -1,6 +1,10 @@
+#[path = "../../core/tests/fake_http/mod.rs"]
+mod fake_http;
+
 use std::path::Path;
 use std::process::{Command, Output};
 
+use fake_http::{Canned, Fake};
 use jobpilot_core::{AppPaths, Db, app_schema_version, documents};
 
 fn run(home: &Path, args: &[&str]) -> Output {
@@ -789,6 +793,8 @@ fn panel_refuses_new_ai_commands() {
         vec!["ai", "enable", "openai"],
         vec!["ai", "disable", "openai"],
         vec!["ai", "order", "openai"],
+        vec!["ai", "model", "openai", "m"],
+        vec!["ai", "endpoint", "http://127.0.0.1:1"],
         vec![
             "ai",
             "consent",
@@ -809,6 +815,98 @@ fn panel_refuses_new_ai_commands() {
         let allowed = run_env(&home, &args, &panel);
         assert!(allowed.status.success(), "{args:?}");
     }
+}
+
+#[test]
+fn endpoint_drafts_end_to_end_against_a_fake() {
+    const PATH: &str = "/v1/chat/completions";
+    let (_dir, home) = fresh_home();
+    let (job, reply) = draftable(&home);
+    let content = reply.to_string();
+    let answer = serde_json::json!({
+        "choices": [{"message": {"role": "assistant", "content": content},
+                     "finish_reason": "stop"}],
+    });
+    let fake = Fake::start(vec![(PATH, Canned::json(200, &answer))]);
+    let env = [("JOBPILOT_CLAUDE_BIN", "not-a-path")];
+
+    ok(&home, &["ai", "endpoint", &format!("{}/v1/", fake.url)]);
+    ok(&home, &["ai", "model", "endpoint", "m"]);
+    ok(&home, &["ai", "enable", "endpoint"]);
+    ok(&home, &["ai", "disable", "ollama"]);
+    let shown = stdout_json(&run_env(&home, &["ai", "status", "--json"], &env));
+    let rows = shown["external"].as_array().unwrap();
+    let row = rows.iter().find(|row| row["name"] == "endpoint").unwrap();
+    assert_eq!(row["available"], true);
+    assert_eq!(row["path"], format!("{}/v1", fake.url));
+    assert_eq!(row["model"], "m");
+
+    let refused = run(&home, &["resume", "generate", &job]);
+    assert!(
+        stderr_text(&refused).contains("consent"),
+        "no consent, no send"
+    );
+    assert!(fake.hits(PATH).is_empty());
+
+    ok(
+        &home,
+        &[
+            "ai",
+            "consent",
+            "give",
+            "endpoint",
+            "--categories",
+            DRAFT_CONSENT,
+        ],
+    );
+    let made = stdout_json(&run(&home, &["resume", "generate", &job, "--json"]));
+    assert_eq!(made["provider"], "endpoint");
+    assert_eq!(made["blocked"], 0);
+    assert_eq!(fake.hits(PATH).len(), 1);
+    assert_eq!(fake.hits(PATH)[0]["model"], "m");
+
+    let runs = stdout_json(&run(&home, &["agents", "list", "--json"]));
+    let id = runs[0]["id"].as_str().unwrap();
+    let log = ok(&home, &["agents", "log", id]);
+    let log = String::from_utf8_lossy(&log.stdout).to_string();
+    assert!(log.contains("endpoint/loopback"), "{log}");
+}
+
+#[test]
+fn an_endpoint_refused_or_cleared_leaves_the_row_saying_why() {
+    let (_dir, home) = fresh_home();
+    let env = [("JOBPILOT_CLAUDE_BIN", "not-a-path")];
+    let reason = |home: &Path| {
+        let shown = stdout_json(&run_env(home, &["ai", "status", "--json"], &env));
+        let rows = shown["external"].as_array().unwrap().clone();
+        let row = rows.iter().find(|row| row["name"] == "endpoint").cloned();
+        row.unwrap()["reason"].clone()
+    };
+    assert_eq!(reason(&home), "no_endpoint");
+
+    let refused = run(&home, &["ai", "endpoint", "https://api.example.com/v1"]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(stderr_text(&refused).contains("not_loopback"));
+
+    ok(&home, &["ai", "endpoint", "http://127.0.0.1:9/v1"]);
+    assert_eq!(reason(&home), "no_api_model");
+    ok(&home, &["ai", "endpoint", ""]);
+    assert_eq!(reason(&home), "no_endpoint");
+}
+
+#[test]
+fn ai_model_explains_a_refused_openrouter_model() {
+    let (_dir, home) = fresh_home();
+    let refused = run(&home, &["ai", "model", "openrouter", "meta-llama/llama-x"]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(
+        stderr_text(&refused).contains("not eligible through OpenRouter"),
+        "{}",
+        stderr_text(&refused)
+    );
+    ok(&home, &["ai", "model", "openrouter", "anthropic/claude-x"]);
+    let refused = run(&home, &["ai", "model", "ollama", "m"]);
+    assert!(stderr_text(&refused).contains("validation"));
 }
 
 #[test]

@@ -241,8 +241,8 @@ async fn status_lists_every_provider_but_ollama_and_claude() {
     let openai = &status.external[0];
     assert!(openai.key_stored);
     assert_eq!(openai.model.as_deref(), Some("gpt-x"));
-    assert!(!openai.available);
-    assert_eq!(openai.reason.as_deref(), Some("not_built"));
+    assert!(openai.available);
+    assert_eq!(openai.reason, None);
     assert_eq!(openai.consent, None);
     assert!(openai.runs_job_text);
     assert_eq!(status.external[1].consent.as_deref(), Some(&ALL[..]));

@@ -10,11 +10,8 @@ use reqwest::{Client, Response, Url};
 
 use crate::error::{Error, Result};
 
-// The hosted providers (Tasks 4 and 5) are the callers of these three.
-#[allow(dead_code)]
 /// Largest reply body read from a hosted provider.
 pub(crate) const MAX_REPLY_BYTES: u64 = 4 * 1024 * 1024;
-#[allow(dead_code)]
 /// A vendor's error body is read only to match fixed words, so 64 KiB is plenty.
 pub(crate) const MAX_ERROR_BODY: u64 = 64 * 1024;
 /// The longest `Retry-After` the router will sleep for. A longer one moves on.
@@ -69,7 +66,6 @@ pub fn retry_after(header: Option<&str>) -> Option<Duration> {
     text.parse::<u64>().ok().map(Duration::from_secs)
 }
 
-#[allow(dead_code)]
 /// Reads at most `limit` bytes of the body, counting chunks as they arrive, so a body with no
 /// `Content-Length` is capped too. A longer body is `TooLarge`: a hostile or broken server
 /// cannot fill memory.

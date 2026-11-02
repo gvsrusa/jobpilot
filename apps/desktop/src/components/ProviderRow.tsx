@@ -1,14 +1,113 @@
+import { useId, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { labelOf } from "@/components/ConsentDialog";
 import { ErrorAlert } from "@/components/ErrorAlert";
 import { Button } from "@/components/ui/button";
-import { ipc, type ExternalStatus } from "@/lib/ipc";
-import { SUSPENDED } from "@/lib/reasons";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { ipc, toAppError, type ExternalStatus } from "@/lib/ipc";
+import { explainReason, SUSPENDED } from "@/lib/reasons";
 
 /** A provider's reason code, in plain words. */
 const UNAVAILABLE: Record<string, string> = {
   not_built: "not built yet",
+  no_key: "no key stored",
+  no_api_model: "no model chosen",
+  no_endpoint: "no address set",
 };
+
+/** An AI-screen change. The row and any alert stay up while the status refreshes. */
+function useRowAction<V>(fn: (v: V) => Promise<unknown>) {
+  const client = useQueryClient();
+  return useMutation({ mutationFn: fn, onSuccess: () => client.invalidateQueries({ queryKey: ["ai"] }) });
+}
+
+/** The vendor's own id, typed by hand. Core refuses one that is not eligible. */
+function ModelControls({ row }: { row: ExternalStatus }) {
+  const id = useId();
+  const [model, setModel] = useState(row.model ?? "");
+  const save = useRowAction((value: string) => ipc.aiSetApiModel(row.name, value));
+  const failure = save.error && toAppError(save.error);
+  return (
+    <div className="grid gap-2">
+      <form
+        className="flex flex-wrap items-end gap-2"
+        onSubmit={(e) => {
+          e.preventDefault();
+          save.mutate(model);
+        }}
+      >
+        <div className="grid gap-1">
+          <Label htmlFor={id}>Model id</Label>
+          <Input id={id} value={model} onChange={(e) => setModel(e.target.value)} />
+        </div>
+        <Button
+          type="submit"
+          size="sm"
+          variant="outline"
+          aria-label={`${row.label}: Save model id`}
+          disabled={save.isPending || model.trim() === ""}
+        >
+          Save
+        </Button>
+      </form>
+      <ErrorAlert error={failure && { ...failure, message: explainReason(failure) ?? failure.message }} />
+    </div>
+  );
+}
+
+/** Rust refuses an address off this machine, then asks in its own dialog. */
+function EndpointControls({ row }: { row: ExternalStatus }) {
+  const id = useId();
+  const [open, setOpen] = useState(false);
+  const [address, setAddress] = useState("");
+  const save = useRowAction(async (url: string) => {
+    await ipc.aiSetEndpoint(url);
+    setOpen(false);
+  });
+  return (
+    <div className="grid gap-2">
+      <p className="text-muted-foreground">
+        Loopback only: a server you run on this computer. It still needs your consent, as that server can pass on what it gets.
+      </p>
+      <div className="flex flex-wrap items-center gap-3">
+        {!open && (
+          <Button size="sm" variant="outline" onClick={() => setOpen(true)}>
+            {row.path ? "Change endpoint..." : "Add endpoint..."}
+          </Button>
+        )}
+        {row.path && (
+          <Button size="sm" variant="outline" disabled={save.isPending} onClick={() => save.mutate("")}>
+            Clear endpoint...
+          </Button>
+        )}
+      </div>
+      {open && (
+        <form
+          className="flex flex-wrap items-end gap-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            save.mutate(address);
+          }}
+        >
+          <div className="grid gap-1">
+            <Label htmlFor={id}>Endpoint address (loopback only)</Label>
+            <Input
+              id={id}
+              placeholder="http://127.0.0.1:1234/v1"
+              value={address}
+              onChange={(e) => setAddress(e.target.value)}
+            />
+          </div>
+          <Button type="submit" size="sm" variant="outline" disabled={save.isPending || address.trim() === ""}>
+            Use this address...
+          </Button>
+        </form>
+      )}
+      <ErrorAlert error={save.error} />
+    </div>
+  );
+}
 
 /** Stored or not, and the two actions. Rust does both: no key passes through this screen. */
 function KeyControls({ row }: { row: ExternalStatus }) {
@@ -69,6 +168,8 @@ export function ProviderRow(props: {
         {row.path && <span className="break-all">{row.path}</span>}
       </div>
       {row.suspended && <p role="alert">{SUSPENDED}</p>}
+      {row.kind === "endpoint" && <EndpointControls row={row} />}
+      {row.kind !== "cli" && <ModelControls row={row} />}
       {row.kind !== "cli" && <KeyControls row={row} />}
       {row.consent && <p>Consent given for: {row.consent.map(labelOf).join(", ")}.</p>}
       <div className="flex flex-wrap items-center gap-3">

@@ -11,13 +11,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use jobpilot_core::agents::MemoryRefreshed;
-use jobpilot_core::ai::claude_code;
 use jobpilot_core::ai::ollama::Ollama;
 use jobpilot_core::ai::register::{self, ProviderInfo};
 use jobpilot_core::ai::router::{Router, ollama_from_settings};
 use jobpilot_core::ai::{
     self, AiStatus, CancellationToken, DataCategory, Sharing, TaskType, consent,
 };
+use jobpilot_core::ai::{api, claude_code};
 use jobpilot_core::analytics::{self, Report};
 use jobpilot_core::applications::{self, Application, ApplicationEvent, ApplicationInput};
 use jobpilot_core::audit::{self, AuditEntry};
@@ -149,6 +149,8 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         ai_set_claude_path,
         ai_clear_claude_path,
         ai_set_ollama_url,
+        ai_set_api_model,
+        ai_set_endpoint,
         ai_consent_give,
         ai_consent_revoke,
         ai_sharing,
@@ -1093,6 +1095,38 @@ pub async fn ai_set_ollama_url<R: Runtime>(
     native::confirmed(&app, "Ollama address", message, "Use this address").await?;
     let db = state.work().await?;
     settings::set(&db, "ai.ollama_url", &json!(url)).await
+}
+
+/// The model an API provider or the endpoint runs. No dialog: the consent record is the gate,
+/// and `check_model` holds the origin rules.
+#[tauri::command]
+pub async fn ai_set_api_model(
+    state: State<'_, AppState>,
+    provider: String,
+    model: String,
+) -> Result<()> {
+    api::set_model(&*state.work().await?, &provider, &model).await
+}
+
+/// Where the compatible endpoint listens. Core refuses anything off this machine before anyone
+/// is asked; the dialog is for another program that listens here. An empty address clears it.
+#[tauri::command]
+pub async fn ai_set_endpoint<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    url: String,
+) -> Result<()> {
+    drop(state.work().await?);
+    let (message, button) = if url.trim().is_empty() {
+        let message = "Stop using the compatible endpoint, and forget its address and model?";
+        (message.to_string(), "Clear")
+    } else {
+        api::check_endpoint(&url)?;
+        let message = format!("Send AI requests to this address?\n\n{url}");
+        (message, "Use this address")
+    };
+    native::confirmed(&app, "Compatible endpoint", message, button).await?;
+    api::set_endpoint(&*state.work().await?, &url).await
 }
 
 /// A provider in the table. Ollama is not one: it runs here and needs no record, and a name
@@ -2609,6 +2643,8 @@ mod tests {
         "ai_set_claude_path",
         "ai_clear_claude_path",
         "ai_set_ollama_url",
+        "ai_set_api_model",
+        "ai_set_endpoint",
         "ai_consent_give",
         "ai_consent_revoke",
         "ai_sharing",
@@ -3208,6 +3244,8 @@ mod tests {
             "ai.order",
             "ai.drafting_model",
             "ai.embedding_model",
+            "ai.model.openai",
+            "ai.endpoint.url",
             "ai.anything_later",
             "recovery_key_exported_0123456789abcdef",
         ] {
@@ -3308,6 +3346,89 @@ mod tests {
         assert_eq!(h.code("ai_set_ollama_url", args), "confirmation_required");
         assert!(h.asked()[0].contains("http://127.0.0.1:11500"));
         assert_eq!(h.ok("settings_get", key), Value::Null);
+    }
+
+    #[test]
+    fn ai_set_endpoint_refuses_before_any_dialog() {
+        let h = ready();
+        let key = json!({ "key": "ai.endpoint.url" });
+        for url in [
+            "https://api.example.com/v1",
+            "http://192.168.1.2:1234/v1",
+            "https://127.0.0.1:1234/v1",
+        ] {
+            let args = json!({ "url": url });
+            assert_eq!(h.code("ai_set_endpoint", args), "refused", "{url}");
+        }
+        for url in [
+            "http://user:secret@127.0.0.1:1234/v1",
+            "http://127.0.0.1:1234/v1?key=x",
+        ] {
+            let args = json!({ "url": url });
+            assert_eq!(h.code("ai_set_endpoint", args), "validation", "{url}");
+        }
+        assert!(h.asked().is_empty(), "a refused address asks nothing");
+        assert_eq!(h.ok("settings_get", key), Value::Null);
+    }
+
+    #[test]
+    fn the_endpoint_address_is_natively_confirmed_and_reaches_status() {
+        let h = ready();
+        let key = json!({ "key": "ai.endpoint.url" });
+        let args = json!({ "url": "http://127.0.0.1:1234/v1/" });
+
+        h.answer(false);
+        assert_eq!(
+            h.code("ai_set_endpoint", args.clone()),
+            "confirmation_required"
+        );
+        assert!(h.asked()[0].contains("http://127.0.0.1:1234/v1"));
+        assert_eq!(h.ok("settings_get", key.clone()), Value::Null);
+
+        h.answer(true);
+        h.ok("ai_set_endpoint", args);
+        assert_eq!(
+            h.ok("settings_get", key.clone()),
+            "http://127.0.0.1:1234/v1"
+        );
+        let row = |status: &Value| {
+            let rows = status["external"].as_array().unwrap();
+            let row = rows.iter().find(|row| row["name"] == "endpoint");
+            row.unwrap().clone()
+        };
+        let status = h.ok("ai_status", json!({}));
+        assert_eq!(row(&status)["path"], "http://127.0.0.1:1234/v1");
+        assert_eq!(row(&status)["reason"], "no_api_model");
+
+        h.answer(false);
+        let clear = json!({ "url": "" });
+        assert_eq!(
+            h.code("ai_set_endpoint", clear.clone()),
+            "confirmation_required"
+        );
+        h.answer(true);
+        h.ok("ai_set_endpoint", clear);
+        let status = h.ok("ai_status", json!({}));
+        assert_eq!(row(&status)["reason"], "no_endpoint");
+    }
+
+    #[test]
+    fn api_model_reaches_core() {
+        let h = ready();
+        let key = json!({ "key": "ai.model.openrouter" });
+        let args = json!({ "provider": "openrouter", "model": "anthropic/claude-x" });
+
+        h.ok("ai_set_api_model", args);
+
+        assert_eq!(h.ok("settings_get", key.clone()), "anthropic/claude-x");
+        assert!(h.asked().is_empty(), "the consent record is the gate");
+        let bad = json!({ "provider": "openrouter", "model": "meta-llama/llama-x" });
+        let error = h.call("ai_set_api_model", bad).unwrap_err();
+        assert_eq!(error["code"], "refused");
+        assert_eq!(error["message"], "refused: origin_refused");
+        assert_eq!(h.ok("settings_get", key), "anthropic/claude-x");
+        let cli = json!({ "provider": "gemini_cli", "model": "m" });
+        assert_eq!(h.code("ai_set_api_model", cli), "validation");
     }
 
     #[test]

@@ -390,6 +390,7 @@ export type ExternalStatus = {
   reason: string | null;
   model: string | null;
   key_stored: boolean;
+  /** The program a CLI row runs, or the address an endpoint row sends to. */
   path: string | null;
   consent: DataCategory[] | null;
   suspended: boolean;
@@ -611,6 +612,11 @@ export const ipc = {
   aiKeyFromClipboard: (provider: Provider) => invoke<void>("ai_key_from_clipboard", { provider }),
   /** Rust confirms in a native dialog. */
   aiKeyRemove: (provider: Provider) => invoke<void>("ai_key_remove", { provider }),
+  /** The consent record is the gate, so there is no dialog. Core holds the origin rules. */
+  aiSetApiModel: (provider: Provider, model: string) =>
+    invoke<void>("ai_set_api_model", { provider, model }),
+  /** Rust refuses anything off this machine, then confirms in its own dialog. Empty clears. */
+  aiSetEndpoint: (url: string) => invoke<void>("ai_set_endpoint", { url }),
   aiSharing: (provider: Provider) => invoke<Sharing>("ai_sharing", { provider }),
   /** Builds the prompt and sends nothing. */
   aiPreview: (jobTextId: string) => invoke<PromptPreview>("ai_preview", { jobTextId }),

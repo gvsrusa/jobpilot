@@ -17,6 +17,8 @@ pub struct Canned {
     pub body: String,
     /// The connection stays open this long after the reply, then closes.
     pub hold: Duration,
+    /// Sent as `Content-Length` in place of the body's length.
+    pub announced: Option<usize>,
 }
 
 impl Canned {
@@ -26,6 +28,19 @@ impl Canned {
             headers: vec![("Content-Type", "application/json".into())],
             body: body.to_string(),
             hold: Duration::ZERO,
+            announced: None,
+        }
+    }
+
+    /// A `200` whose body stops part way and then sits open for `hold`: headers arrive at once,
+    /// so only a deadline around the body read can end it.
+    pub fn stalled(hold: Duration) -> Canned {
+        Canned {
+            status: 200,
+            headers: Vec::new(),
+            body: "{".into(),
+            hold,
+            announced: Some(1 << 20),
         }
     }
 
@@ -157,7 +172,7 @@ fn serve(mut stream: std::net::TcpStream, queues: &Queues, log: &Seen) {
     }
     reply.push_str(&format!(
         "Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-        canned.body.len(),
+        canned.announced.unwrap_or(canned.body.len()),
         canned.body
     ));
     let _ = stream.write_all(reply.as_bytes());

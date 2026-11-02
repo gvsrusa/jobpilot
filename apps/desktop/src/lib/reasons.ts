@@ -47,6 +47,19 @@ const REASONS: [word: string, text: string][] = [
     "The AI provider says your usage or credit has run out. Add credit with the vendor, then try again.",
   ],
   [
+    "no_key",
+    "No key is stored for this provider. Add one on the AI screen, or write this one yourself.",
+  ],
+  [
+    "no_api_model",
+    "No model is chosen for this provider. Set one on the AI screen, or write this one yourself.",
+  ],
+  ["no_endpoint", "No endpoint address is set. Add one on the AI screen, or write this one yourself."],
+  [
+    "origin_refused",
+    "That model is not eligible through OpenRouter. Use an openai/, anthropic/, or google/ model, and not a free one.",
+  ],
+  [
     "use_profile_by_country",
     "Work authorization is answered from your profile, for one country at a time. If this question asks something else, remove it and add it in other words",
   ],

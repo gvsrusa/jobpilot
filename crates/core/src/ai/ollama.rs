@@ -357,7 +357,7 @@ impl Provider for Ollama {
 }
 
 /// A cloud model is named `<name>:cloud` (docs.ollama.com/cloud); `-cloud` covers variants.
-fn name_is_local(name: &str) -> bool {
+pub(crate) fn name_is_local(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     !name.is_empty() && !name.ends_with(":cloud") && !name.contains("-cloud")
 }

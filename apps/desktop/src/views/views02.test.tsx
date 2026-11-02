@@ -12,6 +12,7 @@ import type {
   ProfileBasic,
   Status,
 } from "../lib/ipc";
+import { explainReason } from "../lib/reasons";
 import { backend, count, READY, renderApp, sharing } from "../test-utils";
 
 const NOTHING: ProfileBasic = {
@@ -962,6 +963,114 @@ describe("ai", () => {
     const { user } = renderApp();
     await keyRow(user);
     expect(document.querySelector("input[type=password]")).toBeNull();
+  });
+
+  it("an_api_row_sets_a_model", async () => {
+    const b = backend({
+      ai_status: () => aiWith({ external: [external({ reason: "no_api_model", model: "gpt-old" })] }),
+      ai_set_api_model: () => null,
+    });
+    const { user } = renderApp();
+    const row = await keyRow(user);
+    expect(row.getByText("Unavailable: no model chosen")).toBeInTheDocument();
+    const field = row.getByLabelText("Model id");
+    expect(field).toHaveValue("gpt-old");
+    await user.clear(field);
+    await user.type(field, "gpt-new");
+    await user.click(row.getByRole("button", { name: "OpenAI: Save model id" }));
+    await waitFor(() => expect(count(b, "ai_set_api_model")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_set_api_model")?.args).toEqual({ provider: "openai", model: "gpt-new" });
+  });
+
+  it("a_refused_model_shows_its_code", async () => {
+    backend({
+      ai_status: () => aiWith({ external: [external({ name: "openrouter", label: "OpenRouter" })] }),
+      ai_set_api_model: () => {
+        throw { code: "refused", message: "refused: origin_refused" };
+      },
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "OpenRouter" }));
+    await user.type(row.getByLabelText("Model id"), "meta-llama/x");
+    await user.click(row.getByRole("button", { name: "OpenRouter: Save model id" }));
+    const alert = await row.findByRole("alert");
+    expect(alert).toHaveTextContent("code: refused");
+    expect(alert).toHaveTextContent("not eligible through OpenRouter");
+  });
+
+  it("a_cli_row_has_no_model_field", async () => {
+    backend({
+      ai_status: () => aiWith({ external: [external({ name: "gemini_cli", label: "Gemini CLI", kind: "cli" })] }),
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "Gemini CLI" }));
+    expect(row.queryByLabelText("Model id")).toBeNull();
+    expect(row.queryByRole("button", { name: "Add endpoint..." })).toBeNull();
+  });
+
+  const endpointRow = async (user: ReturnType<typeof renderApp>["user"]) => {
+    await go(user, "AI", /AI/);
+    return within(await screen.findByRole("listitem", { name: "Compatible endpoint" }));
+  };
+  const ENDPOINT = { name: "endpoint", label: "Compatible endpoint", kind: "endpoint" } as const;
+
+  it("the_endpoint_row_explains_loopback_only", async () => {
+    const b = backend({
+      ai_status: () => aiWith({ external: [external({ ...ENDPOINT, reason: "no_endpoint" })] }),
+      ai_set_endpoint: () => null,
+    });
+    const { user } = renderApp();
+    const row = await endpointRow(user);
+    expect(row.getByText("Unavailable: no address set")).toBeInTheDocument();
+    expect(row.getByText(/Loopback only: a server you run on this computer/)).toBeInTheDocument();
+    expect(row.getByText(/It still needs your consent/)).toBeInTheDocument();
+    expect(row.queryByLabelText("Endpoint address (loopback only)")).toBeNull();
+    await user.click(row.getByRole("button", { name: "Add endpoint..." }));
+    await user.type(row.getByLabelText("Endpoint address (loopback only)"), "http://127.0.0.1:1234/v1");
+    await user.click(row.getByRole("button", { name: "Use this address..." }));
+    await waitFor(() => expect(count(b, "ai_set_endpoint")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_set_endpoint")?.args).toEqual({ url: "http://127.0.0.1:1234/v1" });
+  });
+
+  it("a_refused_endpoint_shows_its_code_and_keeps_the_address", async () => {
+    backend({
+      ai_status: () => aiWith({ external: [external({ ...ENDPOINT, reason: "no_endpoint" })] }),
+      ai_set_endpoint: () => {
+        throw { code: "refused", message: "refused: not_loopback" };
+      },
+    });
+    const { user } = renderApp();
+    const row = await endpointRow(user);
+    await user.click(row.getByRole("button", { name: "Add endpoint..." }));
+    const field = row.getByLabelText("Endpoint address (loopback only)");
+    await user.type(field, "https://api.example.com/v1");
+    await user.click(row.getByRole("button", { name: "Use this address..." }));
+    expect(await row.findByRole("alert")).toHaveTextContent("code: refused");
+    expect(field).toHaveValue("https://api.example.com/v1");
+  });
+
+  it("a_set_endpoint_shows_its_address_and_can_be_cleared", async () => {
+    const b = backend({
+      ai_status: () => aiWith({ external: [external({ ...ENDPOINT, reason: null, available: true, path: "http://127.0.0.1:1234/v1" })] }),
+      ai_set_endpoint: () => null,
+    });
+    const { user } = renderApp();
+    const row = await endpointRow(user);
+    expect(row.getByText("http://127.0.0.1:1234/v1")).toBeInTheDocument();
+    expect(row.getByRole("button", { name: "Change endpoint..." })).toBeInTheDocument();
+    await user.click(row.getByRole("button", { name: "Clear endpoint..." }));
+    await waitFor(() => expect(count(b, "ai_set_endpoint")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_set_endpoint")?.args).toEqual({ url: "" });
+  });
+
+  it("the_api_failure_reasons_read_in_plain_words", () => {
+    const said = (word: string) => explainReason({ code: "manual_required", message: `this needs manual work: ${word}` });
+    expect(said("no_key")).toMatch(/No key is stored/);
+    expect(said("no_api_model")).toMatch(/No model is chosen/);
+    expect(said("no_endpoint")).toMatch(/No endpoint address/);
+    expect(said("origin_refused")).toMatch(/not eligible through OpenRouter/);
   });
 
   it("consent_focus_starts_on_cancel", async () => {

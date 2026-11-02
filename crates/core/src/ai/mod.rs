@@ -14,11 +14,13 @@ use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::hardware::{self, Hardware};
 use crate::{secrets, settings};
+use api::ApiProvider;
 use claude_code::ClaudeCode;
 use consent::ConsentState;
 use ollama::OllamaStatus;
 use register::ProviderKind;
 
+pub mod api;
 pub mod claude_code;
 pub mod consent;
 pub mod net;
@@ -320,6 +322,7 @@ pub struct ExternalStatus {
     pub reason: Option<String>,
     pub model: Option<String>,
     pub key_stored: bool,
+    /// The program a CLI row runs, or the address an endpoint row sends to.
     pub path: Option<String>,
     pub consent: Option<Vec<DataCategory>>,
     pub suspended: bool,
@@ -467,8 +470,23 @@ pub(crate) async fn provider_settings(db: &Db) -> Result<(Vec<String>, serde_jso
     Ok((order, enabled))
 }
 
+/// A provider row's availability, by the same checks routing uses. Opens no socket.
+// ponytail: a row reads `not_built` until its adapter lands, Tasks 5 to 8.
+async fn row_availability(
+    db: &Db,
+    info: &register::ProviderInfo,
+) -> Result<(bool, Option<String>)> {
+    Ok(match ApiProvider::from_settings(db, info.name).await? {
+        Some(provider) => match provider.available().await {
+            Availability::Available => (true, None),
+            Availability::Unavailable(why) => (false, Some(why)),
+        },
+        None if info.kind == ProviderKind::Endpoint => (false, Some("no_endpoint".into())),
+        None => (false, Some("not_built".into())),
+    })
+}
+
 /// Every external provider but Claude Code, from the table.
-// ponytail: `available` reads `not_built` until a provider's adapter lands, Tasks 3 to 8.
 async fn external_status(db: &Db) -> Result<Vec<ExternalStatus>> {
     let stored = secrets::names(db).await?;
     let mut rows = Vec::new();
@@ -478,15 +496,21 @@ async fn external_status(db: &Db) -> Result<Vec<ExternalStatus>> {
         }
         let state = consent::state(db, &info.id.to_string()).await?;
         let suspended = matches!(state, ConsentState::Suspended(_));
+        let (available, reason) = row_availability(db, info).await?;
+        let model = text_setting(db, &format!("ai.model.{}", info.name)).await?;
+        let path = match info.kind {
+            ProviderKind::Endpoint => api::endpoint_address(db).await?,
+            _ => None,
+        };
         rows.push(ExternalStatus {
             name: info.name.into(),
             label: info.label.into(),
             kind: info.kind,
-            available: false,
-            reason: Some("not_built".into()),
-            model: text_setting(db, &format!("ai.model.{}", info.name)).await?,
+            available,
+            reason,
+            model: model.filter(|model| !model.is_empty()),
             key_stored: stored.contains(&secrets::api_key_name(info.name)),
-            path: None,
+            path,
             consent: state.allowed(),
             suspended,
             runs_job_text: router::lacking(spec(TaskType::DraftResume), info.capabilities)

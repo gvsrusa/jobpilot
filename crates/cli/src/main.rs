@@ -104,6 +104,8 @@ impl Command {
                     AiCommand::ClaudePath { .. }
                         | AiCommand::Consent(ConsentCommand::Give { .. })
                         | AiCommand::Key(_)
+                        | AiCommand::Model { .. }
+                        | AiCommand::Endpoint { .. }
                         | AiCommand::Enable { .. }
                         | AiCommand::Disable { .. }
                         | AiCommand::Order { .. }
@@ -283,6 +285,21 @@ fn message(error: &Error) -> String {
              then try again."
                 .into()
         }
+        Error::ManualRequired(reason) if reason == "no_key" => {
+            "No key is stored for this provider. Add one with `jobpilot ai key set <provider>` \
+             in an ordinary terminal, or on the AI screen."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "no_api_model" => {
+            "No model is chosen for this provider. Set one with `jobpilot ai model <provider> \
+             <id>`, or on the AI screen."
+                .into()
+        }
+        Error::ManualRequired(reason) | Error::Refused(reason) if reason == "origin_refused" => {
+            "That model is not eligible through OpenRouter. Use an openai/, anthropic/, or \
+             google/ model, and not a free one."
+                .into()
+        }
         Error::Refused(reason) if reason == "attestation_needed" => {
             "This provider needs you to state the line above. If it is true, run this again \
              with --attest."
@@ -454,6 +471,8 @@ mod tests {
         ("ai order openai", true),
         ("ai key set openai", true),
         ("ai key remove openai", true),
+        ("ai model openai m", true),
+        ("ai endpoint http://127.0.0.1:1", true),
         ("ai consent give claude_code --categories job_text", true),
         ("ai consent give openai --categories job_text", true),
         ("ai consent revoke claude_code", false),
@@ -539,6 +558,29 @@ mod tests {
             let text = message(&Error::ManualRequired(reason.into()));
             assert!(text.contains(words), "{reason}: {text}");
         }
+    }
+
+    #[test]
+    fn api_reasons_say_what_to_do() {
+        let text = message(&Error::ManualRequired("no_key".into()));
+        assert_eq!(
+            text,
+            "No key is stored for this provider. Add one with `jobpilot ai key set <provider>` \
+             in an ordinary terminal, or on the AI screen."
+        );
+        let text = message(&Error::ManualRequired("no_api_model".into()));
+        assert_eq!(
+            text,
+            "No model is chosen for this provider. Set one with `jobpilot ai model <provider> \
+             <id>`, or on the AI screen."
+        );
+        let origin = "That model is not eligible through OpenRouter. Use an openai/, anthropic/, \
+                      or google/ model, and not a free one.";
+        assert_eq!(message(&Error::Refused("origin_refused".into())), origin);
+        assert_eq!(
+            message(&Error::ManualRequired("origin_refused".into())),
+            origin
+        );
     }
 
     #[test]

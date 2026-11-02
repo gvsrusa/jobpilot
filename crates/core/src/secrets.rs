@@ -94,8 +94,6 @@ async fn forget_unheld(db: &Db, holds: impl Fn(&str) -> Result<bool> + Send + Co
 }
 
 /// Off the runtime. `None` when no entry.
-// Task 4's `KeySource::Keychain` is the first caller.
-#[allow(dead_code)]
 pub(crate) async fn read_api_key(provider: &str) -> Result<Option<Zeroizing<String>>> {
     let name = api_key_name(provider);
     keychain(move || Ok(get(&name)?.map(Zeroizing::new))).await
