@@ -1,5 +1,6 @@
+import { useEffect } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ipc, type PauseState } from "./ipc";
+import { ipc, toAppError, type PauseState } from "./ipc";
 
 /** Ctrl+Shift+H, or Cmd+Shift+H on a Mac. The menu accelerator in Rust is the same key. */
 export const isPauseKey = (e: KeyboardEvent): boolean =>
@@ -25,6 +26,15 @@ export function usePause() {
   };
   const set = useMutation({ mutationFn: ipc.pauseSet, onSuccess: done });
   const clear = useMutation({ mutationFn: ipc.pauseClear, onSuccess: done });
+  // "No data is open" was true when it was said. Once the pause can be read, it is stale.
+  const readable = status.isSuccess;
+  const { reset: resetSet, error: setError } = set;
+  const { reset: resetClear, error: clearError } = clear;
+  useEffect(() => {
+    if (!readable) return;
+    if (setError && toAppError(setError).code === "unavailable") resetSet();
+    if (clearError && toAppError(clearError).code === "unavailable") resetClear();
+  }, [readable, status.dataUpdatedAt, setError, clearError, resetSet, resetClear]);
   return { status, set, clear };
 }
 

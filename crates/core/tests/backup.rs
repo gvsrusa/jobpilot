@@ -1963,5 +1963,122 @@ async fn restore_adds_no_pause_when_none_was_set() {
         .unwrap()
         .db;
     assert!(pause::is_set(&again).await.unwrap());
+    // The table takes a person only, so an actor outside it is recorded as the CLI.
+    assert_eq!(
+        pause::state(&again).await.unwrap().set_by.as_deref(),
+        Some("cli")
+    );
     again.close().await;
+}
+
+fn audit_actions(entries: &[audit::AuditEntry], action: &str) -> usize {
+    entries.iter().filter(|e| e.action == action).count()
+}
+
+/// A live database that cannot be read cannot say whether the pause was on, so the restored
+/// data comes up paused and the audit log says why.
+#[tokio::test]
+async fn offline_restore_over_an_unreadable_database_comes_up_paused() {
+    let (_tmp, paths) = temp_root();
+    let source = backup_with_doc(&paths, "alpha").await;
+    let db = Db::open(&paths).await.unwrap();
+    db.close().await;
+    for suffix in ["-wal", "-shm"] {
+        let _ = fs::remove_file(sidecar(&paths.db(), suffix));
+    }
+    fs::write(paths.db(), b"this is not a database at all, just bytes").unwrap();
+
+    let db = backup::restore_offline(&paths, &source, "gui")
+        .await
+        .unwrap()
+        .db;
+
+    assert!(pause::is_set(&db).await.unwrap());
+    let entries = audit::recent(&db, 20).await.unwrap();
+    assert_eq!(audit_actions(&entries, "emergency_pause_set_by_restore"), 1);
+    let row = entries
+        .iter()
+        .find(|e| e.action == "emergency_pause_set_by_restore")
+        .unwrap();
+    assert_eq!(row.detail, json!({ "why": "live_state_unreadable" }));
+    db.close().await;
+}
+
+/// An older schema has no pause table, which is a pause that was never on.
+#[tokio::test]
+async fn offline_restore_over_a_database_with_no_pause_table_stays_unpaused() {
+    let (_tmp, paths) = temp_root();
+    let source = backup_with_doc(&paths, "alpha").await;
+    let db = Db::open(&paths).await.unwrap();
+    sqlx::query("DROP TABLE emergency_pause")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    plant_future_version(&db.pool).await;
+    db.close().await;
+
+    let db = backup::restore_offline(&paths, &source, "gui")
+        .await
+        .unwrap()
+        .db;
+
+    assert!(!pause::is_set(&db).await.unwrap());
+    let entries = audit::recent(&db, 20).await.unwrap();
+    assert_eq!(audit_actions(&entries, "emergency_pause_set_by_restore"), 0);
+    db.close().await;
+}
+
+/// No database file is no live data, and no pause.
+#[tokio::test]
+async fn offline_restore_with_no_live_database_stays_unpaused() {
+    let (_tmp, paths) = temp_root();
+    let source = backup_with_doc(&paths, "alpha").await;
+    let db = Db::open(&paths).await.unwrap();
+    db.close().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = fs::remove_file(sidecar(&paths.db(), suffix));
+    }
+
+    let db = backup::restore_offline(&paths, &source, "gui")
+        .await
+        .unwrap()
+        .db;
+
+    assert!(!pause::is_set(&db).await.unwrap());
+    db.close().await;
+}
+
+/// A restore whose live pause was readable keeps the backup's own row and audits once.
+#[tokio::test]
+async fn a_kept_pause_is_audited_once_and_not_when_the_backup_already_had_it() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let plain = backup::create(&db, "cli").await.unwrap().path;
+    pause::set(&db, "gui").await.unwrap();
+    let paused_backup = backup::create(&db, "cli").await.unwrap().path;
+
+    let db = backup::restore(db, &plain, "cli").await.unwrap().db;
+    let entries = audit::recent(&db, 50).await.unwrap();
+    assert_eq!(
+        audit_actions(&entries, "emergency_pause_kept_by_restore"),
+        1
+    );
+    assert_eq!(
+        pause::state(&db).await.unwrap().set_by.as_deref(),
+        Some("cli")
+    );
+
+    let db = backup::restore(db, &paused_backup, "cli").await.unwrap().db;
+    let entries = audit::recent(&db, 50).await.unwrap();
+    // The backup carried the row, so this restore adds none and audits none (the log is the
+    // backup's own, which never saw the first restore).
+    assert_eq!(
+        audit_actions(&entries, "emergency_pause_kept_by_restore"),
+        0
+    );
+    assert_eq!(
+        pause::state(&db).await.unwrap().set_by.as_deref(),
+        Some("gui")
+    );
+    db.close().await;
 }

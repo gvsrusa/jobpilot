@@ -64,12 +64,14 @@ async fn actions(db: &Db, action: &str) -> Vec<String> {
 /// A step that waits for its token, as a model call does.
 struct Blocker {
     saw_cancel: Arc<AtomicBool>,
+    abandoned: Arc<AtomicBool>,
 }
 
 impl Blocker {
     fn new() -> Blocker {
         Blocker {
             saw_cancel: Arc::default(),
+            abandoned: Arc::default(),
         }
     }
 }
@@ -85,6 +87,17 @@ impl Workflow for Blocker {
 
     fn steps(&self) -> &'static [StepDef] {
         ONE
+    }
+
+    fn abandon<'a>(
+        &'a self,
+        _db: &'a Db,
+        _saved: &'a runner::Checkpoint,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async {
+            self.abandoned.store(true, Ordering::SeqCst);
+            Ok(())
+        })
     }
 
     fn step<'a>(&'a self, ctx: &'a Ctx<'a>, _index: usize) -> BoxFuture<'a, Result<StepOutput>> {
@@ -633,23 +646,58 @@ async fn status_edits_say_paused_and_field_edits_still_work() {
     .unwrap();
 }
 
-/// The files of a source tree, with anything after `#[cfg(test)]` cut off: a unit test
-/// calling a function is not a route to it.
-fn code_files(dir: &Path, found: &mut Vec<(PathBuf, String)>) {
+/// Every `.rs` file under a source tree, whole: a `#[cfg(test)]` module is scanned too, so
+/// nothing hides below one.
+fn source_files(dir: &Path, found: &mut Vec<(PathBuf, String)>) {
     for entry in fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
         if path.is_dir() {
-            code_files(&path, found);
+            source_files(&path, found);
         } else if path.extension().is_some_and(|ext| ext == "rs") {
-            let text = fs::read_to_string(&path).unwrap();
-            let live = text.split("#[cfg(test)]").next().unwrap().to_owned();
-            found.push((path, live));
+            found.push((path.clone(), fs::read_to_string(&path).unwrap()));
         }
     }
 }
 
-/// Every route to a status write, by file. A new one fails here until it is listed, and
-/// listing it means saying why the pause covers it.
+/// Lower case, with every run of whitespace one space, so case and line breaks cannot hide a
+/// statement.
+fn flat(text: &str) -> String {
+    text.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Each `update applications` statement, up to where it is bound or run, with the file it
+/// is in and the name of the function that holds it.
+fn applications_updates(files: &[(PathBuf, String)]) -> Vec<(String, String, String)> {
+    let mut found = Vec::new();
+    for (path, text) in files {
+        let text = flat(text);
+        let mut from = 0;
+        while let Some(at) = text[from..].find("update applications") {
+            let start = from + at;
+            let rest = &text[start..];
+            let end = [".bind(", ".execute(", ".fetch"]
+                .iter()
+                .filter_map(|stop| rest.find(stop))
+                .min()
+                .unwrap_or(rest.len());
+            let owner = text[..start]
+                .rfind(" fn ")
+                .map(|i| text[i + 4..].split(['(', '<']).next().unwrap().to_owned())
+                .unwrap_or_default();
+            let file = path.file_name().unwrap().to_string_lossy().into_owned();
+            found.push((file, owner, rest[..end].to_owned()));
+            from = start + 1;
+        }
+    }
+    found
+}
+
+/// Every route to a status write. The only statement that sets the column is inside
+/// `set_status`, which gates itself before it. A new one, however it is spelled, fails here
+/// until it is looked at: `force_status`, `SET updated_at = 'x', status = ...`, `set status`.
 #[test]
 fn every_route_to_a_status_write_passes_the_gate() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -659,34 +707,232 @@ fn every_route_to_a_status_write_passes_the_gate() {
         manifest.join("../cli/src"),
         manifest.join("../../apps/desktop/src-tauri/src"),
     ] {
-        code_files(&dir, &mut files);
+        source_files(&dir, &mut files);
     }
-    let reached = |needle: &str| -> Vec<String> {
+
+    let writes: Vec<_> = applications_updates(&files)
+        .into_iter()
+        .filter(|(_, _, statement)| statement.contains("status"))
+        .collect();
+    assert_eq!(writes.len(), 1, "one statement sets status: {writes:?}");
+    assert_eq!(
+        (writes[0].0.as_str(), writes[0].1.as_str()),
+        ("applications.rs", "set_status")
+    );
+
+    // That function refuses first.
+    let (_, text) = files
+        .iter()
+        .find(|(path, _)| path.ends_with("src/applications.rs"))
+        .unwrap();
+    let body = flat(text);
+    let body = &body[body.find("pub async fn set_status").unwrap()..];
+    let gate = body
+        .find("pause::ensure_off(db)")
+        .expect("set_status gates itself");
+    assert!(gate < body.find("update applications").unwrap());
+
+    // Nothing but the gated function and the agent that runs it names it.
+    let reaching = |needle: &str| -> Vec<String> {
         let mut found: Vec<String> = files
             .iter()
-            .filter(|(_, text)| text.contains(needle))
-            .map(|(path, _)| {
-                let name = path.components().rev().take(2).collect::<Vec<_>>();
-                format!(
-                    "{}/{}",
-                    name[1].as_os_str().to_string_lossy(),
-                    name[0].as_os_str().to_string_lossy()
-                )
-            })
+            .filter(|(_, text)| flat(text).contains(needle))
+            .map(|(path, _)| path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         found.sort();
         found
     };
-
-    // The store function: the agent's tracking step, which runs behind `runner::start`.
-    // It also refuses on its own, so a new caller cannot skip the pause.
-    assert_eq!(reached("applications::set_status("), ["agents/tracking.rs"]);
-    // The agent: the CLI's `apps status` and the desktop's `app_set_status`. It starts a
-    // run, and `runner::start` is the gate.
+    // The gated store function: the tracking step, which also runs behind `runner::start`.
     assert_eq!(
-        reached("agents::set_status("),
-        ["src/apps.rs", "src/commands.rs"]
+        reaching("applications::set_status("),
+        ["crypto.rs", "tracking.rs"],
+        "crypto.rs is a unit test"
     );
-    // Nothing else writes the column.
-    assert_eq!(reached("SET status"), ["src/applications.rs"]);
+    // The agent, whose `start` is a gate: the CLI's `app status` and the desktop command.
+    assert_eq!(reaching("agents::set_status("), ["apps.rs", "commands.rs"]);
+}
+
+/// The scan reads statements the way the guard needs, whatever the case or the spelling.
+#[test]
+fn the_scan_sees_a_status_write_however_it_is_spelled() {
+    let sources = |text: &str| vec![(PathBuf::from("x/other.rs"), text.to_owned())];
+    for sneaky in [
+        "fn force_status() { sqlx::query(\"UPDATE applications SET status = 'x'\").bind(1); }",
+        "fn a() { sqlx::query(\"update applications set updated_at='x', status=?\").bind(1); }",
+        "fn b() { sqlx::query(\"UPDATE\n  applications\n  SET Status = 1\").execute(p); }",
+        "fn c() { sqlx::query(concat!(\"UPDATE applications SET status = ?1, updated_at = \", now!())).bind(1); }",
+    ] {
+        let found = applications_updates(&sources(sneaky));
+        assert_eq!(found.len(), 1, "{sneaky}");
+        assert!(found[0].2.contains("status"), "{sneaky}: {found:?}");
+    }
+    let harmless =
+        sources("fn d() { sqlx::query(\"UPDATE applications SET notes = ?\").bind(1); }");
+    assert!(!applications_updates(&harmless)[0].2.contains("status"));
+}
+
+/// The desktop fires the tokens before it writes the row, so a step can end on its token
+/// while the row is still being written behind a lock. It was a pause all the same.
+#[tokio::test]
+async fn a_token_fired_before_the_row_is_written_still_halts_the_run_as_paused() {
+    let (tmp, db) = setup().await;
+    let db = Arc::new(db);
+    let third = second_handle(&tmp).await;
+    let workflow = Arc::new(Blocker::new());
+    let token = CancellationToken::new();
+    let (held, step, cancel) = (db.clone(), workflow.clone(), token.clone());
+    let task = tokio::spawn(async move { runner::start(&held, "gui", &*step, cancel).await });
+    wait_for(
+        &db,
+        "SELECT count(*) FROM agent_runs WHERE state = 'running'",
+    )
+    .await;
+
+    // Another handle holds the write lock for 300 ms, and the pause path runs behind it.
+    let mut lock = third.pool.acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    pause::announce(db.paths());
+    token.cancel();
+    let writer = {
+        let handle = second_handle(&tmp).await;
+        tokio::spawn(async move { pause::set(&handle, "gui").await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    sqlx::query("ROLLBACK").execute(&mut *lock).await.unwrap();
+    drop(lock);
+
+    let done = task.await.unwrap().unwrap();
+    writer.await.unwrap().unwrap();
+    assert_eq!(done.state, RunState::Halted);
+    assert_eq!(done.reason.as_deref(), Some("paused"));
+    assert!(
+        !workflow.abandoned.load(Ordering::SeqCst),
+        "nothing was dropped"
+    );
+    // Resumable once cleared.
+    pause::clear(&db, "gui").await.unwrap();
+    let again = runner::resume(
+        &db,
+        "gui",
+        &done.run_id,
+        &Instant1,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(again.state, RunState::Completed);
+}
+
+/// A clear that lands while the stop is under way does not turn the stop into a cancel.
+#[tokio::test]
+async fn clearing_during_the_stop_still_ends_the_run_halted() {
+    let (_tmp, db) = setup().await;
+    let db = Arc::new(db);
+    let workflow = Arc::new(Blocker::new());
+    let token = CancellationToken::new();
+    let (held, step, cancel) = (db.clone(), workflow.clone(), token.clone());
+    let task = tokio::spawn(async move { runner::start(&held, "gui", &*step, cancel).await });
+    wait_for(
+        &db,
+        "SELECT count(*) FROM agent_runs WHERE state = 'running'",
+    )
+    .await;
+
+    pause::announce(db.paths());
+    pause::set(&db, "gui").await.unwrap();
+    pause::clear(&db, "gui").await.unwrap();
+    token.cancel();
+
+    let done = task.await.unwrap().unwrap();
+    assert_eq!(done.state, RunState::Halted);
+    assert_eq!(done.reason.as_deref(), Some("paused"));
+    assert!(!workflow.abandoned.load(Ordering::SeqCst));
+}
+
+/// A person's own cancel outranks a pause that was also under way.
+#[tokio::test]
+async fn a_persons_cancel_still_wins_over_the_pause() {
+    let (_tmp, db) = setup().await;
+    let db = Arc::new(db);
+    let workflow = Arc::new(Blocker::new());
+    let (held, step) = (db.clone(), workflow.clone());
+    let task =
+        tokio::spawn(
+            async move { runner::start(&held, "gui", &*step, CancellationToken::new()).await },
+        );
+    wait_for(
+        &db,
+        "SELECT count(*) FROM agent_runs WHERE state = 'running'",
+    )
+    .await;
+    let id: String = sqlx::query_scalar("SELECT id FROM agent_runs")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    pause::announce(db.paths());
+    agents::cancel_run(&db, "gui", &id).await.unwrap();
+
+    let done = task.await.unwrap().unwrap();
+    assert_eq!(done.state, RunState::Cancelled);
+}
+
+/// A pause announced for one data folder says nothing about another.
+#[tokio::test]
+async fn an_announced_pause_is_per_data_folder() {
+    let (_a, one) = setup().await;
+    let (_b, two) = setup().await;
+    let before = pause::epoch(two.paths());
+    pause::announce(one.paths());
+    assert_eq!(pause::epoch(two.paths()), before);
+    assert_ne!(pause::epoch(one.paths()), 0);
+}
+
+/// Indexing is automation: while paused it says so, instead of asking for manual work.
+#[tokio::test]
+async fn indexing_while_paused_says_paused() {
+    let (_tmp, db) = setup().await;
+    settings::set(&db, "ai.embedding_model", &json!("test-embed"))
+        .await
+        .unwrap();
+    memory::add_question(&db, "Why do you want this job?", None)
+        .await
+        .unwrap();
+    let (mock, calls) = Mock::new();
+    let router = Router::with_providers(vec![Box::new(mock)]);
+    pause::set(&db, "cli").await.unwrap();
+
+    let items = jobpilot_core::embed::index_missing(&db, &router, CancellationToken::new()).await;
+    assert_eq!(items.unwrap_err().code(), "paused");
+    let questions = memory::index_missing(&db, &router, CancellationToken::new()).await;
+    assert_eq!(questions.unwrap_err().code(), "paused");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+/// Building a report is automation too: nothing is dropped or started while paused.
+#[tokio::test]
+async fn a_report_is_refused_while_paused_and_drops_nothing() {
+    let (_tmp, db) = setup().await;
+    sqlx::query(
+        "INSERT INTO reports (id, created_at, complete, figures) VALUES ('half', 't', 0, '{}')",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    pause::set(&db, "cli").await.unwrap();
+
+    let error = agents::analytics_report(&db, "cli", CancellationToken::new())
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), "paused");
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM reports").await,
+        1,
+        "nothing was dropped"
+    );
+    assert_eq!(count(&db, "SELECT count(*) FROM agent_runs").await, 0);
 }

@@ -57,6 +57,7 @@ pub(crate) fn check(vectors: &[Vec<f32>], inputs: usize) -> Result<usize> {
 /// many. Marked items are never sent, and have no rows. `ManualRequired` when no local
 /// embedding model is set up. A batch is stored whole or not at all.
 pub async fn index_missing(db: &Db, router: &Router, cancel: CancellationToken) -> Result<usize> {
+    crate::pause::ensure_off(db).await?;
     let model = model_setting(db).await?;
     let done: Vec<String> = sqlx::query_scalar("SELECT item_id FROM embeddings WHERE model = ?")
         .bind(&model)

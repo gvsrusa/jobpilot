@@ -212,6 +212,7 @@ async fn finish(db: &Db, rows: Vec<Candidate>, via: &str) -> Result<Vec<MemoryHi
 /// `Cancelled`, so the next call embeds the rest. `ManualRequired` when no local embedding
 /// model is set up.
 pub async fn index_missing(db: &Db, router: &Router, cancel: CancellationToken) -> Result<usize> {
+    crate::pause::ensure_off(db).await?;
     let model = embed::model_setting(db).await?;
     let mut stored = 0;
     loop {

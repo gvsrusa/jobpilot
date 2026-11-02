@@ -329,6 +329,7 @@ pub async fn start_with(
         state: RunState::Queued,
         generation: 0,
         step: 0,
+        epoch: pause::epoch(db.paths()),
         clock: Instant::now(),
     };
     execute(run, Checkpoint::default(), actor, workflow, cancel, limits).await
@@ -360,6 +361,7 @@ pub async fn resume(
         state: RunState::Checking,
         generation: stored.generation + 1,
         step: stored.step,
+        epoch: pause::epoch(db.paths()),
         clock: Instant::now(),
     };
     let limits = Limits::of(stored.agent);
@@ -410,6 +412,8 @@ struct Run<'a> {
     /// Bumped by each resume. A row under a later one belongs to another process.
     generation: i64,
     step: i64,
+    /// [`pause::epoch`] when this process took the run: a later one means a pause began.
+    epoch: u64,
     /// Since the last state change: a log row's duration is the time spent reaching it.
     clock: Instant,
 }
@@ -587,19 +591,22 @@ async fn stop_asked(run: &Run<'_>, ctx: &Ctx<'_>) -> Result<Option<Error>> {
         ctx.cancel.cancel();
         return Ok(Some(Error::Cancelled));
     }
-    if pause::is_set(run.db).await? {
+    if pause::epoch(run.db.paths()) != run.epoch || pause::is_set(run.db).await? {
         ctx.cancel.cancel();
         return Ok(Some(Error::Paused));
     }
     Ok(ctx.cancel.is_cancelled().then_some(Error::Cancelled))
 }
 
-/// Whether the pause, not a person's cancel, is why a step ended. A failed read says no.
+/// Whether the pause, not a person's cancel, is why a step ended. The row may not be written
+/// yet, or may be cleared already, so a pause begun in this process since the run took
+/// hold counts too. A failed read says no.
 async fn paused(run: &Run<'_>) -> bool {
     let cancelled = store::cancel_requested(run.db, &run.id)
         .await
         .unwrap_or(false);
-    !cancelled && pause::is_set(run.db).await.unwrap_or(false)
+    let begun = pause::epoch(run.db.paths()) != run.epoch;
+    !cancelled && (begun || pause::is_set(run.db).await.unwrap_or(false))
 }
 
 async fn execute(

@@ -1,4 +1,4 @@
-//! The emergency pause (FR-11.17). One row says nothing automated runs until a person
+//! The emergency pause (FR-12.8). One row says nothing automated runs until a person
 //! clears it. The flag lives in the database, so another process sees it: a `pause set` from
 //! the CLI stops a run the desktop started, and the reverse.
 //!
@@ -6,6 +6,9 @@
 //! and each step), the router (`run` and each attempt, `embed`), `Ollama::pull`, and
 //! `applications::set_status`. Cancelling a run and editing fields stay open.
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -17,6 +20,7 @@ use crate::ai::CancellationToken;
 use crate::audit;
 use crate::db::Db;
 use crate::error::{Error, Result};
+use crate::paths::AppPaths;
 use crate::runner;
 
 /// How often [`watch`] looks.
@@ -107,4 +111,25 @@ pub async fn watch(db: &Db, cancel: &CancellationToken) {
         }
         sleep(POLL).await;
     }
+}
+
+/// How many pauses this process has begun, per data folder. Kept in memory because a stop
+/// must work before, and without, the row: the desktop fires its tokens first, then writes
+/// the row, which can wait behind another writer.
+static BEGUN: Mutex<BTreeMap<PathBuf, u64>> = Mutex::new(BTreeMap::new());
+
+fn begun() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, u64>> {
+    BEGUN.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Call before firing any token for a pause. A run that started before this and ends on its
+/// token is then known to have been paused, even if the row is not written yet, or is
+/// already cleared. Clearing does not undo it: that run was stopped by a pause.
+pub fn announce(paths: &AppPaths) {
+    *begun().entry(paths.root().to_path_buf()).or_insert(0) += 1;
+}
+
+/// Read when a run starts; a later value means a pause began during it.
+pub fn epoch(paths: &AppPaths) -> u64 {
+    begun().get(paths.root()).copied().unwrap_or(0)
 }

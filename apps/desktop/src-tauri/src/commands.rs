@@ -1151,6 +1151,8 @@ pub async fn ai_cancel(state: State<'_, AppState>) -> Result<()> {
 /// after, so a running task stops even with no data open. The write goes through the `db`
 /// read lock and not [`AppState::work`]: it must not queue behind a task holding the gate.
 pub async fn pause_now(state: &AppState) -> Result<PauseState> {
+    // Before the tokens, so a run that ends on its token knows why while the row is pending.
+    pause::announce(&state.paths);
     state.ai.cancel();
     state.pull.cancel();
     let slot = state.db.read().await;
@@ -4282,8 +4284,14 @@ mod tests {
         let pull = state.pull.begin().unwrap();
         assert_eq!(h.ok("pause_status", json!({}))["paused"], false);
 
+        let before = jobpilot_core::pause::epoch(&h.paths);
         let on = h.ok("pause_set", json!({}));
 
+        assert_eq!(
+            jobpilot_core::pause::epoch(&h.paths),
+            before + 1,
+            "announced first"
+        );
         assert_eq!(on["paused"], true);
         assert_eq!(on["set_by"], "gui");
         assert!(ai.token.is_cancelled() && pull.token.is_cancelled());

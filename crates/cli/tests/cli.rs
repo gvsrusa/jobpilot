@@ -1804,3 +1804,140 @@ fn pause_from_a_second_process_stops_a_running_draft() {
     }
     assert!(!alive(&child_pid), "the claude child survived the pause");
 }
+
+/// A stand-in for a loopback Ollama. It lists one local model, and then holds `/api/pull` and
+/// `/api/embed` open without ever finishing them, as a long download or a slow model does.
+/// `reached` says when a held request has arrived.
+fn fake_ollama() -> (String, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let reached = Arc::new(AtomicBool::new(false));
+    let flag = reached.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let flag = flag.clone();
+            std::thread::spawn(move || {
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => seen.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&seen).into_owned();
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_owned();
+                let whole = |body: &str| {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                match path.as_str() {
+                    "/api/version" => {
+                        let _ = stream.write_all(whole(r#"{"version":"0.5.0"}"#).as_bytes());
+                    }
+                    "/api/tags" => {
+                        let tags = r#"{"models":[{"name":"gemma3:4b","size":3338801718,
+                            "details":{"family":"gemma3","parameter_size":"4.3B"}}]}"#;
+                        let _ = stream.write_all(whole(tags).as_bytes());
+                    }
+                    _ => {
+                        if path == "/api/pull" {
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+                            );
+                        }
+                        flag.store(true, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_secs(60));
+                    }
+                }
+            });
+        }
+    });
+    (url, reached)
+}
+
+/// A pause from a second process ends a download or an index the CLI is running, and the
+/// command says `paused`, not `cancelled` and not a manual-work error.
+#[tokio::test]
+async fn pause_from_a_second_process_stops_ai_pull_and_ai_index() {
+    use std::process::Stdio;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    for args in [vec!["ai", "pull", "gemma3:4b"], vec!["ai", "index"]] {
+        let (_dir, home) = fresh_home();
+        let (url, reached) = fake_ollama();
+        ok(
+            &home,
+            &["kb", "add", "experience", "Shipped the Rust compiler"],
+        );
+        let db = Db::open(&AppPaths::new(&home)).await.unwrap();
+        jobpilot_core::settings::set(&db, "ai.ollama_url", &serde_json::json!(url))
+            .await
+            .unwrap();
+        jobpilot_core::settings::set(&db, "ai.embedding_model", &serde_json::json!("gemma3:4b"))
+            .await
+            .unwrap();
+        db.close().await;
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_jobpilot"))
+            .args(&args)
+            .env("JOBPILOT_HOME", &home)
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !reached.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "{args:?} never reached the server"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        ok(&home, &["pause", "set"]);
+        let paused_at = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                paused_at.elapsed() < Duration::from_secs(5),
+                "{args:?} ignored the pause"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let mut stderr = String::new();
+        std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+        assert_eq!(status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(stderr.contains("error[paused]"), "{args:?}: {stderr}");
+    }
+}
+
+#[tokio::test]
+async fn ai_index_while_paused_says_paused() {
+    let (_dir, home) = fresh_home();
+    ok(
+        &home,
+        &["kb", "add", "experience", "Shipped the Rust compiler"],
+    );
+    let db = Db::open(&AppPaths::new(&home)).await.unwrap();
+    jobpilot_core::settings::set(&db, "ai.embedding_model", &serde_json::json!("gemma3:4b"))
+        .await
+        .unwrap();
+    db.close().await;
+    ok(&home, &["pause", "set"]);
+    let refused = run(&home, &["ai", "index"]);
+    assert_eq!(refused.status.code(), Some(1));
+    let text = stderr_text(&refused);
+    assert!(text.starts_with("error[paused]"), "{text}");
+}

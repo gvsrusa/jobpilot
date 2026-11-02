@@ -2,7 +2,7 @@ import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import type { PauseState } from "./lib/ipc";
 import { isPauseKey } from "./lib/pause";
-import { backend, count, recovery, renderApp } from "./test-utils";
+import { backend, count, READY, recovery, renderApp } from "./test-utils";
 
 const VIEWS = ["Status", "Documents", "Data", "Profile", "Resumes", "AI", "Applications", "Memory", "Agents"];
 const PAUSED = "Paused. Nothing automated runs.";
@@ -177,4 +177,50 @@ describe("emergency pause", () => {
     await waitFor(() => expect(screen.getByText(PAUSED)).toBeInTheDocument());
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
+
+  it("the_shortcut_is_consumed_so_the_page_never_sees_it", async () => {
+    backend({ pause_status: () => OFF, pause_set: () => ON });
+    renderApp();
+    await screen.findByRole("heading", { name: "Status" });
+    const handled = fireEvent.keyDown(document.body, { key: "H", ctrlKey: true, shiftKey: true });
+    expect(handled, "preventDefault was called").toBe(false);
+    const other = fireEvent.keyDown(document.body, { key: "J", ctrlKey: true, shiftKey: true });
+    expect(other).toBe(true);
+  });
+
+  it("pausing_and_clearing_refresh_the_run_list", async () => {
+    const api = backend();
+    const { user } = renderApp();
+    await openView(user, "Agents");
+    await waitFor(() => expect(count(api, "agents_list")).toBe(1));
+
+    await user.keyboard(KEYS);
+    await waitFor(() => expect(count(api, "agents_list")).toBe(2));
+
+    await user.click(await screen.findByRole("button", { name: "Clear pause" }));
+    await waitFor(() => expect(count(api, "agents_list")).toBe(3));
+  });
+
+  it("the_no_data_alert_goes_away_once_data_opens", async () => {
+    let open = false;
+    const unavailable = { code: "unavailable", message: "not available" };
+    backend({
+      status: () => (open ? READY : recovery("schema_too_new")),
+      pause_status: () => (open ? OFF : Promise.reject(unavailable)),
+      pause_set: () => Promise.reject(unavailable),
+    });
+    const { user, client } = renderApp();
+    await screen.findByText(/newer JobPilot/);
+    await user.keyboard(KEYS);
+    await screen.findByText("No data is open, so nothing is running.");
+
+    open = true;
+    await client.invalidateQueries({ queryKey: ["status"] });
+
+    await waitFor(
+      () => expect(screen.queryByText("No data is open, so nothing is running.")).not.toBeInTheDocument(),
+      { timeout: 4000 },
+    );
+    expect(screen.getByRole("button", { name: "Emergency pause" })).toBeInTheDocument();
+  }, 8000);
 });
