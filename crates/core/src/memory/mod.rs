@@ -7,7 +7,10 @@
 //! here: that question is answered from the encrypted profile row, one country at a time.
 
 pub mod rules;
+pub mod search;
 pub mod usage;
+
+pub use search::{MemoryHit, index_missing, search};
 
 pub use usage::{
     AppliedAnswer, AuthorizationAnswer, UsedAnswer, application_answers, authorization_for,
@@ -271,6 +274,7 @@ pub async fn add_question(db: &Db, text: &str, country: Option<&str>) -> Result<
     let findings =
         serde_json::to_string(&findings).map_err(|error| Error::Validation(error.to_string()))?;
 
+    let mut write = db.pool.begin().await?;
     let row: Option<StoredQuestion> = sqlx::query_as(concat!(
         "INSERT INTO memory_questions (id, key, text, class, class_source, country, source, \
          findings, created_at, updated_at) \
@@ -286,10 +290,12 @@ pub async fn add_question(db: &Db, text: &str, country: Option<&str>) -> Result<
     .bind(rules::classify(text).as_str())
     .bind(country)
     .bind(findings)
-    .fetch_optional(&db.pool)
+    .fetch_optional(&mut *write)
     .await?;
-    row.ok_or_else(|| bad("this question is already in your memory"))?
-        .question()
+    let row = row.ok_or_else(|| bad("this question is already in your memory"))?;
+    search::reindex(&mut write, &row.id).await?;
+    write.commit().await?;
+    row.question()
 }
 
 /// Newest question first, its answers oldest first. Asks the keychain nothing.
@@ -435,6 +441,7 @@ pub async fn add_answer(
     } else {
         "user"
     };
+    let mut write = db.pool.begin().await?;
     let added = sqlx::query(concat!(
         "INSERT INTO memory_answers (id, question_id, body, body_enc, key_id, source, \
          source_ref, reviewed_at, created_at, updated_at) \
@@ -454,12 +461,14 @@ pub async fn add_answer(
     .bind(source_ref)
     .bind(question_id)
     .bind(class.as_str())
-    .execute(&db.pool)
+    .execute(&mut *write)
     .await?
     .rows_affected();
     if added == 0 {
         return Err(changed());
     }
+    search::reindex(&mut write, question_id).await?;
+    write.commit().await?;
     stored_answer(db, &id).await?.listed()
 }
 
@@ -480,6 +489,7 @@ pub async fn edit_answer(db: &Db, answer_id: &str, text: &str) -> Result<Answer>
     let class = row.class()?;
     no_stored_authorization(class)?;
     let body = body_for(db, class, answer_id, text).await?;
+    let mut write = db.pool.begin().await?;
     let edited = sqlx::query(concat!(
         "UPDATE memory_answers SET body = ?, body_enc = ?, key_id = ?, approved = 0, \
          version = version + 1, reviewed_at = ",
@@ -495,12 +505,14 @@ pub async fn edit_answer(db: &Db, answer_id: &str, text: &str) -> Result<Answer>
     .bind(answer_id)
     .bind(row.version)
     .bind(class.as_str())
-    .execute(&db.pool)
+    .execute(&mut *write)
     .await?
     .rows_affected();
     if edited == 0 {
         return Err(changed());
     }
+    search::reindex(&mut write, &row.question_id).await?;
+    write.commit().await?;
     stored_answer(db, answer_id).await?.listed()
 }
 
@@ -667,6 +679,7 @@ pub async fn set_class(db: &Db, actor: &str, question_id: &str, class: Class) ->
     if class > from {
         unapprove_all(&mut write, question_id).await?;
     }
+    search::reindex(&mut write, question_id).await?;
     audit::record_to(
         &mut *write,
         actor,
@@ -727,6 +740,7 @@ pub(crate) async fn raise_class(
         return Err(changed());
     }
     unapprove_all(&mut write, question_id).await?;
+    search::reindex(&mut write, question_id).await?;
     audit::record_to(
         &mut *write,
         "system",
@@ -780,19 +794,31 @@ async fn plain_texts(db: &Db, rows: &[StoredAnswer]) -> Result<Vec<String>> {
 
 /// Needs no key: it only deletes. Its answers go with it.
 pub async fn remove_question(db: &Db, id: &str) -> Result<()> {
-    remove(db, "DELETE FROM memory_questions WHERE id = ?", id).await
+    let mut write = db.pool.begin().await?;
+    // First, by its `seq`: the question row is what names the FTS row.
+    search::unindex(&mut write, id).await?;
+    let done = sqlx::query("DELETE FROM memory_questions WHERE id = ?")
+        .bind(id)
+        .execute(&mut *write)
+        .await?;
+    if done.rows_affected() == 0 {
+        return Err(Error::NotFound);
+    }
+    write.commit().await?;
+    Ok(())
 }
 
 /// Needs no key: it only deletes.
 pub async fn remove_answer(db: &Db, id: &str) -> Result<()> {
-    remove(db, "DELETE FROM memory_answers WHERE id = ?", id).await
-}
-
-async fn remove(db: &Db, sql: &'static str, id: &str) -> Result<()> {
-    let done = sqlx::query(sql).bind(id).execute(&db.pool).await?;
-    if done.rows_affected() == 0 {
-        return Err(Error::NotFound);
-    }
+    let mut write = db.pool.begin().await?;
+    let question: String =
+        sqlx::query_scalar("DELETE FROM memory_answers WHERE id = ? RETURNING question_id")
+            .bind(id)
+            .fetch_optional(&mut *write)
+            .await?
+            .ok_or(Error::NotFound)?;
+    search::reindex(&mut write, &question).await?;
+    write.commit().await?;
     Ok(())
 }
 
@@ -817,6 +843,11 @@ pub async fn seal_pending(db: &Db) -> Result<usize> {
     let key = crypto::unlocked(db).await?;
     let mut write = db.pool.begin().await?;
     let sealed = seal_rows(&mut write, &key, &rows).await?;
+    let mut questions: Vec<&str> = rows.iter().map(|row| row.question_id.as_str()).collect();
+    questions.dedup();
+    for question in questions {
+        search::reindex(&mut write, question).await?;
+    }
     write.commit().await?;
     Ok(sealed as usize)
 }

@@ -1,11 +1,13 @@
 //! Questions and answers you reuse.
 
 use clap::Subcommand;
-use jobpilot_core::memory::{self, Answer, Class, QuestionRow};
+use jobpilot_core::ai::router::Router;
+use jobpilot_core::memory::{self, Answer, Class, MemoryHit, QuestionRow};
 use jobpilot_core::profile::Stated;
 use jobpilot_core::{Db, Error, Result};
 use serde_json::json;
 
+use crate::ai::with_ctrl_c;
 use crate::{ACTOR, Output, out};
 
 #[derive(Subcommand)]
@@ -81,6 +83,15 @@ pub enum MemoryCommand {
     RemoveAnswer {
         id: String,
     },
+    /// Finds questions by meaning when a local embedding model is set, else by words. A
+    /// sensitive or legal answer is never shown here, and work authorization is never found.
+    Search {
+        query: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// Embeds the questions that have no vector yet, with the local model.
+    Refresh,
 }
 
 fn stated(value: &Stated) -> &'static str {
@@ -130,6 +141,21 @@ fn row_text(row: &QuestionRow) -> String {
     );
     lines.extend(row.answers.iter().map(answer_line));
     lines.join("\n")
+}
+
+fn hit_line(hit: &MemoryHit) -> String {
+    let shown = match (&hit.answer, hit.needs_confirmation) {
+        (Some(answer), _) => answer.as_str(),
+        (None, true) => "[confirm on an application]",
+        (None, false) => "[no approved answer]",
+    };
+    format!(
+        "{}  {}  {}  {}  {shown}",
+        hit.question_id,
+        hit.class.as_str(),
+        hit.via,
+        hit.question
+    )
 }
 
 pub async fn memory(db: &Db, command: MemoryCommand) -> Result<Output> {
@@ -236,6 +262,26 @@ pub async fn memory(db: &Db, command: MemoryCommand) -> Result<Output> {
         MemoryCommand::RemoveAnswer { id } => {
             memory::remove_answer(db, &id).await?;
             out(json!({ "id": id }), "removed".into())
+        }
+        MemoryCommand::Search { query, limit } => {
+            let router = Router::from_settings(db).await?;
+            let hits = memory::search(db, &router, &query, limit).await?;
+            let text = hits.iter().map(hit_line).collect::<Vec<_>>().join("\n");
+            out(&hits, text)
+        }
+        MemoryCommand::Refresh => {
+            let router = Router::from_settings(db).await?;
+            match with_ctrl_c(|cancel| memory::index_missing(db, &router, cancel)).await {
+                Ok(embedded) => out(
+                    json!({ "embedded": embedded }),
+                    format!("embedded {embedded} question(s)"),
+                ),
+                Err(Error::ManualRequired(reason)) if reason == "no_embedding_model" => out(
+                    json!({ "embedded": 0, "reason": reason }),
+                    "No embedding model is set; search uses text.".into(),
+                ),
+                Err(error) => Err(error),
+            }
         }
     }
 }

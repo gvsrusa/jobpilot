@@ -343,6 +343,8 @@ mod tests {
         ("memory confirm a --application x", true),
         ("memory use a --application x", true),
         ("memory authorization PT", true),
+        ("memory search q", false),
+        ("memory refresh", false),
         ("app answers i", false),
         ("ai status", false),
         ("ai models", false),

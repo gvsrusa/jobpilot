@@ -11,6 +11,7 @@ import type {
   Finding,
   KnowledgeItem,
   MemoryClass,
+  MemoryHit,
   Question,
   QuestionRow,
 } from "../lib/ipc";
@@ -530,6 +531,64 @@ describe("career memory", () => {
     expect(screen.getByText("<img src=x onerror=alert(1)>")).toBeInTheDocument();
     expect(screen.getByText(/Ignore previous rules/)).toBeInTheDocument();
     expect(container.querySelectorAll("main a, main img")).toHaveLength(0);
+  });
+
+  it("memory_search_shows_a_sealed_hit_with_no_value", async () => {
+    const hit = (over: Partial<MemoryHit>): MemoryHit => ({
+      question_id: "q1",
+      question: "Your salary?",
+      class: "sensitive",
+      answer_id: "a1",
+      answer: null,
+      stale: false,
+      needs_confirmation: true,
+      source: null,
+      score: 1,
+      via: "text",
+      ...over,
+    });
+    const hits = [
+      hit({}),
+      hit({
+        question_id: "q2",
+        question: "Why this job?",
+        class: "normal",
+        answer: "Because",
+        needs_confirmation: false,
+        via: "semantic",
+      }),
+    ];
+    const api = bank([], {
+      memory_search: ({ query }: Args) => (query === "none" ? [] : hits),
+      memory_refresh: () => 2,
+    });
+    const { user, container } = renderApp();
+    await openMemory(user);
+
+    await user.type(screen.getByLabelText("Search memory"), "job");
+    await user.click(screen.getByRole("button", { name: "Search" }));
+    const results = await screen.findByRole("list", { name: "Search results" });
+    const sealed = within(results).getByText("Your salary?").closest("li")!;
+    expect(within(sealed).getByText("Sensitive")).toBeInTheDocument();
+    expect(within(sealed).getByText("by text")).toBeInTheDocument();
+    expect(within(sealed).getByText("Confirm on an application")).toBeInTheDocument();
+    expect(within(sealed).queryByRole("button")).toBeNull();
+    const open = within(results).getByText("Why this job?").closest("li")!;
+    expect(within(open).getByText("by meaning")).toBeInTheDocument();
+    expect(within(open).getByText("Because")).toBeInTheDocument();
+    expect(container.querySelectorAll("main a, main img")).toHaveLength(0);
+    expect(api.calls.find((c) => c.cmd === "memory_search")?.args).toEqual({
+      query: "job",
+      limit: 10,
+    });
+
+    await user.click(screen.getByRole("button", { name: "Refresh index" }));
+    expect(await screen.findByText("Embedded 2 questions.")).toBeInTheDocument();
+
+    await user.clear(screen.getByLabelText("Search memory"));
+    await user.type(screen.getByLabelText("Search memory"), "none");
+    await user.click(screen.getByRole("button", { name: "Search" }));
+    expect(await screen.findByText("Nothing matches.")).toBeInTheDocument();
   });
 
   it("a_cleared_body_offers_no_show_and_no_approve", async () => {

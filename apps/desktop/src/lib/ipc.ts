@@ -158,6 +158,21 @@ export type Answer = {
 
 export type QuestionRow = { question: Question; answers: Answer[] };
 
+/** One search hit. `answer` is set only for an approved answer of the normal class; a sealed
+ * class has none and needs a confirmation on an application. Render text only. */
+export type MemoryHit = {
+  question_id: string;
+  question: string;
+  class: MemoryClass;
+  answer_id: string | null;
+  answer: string | null;
+  stale: boolean;
+  needs_confirmation: boolean;
+  source: string | null;
+  score: number;
+  via: "semantic" | "text";
+};
+
 /** What `memoryUse` returns. The only place an answer's text reaches the screen for an
  * application. Render it as text only. */
 export type UsedAnswer = {
@@ -399,6 +414,10 @@ export const ipc = {
     invoke<AuthorizationAnswer>("memory_authorization", { country }),
   memoryRemoveQuestion: (id: string) => invoke<void>("memory_remove_question", { id }),
   memoryRemoveAnswer: (id: string) => invoke<void>("memory_remove_answer", { id }),
+  memorySearch: (query: string, limit: number) =>
+    invoke<MemoryHit[]>("memory_search", { query, limit }),
+  /** Embeds the questions with no vector yet. Zero when no embedding model is set. */
+  memoryRefresh: () => invoke<number>("memory_refresh"),
 
   /** Rust opens the picker. Rejects with `cancelled` when the user closes it. */
   resumeImport: () => invoke<Imported>("resume_import"),

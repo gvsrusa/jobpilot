@@ -238,6 +238,83 @@ function QuestionCard({
   );
 }
 
+const SEARCH_LIMIT = 10;
+
+/** Hits show the question and, for a normal class, its approved answer. A sealed class
+ * never shows a value here: it is confirmed on an application. All of it is inert text. */
+function SearchSection() {
+  const id = useId();
+  const [query, setQuery] = useState("");
+  const [asked, setAsked] = useState<string | null>(null);
+  const search = useMutation({
+    mutationFn: (q: string) => ipc.memorySearch(q, SEARCH_LIMIT),
+    onSuccess: (_hits, q) => setAsked(q),
+  });
+  const refresh = useMutation({ mutationFn: ipc.memoryRefresh });
+  const hits = search.data ?? [];
+
+  return (
+    <section aria-label="Search" className="grid gap-2">
+      <form
+        className="flex flex-wrap items-end gap-2"
+        role="search"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (query.trim() && !search.isPending) search.mutate(query);
+        }}
+      >
+        <div className="grid gap-1.5">
+          <Label htmlFor={`${id}-q`}>Search memory</Label>
+          <Input id={`${id}-q`} value={query} onChange={(e) => setQuery(e.target.value)} />
+        </div>
+        <Button type="submit" variant="outline" disabled={!query.trim() || search.isPending}>
+          Search
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          disabled={refresh.isPending}
+          onClick={() => refresh.mutate()}
+        >
+          {refresh.isPending ? "Refreshing..." : "Refresh index"}
+        </Button>
+      </form>
+      <ErrorAlert error={search.error ?? refresh.error} />
+      {refresh.isSuccess && (
+        <p role="status" className="text-sm text-muted-foreground">
+          {refresh.data === 0
+            ? "Nothing new to embed. Search uses text when no embedding model is set."
+            : `Embedded ${refresh.data} question${refresh.data === 1 ? "" : "s"}.`}
+        </p>
+      )}
+      {asked !== null && hits.length === 0 && (
+        <p className="text-sm text-muted-foreground">Nothing matches.</p>
+      )}
+      {hits.length > 0 && (
+        <ul aria-label="Search results" className="grid gap-2">
+          {hits.map((hit) => (
+            <li key={hit.question_id} className="grid gap-1 rounded border p-2 text-sm">
+              <span className="font-medium whitespace-pre-wrap select-text">{hit.question}</span>
+              <span className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                <span className="rounded border px-1.5 py-0.5">{LABELS[hit.class]}</span>
+                <span>{hit.via === "semantic" ? "by meaning" : "by text"}</span>
+                {hit.stale && hit.answer !== null && <span>Stale</span>}
+              </span>
+              {hit.answer !== null ? (
+                <span className="whitespace-pre-wrap select-text">{hit.answer}</span>
+              ) : hit.needs_confirmation ? (
+                <span className="text-muted-foreground">Confirm on an application</span>
+              ) : (
+                <span className="text-muted-foreground">No approved answer</span>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
 export function MemoryView() {
   const refresh = useRefresh();
   const [filter, setFilter] = useState<MemoryClass | "">("");
@@ -272,6 +349,7 @@ export function MemoryView() {
     <div className="grid max-w-3xl gap-4">
       <PageHeading>Career memory</PageHeading>
       <ErrorAlert error={rows.error ?? items.error} />
+      <SearchSection />
       <div className="flex items-center gap-3">
         <Label htmlFor="memory-filter">Filter by class</Label>
         <select

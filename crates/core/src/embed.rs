@@ -28,7 +28,7 @@ fn no_model() -> Error {
     Error::ManualRequired("no_embedding_model".into())
 }
 
-async fn model_setting(db: &Db) -> Result<String> {
+pub(crate) async fn model_setting(db: &Db) -> Result<String> {
     settings::get(db, "ai.embedding_model")
         .await?
         .and_then(|value| value.as_str().map(str::to_string))
@@ -38,7 +38,7 @@ async fn model_setting(db: &Db) -> Result<String> {
 
 /// A reply the caller can trust to line up with its inputs. The router checks this too;
 /// a vector stored against the wrong item would poison every later search.
-fn check(vectors: &[Vec<f32>], inputs: usize) -> Result<usize> {
+pub(crate) fn check(vectors: &[Vec<f32>], inputs: usize) -> Result<usize> {
     let dims = vectors.first().map_or(0, Vec::len);
     let sound = vectors.len() == inputs
         && dims > 0

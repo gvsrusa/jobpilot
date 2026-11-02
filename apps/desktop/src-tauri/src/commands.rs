@@ -24,7 +24,8 @@ use jobpilot_core::embed::{self, Hit};
 use jobpilot_core::generate::{self, Generated};
 use jobpilot_core::knowledge::{self, JobText, KnowledgeItem};
 use jobpilot_core::memory::{
-    self, Answer, AppliedAnswer, AuthorizationAnswer, Class, Question, QuestionRow, UsedAnswer,
+    self, Answer, AppliedAnswer, AuthorizationAnswer, Class, MemoryHit, Question, QuestionRow,
+    UsedAnswer,
 };
 use jobpilot_core::parse::{self, Imported};
 use jobpilot_core::profile::{self, Profile, ProfileBasic, WorkAuthorization};
@@ -103,6 +104,8 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         memory_authorization,
         memory_remove_question,
         memory_remove_answer,
+        memory_search,
+        memory_refresh,
         resume_import,
         resume_list,
         resume_versions,
@@ -778,6 +781,32 @@ pub async fn memory_remove_question(state: State<'_, AppState>, id: String) -> R
 #[tauri::command]
 pub async fn memory_remove_answer(state: State<'_, AppState>, id: String) -> Result<()> {
     memory::remove_answer(&*state.work().await?, &id).await
+}
+
+/// By meaning when a local model is set up, else by words. A sealed answer's text is never
+/// in a hit.
+#[tauri::command]
+pub async fn memory_search(
+    state: State<'_, AppState>,
+    query: String,
+    limit: usize,
+) -> Result<Vec<MemoryHit>> {
+    let db = state.work().await?;
+    let router = Router::from_settings(&db).await?;
+    memory::search(&db, &router, &query, limit).await
+}
+
+/// Embeds the questions with no vector yet. With no embedding model it embeds none: search
+/// still works by words.
+#[tauri::command]
+pub async fn memory_refresh(state: State<'_, AppState>) -> Result<usize> {
+    let running = state.ai.begin()?;
+    let db = state.work().await?;
+    let router = Router::from_settings(&db).await?;
+    match memory::index_missing(&db, &router, running.token.clone()).await {
+        Err(Error::ManualRequired(reason)) if reason == "no_embedding_model" => Ok(0),
+        done => done,
+    }
 }
 
 /// The path comes from the picker: the webview never names a file to read. Closing the
@@ -2284,6 +2313,8 @@ mod tests {
         "memory_authorization",
         "memory_remove_question",
         "memory_remove_answer",
+        "memory_search",
+        "memory_refresh",
         "resume_import",
         "resume_list",
         "resume_versions",
@@ -3403,6 +3434,46 @@ mod tests {
     }
 
     #[test]
+    fn memory_search_reaches_core() {
+        let h = ready();
+        let found = h.ok(
+            "memory_add_question",
+            json!({ "text": "Describe your leadership style", "country": null }),
+        );
+        let found = found["id"].as_str().unwrap().to_owned();
+        let answer = h.ok(
+            "memory_add_answer",
+            json!({ "questionId": found, "text": "I mentor", "sourceRef": null }),
+        );
+        h.ok(
+            "memory_approve",
+            json!({ "answerId": answer["id"], "approved": true }),
+        );
+        let authorization = h.ok(
+            "memory_add_question",
+            json!({ "text": "Are you authorized to work in the US?", "country": "US" }),
+        );
+        assert_eq!(authorization["class"], "work_authorization");
+
+        let hits = h.ok(
+            "memory_search",
+            json!({ "query": "leadership", "limit": 5 }),
+        );
+        assert_eq!(hits.as_array().unwrap().len(), 1);
+        assert_eq!(hits[0]["question_id"], found.as_str());
+        assert_eq!(hits[0]["via"], "text");
+        assert_eq!(hits[0]["answer"], "I mentor");
+        let none = h.ok(
+            "memory_search",
+            json!({ "query": "authorized", "limit": 5 }),
+        );
+        assert!(none.as_array().unwrap().is_empty());
+
+        // With no embedding model the refresh embeds nothing and is not an error.
+        assert_eq!(h.ok("memory_refresh", json!({})), 0);
+    }
+
+    #[test]
     fn approving_a_sealed_class_answer_asks_natively() {
         let h = ready();
         let question = seal_answer_without_a_key(&h, "sensitive", "s1");
@@ -3630,6 +3701,26 @@ mod tests {
     }
 
     #[test]
+    fn confirm_use_refuses_an_unapproved_answer_before_any_dialog() {
+        let h = ready();
+        let (id, app) = waiting_sensitive_answer(&h);
+        with_db(&h, |db| async move {
+            sqlx::query("UPDATE memory_answers SET approved = 0")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        });
+
+        let refused = h.call(
+            "memory_confirm_use",
+            json!({ "answerId": id, "applicationId": app }),
+        );
+
+        assert_eq!(code_of(refused), "refused");
+        assert!(h.asked().is_empty());
+    }
+
+    #[test]
     fn memory_authorization_reads_the_profile_by_country() {
         let h = ready();
         let none = h.ok("memory_authorization", json!({ "country": "ca" }));
@@ -3658,26 +3749,6 @@ mod tests {
         );
         let unknown = h.call("memory_reveal", json!({ "answerId": "nope" }));
         assert_eq!(code_of(unknown), "not_found");
-        assert!(h.asked().is_empty());
-    }
-
-    #[test]
-    fn confirm_use_refuses_an_unapproved_answer_before_any_dialog() {
-        let h = ready();
-        let (id, app) = waiting_sensitive_answer(&h);
-        with_db(&h, |db| async move {
-            sqlx::query("UPDATE memory_answers SET approved = 0")
-                .execute(&db.pool)
-                .await
-                .unwrap();
-        });
-
-        let refused = h.call(
-            "memory_confirm_use",
-            json!({ "answerId": id, "applicationId": app }),
-        );
-
-        assert_eq!(code_of(refused), "refused");
         assert!(h.asked().is_empty());
     }
 

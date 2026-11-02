@@ -59,7 +59,7 @@ async fn export_covers_every_user_table() {
 
     let expected: BTreeSet<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_master WHERE type = 'table' \
-         AND name NOT GLOB '_sqlx_*' AND name NOT GLOB 'documents_fts*'",
+         AND name NOT GLOB '_sqlx_*' AND name NOT GLOB 'documents_fts*' AND name NOT GLOB 'memory_fts*'",
     )
     .fetch_all(&db.pool)
     .await

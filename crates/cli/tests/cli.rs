@@ -1121,3 +1121,54 @@ fn panel_refuses_confirm_use_and_authorization() {
         stderr_text(&listed)
     );
 }
+
+#[test]
+fn memory_search_by_text_with_no_model() {
+    let (_dir, home) = fresh_home();
+    let added = stdout_json(&run(
+        &home,
+        &[
+            "memory",
+            "add-question",
+            "Describe your leadership style",
+            "--json",
+        ],
+    ));
+    let question = added["id"].as_str().unwrap().to_string();
+    let answer = stdout_json(&run(
+        &home,
+        &["memory", "add-answer", &question, "I mentor", "--json"],
+    ));
+    ok(
+        &home,
+        &["memory", "approve", answer["id"].as_str().unwrap()],
+    );
+    stdout_json(&run(
+        &home,
+        &[
+            "memory",
+            "add-question",
+            "Are you authorized to work in the US?",
+            "--country",
+            "US",
+            "--json",
+        ],
+    ));
+
+    let found = stdout_json(&run(&home, &["memory", "search", "leadership", "--json"]));
+    assert_eq!(found.as_array().unwrap().len(), 1);
+    assert_eq!(found[0]["question_id"], question.as_str());
+    assert_eq!(found[0]["via"], "text");
+    assert_eq!(found[0]["answer"], "I mentor");
+    // Work authorization is never found, whatever the words.
+    let none = stdout_json(&run(&home, &["memory", "search", "authorized", "--json"]));
+    assert!(none.as_array().unwrap().is_empty());
+
+    // With no model, refresh says so and succeeds.
+    let refreshed = run(&home, &["memory", "refresh"]);
+    assert!(refreshed.status.success());
+    assert!(
+        String::from_utf8_lossy(&refreshed.stdout)
+            .contains("No embedding model is set; search uses text.")
+    );
+}
