@@ -3405,3 +3405,36 @@ fn job_prefs_set_then_show_keeps_the_other_value() {
     let bad = run(&home, &["job", "prefs", "set", "--seniority", "boss"]);
     assert!(stderr_text(&bad).starts_with("error[validation]"));
 }
+
+#[tokio::test]
+async fn a_cut_job_list_says_how_many_are_shown() {
+    use jobpilot_core::jobs::{PastedJob, import_pasted};
+    let (_dir, home) = fresh_home();
+    let db = Db::open(&AppPaths::new(&home)).await.unwrap();
+    for n in 0..201 {
+        let job = PastedJob {
+            title: format!("Role {n}"),
+            company: format!("Company {n}"),
+            url: None,
+            text: format!("Work number {n}."),
+        };
+        import_pasted(&db, job).await.unwrap();
+    }
+    db.close().await;
+    let said = "200 of 201 shown. Narrow with --country, --mode, or --min-pay.";
+    let text = stdout_of(&run(&home, &["job", "list"]));
+    assert!(text.contains(said), "{text}");
+    let json = stdout_json(&run(&home, &["job", "list", "--json"]));
+    assert_eq!(
+        json.as_array().unwrap().len(),
+        200,
+        "the shape stays a list"
+    );
+    let search = stdout_of(&run(&home, &["job", "search", "Work"]));
+    assert!(
+        search.contains("200 of 201 shown. Narrow the query."),
+        "{search}"
+    );
+    let few = stdout_of(&run(&home, &["job", "search", "199"]));
+    assert!(!few.contains(" shown."), "{few}");
+}

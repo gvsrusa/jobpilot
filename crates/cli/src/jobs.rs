@@ -221,8 +221,16 @@ fn job_line(job: &Job) -> String {
     line
 }
 
-fn jobs_out(jobs: Vec<Job>) -> Result<Output> {
-    let text = jobs.iter().map(job_line).collect::<Vec<_>>().join("\n");
+/// Lists what matched, the first `LIST_LIMIT` of it. A cut says so in the text; the JSON stays
+/// the list. `narrow` finishes the sentence that tells the person how to cut it down.
+async fn listed(db: &Db, filter: &JobFilter, narrow: &str) -> Result<Output> {
+    let mut jobs = core::list(db, filter, i64::MAX).await?;
+    let total = jobs.len();
+    jobs.truncate(LIST_LIMIT as usize);
+    let mut text = jobs.iter().map(job_line).collect::<Vec<_>>().join("\n");
+    if total > jobs.len() {
+        text.push_str(&format!("\n{} of {total} shown. {narrow}", jobs.len()));
+    }
     out(jobs, text)
 }
 
@@ -685,14 +693,14 @@ pub async fn job(db: &Db, command: JobCommand) -> Result<Output> {
                 query: None,
                 include_duplicates: all,
             };
-            jobs_out(core::list(db, &filter, LIST_LIMIT).await?)
+            listed(db, &filter, "Narrow with --country, --mode, or --min-pay.").await
         }
         JobCommand::Search { query } => {
             let filter = JobFilter {
                 query: Some(query),
                 ..JobFilter::default()
             };
-            jobs_out(core::list(db, &filter, LIST_LIMIT).await?)
+            listed(db, &filter, "Narrow the query.").await
         }
         JobCommand::Show { id } => {
             let detail = core::detail(db, &id).await?;

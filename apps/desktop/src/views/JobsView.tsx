@@ -447,6 +447,11 @@ function List({
             onOpen={onOpen}
             onImport={() => setImporting(true)}
           />
+          {jobs.data.length === LIMIT && (
+            <p className="text-xs text-muted-foreground">
+              The first {LIMIT} jobs are shown. Narrow with the country, mode, or pay filters.
+            </p>
+          )}
         </>
       )}
       {statuses.isSuccess && <Sources statuses={statuses.data} onFetched={() => rescore()} />}

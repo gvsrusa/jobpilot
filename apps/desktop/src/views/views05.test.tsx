@@ -163,6 +163,19 @@ describe("Jobs screen", () => {
     expect(container.querySelector("main a")).toBeNull();
   });
 
+  it("says when the list is cut at 200 jobs", async () => {
+    jobsBackend(Array.from({ length: 200 }, (_, i) => job({ id: `j${i}`, title: `Role ${i}` })));
+    await openJobs();
+    expect(await screen.findByText(/The first 200 jobs are shown\. Narrow with the country, mode, or pay filters\./)).toBeInTheDocument();
+  });
+
+  it("says nothing of a cut below 200 jobs", async () => {
+    jobsBackend(Array.from({ length: 199 }, (_, i) => job({ id: `j${i}`, title: `Role ${i}` })));
+    await openJobs();
+    await screen.findByRole("row", { name: /Role 0\b/ });
+    expect(screen.queryByText(/jobs are shown/)).toBeNull();
+  });
+
   it("shows -- and the reason when a job has no score", async () => {
     jobsBackend([job({ id: "n1", score: null, title: "Data Eng", company: "Gamma" })]);
     await openJobs();
