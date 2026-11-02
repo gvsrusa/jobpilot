@@ -419,6 +419,12 @@ fn no_permission_names_a_forbidden_power() {
         Model(TaskType::ClassifyAnswer),
         Model(TaskType::Embed),
         EmbedLocal,
+        ReadMatches,
+        WriteJobs,
+        WriteMatches,
+        WriteCompanyNotes,
+        WriteJobFields,
+        NetConnector,
     ];
     for permission in all {
         let name = format!("{permission:?}").to_lowercase();

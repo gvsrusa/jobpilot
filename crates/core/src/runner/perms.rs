@@ -23,6 +23,13 @@ pub enum Permission {
     WriteReports,
     Model(TaskType),
     EmbedLocal,
+    ReadMatches,
+    WriteJobs,
+    WriteMatches,
+    WriteCompanyNotes,
+    WriteJobFields,
+    /// Reads a connector's declared endpoints, through the `Fetcher` only: no other socket.
+    NetConnector,
 }
 
 use Permission::*;

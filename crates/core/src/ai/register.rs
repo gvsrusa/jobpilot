@@ -228,3 +228,23 @@ pub fn register_date() -> String {
     let date = line.split_once(DATE_LABEL).map_or("", |(_, rest)| rest);
     date.split('.').next().unwrap_or_default().to_string()
 }
+
+const VERDICT_CELL: usize = 5;
+
+/// A connector's row of the vendor table: its verdict and Date read, backticks stripped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SiteRow {
+    pub verdict: String,
+    pub date_read: String,
+}
+
+pub(crate) fn site_row(register: &str, integration: &str, op: &str) -> Option<SiteRow> {
+    let cells = register
+        .lines()
+        .map(cells)
+        .find(|cells| cells.len() > VERDICT_CELL && cells[0] == integration && cells[1] == op)?;
+    Some(SiteRow {
+        verdict: cells[VERDICT_CELL].replace('`', ""),
+        date_read: cells[DATE_READ_CELL].replace('`', ""),
+    })
+}

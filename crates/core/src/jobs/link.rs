@@ -16,7 +16,8 @@ pub enum LinkRoute {
 }
 
 /// The route for an `http` or `https` link. The host decides: it is what follows the scheme
-/// and any user info, up to the port, and a suffix counts only on a dot boundary.
+/// and any user info, up to the port, and a suffix counts only on a dot boundary or as the whole
+/// host. A backslash ends the authority, as a browser reads it.
 pub fn route(url: &str) -> Result<LinkRoute> {
     let (host, path) = split(url)?;
     let first = path.split('/').find(|part| !part.is_empty()).unwrap_or("");
@@ -68,8 +69,10 @@ pub(crate) fn attribution_of(route: &LinkRoute) -> Option<&'static str> {
 }
 
 fn under(host: &str, suffix: &str) -> bool {
-    host.strip_suffix(suffix)
-        .is_some_and(|rest| rest.ends_with('.'))
+    host == suffix
+        || host
+            .strip_suffix(suffix)
+            .is_some_and(|rest| rest.ends_with('.'))
 }
 
 fn bad() -> Error {
@@ -83,7 +86,7 @@ fn split(url: &str) -> Result<(String, String)> {
     if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
         return Err(bad());
     }
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let end = rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len());
     let (authority, path) = rest.split_at(end);
     let authority = authority.rsplit('@').next().unwrap_or("");
     let host = match authority.strip_prefix('[') {
@@ -99,5 +102,6 @@ fn split(url: &str) -> Result<(String, String)> {
         return Err(bad());
     }
     let path = path.split(['?', '#']).next().unwrap_or("");
-    Ok((host, path.to_string()))
+    // A browser reads `\` as `/` in an http link.
+    Ok((host, path.replace('\\', "/")))
 }

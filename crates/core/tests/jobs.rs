@@ -376,3 +376,44 @@ async fn removing_a_job_keeps_a_text_a_draft_cites() {
     assert_eq!(audited, 2);
     db.close().await;
 }
+
+#[test]
+fn a_backslash_ends_the_authority_as_a_browser_reads_it() {
+    // WHATWG reads `\` as `/` in an http link, so the host here is evil.test.
+    assert!(matches!(
+        route("https://evil.test\\@www.indeed.com/x").unwrap(),
+        LinkRoute::CompanyPage
+    ));
+    assert!(matches!(
+        route("https://evil.test\\@jobs.lever.co/acme").unwrap(),
+        LinkRoute::CompanyPage
+    ));
+    // And the real host is the one before it.
+    assert!(matches!(
+        route("https://www.indeed.com\\@evil.test/x").unwrap(),
+        LinkRoute::Indeed
+    ));
+    assert_eq!(
+        route("https://jobs.lever.co\\acme\\1").unwrap(),
+        LinkRoute::Lever {
+            site: "acme".into(),
+            eu: false
+        }
+    );
+}
+
+#[test]
+fn a_bare_apex_routes_to_its_connector() {
+    assert!(matches!(
+        route("https://indeed.com/x").unwrap(),
+        LinkRoute::Indeed
+    ));
+    assert!(matches!(
+        route("https://linkedin.com/jobs/1").unwrap(),
+        LinkRoute::LinkedIn
+    ));
+    assert!(matches!(
+        route("https://myworkdayjobs.com/x").unwrap(),
+        LinkRoute::Workday
+    ));
+}

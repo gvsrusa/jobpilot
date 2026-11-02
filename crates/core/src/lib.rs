@@ -6,6 +6,7 @@ pub mod analytics;
 pub mod applications;
 pub mod audit;
 pub mod backup;
+pub mod connectors;
 pub mod crypto;
 pub mod db;
 pub mod documents;
