@@ -16,6 +16,7 @@ use crate::ai::{BoxFuture, CancellationToken, DataCategory, ProviderId, RUN_REAS
 use crate::db::Db;
 use crate::drafts::ExportFormat;
 use crate::error::{Error, Result};
+use crate::pause;
 use crate::render::Template;
 
 mod perms;
@@ -310,6 +311,7 @@ pub async fn start_with(
     limits: Limits,
 ) -> Result<Finished> {
     person(actor)?;
+    pause::ensure_off(db).await?;
     store::reap(db, limits.stale).await?;
     let agent = workflow.agent();
     let steps = i64::try_from(workflow.steps().len()).unwrap_or(i64::MAX);
@@ -335,6 +337,7 @@ pub async fn resume(
     cancel: CancellationToken,
 ) -> Result<Finished> {
     person(actor)?;
+    pause::ensure_off(db).await?;
     reap_stale(db).await?;
     let stored = store::load(db, run_id).await?;
     let steps = i64::try_from(workflow.steps().len()).unwrap_or(i64::MAX);
@@ -525,6 +528,9 @@ async fn watch(run: &Run<'_>, cancel: &CancellationToken, limits: &Limits) -> bo
         {
             return false;
         }
+        if pause::is_set(run.db).await.unwrap_or(false) {
+            return false;
+        }
         if beat.elapsed() >= limits.beat {
             beat = Instant::now();
             let held = store::heartbeat(run.db, &run.id, run.generation).await;
@@ -567,12 +573,27 @@ async fn drive(
     }
 }
 
-/// Between attempts and steps, where no watch is running: the row can hold a cancel too.
-async fn stop_asked(run: &Run<'_>, ctx: &Ctx<'_>) -> Result<bool> {
+/// Between attempts and steps, where no watch is running: the row can hold a cancel, and the
+/// pause can be on. What stopped the run is the error to end it with. A person's cancel
+/// outranks the pause, and a token fired with the pause on is the pause.
+async fn stop_asked(run: &Run<'_>, ctx: &Ctx<'_>) -> Result<Option<Error>> {
     if store::cancel_requested(run.db, &run.id).await? {
         ctx.cancel.cancel();
+        return Ok(Some(Error::Cancelled));
     }
-    Ok(ctx.cancel.is_cancelled())
+    if pause::is_set(run.db).await? {
+        ctx.cancel.cancel();
+        return Ok(Some(Error::Paused));
+    }
+    Ok(ctx.cancel.is_cancelled().then_some(Error::Cancelled))
+}
+
+/// Whether the pause, not a person's cancel, is why a step ended. A failed read says no.
+async fn paused(run: &Run<'_>) -> bool {
+    let cancelled = store::cancel_requested(run.db, &run.id)
+        .await
+        .unwrap_or(false);
+    !cancelled && pause::is_set(run.db).await.unwrap_or(false)
 }
 
 async fn execute(
@@ -633,8 +654,8 @@ async fn walk(
             ctx.cancel.cancel();
             return run.end(RUN_STEP, ctx, workflow, Error::Timeout).await;
         }
-        if stop_asked(&run, ctx).await? {
-            return run.end(RUN_STEP, ctx, workflow, Error::Cancelled).await;
+        if let Some(stop) = stop_asked(&run, ctx).await? {
+            return run.end(RUN_STEP, ctx, workflow, stop).await;
         }
 
         // A resume has already entered Checking.
@@ -664,13 +685,16 @@ async fn walk(
                     attempt += 1;
                     run.change(RunState::Retrying, def.name, ctx, Some("busy"), None)
                         .await?;
-                    if stop_asked(&run, ctx).await? {
-                        return run.end(def.name, ctx, workflow, Error::Cancelled).await;
+                    if let Some(stop) = stop_asked(&run, ctx).await? {
+                        return run.end(def.name, ctx, workflow, stop).await;
                     }
                 }
                 Err(error) => {
                     let error = if seen.timed_out {
                         Error::Timeout
+                    } else if paused(&run).await {
+                        // Whatever a step says on its way out, the pause stopped it.
+                        Error::Paused
                     } else if ctx.cancel.is_cancelled() && !matches!(error, Error::Paused) {
                         // Whatever a step says on its way out, the person asked it to stop.
                         Error::Cancelled

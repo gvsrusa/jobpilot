@@ -1,4 +1,5 @@
 mod commands;
+mod menu;
 mod native;
 mod pty;
 mod state;
@@ -18,6 +19,19 @@ fn focus_main_window(app: &AppHandle) {
     }
 }
 
+/// A `jobpilot pause set` from the CLI ends a download or an index started here, within a
+/// second. Runs are ended by their own poll in core.
+fn watch_pause(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if let Some(state) = app.try_state::<AppState>() {
+                commands::stop_if_paused(&state).await;
+            }
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -27,6 +41,8 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .manage(PtyState::default())
+        .menu(menu::build)
+        .on_menu_event(menu::on_event)
         .on_window_event(pty::on_window_event)
         .invoke_handler(commands::handler())
         .setup(|app| {
@@ -35,6 +51,7 @@ pub fn run() {
                 Err(error) => AppState::no_root(&error),
             };
             app.manage(state);
+            watch_pause(app.handle().clone());
             Ok(())
         })
         .build(tauri::generate_context!())

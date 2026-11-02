@@ -5,7 +5,7 @@ import userEvent from "@testing-library/user-event";
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import App from "./App";
 import { useUiStore } from "./lib/store";
-import type { BackupInfo, Document, Status } from "./lib/ipc";
+import type { BackupInfo, Document, PauseState, Status } from "./lib/ipc";
 
 export const READY: Status = {
   state: "ready",
@@ -42,6 +42,7 @@ export function backend(overrides: Record<string, Handler> = {}): Backend {
   const docs: Document[] = [];
   const secrets: string[] = [];
   const backups: BackupInfo[] = [];
+  let pause: PauseState = { paused: false, set_at: null, set_by: null };
   const defaults: Record<string, Handler> = {
     status: () => READY,
     retry_open: () => READY,
@@ -88,6 +89,15 @@ export function backend(overrides: Record<string, Handler> = {}): Backend {
     },
     secret_delete: ({ name }) => {
       secrets.splice(secrets.indexOf(String(name)), 1);
+    },
+    pause_status: () => pause,
+    pause_set: () => {
+      pause = { paused: true, set_at: "2026-11-01T10:00:00.000Z", set_by: "gui" };
+      return pause;
+    },
+    pause_clear: () => {
+      pause = { paused: false, set_at: null, set_by: null };
+      return pause;
     },
     audit_recent: () => [],
     app_list: () => [],

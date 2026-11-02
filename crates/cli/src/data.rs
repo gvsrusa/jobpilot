@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use clap::Subcommand;
 use jobpilot_core::crypto::{self, KeyState};
 use jobpilot_core::{
-    AppPaths, Db, Error, Result, app_schema_version, backup, documents, memory, profile, recovery,
-    transfer,
+    AppPaths, Db, Error, Result, app_schema_version, backup, documents, memory, pause, profile,
+    recovery, transfer,
 };
 use serde_json::json;
 
@@ -87,8 +87,9 @@ pub async fn status(db: &Db) -> Result<Output> {
     let ollama =
         serde_json::to_value(&ai.ollama).map_err(|e| Error::Io(std::io::Error::other(e)))?;
     let swap = db.swap_interrupted();
+    let paused = pause::state(db).await?;
     let mut text = format!(
-        "jobpilot {}\nschema {schema}\ndata {}\n{}\nollama: {}\nclaude code: {}",
+        "jobpilot {}\nschema {schema}\ndata {}\n{}\nollama: {}\nclaude code: {}\n{}",
         jobpilot_core::VERSION,
         db.paths().root().display(),
         describe_key(&key_state),
@@ -98,6 +99,7 @@ pub async fn status(db: &Db) -> Result<Output> {
         } else {
             "not found"
         },
+        crate::pause::describe(&paused),
     );
     if swap {
         text.push_str("\nwarning: a restore was interrupted; check your documents");
@@ -110,6 +112,9 @@ pub async fn status(db: &Db) -> Result<Output> {
             "root": db.paths().root(),
             "key_state": key_state,
             "swap_interrupted": swap,
+            "paused": paused.paused,
+            "paused_at": paused.set_at,
+            "paused_by": paused.set_by,
             "ai": {
                 "ollama": ollama,
                 "claude_code": { "available": ai.claude_code.available },

@@ -6,7 +6,7 @@ use std::time::Duration;
 use jobpilot_core::ai::{self, DataCategory, consent};
 use jobpilot_core::crypto::{self, KEY_ACCOUNT_PREFIX, KeyState};
 use jobpilot_core::{
-    AppPaths, Db, Error, MIGRATOR, app_schema_version, audit, backup, documents, settings,
+    AppPaths, Db, Error, MIGRATOR, app_schema_version, audit, backup, documents, pause, settings,
 };
 use serde_json::{Value, json};
 use sqlx::SqlSafeStr;
@@ -1910,4 +1910,58 @@ async fn a_readable_outgoing_key_stands_in_for_a_lost_backup_key_with_no_ciphert
     rows.sort_by_key(|(_, active)| *active);
     assert_eq!(rows, [(KEY_ID.to_owned(), 0), (key_id, 1)]);
     report.db.close().await;
+}
+
+/// A restore must never be the way out of an emergency pause: only a person clears it.
+#[tokio::test]
+async fn restore_keeps_a_set_pause() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let earlier = backup::create(&db, "cli").await.unwrap().path;
+    pause::set(&db, "cli").await.unwrap();
+
+    let restored = backup::restore(db, &earlier, "cli").await.unwrap().db;
+
+    assert!(pause::is_set(&restored).await.unwrap());
+    let kept: Vec<_> = audit::recent(&restored, 20)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.action == "emergency_pause_kept_by_restore")
+        .collect();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].actor, "cli");
+    restored.close().await;
+}
+
+#[tokio::test]
+async fn restoring_a_paused_backup_stays_paused() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    pause::set(&db, "cli").await.unwrap();
+    let during = backup::create(&db, "cli").await.unwrap().path;
+    pause::clear(&db, "cli").await.unwrap();
+
+    let restored = backup::restore(db, &during, "cli").await.unwrap().db;
+
+    assert!(pause::is_set(&restored).await.unwrap());
+    restored.close().await;
+}
+
+/// A restore with no pause on either side leaves none, and a restore under an actor the
+/// pause table does not take still completes.
+#[tokio::test]
+async fn restore_adds_no_pause_when_none_was_set() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let earlier = backup::create(&db, "cli").await.unwrap().path;
+    let restored = backup::restore(db, &earlier, "test").await.unwrap().db;
+    assert!(!pause::is_set(&restored).await.unwrap());
+    pause::set(&restored, "gui").await.unwrap();
+    let again = backup::restore(restored, &earlier, "test")
+        .await
+        .unwrap()
+        .db;
+    assert!(pause::is_set(&again).await.unwrap());
+    again.close().await;
 }

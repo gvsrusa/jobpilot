@@ -6,6 +6,7 @@ mod analytics;
 mod apps;
 mod data;
 mod memory;
+mod pause;
 mod profile;
 mod resume;
 mod shell;
@@ -76,6 +77,9 @@ pub enum Command {
     /// AI providers, models, and consent.
     #[command(subcommand)]
     Ai(ai::AiCommand),
+    /// Stop all automation.
+    #[command(subcommand)]
+    Pause(pause::PauseCommand),
     /// Restricted prompt used by the app's terminal panel.
     Shell,
 }
@@ -90,6 +94,7 @@ impl Command {
         use ai::{AiCommand, ConsentCommand};
         use data::{BackupCommand, DataCommand};
         use memory::MemoryCommand;
+        use pause::PauseCommand;
         use profile::{JobCommand, KbCommand};
         use resume::{ExportArgs, LetterCommand, ResumeCommand};
         matches!(
@@ -109,6 +114,7 @@ impl Command {
                         | DataCommand::RecoveryKey(_)
                         | DataCommand::DiscardLocked { .. }
                 )
+                | Command::Pause(PauseCommand::Clear)
                 | Command::Kb(KbCommand::Reveal { .. })
                 | Command::Memory(
                     MemoryCommand::Approve { .. }
@@ -202,6 +208,9 @@ pub fn error_line(error: &Error) -> String {
 fn message(error: &Error) -> String {
     match error {
         Error::PanelRefused => shell::REFUSAL.into(),
+        Error::Paused => "Emergency pause is on, so nothing automated runs. Clear it with \
+                          `jobpilot pause clear` in an ordinary terminal, or from the title bar."
+            .into(),
         Error::ManualRequired(reason) if reason == "not_logged_in" => {
             "Claude Code is not signed in. Run `claude` once to log in, then try again.".into()
         }
@@ -273,6 +282,7 @@ async fn with_db(db: &Db, command: Command) -> Result<Output> {
         Command::Agents(command) => agents::agents(db, command).await,
         Command::Analytics(command) => analytics::analytics(db, command).await,
         Command::Ai(command) => ai::ai(db, command).await,
+        Command::Pause(command) => pause::pause(db, command).await,
         // `main` and the shell handle this before any command runs.
         Command::Shell => Err(Error::PanelRefused),
     }
@@ -373,6 +383,9 @@ mod tests {
         ("agents resume r", false),
         ("analytics report", false),
         ("analytics show", false),
+        ("pause set", false),
+        ("pause status", false),
+        ("pause clear", true),
         ("ai status", false),
         ("ai models", false),
         ("ai pull m", true),

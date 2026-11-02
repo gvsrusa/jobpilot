@@ -18,6 +18,7 @@ use crate::audit;
 use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::hardware::{self, Hardware};
+use crate::pause;
 
 pub const DEFAULT_URL: &str = "http://127.0.0.1:11434";
 
@@ -143,6 +144,7 @@ impl Ollama {
         if !name_is_local(model) {
             return Err(Error::Refused("not_local".into()));
         }
+        pause::ensure_off(db).await?;
         audit::record(
             db,
             actor,

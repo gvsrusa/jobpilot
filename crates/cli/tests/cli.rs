@@ -1628,3 +1628,174 @@ fn analytics_report_after_applying_prints_a_rate() {
     let runs = stdout_json(&run(&home, &["agents", "list", "--json"]));
     assert_eq!(runs[0]["agent"], "analytics");
 }
+
+#[test]
+fn pause_set_status_clear_round_trip() {
+    let (_dir, home) = fresh_home();
+    let off = stdout_json(&run(&home, &["pause", "status", "--json"]));
+    assert_eq!(off["paused"], false);
+    assert!(off["set_at"].is_null());
+    assert!(String::from_utf8_lossy(&ok(&home, &["pause", "status"]).stdout).contains("no"));
+
+    let on = stdout_json(&run(&home, &["pause", "set", "--json"]));
+    assert_eq!(on["paused"], true);
+    assert_eq!(on["set_by"], "cli");
+    // A second set changes nothing.
+    let again = stdout_json(&run(&home, &["pause", "set", "--json"]));
+    assert_eq!(again["set_at"], on["set_at"]);
+
+    // Nothing automated starts, and the error says how to clear it.
+    let app = stdout_json(&run(
+        &home,
+        &["app", "add", "--company", "Acme", "--role", "Dev", "--json"],
+    ));
+    let id = app["id"].as_str().unwrap();
+    let refused = run(&home, &["app", "status", id, "applied"]);
+    assert_eq!(refused.status.code(), Some(1));
+    let text = stderr_text(&refused);
+    assert!(text.starts_with("error[paused]"), "{text}");
+    assert!(text.contains("jobpilot pause clear"), "{text}");
+    // Editing a field stays open.
+    ok(&home, &["app", "edit", id, "--role", "Staff"]);
+    let json = stdout_json(&run(&home, &["agents", "list", "--json"]));
+    assert!(json.as_array().unwrap().is_empty(), "no run started");
+
+    let cleared = stdout_json(&run(&home, &["pause", "clear", "--json"]));
+    assert_eq!(cleared["paused"], false);
+    ok(&home, &["app", "status", id, "applied"]);
+}
+
+#[test]
+fn pause_clear_is_refused_in_the_panel() {
+    let (_dir, home) = fresh_home();
+    let panel = [("JOBPILOT_PANEL", "1")];
+    let set = run_env(&home, &["pause", "set"], &panel);
+    assert!(set.status.success(), "{}", stderr_text(&set));
+    let status = run_env(&home, &["pause", "status"], &panel);
+    assert!(status.status.success());
+    let refused = run_env(&home, &["pause", "clear"], &panel);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(stderr_text(&refused).starts_with("error[panel_refused]"));
+    let still = stdout_json(&run(&home, &["pause", "status", "--json"]));
+    assert_eq!(still["paused"], true);
+}
+
+#[test]
+fn status_prints_the_pause() {
+    let (_dir, home) = fresh_home();
+    let text = |home: &Path| String::from_utf8_lossy(&ok(home, &["status"]).stdout).into_owned();
+    assert!(text(&home).contains("paused: no"), "{}", text(&home));
+    assert_eq!(
+        stdout_json(&run(&home, &["status", "--json"]))["paused"],
+        false
+    );
+    ok(&home, &["pause", "set"]);
+    let on = text(&home);
+    assert!(on.contains("paused: yes, set "), "{on}");
+    assert!(on.contains(" by cli"), "{on}");
+    let json = stdout_json(&run(&home, &["status", "--json"]));
+    assert_eq!(json["paused"], true);
+    assert_eq!(json["paused_by"], "cli");
+}
+
+#[cfg(unix)]
+#[test]
+fn pause_from_a_second_process_stops_a_running_draft() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let (_dir, home) = fresh_home();
+    let dir = home.parent().unwrap();
+    let mock = Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/tests/mock-claude/claude");
+    let (pids, done) = (dir.join("pids"), dir.join("done"));
+    // The child gets a scrubbed environment, so the mock's knobs live in a wrapper script.
+    let wrapper = dir.join("claude");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexport MOCK_CLAUDE_SLEEP=30 MOCK_CLAUDE_PID='{}' MOCK_CLAUDE_DONE='{}'\n\
+             exec '{}' \"$@\"\n",
+            pids.display(),
+            done.display(),
+            mock.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &wrapper,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let bin = wrapper.to_str().unwrap();
+    claude_only(&home, bin, DRAFT_CONSENT);
+    let (job, _) = draftable(&home);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jobpilot"))
+        .args(["resume", "generate", &job])
+        .env("JOBPILOT_HOME", &home)
+        .env("JOBPILOT_CLAUDE_BIN", bin)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    // The run row shows running, and the mock has started.
+    let child_pid = loop {
+        let runs = stdout_json(&run(&home, &["agents", "list", "--json"]));
+        let running = runs
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|run| run["state"] == "running");
+        let pid = std::fs::read_to_string(&pids)
+            .ok()
+            .and_then(|t| t.lines().next().map(str::to_string))
+            .filter(|p| !p.is_empty());
+        if let (true, Some(pid)) = (running, pid) {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "the draft never started");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let alive = |pid: &str| {
+        Command::new("kill")
+            .args(["-0", pid])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(alive(&child_pid));
+
+    ok(&home, &["pause", "set"]);
+    let paused_at = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            paused_at.elapsed() < Duration::from_secs(5),
+            "the draft ignored the pause"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "signal {:?}: {stderr}",
+        status.signal()
+    );
+    assert!(stderr.starts_with("error[paused]"), "{stderr}");
+
+    let runs = stdout_json(&run(&home, &["agents", "list", "--json"]));
+    assert_eq!(runs[0]["state"], "halted");
+    assert_eq!(runs[0]["reason"], "paused");
+    assert!(!done.exists(), "the mock finished its work");
+    let gone = Instant::now() + Duration::from_secs(5);
+    while alive(&child_pid) && Instant::now() < gone {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!alive(&child_pid), "the claude child survived the pause");
+}

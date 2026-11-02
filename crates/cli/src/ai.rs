@@ -7,7 +7,7 @@ use jobpilot_core::ai::claude_code::{self, TERMS_DATE};
 use jobpilot_core::ai::ollama::{Ollama, OllamaStatus};
 use jobpilot_core::ai::router::{Router, ollama_from_settings};
 use jobpilot_core::ai::{self, CancellationToken, DataCategory, ProviderId, consent};
-use jobpilot_core::{Db, Error, Result, embed};
+use jobpilot_core::{Db, Error, Result, embed, pause};
 use serde_json::json;
 
 use crate::{ACTOR, Output, out};
@@ -83,9 +83,10 @@ fn category(text: &str) -> std::result::Result<DataCategory, String> {
     })
 }
 
-/// Runs AI work so that Ctrl-C cancels its token and then waits for the task to finish,
-/// which drops the `claude` child. Returning early would orphan a paid child.
-pub async fn with_ctrl_c<T, F, Fut>(run: F) -> Result<T>
+/// Runs automated work so that Ctrl-C, or an emergency pause set from any process, cancels
+/// its token and then waits for the task to finish, which drops the `claude` child.
+/// Returning early would orphan a paid child. A task a pause cut short reports `paused`.
+pub async fn with_interrupts<T, F, Fut>(db: &Db, run: F) -> Result<T>
 where
     F: FnOnce(CancellationToken) -> Fut,
     Fut: Future<Output = Result<T>>,
@@ -98,22 +99,26 @@ where
             std::future::pending::<()>().await;
         }
     };
-    tokio::select! {
-        done = &mut task => done,
-        () = interrupt => {
-            token.cancel();
-            // A second Ctrl-C gives up waiting. The child is not dropped then, so this
-            // is the user's explicit choice.
-            let again = async {
-                if tokio::signal::ctrl_c().await.is_err() {
-                    std::future::pending::<()>().await;
-                }
-            };
-            tokio::select! {
-                done = &mut task => done,
-                () = again => std::process::exit(130),
-            }
+    let paused = tokio::select! {
+        done = &mut task => return done,
+        () = interrupt => false,
+        () = pause::watch(db, &token) => true,
+    };
+    token.cancel();
+    // A second Ctrl-C gives up waiting. The child is not dropped then, so this
+    // is the user's explicit choice.
+    let again = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
         }
+    };
+    let done = tokio::select! {
+        done = &mut task => done,
+        () = again => std::process::exit(130),
+    };
+    match done {
+        Err(Error::Cancelled) if paused => Err(Error::Paused),
+        done => done,
     }
 }
 
@@ -181,7 +186,10 @@ pub async fn ai(db: &Db, command: AiCommand) -> Result<Output> {
                     eprintln!("pulling {model}: {percent}%");
                 }
             };
-            with_ctrl_c(|cancel| ollama.pull(db, ACTOR, &model, progress, cancel)).await?;
+            with_interrupts(db, |cancel| {
+                ollama.pull(db, ACTOR, &model, progress, cancel)
+            })
+            .await?;
             out(json!({ "pulled": model }), format!("pulled {model}"))
         }
         AiCommand::SetModel {
@@ -244,7 +252,8 @@ pub async fn ai(db: &Db, command: AiCommand) -> Result<Output> {
         }
         AiCommand::Index => {
             let router = Router::from_settings(db).await?;
-            let indexed = with_ctrl_c(|cancel| embed::index_missing(db, &router, cancel)).await?;
+            let indexed =
+                with_interrupts(db, |cancel| embed::index_missing(db, &router, cancel)).await?;
             out(
                 json!({ "indexed": indexed }),
                 format!("indexed {indexed} item(s)"),

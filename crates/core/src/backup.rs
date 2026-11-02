@@ -38,6 +38,7 @@ use crate::db::{
 };
 use crate::error::{Error, Result};
 use crate::paths::AppPaths;
+use crate::pause;
 use crate::{audit, secrets};
 
 const DB_FILE: &str = "jobpilot.db";
@@ -77,6 +78,8 @@ type KeyRow = (String, String, Vec<u8>);
 struct LiveRows {
     secrets: Option<Vec<SecretRow>>,
     keys: Option<Vec<KeyRow>>,
+    /// Whether the emergency pause was on. A restore is never the way out of it.
+    paused: Option<bool>,
 }
 
 /// What step 1 found in the source.
@@ -231,6 +234,7 @@ async fn prepare(db: &Db, source: &Path, migrator: &Migrator) -> Result<(Validat
     let live = LiveRows {
         secrets: Some(read_secrets(&db.pool).await?),
         keys: Some(read_keys(&db.pool).await?),
+        paused: Some(pause::is_set(db).await?),
     };
     Ok((validated, live))
 }
@@ -444,6 +448,7 @@ async fn read_live(paths: &AppPaths) -> (Option<i64>, LiveRows) {
         let live = LiveRows {
             secrets: None,
             keys: None,
+            paused: None,
         };
         return (None, live);
     };
@@ -451,6 +456,7 @@ async fn read_live(paths: &AppPaths) -> (Option<i64>, LiveRows) {
     let live = LiveRows {
         secrets: read_secrets(&pool).await.ok(),
         keys: read_keys(&pool).await.ok(),
+        paused: read_paused(&pool).await.ok(),
     };
     pool.close().await;
     (version, live)
@@ -558,6 +564,7 @@ async fn migrate_and_fill(pool: &SqlitePool, plan: &Plan<'_>) -> Result<()> {
     }
 
     revoke_external_consent(pool, plan.actor).await?;
+    keep_pause(pool, plan).await?;
 
     let target = plan.source.to_string_lossy();
     let mut detail = json!({});
@@ -568,6 +575,39 @@ async fn migrate_and_fill(pool: &SqlitePool, plan: &Plan<'_>) -> Result<()> {
         detail["data_keys_lost"] = json!(true);
     }
     audit::record_to(pool, plan.actor, "restore", Some(&target), detail).await
+}
+
+/// A pause that was on stays on, whatever the backup says. The backup's own row, if it has
+/// one, is kept as it is. Only a person clears it, so a restore cannot be the way out.
+async fn keep_pause(pool: &SqlitePool, plan: &Plan<'_>) -> Result<()> {
+    if plan.live.paused != Some(true) {
+        return Ok(());
+    }
+    // The table takes a person only. An actor outside it still keeps the pause, as the CLI's.
+    let by = if matches!(plan.actor, "gui" | "cli") {
+        plan.actor
+    } else {
+        "cli"
+    };
+    let added = sqlx::query(
+        "INSERT OR IGNORE INTO emergency_pause (id, set_at, set_by) \
+         VALUES ('me', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?)",
+    )
+    .bind(by)
+    .execute(pool)
+    .await?;
+    if added.rows_affected() == 1 {
+        let action = "emergency_pause_kept_by_restore";
+        audit::record_to(pool, plan.actor, action, None, json!({})).await?;
+    }
+    Ok(())
+}
+
+async fn read_paused(pool: &SqlitePool) -> Result<bool> {
+    let found: Option<i64> = sqlx::query_scalar("SELECT 1 FROM emergency_pause WHERE id = 'me'")
+        .fetch_optional(pool)
+        .await?;
+    Ok(found.is_some())
 }
 
 /// Consent is a decision made now, and a backup is an old one, or someone else's copy, so a

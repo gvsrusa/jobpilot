@@ -30,6 +30,7 @@ use jobpilot_core::memory::{
     RefreshPlan, UsedAnswer,
 };
 use jobpilot_core::parse::{self, Imported};
+use jobpilot_core::pause::{self, PauseState};
 use jobpilot_core::profile::{self, Profile, ProfileBasic, WorkAuthorization};
 use jobpilot_core::recovery::{self, RecoveryReceipt};
 use jobpilot_core::render::{ResumeDoc, Template};
@@ -103,6 +104,9 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         agent_get,
         agent_cancel,
         agent_resume,
+        pause_status,
+        pause_set,
+        pause_clear,
         analytics_run,
         analytics_latest,
         app_remove,
@@ -1141,6 +1145,60 @@ pub async fn ai_index(state: State<'_, AppState>) -> Result<usize> {
 pub async fn ai_cancel(state: State<'_, AppState>) -> Result<()> {
     state.ai.cancel();
     Ok(())
+}
+
+/// What the command and the menu item both run. The tokens fire first, whatever comes
+/// after, so a running task stops even with no data open. The write goes through the `db`
+/// read lock and not [`AppState::work`]: it must not queue behind a task holding the gate.
+pub async fn pause_now(state: &AppState) -> Result<PauseState> {
+    state.ai.cancel();
+    state.pull.cancel();
+    let slot = state.db.read().await;
+    pause::set(ready(&slot)?, ACTOR).await
+}
+
+/// For a pause set by another process, such as `jobpilot pause set`: its running tasks are
+/// not this app's to find, but a download or an index started here is. True when it is on.
+pub async fn stop_if_paused(state: &AppState) -> bool {
+    let on = match state.db.read().await.as_deref() {
+        Some(db) => pause::is_set(db).await.unwrap_or(false),
+        None => false,
+    };
+    if on {
+        state.ai.cancel();
+        state.pull.cancel();
+    }
+    on
+}
+
+#[tauri::command]
+pub async fn pause_status(state: State<'_, AppState>) -> Result<PauseState> {
+    let slot = state.db.read().await;
+    pause::state(ready(&slot)?).await
+}
+
+#[tauri::command]
+pub async fn pause_set(state: State<'_, AppState>) -> Result<PauseState> {
+    pause_now(&state).await
+}
+
+/// Only a dialog Rust opens clears it, with no lock held while it waits. The shortcut and
+/// the menu only ever set.
+#[tauri::command]
+pub async fn pause_clear<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+) -> Result<PauseState> {
+    ready(&*state.db.read().await)?;
+    native::confirmed(
+        &app,
+        "Clear emergency pause",
+        "Runs stay halted until you resume each one.".into(),
+        "Clear",
+    )
+    .await?;
+    let slot = state.db.read().await;
+    pause::clear(ready(&slot)?, ACTOR).await
 }
 
 #[tauri::command]
@@ -2405,6 +2463,9 @@ mod tests {
         "agent_get",
         "agent_cancel",
         "agent_resume",
+        "pause_status",
+        "pause_set",
+        "pause_clear",
         "analytics_run",
         "analytics_latest",
         "app_remove",
@@ -4177,6 +4238,156 @@ mod tests {
         assert!(h.asked().is_empty());
         let runs = h.ok("agents_list", json!({ "limit": 10 }));
         assert_eq!(runs[0]["agent"], "career_memory");
+    }
+
+    fn audited(h: &Harness, action: &str) -> Vec<String> {
+        let rows = h.ok("audit_recent", json!({ "limit": 50 }));
+        let rows = rows.as_array().unwrap();
+        rows.iter()
+            .filter(|row| row["action"] == action)
+            .map(|row| row["actor"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn pause_set_fires_the_running_tokens_and_is_audited_as_gui() {
+        let h = ready();
+        let state = h.app.state::<AppState>();
+        let ai = state.ai.begin().unwrap();
+        let pull = state.pull.begin().unwrap();
+        assert_eq!(h.ok("pause_status", json!({}))["paused"], false);
+
+        let on = h.ok("pause_set", json!({}));
+
+        assert_eq!(on["paused"], true);
+        assert_eq!(on["set_by"], "gui");
+        assert!(ai.token.is_cancelled() && pull.token.is_cancelled());
+        assert_eq!(audited(&h, "emergency_pause_set"), ["gui"]);
+        assert_eq!(h.ok("pause_status", json!({}))["paused"], true);
+        // Again: nothing more is written.
+        h.ok("pause_set", json!({}));
+        assert_eq!(audited(&h, "emergency_pause_set"), ["gui"]);
+    }
+
+    #[test]
+    fn pause_set_in_recovery_fires_tokens_and_reports_unavailable() {
+        let h = recovery(OPENS);
+        let state = h.app.state::<AppState>();
+        let ai = state.ai.begin().unwrap();
+        let pull = state.pull.begin().unwrap();
+
+        assert_eq!(h.code("pause_set", json!({})), "unavailable");
+
+        assert!(ai.token.is_cancelled() && pull.token.is_cancelled());
+        assert_eq!(h.code("pause_status", json!({})), "unavailable");
+    }
+
+    #[test]
+    fn pause_clear_asks_natively_and_stays_set_when_refused() {
+        let h = ready();
+        h.ok("pause_set", json!({}));
+
+        h.answer(false);
+        assert_eq!(h.code("pause_clear", json!({})), "confirmation_required");
+        assert_eq!(h.ok("pause_status", json!({}))["paused"], true);
+        let asked = h.asked();
+        assert!(
+            asked.last().unwrap().contains("Clear emergency pause"),
+            "{asked:?}"
+        );
+        let hook = h.app.state::<NativeHook>();
+        assert_eq!(hook.work_at_dialog.lock().unwrap().last(), Some(&false));
+        assert!(audited(&h, "emergency_pause_cleared").is_empty());
+
+        h.answer(true);
+        let off = h.ok("pause_clear", json!({}));
+        assert_eq!(off["paused"], false);
+        assert_eq!(audited(&h, "emergency_pause_cleared"), ["gui"]);
+    }
+
+    #[test]
+    fn pause_clear_in_recovery_asks_nothing() {
+        let h = recovery(OPENS);
+        assert_eq!(h.code("pause_clear", json!({})), "unavailable");
+        assert!(h.asked().is_empty());
+    }
+
+    #[test]
+    fn the_menu_item_uses_the_shared_pause_path() {
+        use crate::menu::{self, PAUSE_ID};
+        let h = ready();
+        let state = h.app.state::<AppState>();
+        let ai = state.ai.begin().unwrap();
+        let event = |id: &str| tauri::menu::MenuEvent { id: id.into() };
+
+        menu::on_event(h.app.handle(), event("something_else"));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(h.ok("pause_status", json!({}))["paused"], false);
+
+        menu::on_event(h.app.handle(), event(PAUSE_ID));
+        wait_until(|| h.ok("pause_status", json!({}))["paused"] == true);
+        assert!(ai.token.is_cancelled());
+        assert_eq!(audited(&h, "emergency_pause_set"), ["gui"]);
+    }
+
+    /// macOS makes a submenu only on the main thread, and a test never runs there, so the
+    /// whole menu is built where it can be: the item is checked on every system.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn menu_has_the_pause_item_and_accelerator() {
+        use crate::menu::{self, PAUSE_ACCELERATOR, PAUSE_ID, SAFETY};
+        let h = ready();
+
+        let menu = menu::build(h.app.handle()).unwrap();
+
+        let items = menu.items().unwrap();
+        let names: Vec<String> = items
+            .iter()
+            .filter_map(|item| item.as_submenu()?.text().ok())
+            .collect();
+        assert!(
+            names.contains(&"Edit".to_owned()),
+            "copy and paste stay: {names:?}"
+        );
+        let safety = items
+            .iter()
+            .filter_map(|item| item.as_submenu())
+            .find(|submenu| submenu.text().is_ok_and(|text| text == SAFETY))
+            .expect("a Safety submenu");
+        assert!(safety.get(PAUSE_ID).is_some());
+        assert_eq!(PAUSE_ACCELERATOR, "CmdOrCtrl+Shift+H");
+    }
+
+    #[test]
+    fn the_pause_item_has_its_id_label_and_a_valid_accelerator() {
+        use crate::menu::{self, PAUSE_ACCELERATOR, PAUSE_ID};
+        let h = ready();
+
+        let item = menu::pause_item(h.app.handle()).unwrap();
+
+        assert_eq!(item.id().0, PAUSE_ID);
+        assert_eq!(item.text().unwrap(), "Emergency pause");
+        assert_eq!(PAUSE_ACCELERATOR, "CmdOrCtrl+Shift+H");
+        assert!(item.is_enabled().unwrap());
+    }
+
+    #[test]
+    fn a_pause_set_by_another_process_fires_the_tokens() {
+        let h = ready();
+        let state = h.app.state::<AppState>();
+        let (ai, pull) = (state.ai.begin().unwrap(), state.pull.begin().unwrap());
+        assert!(!block_on(super::stop_if_paused(&state)));
+        assert!(!ai.token.is_cancelled());
+
+        // A second handle stands for the CLI.
+        block_on(async {
+            let other = Db::open(&h.paths).await.unwrap();
+            jobpilot_core::pause::set(&other, "cli").await.unwrap();
+            other.close().await;
+        });
+
+        assert!(block_on(super::stop_if_paused(&state)));
+        assert!(ai.token.is_cancelled() && pull.token.is_cancelled());
     }
 
     fn code_of(result: Result<Value, Value>) -> String {

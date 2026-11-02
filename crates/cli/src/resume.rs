@@ -12,7 +12,7 @@ use jobpilot_core::runner::ExportChoice;
 use jobpilot_core::{Db, Result, parse};
 use serde_json::json;
 
-use crate::ai::with_ctrl_c;
+use crate::ai::with_interrupts;
 use crate::{ACTOR, Output, out};
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -154,7 +154,7 @@ pub async fn resume(db: &Db, command: ResumeCommand) -> Result<Output> {
         ResumeCommand::Generate(args) => {
             let router = Router::from_settings(db).await?;
             let choice = args.choice();
-            let made = with_ctrl_c(|cancel| {
+            let made = with_interrupts(db, |cancel| {
                 agents::draft_resume(db, &router, ACTOR, &args.job_id, choice, cancel)
             })
             .await?;
@@ -206,7 +206,7 @@ pub async fn letter(db: &Db, command: LetterCommand) -> Result<Output> {
         LetterCommand::Generate(args) => {
             let router = Router::from_settings(db).await?;
             let choice = args.choice();
-            let made = with_ctrl_c(|cancel| {
+            let made = with_interrupts(db, |cancel| {
                 agents::draft_cover_letter(db, &router, ACTOR, &args.job_id, choice, cancel)
             })
             .await?;

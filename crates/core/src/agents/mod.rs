@@ -50,6 +50,7 @@ pub async fn set_status(
 /// report; a finished one stays until the next.
 pub async fn analytics_report(db: &Db, actor: &str, cancel: CancellationToken) -> Result<Report> {
     runner::person(actor)?;
+    crate::pause::ensure_off(db).await?;
     crate::analytics::drop_unfinished(db).await?;
     let saved = runner::start(db, actor, &Analytics, cancel)
         .await?

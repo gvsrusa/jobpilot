@@ -234,6 +234,9 @@ export type ApplicationEvent = {
   note: string;
 };
 
+/** The emergency pause. `set_by` is `gui` or `cli`. */
+export type PauseState = { paused: boolean; set_at: string | null; set_by: string | null };
+
 export type Agent = "resume" | "cover_letter" | "career_memory" | "tracking" | "analytics";
 
 export type RunState =
@@ -463,6 +466,12 @@ export const ipc = {
   /** An active run stops at its next poll; a halted run ends now. */
   agentCancel: (id: string) => invoke<void>("agent_cancel", { id }),
   agentResume: (id: string) => invoke<RunDetail>("agent_resume", { id }),
+
+  pauseStatus: () => invoke<PauseState>("pause_status"),
+  /** Stops everything automated now. Idempotent, and never clears. */
+  pauseSet: () => invoke<PauseState>("pause_set"),
+  /** Rust asks in a native dialog; only this button reaches it. */
+  pauseClear: () => invoke<PauseState>("pause_clear"),
   /** Builds a new report from the application store. No model is involved. */
   analyticsRun: () => invoke<Report>("analytics_run"),
   analyticsLatest: () => invoke<Report | null>("analytics_latest"),

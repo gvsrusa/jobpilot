@@ -7,7 +7,7 @@ use jobpilot_core::{Db, Result, agents};
 use serde::Serialize;
 use serde_json::json;
 
-use crate::ai::with_ctrl_c;
+use crate::ai::with_interrupts;
 use crate::{ACTOR, Output, out};
 
 #[derive(Subcommand)]
@@ -95,8 +95,10 @@ pub async fn agents(db: &Db, command: AgentsCommand) -> Result<Output> {
         }
         AgentsCommand::Resume { id } => {
             let router = Router::from_settings(db).await?;
-            let finished =
-                with_ctrl_c(|cancel| agents::resume_run(db, &router, ACTOR, &id, cancel)).await?;
+            let finished = with_interrupts(db, |cancel| {
+                agents::resume_run(db, &router, ACTOR, &id, cancel)
+            })
+            .await?;
             let state = word(&finished.state);
             finished.into_result()?;
             out(

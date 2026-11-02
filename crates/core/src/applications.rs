@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::audit;
 use crate::db::Db;
 use crate::error::{Error, Result};
+use crate::pause;
 
 pub const STATUSES: [&str; 8] = [
     "saved",
@@ -314,6 +315,8 @@ pub async fn set_status(
     on: Option<&str>,
     note: &str,
 ) -> Result<Application> {
+    // Public, so it gates itself: the tracking agent is one caller, not the only possible one.
+    pause::ensure_off(db).await?;
     check_change(db, status, on, note).await?;
     let note = note.trim();
     let mut tx = db.pool.begin().await?;

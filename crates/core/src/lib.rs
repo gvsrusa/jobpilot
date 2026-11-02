@@ -18,6 +18,7 @@ pub mod knowledge;
 pub mod memory;
 pub mod parse;
 pub mod paths;
+pub mod pause;
 pub mod profile;
 pub mod recovery;
 pub mod render;

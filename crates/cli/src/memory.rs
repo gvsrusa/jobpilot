@@ -8,7 +8,7 @@ use jobpilot_core::profile::Stated;
 use jobpilot_core::{Db, Error, Result};
 use serde_json::json;
 
-use crate::ai::with_ctrl_c;
+use crate::ai::with_interrupts;
 use crate::{ACTOR, Output, out};
 
 #[derive(Subcommand)]
@@ -292,8 +292,10 @@ pub async fn memory(db: &Db, command: MemoryCommand) -> Result<Output> {
                 let shown = json!({ "claude_calls": plan.claude_calls, "pending": plan.pending });
                 return out(shown, text);
             }
-            let done =
-                with_ctrl_c(|cancel| agents::memory_refresh(db, &router, ACTOR, cancel)).await?;
+            let done = with_interrupts(db, |cancel| {
+                agents::memory_refresh(db, &router, ACTOR, cancel)
+            })
+            .await?;
             let mut text = format!(
                 "Checked {}, raised {}, indexed {}",
                 done.classified.checked, done.classified.raised, done.embedded

@@ -4,7 +4,7 @@ use clap::Subcommand;
 use jobpilot_core::analytics::{self, Report, Timing};
 use jobpilot_core::{Db, Result, agents};
 
-use crate::ai::with_ctrl_c;
+use crate::ai::with_interrupts;
 use crate::{ACTOR, Output, out};
 
 const NO_DATA: &str = "not enough data yet";
@@ -64,7 +64,8 @@ fn text(report: &Report) -> String {
 pub async fn analytics(db: &Db, command: AnalyticsCommand) -> Result<Output> {
     match command {
         AnalyticsCommand::Report => {
-            let report = with_ctrl_c(|cancel| agents::analytics_report(db, ACTOR, cancel)).await?;
+            let report =
+                with_interrupts(db, |cancel| agents::analytics_report(db, ACTOR, cancel)).await?;
             out(&report, text(&report))
         }
         AnalyticsCommand::Show => match analytics::latest(db).await? {

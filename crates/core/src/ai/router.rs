@@ -19,6 +19,7 @@ use super::{
 use crate::audit;
 use crate::db::Db;
 use crate::error::{Error, Result};
+use crate::pause;
 use crate::settings;
 
 const CANCEL_POLL: Duration = Duration::from_millis(100);
@@ -160,6 +161,7 @@ impl Router {
                 reason: reason.into(),
             });
         }
+        pause::ensure_off(db).await?;
         // What the user can act on, when every provider has passed.
         let mut manual = None;
 
@@ -225,6 +227,10 @@ impl Router {
             cancel: &cancel,
             tokens: 0,
         };
+        // Manual, not a refusal, so a search still answers by words while the pause is on.
+        if pause::is_set(db).await? {
+            return Err(Error::ManualRequired("paused".into()));
+        }
         let model = settings::get(db, "ai.embedding_model")
             .await?
             .and_then(|value| value.as_str().map(str::to_string))
@@ -317,7 +323,8 @@ impl Router {
                 .await?;
                 return Ok(after_skip(task, &declaration, &reason));
             }
-            if task.cancel.is_cancelled() {
+            // Each attempt: a pause set during the last one stops the next.
+            if task.cancel.is_cancelled() || pause::is_set(task.db).await? {
                 log(task, row(&name, attempt, "cancelled", None, task.db).await?).await?;
                 return Ok(Step::Cancelled);
             }
