@@ -326,11 +326,11 @@ async fn a_0_2_database_upgrades_to_0_3() {
 }
 
 #[tokio::test]
-async fn a_fresh_database_is_schema_13() {
+async fn a_fresh_database_is_schema_14() {
     let (_tmp, paths) = temp_root();
     let db = Db::open(&paths).await.unwrap();
-    assert_eq!(db.schema_version().await.unwrap(), 13);
-    assert_eq!(app_schema_version(), 13);
+    assert_eq!(db.schema_version().await.unwrap(), 14);
+    assert_eq!(app_schema_version(), 14);
     db.close().await;
 }
 
@@ -360,7 +360,7 @@ async fn a_0_3_database_upgrades_to_0_4() {
 
     let db = Db::open(&paths).await.unwrap();
 
-    assert_eq!(db.schema_version().await.unwrap(), 13);
+    assert_eq!(db.schema_version().await.unwrap(), 14);
     assert_eq!(snapshots(&paths, "pre-migrate-11-").len(), 1);
     let kept: (String, String) = sqlx::query_as("SELECT provider, register_row FROM consent")
         .fetch_one(&db.pool)
@@ -404,7 +404,7 @@ async fn a_0_4_database_upgrades_to_0_5() {
 
     let db = Db::open(&paths).await.unwrap();
 
-    assert_eq!(db.schema_version().await.unwrap(), 13);
+    assert_eq!(db.schema_version().await.unwrap(), 14);
     assert_eq!(snapshots(&paths, "pre-migrate-12-").len(), 1);
     let draft: String = sqlx::query_scalar("SELECT job_text_id FROM drafts WHERE id = 'dr1'")
         .fetch_one(&db.pool)

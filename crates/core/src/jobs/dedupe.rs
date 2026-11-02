@@ -11,11 +11,17 @@ use std::collections::{HashMap, HashSet};
 use sqlx::FromRow;
 
 use crate::db::Db;
-use crate::drafts::fold;
+use crate::drafts::fold as plain_fold;
 use crate::error::Result;
 
 /// Word-set Jaccard at or above this makes two titles the same title.
 pub const SIMILAR: f32 = 0.85;
+
+/// [`plain_fold`] that keeps `+` and `#`, so "C++" and "C#" stay two languages.
+// ponytail: each is spelled out as a word before folding, so a run of them stays distinct.
+pub(crate) fn fold(text: &str) -> String {
+    plain_fold(&text.replace('+', " xplusx ").replace('#', " xsharpx "))
+}
 
 /// Legal forms that are not part of a company's name.
 const LEGAL: [&str; 6] = ["inc", "llc", "ltd", "gmbh", "corp", "co"];
@@ -77,14 +83,30 @@ pub fn similar(a: &str, b: &str) -> f32 {
     a.intersection(&b).count() as f32 / union as f32
 }
 
-/// The link without its query and fragment and with a lower-case host. Empty when absent or
-/// not a link.
+/// Parameters that name a visitor's route, not a page.
+fn is_tracking(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with("utm_") || matches!(name.as_str(), "ref" | "source" | "gclid" | "fbclid")
+}
+
+/// The link with a lower-case host, no fragment, and only its tracking parameters dropped:
+/// `?gh_jid=1` and `?gh_jid=2` are two jobs. Empty when absent or not a link.
 fn normal_url(url: Option<&str>) -> String {
     let Some(Ok(mut url)) = url.map(reqwest::Url::parse) else {
         return String::new();
     };
-    url.set_query(None);
     url.set_fragment(None);
+    let mut kept: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(name, _)| !is_tracking(name))
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect();
+    kept.sort();
+    if kept.is_empty() {
+        url.set_query(None);
+    } else {
+        url.query_pairs_mut().clear().extend_pairs(kept);
+    }
     url.to_string()
 }
 
@@ -95,6 +117,7 @@ struct Row {
     title: String,
     country: Option<String>,
     work_mode: Option<String>,
+    location: String,
     url: Option<String>,
     dedupe_key: String,
     duplicate_of: Option<String>,
@@ -114,7 +137,7 @@ struct Seen {
 // and mode, which keeps a few thousand rows well under a second.
 pub async fn run(db: &Db) -> Result<usize> {
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT j.id, c.name AS company, j.title, j.country, j.work_mode, j.url, j.dedupe_key, \
+        "SELECT j.id, c.name AS company, j.title, j.country, j.work_mode, j.location, j.url, j.dedupe_key, \
                 j.duplicate_of, j.not_duplicate \
          FROM jobs j LEFT JOIN companies c ON c.id = j.company_id \
          ORDER BY j.first_seen_at, j.seq",
@@ -142,12 +165,28 @@ pub async fn run(db: &Db) -> Result<usize> {
             continue;
         }
         let url = normal_url(row.url.as_deref());
+        // Two postings are one job only if the place they name is the same, folded. With no
+        // country and no place, nothing says where, so only a link can match.
+        let place = fold(&row.location);
+        let placed = row.country.is_some() || !place.is_empty();
+        let key = if placed && !key.is_empty() {
+            format!("{key}@{place}")
+        } else {
+            String::new()
+        };
         let near = (
-            company_key(company),
-            row.country
-                .as_deref()
-                .map(str::to_lowercase)
-                .unwrap_or_default(),
+            if placed {
+                company_key(company)
+            } else {
+                String::new()
+            },
+            format!(
+                "{}@{place}",
+                row.country
+                    .as_deref()
+                    .map(str::to_lowercase)
+                    .unwrap_or_default()
+            ),
             row.work_mode.clone().unwrap_or_default(),
         );
         let mut found = None;

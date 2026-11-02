@@ -710,6 +710,17 @@ async fn bare(
     url: Option<&str>,
     country: Option<&str>,
 ) -> String {
+    bare_in(db, title, company, url, country, "").await
+}
+
+async fn bare_in(
+    db: &Db,
+    title: &str,
+    company: &str,
+    url: Option<&str>,
+    country: Option<&str>,
+    location: &str,
+) -> String {
     let text = jobpilot_core::knowledge::import_job_text(db, title, "<p>body</p>")
         .await
         .unwrap();
@@ -722,8 +733,8 @@ async fn bare(
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO jobs (id, job_text_id, connector, title, company_id, url, country, \
-         first_seen_at, last_seen_at) VALUES (?1, ?1, 'import', ?2, ?3, ?4, ?5, \
+        "INSERT INTO jobs (id, job_text_id, connector, title, company_id, url, country, location, \
+         first_seen_at, last_seen_at) VALUES (?1, ?1, 'import', ?2, ?3, ?4, ?5, ?6, \
          strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
     )
     .bind(&text.id)
@@ -731,6 +742,7 @@ async fn bare(
     .bind(company_id)
     .bind(url)
     .bind(country)
+    .bind(location)
     .execute(&db.pool)
     .await
     .unwrap();
@@ -745,7 +757,7 @@ async fn the_rule_groups_by_link_key_or_near_title_and_never_deletes() {
         &db,
         "Senior Rust Engineer",
         "Acme",
-        Some("https://Jobs.Acme.test/a/1?utm=1#top"),
+        Some("https://Jobs.Acme.test/a/1?utm_source=x&ref=y#top"),
         Some("US"),
     )
     .await;
@@ -801,4 +813,313 @@ async fn the_rule_groups_by_link_key_or_near_title_and_never_deletes() {
         .await
         .unwrap();
     assert_eq!(rows, 8);
+}
+
+async fn parent_of(db: &Db, id: &str) -> Option<String> {
+    jobpilot_core::jobs::get(db, id).await.unwrap().duplicate_of
+}
+
+#[tokio::test]
+async fn one_title_in_two_places_is_two_jobs() {
+    let (_t, db) = open().await;
+    let london = bare_in(&db, "Account Executive", "Acme", None, None, "London, UK").await;
+    let york = bare_in(&db, "Account Executive", "Acme", None, None, "New York, NY").await;
+    let again = bare_in(&db, "Account Executive", "Acme", None, None, "london uk").await;
+    let unknown_a = bare_in(&db, "Sales Lead", "Acme", None, None, "").await;
+    let unknown_b = bare_in(&db, "Sales Lead", "Acme", None, None, "").await;
+    dedupe::run(&db).await.unwrap();
+    assert_eq!(parent_of(&db, &london).await, None);
+    assert_eq!(parent_of(&db, &york).await, None);
+    assert_eq!(
+        parent_of(&db, &again).await.as_deref(),
+        Some(london.as_str())
+    );
+    assert_eq!(parent_of(&db, &unknown_a).await, None);
+    assert_eq!(
+        parent_of(&db, &unknown_b).await,
+        None,
+        "an unknown place never matches on title alone"
+    );
+    // The same holds for a near title.
+    let long = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike";
+    let a = bare_in(&db, long, "Zed", None, Some("US"), "Austin").await;
+    let b = bare_in(
+        &db,
+        &format!("{long} november"),
+        "Zed",
+        None,
+        Some("US"),
+        "Denver",
+    )
+    .await;
+    dedupe::run(&db).await.unwrap();
+    assert_eq!(parent_of(&db, &a).await, None);
+    assert_eq!(parent_of(&db, &b).await, None);
+}
+
+#[tokio::test]
+async fn links_keep_their_job_ids_and_drop_only_tracking() {
+    let (_t, db) = open().await;
+    let one = bare(
+        &db,
+        "A",
+        "X1",
+        Some("https://boards.test/acme?gh_jid=1"),
+        None,
+    )
+    .await;
+    let two = bare(
+        &db,
+        "B",
+        "X2",
+        Some("https://boards.test/acme?gh_jid=2"),
+        None,
+    )
+    .await;
+    let tracked = bare(
+        &db,
+        "C",
+        "X3",
+        Some("https://Boards.test/acme?utm_medium=a&gh_jid=1&gclid=z&fbclid=q&ref=r&source=s#f"),
+        None,
+    )
+    .await;
+    dedupe::run(&db).await.unwrap();
+    assert_eq!(parent_of(&db, &one).await, None);
+    assert_eq!(parent_of(&db, &two).await, None);
+    assert_eq!(
+        parent_of(&db, &tracked).await.as_deref(),
+        Some(one.as_str())
+    );
+}
+
+#[test]
+fn plus_and_hash_stay_in_a_title() {
+    assert_ne!(
+        dedupe_key("Acme", "C++ Developer", Some("US"), None),
+        dedupe_key("Acme", "C# Developer", Some("US"), None)
+    );
+    assert_ne!(
+        dedupe_key("Acme", "C++ Developer", None, None),
+        dedupe_key("Acme", "C Developer", None, None)
+    );
+    assert!(similar("C++ Developer", "C# Developer") < SIMILAR);
+    assert_ne!(company_key("C++ Inc"), company_key("C# Inc"));
+}
+
+#[tokio::test]
+async fn removing_a_job_removes_every_version_of_its_text() {
+    let (_t, db) = open().await;
+    let (_fake, fetcher) = fake_remoteok(&three());
+    let id = source(&db, "remoteok", "", "").await;
+    discover_with(&db, &fetcher, "cli", vec![id.clone()], token())
+        .await
+        .unwrap();
+    for text in ["<p>Draw v2.</p>", "<p>Draw v3.</p>"] {
+        let body = remoteok_body(&[
+            ("1", "Rust Engineer", &["rust"], "<p>Build things.</p>"),
+            ("2", "Designer", &["design"], text),
+            ("3", "Analyst", &["data"], "<p>Count things.</p>"),
+        ]);
+        let (_fake, fetcher) = fake_remoteok(&body);
+        fresh_limits(&db).await;
+        discover_with(&db, &fetcher, "cli", vec![id.clone()], token())
+            .await
+            .unwrap();
+    }
+    let texts = |db: &Db| {
+        let db = db.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM job_texts")
+                .fetch_one(&db)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(texts(&db).await, 5, "three jobs, two older versions");
+    let job = list(&db, &JobFilter::default(), 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|j| j.title == "Designer")
+        .unwrap();
+    jobpilot_core::jobs::remove(&db, "cli", &job.id)
+        .await
+        .unwrap();
+    assert_eq!(texts(&db).await, 2, "every version of that job went");
+}
+
+#[tokio::test]
+async fn handles_racing_to_store_one_posting_end_cleanly() {
+    let (_t, db) = open().await;
+    let (_fake, fetcher) = fake_remoteok(&three());
+    let connector = jobpilot_core::connectors::find("remoteok").unwrap();
+    let target = jobpilot_core::connectors::Target {
+        name: String::new(),
+    };
+    let page = fetcher
+        .page(
+            &db,
+            &*connector,
+            &target,
+            0,
+            jobpilot_core::connectors::Operation::ListFeed,
+            &token(),
+        )
+        .await
+        .unwrap();
+    let decl = connector.decl();
+    for posting in &page.postings {
+        let runs =
+            (0..8).map(|_| jobpilot_core::jobs::upsert_posting(&db, decl, "", None, posting));
+        let done = futures_join(runs).await;
+        let added = done
+            .iter()
+            .filter(|r| matches!(r, Ok(Upserted::Added(_))))
+            .count();
+        assert!(done.iter().all(|r| r.is_ok()), "{done:?}");
+        assert_eq!(added, 1, "{done:?}");
+    }
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 3);
+    let texts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_texts")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(texts, 3, "a lost race leaves no text behind");
+}
+
+async fn futures_join<F: std::future::Future>(items: impl Iterator<Item = F>) -> Vec<F::Output> {
+    let mut set = Vec::new();
+    for item in items {
+        set.push(Box::pin(item));
+    }
+    let mut out = Vec::new();
+    let mut pending: Vec<_> = set.into_iter().map(Some).collect();
+    out.resize_with(pending.len(), || None);
+    std::future::poll_fn(|cx| {
+        let mut left = false;
+        for (at, slot) in pending.iter_mut().enumerate() {
+            if let Some(fut) = slot {
+                match fut.as_mut().poll(cx) {
+                    std::task::Poll::Ready(value) => {
+                        out[at] = Some(value);
+                        *slot = None;
+                    }
+                    std::task::Poll::Pending => left = true,
+                }
+            }
+        }
+        if left {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
+    })
+    .await;
+    out.into_iter().map(Option::unwrap).collect()
+}
+
+#[tokio::test]
+async fn racing_adds_stay_within_the_cap_and_a_repeat_returns_its_row() {
+    let (_t, db) = open().await;
+    let adds = (0..60).map(|n| {
+        add_source(
+            &db,
+            "lever",
+            Box::leak(format!("b{n}").into_boxed_str()),
+            "",
+        )
+    });
+    let done = futures_join(adds).await;
+    let stored = done.iter().filter(|r| r.is_ok()).count();
+    assert_eq!(stored, 50, "{done:?}");
+    assert_eq!(list_sources(&db).await.unwrap().len(), 50);
+    let same = futures_join((0..10).map(|_| add_source(&db, "lever", "b0", ""))).await;
+    let ids: std::collections::HashSet<_> = same
+        .iter()
+        .map(|r| r.as_ref().unwrap().id.clone())
+        .collect();
+    assert_eq!(
+        ids.len(),
+        1,
+        "a repeat returns the stored row, even at the cap"
+    );
+    let (_t2, db2) = open().await;
+    let same = futures_join((0..10).map(|_| add_source(&db2, "lever", "fresh", ""))).await;
+    let ids: std::collections::HashSet<_> = same
+        .iter()
+        .map(|r| r.as_ref().unwrap().id.clone())
+        .collect();
+    assert_eq!(ids.len(), 1);
+    assert_eq!(list_sources(&db2).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_resume_honours_the_stored_cursor_when_page_one_was_all_filtered_out() {
+    let (_t, db) = open().await;
+    let first = Fake::start(vec![
+        (route(0), Canned::json(200, &lever_rows(0, 100))),
+        (route(100), Canned::stalled(Duration::from_secs(20))),
+    ]);
+    let fetcher = Fetcher::for_test(&first.url).unwrap();
+    // No row says "zzz", so nothing is stored and no job id reaches the checkpoint.
+    let id = source(&db, "lever", "acme", "zzz").await;
+    let run = discover_with(&db, &fetcher, "cli", vec![id.clone()], token());
+    let control = async {
+        let began = Instant::now();
+        while !first.paths().contains(&lever_path(100)) {
+            assert!(
+                began.elapsed() < Duration::from_secs(15),
+                "page 2 never asked"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        pause::set(&db, "cli").await.unwrap();
+    };
+    let (result, ()) = tokio::join!(run, control);
+    assert!(matches!(result, Err(Error::Paused)));
+    pause::clear(&db, "cli").await.unwrap();
+    let runs = runner::list(&db, 10).await.unwrap();
+    let second = Fake::start(vec![(route(100), Canned::json(200, &lever_rows(100, 3)))]);
+    let fetcher = Fetcher::for_test(&second.url).unwrap();
+    let router = Router::with_providers(vec![]);
+    let done = resume_run_with(&db, &router, &fetcher, "cli", &runs[0].id, token())
+        .await
+        .unwrap();
+    assert_eq!(done.state, RunState::Completed);
+    assert_eq!(
+        second.paths(),
+        [lever_path(100)],
+        "page 1 is not read again"
+    );
+}
+
+#[tokio::test]
+async fn a_source_removed_mid_run_is_skipped() {
+    let (_t, db) = open().await;
+    let fake = Fake::start(vec![
+        (route(0), Canned::json(200, &lever_rows(0, 100))),
+        (route(100), Canned::json(200, &lever_rows(100, 2))),
+        ("/api", Canned::json(200, &three())),
+    ]);
+    let fetcher = Fetcher::for_test(&fake.url).unwrap();
+    let a = source(&db, "lever", "acme", "").await;
+    let b = source(&db, "remoteok", "", "").await;
+    let run = discover_with(&db, &fetcher, "cli", vec![a, b.clone()], token());
+    let control = async {
+        let began = Instant::now();
+        while !fake.paths().contains(&lever_path(0)) {
+            assert!(began.elapsed() < Duration::from_secs(15));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        remove_source(&db, &b).await.unwrap();
+    };
+    let (report, ()) = tokio::join!(run, control);
+    let report = report.unwrap();
+    assert_eq!(report.sources.len(), 1);
+    assert_eq!(report.sources[0].added, 102);
 }

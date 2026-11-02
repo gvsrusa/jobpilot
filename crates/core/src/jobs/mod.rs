@@ -374,7 +374,8 @@ pub async fn get(db: &Db, id: &str) -> Result<Job> {
     row.into_job()
 }
 
-/// Removes the job, its score, and its search row. Its text goes too unless a draft cites it.
+/// Removes the job, its score, and its search row. Its text goes too, every version of it,
+/// unless a draft cites that one.
 pub async fn remove(db: &Db, actor: &str, id: &str) -> Result<()> {
     runner::person(actor)?;
     let mut tx = db.pool.begin().await?;
@@ -393,11 +394,12 @@ pub async fn remove(db: &Db, actor: &str, id: &str) -> Result<()> {
         .execute(&mut *tx)
         .await?;
     sqlx::query(
-        "DELETE FROM job_texts WHERE id = ?1 \
-           AND NOT EXISTS (SELECT 1 FROM drafts WHERE job_text_id = ?1) \
-           AND NOT EXISTS (SELECT 1 FROM jobs WHERE job_text_id = ?1)",
+        "DELETE FROM job_texts WHERE (id = ?1 OR version_of = ?2) \
+           AND NOT EXISTS (SELECT 1 FROM drafts WHERE job_text_id = job_texts.id) \
+           AND NOT EXISTS (SELECT 1 FROM jobs WHERE job_text_id = job_texts.id)",
     )
     .bind(&text_id)
+    .bind(id)
     .execute(&mut *tx)
     .await?;
     audit::record_to(
@@ -452,53 +454,57 @@ pub async fn upsert_posting(
     source_id: Option<&str>,
     posting: &Posting,
 ) -> Result<Upserted> {
-    let existing: Option<(String, String)> = sqlx::query_as(
-        "SELECT j.id, t.raw FROM jobs j JOIN job_texts t ON t.id = j.job_text_id \
-         WHERE j.connector = ? AND j.board = ? AND j.external_id = ?",
-    )
-    .bind(decl.name)
-    .bind(board)
-    .bind(&posting.external_id)
-    .fetch_optional(&db.pool)
-    .await?;
-    if let Some((id, raw)) = &existing
-        && *raw == posting.raw
-    {
-        sqlx::query(concat!(
-            "UPDATE jobs SET last_seen_at = ",
-            now!(),
-            " WHERE id = ?"
-        ))
-        .bind(id)
-        .execute(&db.pool)
+    // Another handle can store the same new posting between this read and the insert. The
+    // loser then finds it on the second pass and takes the path for a stored one.
+    for _ in 0..2 {
+        let existing: Option<(String, String)> = sqlx::query_as(
+            "SELECT j.id, t.raw FROM jobs j JOIN job_texts t ON t.id = j.job_text_id \
+             WHERE j.connector = ? AND j.board = ? AND j.external_id = ?",
+        )
+        .bind(decl.name)
+        .bind(board)
+        .bind(&posting.external_id)
+        .fetch_optional(&db.pool)
         .await?;
-        return Ok(Upserted::Unchanged(id.clone()));
+        if let Some((id, raw)) = &existing
+            && *raw == posting.raw
+        {
+            sqlx::query(concat!(
+                "UPDATE jobs SET last_seen_at = ",
+                now!(),
+                " WHERE id = ?"
+            ))
+            .bind(id)
+            .execute(&db.pool)
+            .await?;
+            return Ok(Upserted::Unchanged(id.clone()));
+        }
+        let text = knowledge::import_job_text(db, &posting.title, &posting.raw).await?;
+        let written = match &existing {
+            Some((id, _)) => revise(db, id, &text, posting)
+                .await
+                .map(|()| Some(Upserted::Updated(id.clone()))),
+            None => insert_posting(db, decl, board, source_id, &text, posting)
+                .await
+                .map(|won| won.then(|| Upserted::Added(text.id.clone()))),
+        };
+        match written {
+            Ok(Some(done)) => {
+                let (Upserted::Added(id) | Upserted::Updated(id) | Upserted::Unchanged(id)) = &done;
+                apply_rules(db, id).await?;
+                return Ok(done);
+            }
+            lost_or_failed => {
+                // A text no job holds is left to nothing.
+                let _ = sqlx::query("DELETE FROM job_texts WHERE id = ?")
+                    .bind(&text.id)
+                    .execute(&db.pool)
+                    .await;
+                lost_or_failed?;
+            }
+        }
     }
-    let text = knowledge::import_job_text(db, &posting.title, &posting.raw).await?;
-    let written = match &existing {
-        Some((id, _)) => revise(db, id, &text, posting).await.map(|()| id.clone()),
-        None => insert_posting(db, decl, board, source_id, &text, posting)
-            .await
-            .map(|()| text.id.clone()),
-    };
-    match (written, existing) {
-        (Ok(id), Some(_)) => {
-            apply_rules(db, &id).await?;
-            Ok(Upserted::Updated(id))
-        }
-        (Ok(id), None) => {
-            apply_rules(db, &id).await?;
-            Ok(Upserted::Added(id))
-        }
-        (Err(error), _) => {
-            // A text no job holds is left to nothing.
-            let _ = sqlx::query("DELETE FROM job_texts WHERE id = ?")
-                .bind(&text.id)
-                .execute(&db.pool)
-                .await;
-            Err(error)
-        }
-    }
+    Err(Error::Failed("posting_raced".into()))
 }
 
 async fn company_id(tx: &mut sqlx::SqliteConnection, name: &str) -> Result<Option<String>> {
@@ -531,21 +537,22 @@ async fn insert_posting(
     source_id: Option<&str>,
     text: &knowledge::JobText,
     posting: &Posting,
-) -> Result<()> {
+) -> Result<bool> {
     let mut tx = db.pool.begin().await?;
     let company = company_id(&mut tx, &posting.company).await?;
     let pay = posting.pay.as_ref();
-    let seq: i64 = sqlx::query_scalar(concat!(
+    // A source removed since the run began leaves the job with none.
+    let seq: Option<i64> = sqlx::query_scalar(concat!(
         "INSERT INTO jobs (id, job_text_id, connector, source_id, board, external_id, title, \
                            company_id, location, country, work_mode, employment_type, url, \
                            apply_url, attribution, posted_on, pay_min, pay_max, pay_currency, \
                            pay_period, skills, fields_by, first_seen_at, last_seen_at) \
-         VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-                 ?18, ?19, ?20, 'connector', ",
+         VALUES (?1, ?1, ?2, (SELECT id FROM job_sources WHERE id = ?3), ?4, ?5, ?6, ?7, ?8, ?9, \
+                 ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, 'connector', ",
         now!(),
         ", ",
         now!(),
-        ") RETURNING seq"
+        ") ON CONFLICT (connector, board, external_id) DO NOTHING RETURNING seq"
     ))
     .bind(&text.id)
     .bind(decl.name)
@@ -567,8 +574,13 @@ async fn insert_posting(
     .bind(pay.and_then(|pay| pay.currency.as_deref()))
     .bind(pay.and_then(|pay| pay.period).map(PayPeriod::column))
     .bind(skills_of(posting)?)
-    .fetch_one(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
+    let Some(seq) = seq else {
+        // Another handle stored this posting first.
+        tx.rollback().await?;
+        return Ok(false);
+    };
     sqlx::query("INSERT INTO jobs_fts (rowid, title, company, body) VALUES (?, ?, ?, ?)")
         .bind(seq)
         .bind(&text.title)
@@ -577,7 +589,7 @@ async fn insert_posting(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 /// Moves a job to its new text and fields (the rules refill what the new text leaves blank), and drops its score and its old search row.
@@ -585,6 +597,15 @@ async fn revise(db: &Db, id: &str, text: &knowledge::JobText, posting: &Posting)
     let mut tx = db.pool.begin().await?;
     let company = company_id(&mut tx, &posting.company).await?;
     let pay = posting.pay.as_ref();
+    // The text it leaves stays, tied to this job so removing the job removes it too.
+    sqlx::query(
+        "UPDATE job_texts SET version_of = ?1 \
+         WHERE id = (SELECT job_text_id FROM jobs WHERE id = ?1) AND id <> ?2",
+    )
+    .bind(id)
+    .bind(&text.id)
+    .execute(&mut *tx)
+    .await?;
     let seq: i64 = sqlx::query_scalar(concat!(
         "UPDATE jobs SET job_text_id = ?, title = ?, company_id = ?, location = ?, country = ?, \
                 work_mode = ?, employment_type = ?, url = ?, apply_url = ?, posted_on = ?, \
@@ -661,6 +682,26 @@ pub async fn add_source(db: &Db, connector: &str, target: &str, query: &str) -> 
     if query.chars().count() > QUERY_LIMIT {
         return Err(bad("a filter is up to 200 characters"));
     }
+    // One statement counts and inserts, so racing adds cannot pass the cap, and a repeat of
+    // the same source returns its row. At the cap the select yields nothing, hence the lookup.
+    let added: Option<SourceRow> = sqlx::query_as(concat!(
+        "INSERT INTO job_sources (id, connector, target, query, created_at) \
+         SELECT lower(hex(randomblob(16))), ?1, ?2, ?3, ",
+        now!(),
+        " WHERE (SELECT COUNT(*) FROM job_sources) < ?4 \
+         ON CONFLICT (connector, target, query) DO UPDATE SET query = excluded.query \
+         RETURNING ",
+        source_columns!()
+    ))
+    .bind(connector)
+    .bind(target)
+    .bind(query)
+    .bind(SOURCE_LIMIT)
+    .fetch_optional(&db.pool)
+    .await?;
+    if let Some(row) = added {
+        return Ok(row);
+    }
     let stored: Option<SourceRow> = sqlx::query_as(concat!(
         "SELECT ",
         source_columns!(),
@@ -671,27 +712,7 @@ pub async fn add_source(db: &Db, connector: &str, target: &str, query: &str) -> 
     .bind(query)
     .fetch_optional(&db.pool)
     .await?;
-    if let Some(row) = stored {
-        return Ok(row);
-    }
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_sources")
-        .fetch_one(&db.pool)
-        .await?;
-    if count >= SOURCE_LIMIT {
-        return Err(bad("up to 50 sources"));
-    }
-    Ok(sqlx::query_as(concat!(
-        "INSERT INTO job_sources (id, connector, target, query, created_at) \
-         VALUES (lower(hex(randomblob(16))), ?, ?, ?, ",
-        now!(),
-        ") RETURNING ",
-        source_columns!()
-    ))
-    .bind(connector)
-    .bind(target)
-    .bind(query)
-    .fetch_one(&db.pool)
-    .await?)
+    stored.ok_or_else(|| bad("up to 50 sources"))
 }
 
 pub async fn list_sources(db: &Db) -> Result<Vec<SourceRow>> {

@@ -158,6 +158,8 @@ pub struct Ctx<'a> {
     pub cancel: CancellationToken,
     run_id: String,
     agent: Agent,
+    /// Bumped by each resume, so a run that was resumed has a generation above 0.
+    generation: i64,
     checkpoint: Mutex<Checkpoint>,
 }
 
@@ -165,6 +167,12 @@ impl Ctx<'_> {
     /// The row this step belongs to, so a result can be tied to its run.
     pub fn run_id(&self) -> &str {
         &self.run_id
+    }
+
+    /// Whether this process took the run over from an earlier one. A checkpoint cannot say:
+    /// a crash stores none, and a pause may come before the first thing worth saving.
+    pub fn resumed(&self) -> bool {
+        self.generation > 0
     }
 
     pub fn check(&self, permission: Permission) -> Result<()> {
@@ -629,6 +637,7 @@ async fn execute(
         cancel,
         run_id: id.clone(),
         agent: run.agent,
+        generation: run.generation,
         checkpoint: Mutex::new(saved),
     };
     match walk(run, &ctx, workflow, &limits).await {

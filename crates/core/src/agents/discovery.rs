@@ -10,8 +10,8 @@ use crate::ai::{BoxFuture, CancellationToken};
 use crate::connectors::fetch::Fetcher;
 use crate::connectors::{self, Operation, Posting, Target};
 use crate::db::Db;
-use crate::drafts::fold;
 use crate::error::{Error, Result};
+use crate::jobs::dedupe::fold;
 use crate::jobs::{self, SourceRow, Upserted, dedupe};
 use crate::knowledge;
 use crate::runner::{self, Agent, Ctx, Permission, RunInput, StepDef, StepOutput, Workflow};
@@ -108,8 +108,7 @@ impl<'f> DiscoveryWorkflow<'f> {
         let picked = self.sources(db).await?;
         // A cursor is honoured only on a resume: one left by a run that was cancelled or lost
         // must not make a new run skip pages.
-        let resumed = ctx.saved("job").is_some() || ctx.saved("source").is_some();
-        if !resumed {
+        if !ctx.resumed() {
             for source in &picked {
                 set_cursor(db, &source.id, 0).await?;
             }
@@ -124,7 +123,10 @@ impl<'f> DiscoveryWorkflow<'f> {
             .skip(done.map_or(0, |at| at + 1))
         {
             ctx.stop_point()?;
-            let result = self.read(ctx, &source).await?;
+            // A source removed since the run began has nothing left to read.
+            let Some(result) = self.read(ctx, &source).await? else {
+                continue;
+            };
             set_cursor(db, &source.id, 0).await?;
             ctx.save("source", &source.id)?;
             self.results
@@ -137,7 +139,7 @@ impl<'f> DiscoveryWorkflow<'f> {
 
     /// One source, from its stored cursor. Only a pause, a cancel, or a store failure ends the
     /// step; anything else is the source's own and goes in its result.
-    async fn read(&self, ctx: &Ctx<'_>, source: &SourceRow) -> Result<SourceResult> {
+    async fn read(&self, ctx: &Ctx<'_>, source: &SourceRow) -> Result<Option<SourceResult>> {
         let db = ctx.db;
         let mut result = SourceResult {
             source_id: source.id.clone(),
@@ -150,7 +152,7 @@ impl<'f> DiscoveryWorkflow<'f> {
         };
         let Some(connector) = connectors::find(&source.connector) else {
             result.reason = Some("source_unknown".into());
-            return Ok(result);
+            return Ok(Some(result));
         };
         let decl = connector.decl();
         let operation = if decl.operations.contains(&Operation::ListBoard) {
@@ -161,8 +163,11 @@ impl<'f> DiscoveryWorkflow<'f> {
         let target = Target {
             name: source.target.clone(),
         };
-        let mut page_no =
-            u32::try_from(jobs::get_source(db, &source.id).await?.cursor).unwrap_or(0);
+        let mut page_no = match jobs::get_source(db, &source.id).await {
+            Ok(row) => u32::try_from(row.cursor).unwrap_or(0),
+            Err(Error::NotFound) => return Ok(None),
+            Err(other) => return Err(other),
+        };
         loop {
             ctx.stop_point()?;
             let page = match self
@@ -179,7 +184,7 @@ impl<'f> DiscoveryWorkflow<'f> {
                         Error::Refused(why) => why,
                         other => other.code().to_owned(),
                     });
-                    return Ok(result);
+                    return Ok(Some(result));
                 }
             };
             result.skipped += page.skipped;
@@ -212,7 +217,7 @@ impl<'f> DiscoveryWorkflow<'f> {
             }
             match page.next {
                 Some(next) => page_no = next,
-                None => return Ok(result),
+                None => return Ok(Some(result)),
             }
         }
     }

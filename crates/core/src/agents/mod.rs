@@ -75,7 +75,7 @@ pub async fn resume_run(
     run_id: &str,
     cancel: CancellationToken,
 ) -> Result<Finished> {
-    resume_run_with(db, router, &Fetcher::hosted()?, actor, run_id, cancel).await
+    resume_from(db, router, None, actor, run_id, cancel).await
 }
 
 /// [`resume_run`] with the fetcher a discovery run reads through, so a test can point it at a
@@ -85,6 +85,18 @@ pub async fn resume_run_with(
     db: &Db,
     router: &Router,
     fetcher: &Fetcher,
+    actor: &str,
+    run_id: &str,
+    cancel: CancellationToken,
+) -> Result<Finished> {
+    resume_from(db, router, Some(fetcher), actor, run_id, cancel).await
+}
+
+/// Only a discovery run needs a fetcher, so only it builds the hosted one when none is given.
+async fn resume_from(
+    db: &Db,
+    router: &Router,
+    fetcher: Option<&Fetcher>,
     actor: &str,
     run_id: &str,
     cancel: CancellationToken,
@@ -130,6 +142,14 @@ pub async fn resume_run_with(
             runner::resume(db, actor, run_id, &workflow, cancel).await
         }
         RunInput::Discovery { source_ids } => {
+            let hosted;
+            let fetcher = match fetcher {
+                Some(fetcher) => fetcher,
+                None => {
+                    hosted = Fetcher::hosted()?;
+                    &hosted
+                }
+            };
             let workflow = DiscoveryWorkflow::new(source_ids, fetcher);
             runner::resume(db, actor, run_id, &workflow, cancel).await
         }
