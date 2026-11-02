@@ -7,6 +7,9 @@
 
 use std::time::Duration;
 
+pub mod fetch;
+pub mod limit;
+
 use serde::Serialize;
 
 use crate::ai::register::{REGISTER, site_row};
@@ -130,7 +133,7 @@ pub struct Page {
 
 pub trait Connector: Send + Sync {
     fn decl(&self) -> &'static ConnectorDecl;
-    fn req(&self, target: &Target, page: u32) -> Result<PageRequest>;
+    fn request(&self, target: &Target, page: u32) -> Result<PageRequest>;
     fn parse(&self, target: &Target, body: &[u8]) -> Result<Page>;
 }
 
@@ -205,7 +208,7 @@ pub fn gate(decl: &ConnectorDecl, op: Operation) -> Result<()> {
 #[doc(hidden)]
 pub fn gate_on(register: &str, decl: &ConnectorDecl, op: Operation) -> Result<()> {
     if !decl.operations.contains(&op) {
-        return Err(Error::Refused("op_not_declared".into()));
+        return Err(Error::Refused("operation_not_declared".into()));
     }
     if op == Operation::ImportPasted {
         return Ok(());

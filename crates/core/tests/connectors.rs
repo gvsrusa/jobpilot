@@ -163,17 +163,17 @@ fn the_gate_refuses_by_status_with_its_own_code() {
 }
 
 #[test]
-fn an_undeclared_op_is_refused() {
+fn an_undeclared_operation_is_refused() {
     let d = decl(PolicyStatus::SilentRead);
     assert_eq!(
         code(gate_on(TABLE, &d, Operation::ListBoard)),
-        "op_not_declared"
+        "operation_not_declared"
     );
     // The op check comes before the status check.
     let unknown = decl(PolicyStatus::Unknown);
     assert_eq!(
         code(gate_on(TABLE, &unknown, Operation::ListBoard)),
-        "op_not_declared"
+        "operation_not_declared"
     );
 }
 
@@ -198,4 +198,17 @@ fn every_registered_connector_passes_check() {
         let _ = gate(connector.decl(), Operation::ImportPasted);
     }
     assert_eq!(statuses().len(), all().len());
+}
+
+#[test]
+fn a_duplicate_row_with_another_verdict_reads_unknown() {
+    let d = decl(PolicyStatus::SilentRead);
+    let dup = format!(
+        "{TABLE}| Lever | Read public listings through Postings API | https://x.test | 2026-11-01 | \"q\" | `blocked` | n |\n"
+    );
+    assert_eq!(read_status_on(&dup, &d), PolicyStatus::Unknown);
+    let same = format!(
+        "{TABLE}| Lever | Read public listings through Postings API | https://x.test | 2026-11-01 | \"q\" | `silent-read` | n |\n"
+    );
+    assert_eq!(read_status_on(&same, &d), PolicyStatus::SilentRead);
 }

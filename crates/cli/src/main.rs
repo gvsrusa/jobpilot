@@ -237,6 +237,43 @@ pub fn error_line(error: &Error) -> String {
     )
 }
 
+/// Plain words for a job-source refusal. The reason words are the ones on `RUN_REASONS`.
+fn source_reason(reason: &str) -> Option<&'static str> {
+    Some(match reason {
+        "policy_unknown" => {
+            "The policy register has no clear answer for this source, so nothing was requested."
+        }
+        "policy_blocked" => {
+            "The policy register blocks reading this source, so nothing was requested."
+        }
+        "policy_user_assisted" => {
+            "This source is user-assisted only. Import a posting by hand instead."
+        }
+        "operation_not_declared" => {
+            "This source does not declare that operation, so nothing was requested."
+        }
+        "source_blocked" => {
+            "The source refused or showed a challenge page. JobPilot stops there, tries nothing else, and leaves it alone for a day."
+        }
+        "source_not_found" => "The source says that board or feed does not exist. Check the name.",
+        "bad_feed" => {
+            "The source answered in a shape JobPilot does not read, so nothing was stored."
+        }
+        "needs_text" => "That posting has no text to read. Import it with its text instead.",
+        "network" => "The source could not be reached. Check the connection and try again.",
+        _ => return None,
+    })
+}
+
+fn wait_words(wait: std::time::Duration) -> String {
+    let secs = wait.as_secs();
+    match secs {
+        0..=89 => format!("{secs} seconds"),
+        90..=5399 => format!("{} minutes", secs.div_ceil(60)),
+        _ => format!("{} hours", secs.div_ceil(3600)),
+    }
+}
+
 fn message(error: &Error) -> String {
     match error {
         Error::PanelRefused => shell::REFUSAL.into(),
@@ -319,6 +356,15 @@ fn message(error: &Error) -> String {
              <id>`, or on the AI screen."
                 .into()
         }
+        Error::Refused(reason) if source_reason(reason).is_some() => {
+            source_reason(reason).unwrap_or_default().into()
+        }
+        Error::RateLimited {
+            retry_after: Some(wait),
+        } => format!(
+            "This source asked JobPilot to wait, or its limit is reached. Try again in about {}.",
+            wait_words(*wait)
+        ),
         Error::ManualRequired(reason) | Error::Refused(reason) if reason == "origin_refused" => {
             "That model is not eligible through OpenRouter. Use an openai/, anthropic/, or \
              google/ model, not a free one, with no suffix but :nitro or :floor."

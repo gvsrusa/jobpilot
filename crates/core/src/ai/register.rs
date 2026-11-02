@@ -239,12 +239,16 @@ pub(crate) struct SiteRow {
 }
 
 pub(crate) fn site_row(register: &str, integration: &str, op: &str) -> Option<SiteRow> {
-    let cells = register
+    let mut rows = register
         .lines()
         .map(cells)
-        .find(|cells| cells.len() > VERDICT_CELL && cells[0] == integration && cells[1] == op)?;
+        .filter(|cells| cells.len() > VERDICT_CELL && cells[0] == integration && cells[1] == op);
+    let first = rows.next()?;
+    let verdict = first[VERDICT_CELL].replace('`', "");
+    // A repeated row that disagrees leaves the verdict undecided, so it fails closed.
+    let agreed = rows.all(|row| row[VERDICT_CELL].replace('`', "") == verdict);
     Some(SiteRow {
-        verdict: cells[VERDICT_CELL].replace('`', ""),
-        date_read: cells[DATE_READ_CELL].replace('`', ""),
+        verdict: if agreed { verdict } else { "unknown".into() },
+        date_read: first[DATE_READ_CELL].replace('`', ""),
     })
 }

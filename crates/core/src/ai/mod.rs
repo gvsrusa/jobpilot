@@ -64,6 +64,15 @@ pub const RUN_REASONS: &[&str] = &[
     "endpoint_changed",
     "cli_account_refused",
     "unusable_reply",
+    "policy_unknown",
+    "policy_blocked",
+    "policy_user_assisted",
+    "operation_not_declared",
+    "source_blocked",
+    "source_not_found",
+    "bad_feed",
+    "needs_text",
+    "network",
 ];
 
 /// Absent capabilities are false: a declaration lists only what the provider proves.

@@ -97,6 +97,18 @@ const REASONS: [word: string, text: string][] = [
     "use_profile_by_country",
     "Work authorization is answered from your profile, for one country at a time. If this question asks something else, remove it and add it in other words",
   ],
+  ["policy_unknown", "The policy register has no clear answer for this source, so nothing was requested."],
+  ["policy_blocked", "The policy register blocks reading this source, so nothing was requested."],
+  ["policy_user_assisted", "This source is user-assisted only. Import a posting by hand instead."],
+  ["operation_not_declared", "This source does not declare that operation, so nothing was requested."],
+  [
+    "source_blocked",
+    "The source refused or showed a challenge page. JobPilot stops there, tries nothing else, and leaves it alone for a day.",
+  ],
+  ["source_not_found", "The source says that board or feed does not exist. Check the name."],
+  ["bad_feed", "The source answered in a shape JobPilot does not read, so nothing was stored."],
+  ["needs_text", "That posting has no text to read. Import it with its text instead."],
+  ["network", "The source could not be reached. Check the connection and try again."],
   ["no_ai", "No AI provider could take this task, so nothing was generated"],
   ["no_embedding_model", "No embedding model is set on the AI screen"],
 ];
