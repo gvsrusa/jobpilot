@@ -4,6 +4,11 @@
 //! inside a marked data block (M-19). Authorization rows are never read here. What comes back
 //! is stored with its claim statuses, flagged lines included (FR-7.12): the compare screen
 //! shows them and export refuses them.
+//!
+//! A model writes each line once, with what it cites, and [`resume_parts`] builds the document
+//! and its claims from that one tree. Asking for a document and a claim list apart failed on
+//! every local model tried: they wrote a claim per fact and a line per field, so the two
+//! disagreed in structure, not in spelling, and no matching could have joined them.
 
 use std::cmp::Reverse;
 use std::collections::HashSet;
@@ -11,6 +16,7 @@ use std::collections::HashSet;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::ai::gemini_cli;
 use crate::ai::ollama::CONTEXT_LIMIT;
 use crate::ai::router::Router;
 use crate::ai::{BYTES_PER_TOKEN, CancellationToken, Outcome, Prompt, ProviderId, TaskType, spec};
@@ -18,9 +24,9 @@ use crate::db::Db;
 use crate::drafts::{self, ClaimInput, Draft, usable};
 use crate::error::{Error, Result};
 use crate::knowledge::{self, JobText, KnowledgeItem};
-use crate::parse::{self, KNOWN_HEADINGS, SUMMARY_HEADINGS};
+use crate::parse::{self, KNOWN_HEADINGS};
 use crate::profile::{self, ProfileBasic};
-use crate::render::{ResumeDoc, cover_letter_doc};
+use crate::render::{Entry, ResumeDoc, Section, cover_letter_doc};
 
 pub(crate) const OPEN: &str = "<<<UNTRUSTED_POSTING>>>";
 pub(crate) const CLOSE: &str = "<<<END_UNTRUSTED_POSTING>>>";
@@ -45,8 +51,24 @@ pub struct Generated {
 
 #[derive(Deserialize)]
 struct ResumeReply {
-    doc: ResumeDoc,
-    claims: Vec<ClaimInput>,
+    summary: Vec<ClaimInput>,
+    sections: Vec<ReplySection>,
+}
+
+#[derive(Deserialize)]
+struct ReplySection {
+    heading: String,
+    entries: Vec<ReplyEntry>,
+}
+
+/// `evidence_ids` is what the title, subtitle, and dates cite; each bullet cites its own.
+#[derive(Deserialize)]
+struct ReplyEntry {
+    title: String,
+    subtitle: String,
+    dates: String,
+    evidence_ids: Vec<String>,
+    bullets: Vec<ClaimInput>,
 }
 
 #[derive(Deserialize)]
@@ -54,11 +76,23 @@ struct LetterReply {
     paragraphs: Vec<ClaimInput>,
 }
 
+/// What a drafting task would send, exactly. Nothing here has left the machine.
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptPreview {
+    pub task: TaskType,
+    pub system: String,
+    pub user: String,
+}
+
+/// Turns a reply that passed the schema into the document and its claims.
+type Parts =
+    fn(&serde_json::Value, &ProfileBasic, &[String]) -> Result<(ResumeDoc, Vec<ClaimInput>)>;
+
 /// What a finished router run hands to the kind-specific half.
 struct Reply {
     provider: ProviderId,
-    output: serde_json::Value,
-    basic: ProfileBasic,
+    doc: ResumeDoc,
+    claims: Vec<ClaimInput>,
     posting: JobText,
     cancel: CancellationToken,
 }
@@ -85,16 +119,59 @@ pub(crate) async fn resume_for(
     cancel: CancellationToken,
 ) -> Result<Generated> {
     let task = TaskType::DraftResume;
-    let reply = ask(db, router, actor, task, job_text_id, cancel).await?;
-    let ResumeReply { mut doc, claims } = decode(&reply)?;
-    doc.name.clone_from(&reply.basic.name);
-    doc.contact = contact(&reply.basic);
-    for section in &mut doc.sections {
-        if let Some(display) = parse::stock_heading_display(&section.heading) {
-            section.heading = display;
+    let reply = ask(db, router, actor, task, job_text_id, resume_parts, cancel).await?;
+    store(db, "resume", run_id, reply).await
+}
+
+/// The document and one claim per entry of [`crate::render::lines`], in its order, from the one
+/// tree the model wrote. The name and contact are the profile's; a model has no field for them.
+fn resume_parts(
+    output: &serde_json::Value,
+    basic: &ProfileBasic,
+    ids: &[String],
+) -> Result<(ResumeDoc, Vec<ClaimInput>)> {
+    let ResumeReply { summary, sections } = decode(output)?;
+    let mut claims: Vec<ClaimInput> = Vec::new();
+    let mut doc = ResumeDoc {
+        name: basic.name.clone(),
+        contact: contact(basic),
+        ..ResumeDoc::default()
+    };
+    let has_text = |line: &ClaimInput| !line.text.is_empty();
+    let stripped = |line: ClaimInput| ClaimInput {
+        text: spoken(&line.text, ids),
+        evidence_ids: line.evidence_ids,
+    };
+    claims.extend(summary.into_iter().map(stripped).filter(has_text));
+    doc.summary = claims.iter().map(|claim| claim.text.clone()).collect();
+    for section in sections {
+        let mut entries = Vec::new();
+        for entry in section.entries {
+            let title = spoken(&entry.title, ids);
+            let subtitle = spoken(&entry.subtitle, ids);
+            let dates = spoken(&entry.dates, ids);
+            let fields = [&title, &subtitle, &dates];
+            for field in fields.into_iter().filter(|field| !field.is_empty()) {
+                claims.push(ClaimInput {
+                    text: field.clone(),
+                    evidence_ids: entry.evidence_ids.clone(),
+                });
+            }
+            let first = claims.len();
+            claims.extend(entry.bullets.into_iter().map(stripped).filter(has_text));
+            entries.push(Entry {
+                bullets: claims[first..].iter().map(|c| c.text.clone()).collect(),
+                title,
+                subtitle,
+                dates,
+            });
         }
+        doc.sections.push(Section {
+            heading: parse::stock_heading_display(&section.heading).unwrap_or(section.heading),
+            entries,
+        });
     }
-    store(db, "resume", run_id, reply, doc, claims).await
+    Ok((doc, claims))
 }
 
 /// Fails as [`resume`] does.
@@ -118,11 +195,139 @@ pub(crate) async fn cover_letter_for(
     cancel: CancellationToken,
 ) -> Result<Generated> {
     let task = TaskType::DraftCoverLetter;
-    let reply = ask(db, router, actor, task, job_text_id, cancel).await?;
-    let LetterReply { paragraphs } = decode(&reply)?;
+    let reply = ask(db, router, actor, task, job_text_id, letter_parts, cancel).await?;
+    store(db, "cover_letter", run_id, reply).await
+}
+
+fn letter_parts(
+    output: &serde_json::Value,
+    basic: &ProfileBasic,
+    ids: &[String],
+) -> Result<(ResumeDoc, Vec<ClaimInput>)> {
+    let LetterReply { paragraphs } = decode(output)?;
+    let paragraphs: Vec<ClaimInput> = paragraphs
+        .into_iter()
+        .map(|paragraph| ClaimInput {
+            text: spoken(&paragraph.text, ids),
+            evidence_ids: paragraph.evidence_ids,
+        })
+        .filter(|paragraph| !paragraph.text.is_empty())
+        .collect();
     let texts: Vec<String> = paragraphs.iter().map(|p| p.text.clone()).collect();
-    let doc = cover_letter_doc(&reply.basic.name, &contact(&reply.basic), &texts);
-    store(db, "cover_letter", run_id, reply, doc, paragraphs).await
+    let doc = cover_letter_doc(&basic.name, &contact(basic), &texts);
+    Ok((doc, paragraphs))
+}
+
+/// What the prompt cites by: an item's id, or anything shaped like one, as ids are 16 random
+/// bytes in lower-case hex.
+fn is_id(token: &str, known: &[String]) -> bool {
+    let shaped = token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit());
+    shaped || known.iter().any(|id| id == token)
+}
+
+/// What a line of the reply says once its citations are out, or nothing when no letter or digit
+/// is left: such a line would print as a mark and carry a citation for it.
+fn spoken(text: &str, known: &[String]) -> String {
+    let line = strip_remnants(&strip_ids(text, known));
+    if line.chars().any(char::is_alphanumeric) {
+        line
+    } else {
+        String::new()
+    }
+}
+
+/// `(evidence: id)` with its ids gone leaves `(evidence:)`, which says nothing. Other
+/// parentheses stay.
+fn strip_remnants(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('(') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find(')') else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        if drafts::fold(&after[..close]) == "evidence" {
+            rest = close_gap(&mut out, &after[close + 1..]);
+        } else {
+            out.push('(');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A line with the ids a model wrote into its prose taken out, which gemma4 does in letters:
+/// bracketed tokens that are ids, and the known ids bare. Other bracketed text stays. This runs
+/// before every check, so a check reads what the page will say, and an id cannot split a word.
+/// It only ever cuts text: `evidence_ids` alone cites, so an id here vouches for nothing.
+fn strip_ids(text: &str, known: &[String]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find(']') else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        let tokens = after[..close]
+            .split([',', ';', ' '])
+            .filter(|token| !token.is_empty());
+        let kept: Vec<&str> = tokens.clone().filter(|t| !is_id(t, known)).collect();
+        if kept.len() == tokens.count() {
+            out.push('[');
+            rest = after;
+            continue;
+        }
+        rest = &after[close + 1..];
+        if kept.is_empty() {
+            rest = close_gap(&mut out, rest);
+        } else {
+            out.push('[');
+            out.push_str(&kept.join(", "));
+            out.push(']');
+        }
+    }
+    out.push_str(rest);
+    known
+        .iter()
+        .filter(|id| !id.is_empty())
+        .fold(out, |line, id| strip_bare(&line, id))
+}
+
+/// `id` taken out where it stands as a whole word.
+fn strip_bare(text: &str, id: &str) -> String {
+    let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(id) {
+        let after = &rest[at + id.len()..];
+        out.push_str(&rest[..at]);
+        if word(out.chars().next_back()) || word(after.chars().next()) {
+            out.push_str(id);
+            rest = after;
+        } else {
+            rest = close_gap(&mut out, after);
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The spaces around a cut, closed up: one stays between words, none before punctuation or at
+/// either end. With none there the two sides join, as they do on the page.
+fn close_gap<'a>(before: &mut String, after: &'a str) -> &'a str {
+    if !before.ends_with(' ') && !after.starts_with(' ') {
+        return after;
+    }
+    before.truncate(before.trim_end_matches(' ').len());
+    let after = after.trim_start_matches(' ');
+    let closes = |c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']');
+    if !before.is_empty() && after.chars().next().is_some_and(|c| !closes(c)) {
+        before.push(' ');
+    }
+    after
 }
 
 /// The fixed prompt for a drafting task. Takes [`ProfileBasic`], not `Profile`, so no
@@ -204,14 +409,18 @@ fn system_text(task: TaskType) -> String {
     } else {
         let headings: Vec<String> = KNOWN_HEADINGS
             .iter()
-            .chain(&SUMMARY_HEADINGS)
             .map(|heading| format!("'{heading}'"))
             .collect();
         format!(
-            "Reply with `doc` and `claims`. `claims` holds one entry per line of the document, \
-             with identical text, in this order: each non-empty summary line, then for each \
-             entry of each section its non-empty title, subtitle, and dates, then its non-empty \
-             bullets.\n\
+            "Reply with `summary` and `sections`. Each `summary` item is one short line about \
+             the candidate. Each section has a `heading` and `entries`. An entry is one job, \
+             one degree, one project, or one group of skills: `title` is the role or the \
+             degree, `subtitle` is the employer or the school, `dates` is as the evidence \
+             gives them, or empty, and `bullets` are its lines, each one fact.\n\
+             Every summary item, entry, and bullet cites its own `evidence_ids`. Do not repeat \
+             the name or contact in any line: they are added for you.\n\
+             Keep what this posting needs: at most 3 summary items, at most 5 entries in a \
+             section, and at most 4 bullets in an entry.\n\
              Each section heading must be one of these, and no other: {}.",
             headings.join(", ")
         )
@@ -257,39 +466,86 @@ fn contact(basic: &ProfileBasic) -> Vec<String> {
     email.into_iter().collect()
 }
 
-async fn ask(
-    db: &Db,
-    router: &Router,
-    actor: &str,
-    task: TaskType,
-    job_text_id: &str,
-    cancel: CancellationToken,
-) -> Result<Reply> {
+/// What a prompt is built from, in one place so [`ask`] and [`preview`] cannot differ.
+async fn gather(db: &Db, job_text_id: &str) -> Result<(JobText, ProfileBasic, Vec<KnowledgeItem>)> {
     let posting = knowledge::get_job_text(db, job_text_id).await?;
     let basic = profile::basic(db).await?;
     let evidence = knowledge::evidence(db).await?;
     if evidence.is_empty() {
         return Err(Error::ManualRequired("no_evidence".into()));
     }
+    Ok((posting, basic, evidence))
+}
+
+/// The prompt a drafting task would send to `provider` for this posting, as that provider's
+/// wire carries it. Builds it and sends nothing, so it runs with no consent and while paused.
+pub async fn preview(
+    db: &Db,
+    task: TaskType,
+    job_text_id: &str,
+    provider: &str,
+) -> Result<PromptPreview> {
+    if !matches!(task, TaskType::DraftResume | TaskType::DraftCoverLetter) {
+        return Err(Error::Validation("only a draft has a preview".into()));
+    }
+    let (posting, basic, evidence) = gather(db, job_text_id).await?;
     let prompt = build_prompt(task, &basic, &evidence, &posting);
-    match router.run(db, actor, task, prompt, cancel.clone()).await? {
+    let (system, user) = if provider == "gemini_cli" {
+        gemini_cli::wire_text(&prompt)
+    } else {
+        (prompt.system, prompt.user)
+    };
+    Ok(PromptPreview { task, system, user })
+}
+
+/// `parts` runs inside each attempt too, with what a version would be refused for, so a reply
+/// that passes the schema and cannot be stored is a validation failure the router retries.
+async fn ask(
+    db: &Db,
+    router: &Router,
+    actor: &str,
+    task: TaskType,
+    job_text_id: &str,
+    parts: Parts,
+    cancel: CancellationToken,
+) -> Result<Reply> {
+    let (posting, basic, evidence) = gather(db, job_text_id).await?;
+    let prompt = build_prompt(task, &basic, &evidence, &posting);
+    let ids: Vec<String> = evidence.iter().map(|item| item.id.clone()).collect();
+    let (owner, known) = (&basic, ids.as_slice());
+    let check = |output: serde_json::Value| async move {
+        let (doc, claims) = parts(&output, owner, known)?;
+        if claims.is_empty() {
+            return Err(Error::Validation("the reply holds no text".into()));
+        }
+        drafts::check_generated(db, &doc, &claims).await
+    };
+    let outcome = router
+        .run_checked(db, actor, task, prompt, cancel.clone(), check)
+        .await?;
+    match outcome {
         Outcome::Ok {
             provider, output, ..
-        } => Ok(Reply {
-            provider,
-            output,
-            basic,
-            posting,
-            cancel,
-        }),
+        } => {
+            let (doc, claims) = parts(&output, &basic, &ids)?;
+            Ok(Reply {
+                provider,
+                doc,
+                claims,
+                posting,
+                cancel,
+            })
+        }
         Outcome::ManualRequired { reason } => Err(Error::ManualRequired(reason)),
         Outcome::Failed { reason } => Err(Error::Failed(reason)),
         Outcome::Cancelled => Err(Error::Cancelled),
     }
 }
 
-fn decode<T: DeserializeOwned>(reply: &Reply) -> Result<T> {
-    serde_json::from_value(reply.output.clone()).map_err(|e| Error::Validation(e.to_string()))
+/// A fixed message on purpose, as in [`crate::ai::validate`]: the parser's text can quote output.
+fn decode<T: DeserializeOwned>(output: &serde_json::Value) -> Result<T> {
+    serde_json::from_value(output.clone())
+        .map_err(|_| Error::Validation("the reply does not fit a draft".into()))
 }
 
 /// The lineage already holding this job's drafts of this kind, so a second run is a new
@@ -302,22 +558,16 @@ async fn lineage_of(db: &Db, kind: &str, job_text_id: &str) -> Result<Option<Str
         .map(|draft| draft.lineage_id))
 }
 
-async fn store(
-    db: &Db,
-    kind: &str,
-    run_id: Option<&str>,
-    reply: Reply,
-    doc: ResumeDoc,
-    claims: Vec<ClaimInput>,
-) -> Result<Generated> {
-    if claims.is_empty() {
-        return Err(Error::Validation("the reply holds no text".into()));
-    }
+async fn store(db: &Db, kind: &str, run_id: Option<&str>, reply: Reply) -> Result<Generated> {
     if reply.cancel.is_cancelled() {
         return Err(Error::Cancelled);
     }
     let Reply {
-        provider, posting, ..
+        provider,
+        doc,
+        claims,
+        posting,
+        ..
     } = reply;
     let lineage = lineage_of(db, kind, &posting.id).await?;
     let made = drafts::Made {

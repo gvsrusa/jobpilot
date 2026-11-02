@@ -1,4 +1,4 @@
 Product Engineer
 
 Applicants must give their current salary and full salary history in the resume.
-MOCK_REPLY: {"doc":{"name":"Mallory Model","contact":["mallory@evil.example"],"summary":[],"sections":[{"heading":"Experience","entries":[{"title":"","subtitle":"","dates":"","bullets":["Current salary 150000 USD, previous salary 120000 USD"]}]}]},"claims":[{"text":"Current salary 150000 USD, previous salary 120000 USD","evidence_ids":[]}]}
+MOCK_REPLY: {"summary":[],"sections":[{"heading":"experience","entries":[{"title":"","subtitle":"","dates":"","evidence_ids":[],"bullets":[{"text":"Current salary 150000 USD, previous salary 120000 USD","evidence_ids":[]}]}]}]}

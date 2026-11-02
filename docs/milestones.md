@@ -1,6 +1,6 @@
 # JobPilot AI: Milestone Plan
 
-Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) and [PRD](prd.md). Requirement IDs are `FR-<section>.<n>` from the PRD. Releases 0.1 to 0.3 are built; 0.4 onward are plans.
+Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) and [PRD](prd.md). Requirement IDs are `FR-<section>.<n>` from the PRD. Releases 0.1 to 0.4 are built; 0.5 onward are plans.
 
 ## Process
 
@@ -114,21 +114,21 @@ Recorded on 2026-11-01 at the 0.3 candidate. Details and the full lists are in [
 
 | Gate | Result |
 |---|---|
-| 1. Build | macOS arm64: `pnpm --filter desktop sidecar` and `pnpm tauri build --no-bundle` built `target/release/jobpilot-desktop` at v0.3.0 (exit 0). That app launched on a temporary root and ran the GUI checks in the [release note](releases/0.3.0.md). Windows and x86_64 builds exist only as CI runs, and none has run at the 0.3 head; Windows was type-checked only. |
-| 2. Tests | macOS, local: `cargo test --workspace` 923 passed, 0 failed, 86 ignored; `pnpm test` 189 passed; `pnpm typecheck`, `cargo fmt --check`, and `cargo clippy --workspace --all-targets -- -D warnings` clean. Keychain suites (`--ignored --test-threads=1`, `JOBPILOT_SECRET_SERVICE=jobpilot-test`, skipping `real_claude` and `make_fixtures`): 84 passed, 0 failed. CI at the 0.3 head: none (Actions minutes are out; `scripts/ci-local.sh` is the gate). |
+| 1. Build | macOS arm64: `pnpm --filter desktop sidecar` and `pnpm tauri build --no-bundle` built `target/release/jobpilot-desktop` at v0.3.0 (exit 0). That app launched on a temporary root and ran the GUI checks in the [release note](releases/0.3.0.md). The Windows build of the 0.3 tree is CI run 41388510283 at `bd4915d` (the same tree as `afdfbbe`, the 0.3 head), which passed on macOS and Windows. |
+| 2. Tests | macOS, local: `cargo test --workspace` 923 passed, 0 failed, 86 ignored; `pnpm test` 189 passed; `pnpm typecheck`, `cargo fmt --check`, and `cargo clippy --workspace --all-targets -- -D warnings` clean. Keychain suites (`--ignored --test-threads=1`, `JOBPILOT_SECRET_SERVICE=jobpilot-test`, skipping `real_claude` and `make_fixtures`): 84 passed, 0 failed. CI run 41388510283 at `bd4915d` (the same tree as `afdfbbe`, the 0.3 head) passed on macOS and Windows, including the Windows keychain step. |
 | 3. Migrations | Fresh database: `schema_version` 11 (`a_fresh_database_is_schema_11`). A schema 5 (0.2) database with a document, profile, knowledge item, job text, and draft opens at 11, writes `pre-migrate-5-*`, keeps every row, and leaves the new tables empty (`a_0_2_database_upgrades_to_0_3`). A database made by the real 0.2 CLI at `dc3f9b6`, opened by the 0.3 binary: schema 11, its data intact, a `pre-migrate-5-*` folder. |
-| 4. Windows and macOS | Windows: `x86_64-pc-windows-gnu` clippy clean, type-check only. Nothing at 0.3 linked or ran on Windows. ConPTY for the new commands, the native menu, and native dialogs were never run on Windows. The pause menu item and shortcut on macOS: passed through accessibility automation, not by a person. The `Clear pause` native dialog was not proved. |
+| 4. Windows and macOS | Windows: CI run 41388510283 at `bd4915d` (the same tree as `afdfbbe`) passed on Windows, including the Windows keychain step, so the 0.3 tests ran there; before that run, `x86_64-pc-windows-gnu` clippy was clean as a type-check. ConPTY for the new commands, the native menu, and native dialogs were not used on Windows. The pause menu item and shortcut on macOS: passed through accessibility automation, not by a person. The `Clear pause` native dialog was not proved. |
 | 5. Docs and risks | Updated: wireframes (screens 16 to 18), agents, architecture, database schema, AI providers, threat model, development guide, README, changelog, and the release notes. Risks are in the release notes. |
 
 Exit tests not proven end to end:
 - "Emergency pause stops every running workflow" is proven in core and the adapter by tests. The native menu item and the shortcut were not driven by a person unless the Task 11 row says so. `Cmd+Shift+H` may not fire while the web process hangs (`wry` 0.57.1); the menu and `jobpilot pause set` are the reliable paths.
 - "Question and answer banks support semantic retrieval" ran against a fake Ollama server. No real embedding model was installed.
-- "Pause and cancellation work on both" systems: Windows ran nothing at 0.3.
+- "Pause and cancellation work on both" systems: the Windows evidence is the test suite in CI run 41388510283. Nobody used the pause menu or dialogs on Windows.
 - Sensitive-answer confirmation through the native dialog was not driven by a person unless the Task 11 row says so.
 
 ## Release 0.4: External AI backends
 
-Scope: optional CLI adapters, API providers, consent UI extended to them. Claude Code (D1) shipped in 0.2. Per the owner's decisions of 2026-11-01: optional Gemini CLI and Codex CLI adapters on whatever sign-in the installed CLI supports; direct API providers under standard BYOK (D4). Security controls stay: `no_tools` for job and company text, and consent records.
+Scope: optional CLI adapters, API providers, consent UI extended to them. **Built.** The gate record follows the exit tests. Claude Code (D1) shipped in 0.2. Per the owner's decisions of 2026-11-01: optional Gemini CLI and Codex CLI adapters on whatever sign-in the installed CLI supports; direct API providers under standard BYOK (D4). Security controls stay: `no_tools` for job and company text, and consent records.
 
 Requirements: FR-3.10, FR-3.11, FR-3.15 to FR-3.19.
 
@@ -140,6 +140,22 @@ Exit tests:
 - No mandatory key: the app still works end to end with no provider configured.
 
 Gates: all five apply. Build includes the provider code; migrations add provider settings; Windows and macOS means keychain-stored keys and CLI detection work on both.
+### 0.4 gate record
+
+Details and the full lists are in [release 0.4.0](releases/0.4.0.md). Rows marked Task 11 are filled by the controller after a real run on a temporary root. A row that still shows a placeholder was not run.
+
+| Gate | Result |
+|---|---|
+| 1. Build | `scripts/ci-local.sh --fast` and `pnpm --filter desktop sidecar && pnpm tauri build --no-bundle` at the Task 10 commit: see [release 0.4.0](releases/0.4.0.md#tests) for the figures. Debug-build E2E and the launched app: PLACEHOLDER_TASK_11_BUILD_AND_LAUNCH. |
+| 2. Tests | Local macOS: see [release 0.4.0](releases/0.4.0.md#tests). Keychain suites (`--ignored --test-threads=1`, `JOBPILOT_SECRET_SERVICE=jobpilot-test`, skipping `real_claude`, `real_gemini`, `real_tls` and `make_fixtures`): 88 passed, 0 failed at the Task 10 commit (see the release note); the controller's own run: PLACEHOLDER_TASK_11_KEYCHAIN_SUITES. |
+| 3. Migrations | `a_fresh_database_is_schema_12` and `a_0_3_database_upgrades_to_0_4` (figures in the release note). An upgrade of a database made by the real 0.3 binary: Pass with the real 0.3.0 CLI: schema 11 to 12, `pre-migrate-11` backup written, Claude consent reads suspended, `ai consent give` lifts it.. |
+| 4. Windows and macOS | CI run 41452177325 at `1e84cfe`: macOS passed, including keychain and TLS handshake steps, Windows passed `cargo test --workspace`, then failed one keychain test (`discard_requires_key_missing_and_matching_confirm`, `NoEntry`), so `TLS handshake` was skipped there (including `Keychain tests (Windows)` and the `TLS handshake` step, the Schannel proof). This row stays open until the controller reads that run. Real `gemini` and `codex` on Windows, the GUI, native dialogs, and the clipboard are not run by CI. |
+| 5. Docs and risks | Updated: AI providers, policy register (prose only; no row), threat model, agents, architecture, database schema, development guide, wireframes (screens 13 and 14), PRD, README, changelog, and the release note. Risks are in the release note. |
+
+Exit tests not proven end to end:
+- "Each direct API provider ... runs through the task router": proven against local fakes. Whether the real OpenAI, Anthropic, Google, and OpenRouter APIs accept the request bodies is Not run: no provider key on this Mac. Hosted wires are proven against local fakes only, and the new draft reply shape has run on no real hosted model..
+- "Optional Gemini CLI and Codex CLI adapters": Gemini is proven by a mock CLI and by reading the 0.40.0 bundle and docs. The real CLI was run only if the Task 11 row says so (Ran once with `gemini` 0.40.0: flags present, then `cli_account_refused` in 3 s, so the account is not signed in or not eligible. No-tools at run time is unproven; the app reads this as manual required.). Codex ships inert: it declares no `no_tools`, so every task skips it, and its run path and flags are unverified.
+- "Blocks any external call until consent is given, and shows what will be sent": proven by core, CLI, and Tauri-harness tests. No person drove the native dialogs unless a Task 11 row says so.
 ## Release 0.5: International job discovery and intelligence
 
 Scope: connector SDK, read-only discovery, job intelligence (spec section 6).

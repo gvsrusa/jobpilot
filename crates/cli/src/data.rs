@@ -101,6 +101,15 @@ pub async fn status(db: &Db) -> Result<Output> {
         },
         crate::pause::describe(&paused),
     );
+    for row in &ai.external {
+        if ai.enabled[&row.name] == true {
+            let state = match (row.available, row.reason.as_deref()) {
+                (true, _) => "available",
+                (false, reason) => reason.unwrap_or("unavailable"),
+            };
+            text.push_str(&format!("\n{}: {state}", row.label));
+        }
+    }
     if swap {
         text.push_str("\nwarning: a restore was interrupted; check your documents");
     }
@@ -118,6 +127,7 @@ pub async fn status(db: &Db) -> Result<Output> {
             "ai": {
                 "ollama": ollama,
                 "claude_code": { "available": ai.claude_code.available },
+                "external": ai.external,
             },
         }),
         text,

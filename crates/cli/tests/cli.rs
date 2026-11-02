@@ -1,6 +1,10 @@
-use std::path::Path;
+#[path = "../../core/tests/fake_http/mod.rs"]
+mod fake_http;
+
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use fake_http::{Canned, Fake};
 use jobpilot_core::{AppPaths, Db, app_schema_version, documents};
 
 fn run(home: &Path, args: &[&str]) -> Output {
@@ -471,19 +475,477 @@ fn draftable(home: &Path) -> (String, serde_json::Value) {
         ],
     ));
     let reply = serde_json::json!({
-        "doc": {
-            "name": "x", "contact": [], "summary": [],
-            "sections": [{"heading": "Experience", "entries": [{
-                "title": "", "subtitle": "", "dates": "",
-                "bullets": ["Shipped the Rust compiler"],
-            }]}],
-        },
-        "claims": [{"text": "Shipped the Rust compiler", "evidence_ids": [item["id"]]}],
+        "summary": [],
+        "sections": [{"heading": "experience", "entries": [{
+            "title": "", "subtitle": "", "dates": "", "evidence_ids": [],
+            "bullets": [{"text": "Shipped the Rust compiler", "evidence_ids": [item["id"]]}],
+        }]}],
     });
     (job["id"].as_str().unwrap().to_owned(), reply)
 }
 
 const DRAFT_CONSENT: &str = "job_text,resume_text,profile_basic";
+
+/// The mock Gemini CLI, saying `reply` as its stream.
+fn gemini_saying(home: &Path, reply: &serde_json::Value) -> String {
+    let dir = home.parent().unwrap();
+    let text = serde_json::json!({"type": "message", "role": "assistant",
+        "content": reply.to_string(), "delta": true});
+    let end = serde_json::json!({"type": "result", "status": "success", "stats": {}});
+    let reply_file = dir.join("stream.jsonl");
+    std::fs::write(&reply_file, format!("{text}\n{end}\n")).unwrap();
+    let mocks = Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/tests/mock-gemini");
+    if cfg!(windows) {
+        let wrapper = dir.join("gemini.cmd");
+        let script = format!(
+            "@echo off\r\nset MOCK_GEMINI_REPLY={}\r\ncall \"{}\" %*\r\n",
+            reply_file.display(),
+            mocks.join("gemini.cmd").display()
+        );
+        std::fs::write(&wrapper, script).unwrap();
+        return wrapper.to_str().unwrap().to_owned();
+    }
+    let wrapper = dir.join("gemini");
+    let script = format!(
+        "#!/bin/sh\nexport MOCK_GEMINI_REPLY='{}'\nexec '{}' \"$@\"\n",
+        reply_file.display(),
+        mocks.join("gemini").display()
+    );
+    std::fs::write(&wrapper, script).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &wrapper,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    wrapper.to_str().unwrap().to_owned()
+}
+
+#[test]
+fn gemini_cli_drafts_through_the_mock() {
+    let (_dir, home) = fresh_home();
+    let (job, reply) = draftable(&home);
+    let bin = gemini_saying(&home, &reply);
+    let env = [
+        ("JOBPILOT_GEMINI_BIN", bin.as_str()),
+        ("JOBPILOT_CLAUDE_BIN", "not-a-path"),
+    ];
+    for args in [
+        vec!["ai", "disable", "ollama"],
+        vec!["ai", "enable", "gemini_cli"],
+        vec![
+            "ai",
+            "consent",
+            "give",
+            "gemini_cli",
+            "--categories",
+            DRAFT_CONSENT,
+            "--attest",
+        ],
+    ] {
+        let output = run_env(&home, &args, &env);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            stderr_text(&output)
+        );
+    }
+
+    let made = run_env(&home, &["resume", "generate", &job, "--json"], &env);
+    assert!(made.status.success(), "{}", stderr_text(&made));
+    let made = stdout_json(&made);
+    assert_eq!(made["provider"], "gemini_cli");
+    assert_eq!(made["blocked"], 0);
+    let shown = stdout_json(&run_env(
+        &home,
+        &["ai", "consent", "show", "gemini_cli", "--json"],
+        &env,
+    ));
+    assert_eq!(shown["key"], "gemini_cli/cli_login");
+    assert_eq!(shown["path"], bin);
+}
+
+#[test]
+fn gemini_cli_absent_shows_unavailable() {
+    let (dir, home) = fresh_home();
+    let gone = dir.path().join("gemini");
+    let env = [
+        ("JOBPILOT_GEMINI_BIN", gone.to_str().unwrap()),
+        ("JOBPILOT_CLAUDE_BIN", "not-a-path"),
+    ];
+    assert!(
+        run_env(&home, &["ai", "enable", "gemini_cli"], &env)
+            .status
+            .success()
+    );
+    let status = stdout_json(&run_env(&home, &["ai", "status", "--json"], &env));
+    let rows = status["external"].as_array().unwrap();
+    let row = rows.iter().find(|row| row["name"] == "gemini_cli").unwrap();
+    assert_eq!(row["available"], false);
+    assert_eq!(row["reason"], "not_installed");
+    assert_eq!(row["path"], serde_json::Value::Null);
+}
+
+/// The mock Codex CLI behind a wrapper that sets `vars`, and the file its stdin lands in.
+fn codex_with(home: &Path, vars: &[(&str, &str)]) -> (String, PathBuf) {
+    let dir = home.parent().unwrap();
+    let stdin = dir.join("codex-stdin");
+    let mocks = Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/tests/mock-codex");
+    let stdin_var = ("MOCK_CODEX_STDIN", stdin.to_str().unwrap());
+    let all = std::iter::once(&stdin_var).chain(vars);
+    if cfg!(windows) {
+        let wrapper = dir.join("codex.cmd");
+        let mut script = String::from("@echo off\r\n");
+        for (name, value) in all {
+            script.push_str(&format!("set \"{name}={value}\"\r\n"));
+        }
+        script.push_str(&format!(
+            "call \"{}\" %*\r\n",
+            mocks.join("codex.cmd").display()
+        ));
+        std::fs::write(&wrapper, script).unwrap();
+        return (wrapper.to_str().unwrap().to_owned(), stdin);
+    }
+    let wrapper = dir.join("codex");
+    let mut script = String::from("#!/bin/sh\n");
+    for (name, value) in all {
+        script.push_str(&format!("export {name}='{value}'\n"));
+    }
+    script.push_str(&format!(
+        "exec '{}' \"$@\"\n",
+        mocks.join("codex").display()
+    ));
+    std::fs::write(&wrapper, script).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &wrapper,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    (wrapper.to_str().unwrap().to_owned(), stdin)
+}
+
+#[test]
+fn codex_is_skipped_for_a_draft_and_says_why() {
+    let (_dir, home) = fresh_home();
+    let (job, _reply) = draftable(&home);
+    let (bin, stdin) = codex_with(&home, &[]);
+    let env = [
+        ("JOBPILOT_CODEX_BIN", bin.as_str()),
+        ("JOBPILOT_CLAUDE_BIN", "not-a-path"),
+    ];
+    for args in [
+        vec!["ai", "disable", "ollama"],
+        vec!["ai", "enable", "codex_cli"],
+        vec![
+            "ai",
+            "consent",
+            "give",
+            "codex_cli",
+            "--categories",
+            DRAFT_CONSENT,
+            "--attest",
+        ],
+    ] {
+        let output = run_env(&home, &args, &env);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            stderr_text(&output)
+        );
+    }
+    let made = run_env(&home, &["resume", "generate", &job], &env);
+    assert_eq!(made.status.code(), Some(1));
+    assert!(
+        stderr_text(&made).starts_with("error[manual_required]"),
+        "{}",
+        stderr_text(&made)
+    );
+    assert!(!stdin.exists(), "Codex was started for a draft");
+    let shown = run_env(&home, &["ai", "consent", "show", "codex_cli"], &env);
+    let shown = String::from_utf8_lossy(&shown.stdout).to_string();
+    assert!(
+        shown.contains("skipped, this provider cannot prove it has no tools"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("Skipped") || shown.contains("skipped"),
+        "{shown}"
+    );
+}
+
+/// The owner's install today: `codex --version` exits 1. Enabling it is what probes it
+/// (decision 28), so the row reads unavailable only after that.
+#[test]
+fn codex_failing_its_version_shows_unavailable() {
+    let (_dir, home) = fresh_home();
+    let (bin, stdin) = codex_with(&home, &[("MOCK_CODEX_VERSION_EXIT", "1")]);
+    let env = [
+        ("JOBPILOT_CODEX_BIN", bin.as_str()),
+        ("JOBPILOT_CLAUDE_BIN", "not-a-path"),
+    ];
+    let row = || {
+        let status = stdout_json(&run_env(&home, &["ai", "status", "--json"], &env));
+        let rows = status["external"].as_array().unwrap();
+        rows.iter()
+            .find(|row| row["name"] == "codex_cli")
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(row()["available"], true, "off, so never started");
+    assert!(
+        run_env(&home, &["ai", "enable", "codex_cli"], &env)
+            .status
+            .success()
+    );
+    let on = row();
+    assert_eq!(on["available"], false, "{on}");
+    assert!(on["reason"].is_string(), "{on}");
+    assert_eq!(on["runs_job_text"], false, "{on}");
+    assert!(!stdin.exists());
+}
+
+/// An nvm install under a GUI launch: only the login shell can find it, and the quick look an
+/// off row gets does not ask that shell. Turning it on must still reach it.
+#[cfg(unix)]
+#[test]
+fn an_off_cli_only_the_login_shell_finds_comes_up_once_enabled() {
+    use std::os::unix::fs::PermissionsExt;
+    // A real install in a system folder would be found, and started, instead of the mock.
+    let system = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"];
+    if system
+        .iter()
+        .any(|dir| Path::new(dir).join("gemini").exists())
+    {
+        eprintln!("skipped: a real gemini sits in a system folder");
+        return;
+    }
+    let (dir, home) = fresh_home();
+    let mock = Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/tests/mock-gemini/gemini");
+    let shell = dir.path().join("shell");
+    std::fs::write(&shell, format!("#!/bin/sh\necho '{}'\n", mock.display())).unwrap();
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let empty = dir.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    let empty = empty.to_str().unwrap();
+    let env = [
+        ("PATH", empty),
+        ("HOME", empty),
+        ("SHELL", shell.to_str().unwrap()),
+        ("NVM_DIR", empty),
+        ("VOLTA_HOME", empty),
+        ("FNM_DIR", empty),
+        ("FNM_MULTISHELL_PATH", empty),
+        ("JOBPILOT_GEMINI_BIN", ""),
+        ("JOBPILOT_CLAUDE_BIN", "not-a-path"),
+    ];
+    let row = || {
+        let status = stdout_json(&run_env(&home, &["ai", "status", "--json"], &env));
+        let rows = status["external"].as_array().unwrap();
+        rows.iter()
+            .find(|row| row["name"] == "gemini_cli")
+            .unwrap()
+            .clone()
+    };
+    let off = row();
+    assert_eq!(off["available"], false, "{off}");
+    assert_eq!(off["reason"], "not_searched", "{off}");
+
+    let text = run_env(&home, &["ai", "status"], &env);
+    let text = String::from_utf8_lossy(&text.stdout).to_string();
+    assert!(text.contains("turn on to look for it"), "{text}");
+    assert!(!text.contains("not_searched"), "{text}");
+
+    assert!(
+        run_env(&home, &["ai", "enable", "gemini_cli"], &env)
+            .status
+            .success()
+    );
+    let on = row();
+    assert_eq!(on["available"], true, "{on}");
+    assert_eq!(on["reason"], serde_json::Value::Null, "{on}");
+    assert_eq!(on["path"], mock.to_str().unwrap(), "{on}");
+}
+
+#[test]
+fn an_account_the_cli_refuses_gets_the_plan_hint() {
+    let (_dir, home) = fresh_home();
+    let (job, reply) = draftable(&home);
+    let bin = gemini_saying(&home, &reply);
+    let wrapper = Path::new(&bin);
+    let stderr = home.parent().unwrap().join("stderr.txt");
+    std::fs::write(&stderr, "at new IneligibleTierError (x.js:1:1)\n").unwrap();
+    let script = std::fs::read_to_string(wrapper).unwrap();
+    let refused = if cfg!(windows) {
+        script.replace(
+            "@echo off\r\n",
+            &format!(
+                "@echo off\r\nset MOCK_GEMINI_EXIT=1\r\nset MOCK_GEMINI_STDERR={}\r\n",
+                stderr.display()
+            ),
+        )
+    } else {
+        script.replace(
+            "#!/bin/sh\n",
+            &format!(
+                "#!/bin/sh\nexport MOCK_GEMINI_EXIT=1\nexport MOCK_GEMINI_STDERR='{}'\n",
+                stderr.display()
+            ),
+        )
+    };
+    std::fs::write(wrapper, refused).unwrap();
+    let env = [
+        ("JOBPILOT_GEMINI_BIN", bin.as_str()),
+        ("JOBPILOT_CLAUDE_BIN", "not-a-path"),
+    ];
+    for args in [
+        vec!["ai", "disable", "ollama"],
+        vec!["ai", "enable", "gemini_cli"],
+        vec![
+            "ai",
+            "consent",
+            "give",
+            "gemini_cli",
+            "--categories",
+            DRAFT_CONSENT,
+            "--attest",
+        ],
+    ] {
+        assert!(run_env(&home, &args, &env).status.success(), "{args:?}");
+    }
+    let refused = run_env(&home, &["resume", "generate", &job], &env);
+    assert!(!refused.status.success());
+    let text = stderr_text(&refused);
+    assert!(text.contains("Antigravity CLI"), "{text}");
+    assert!(text.contains("may"), "a hint, not a finding: {text}");
+}
+
+#[test]
+fn consent_show_prints_what_gemini_is_really_sent() {
+    let (_dir, home) = fresh_home();
+    let (job, _reply) = draftable(&home);
+    let env = [
+        ("JOBPILOT_GEMINI_BIN", "not-a-path"),
+        ("JOBPILOT_CLAUDE_BIN", "not-a-path"),
+    ];
+    let posting = home.parent().unwrap().join("at.txt");
+    std::fs::write(&posting, "Write to jobs@acme.com").unwrap();
+    let pasted = stdout_json(&run(
+        &home,
+        &[
+            "job",
+            "paste",
+            "At",
+            "--file",
+            posting.to_str().unwrap(),
+            "--json",
+        ],
+    ));
+    let pasted = pasted["id"].as_str().unwrap();
+    let args = [
+        "ai",
+        "consent",
+        "show",
+        "gemini_cli",
+        "--job",
+        pasted,
+        "--json",
+    ];
+    let shown = stdout_json(&run_env(&home, &args, &env));
+    let preview = &shown["preview"];
+    assert!(
+        preview["user"]
+            .as_str()
+            .unwrap()
+            .contains("jobs\\@acme.com"),
+        "{preview}"
+    );
+    assert!(
+        preview["system"]
+            .as_str()
+            .unwrap()
+            .contains("It must match this JSON Schema")
+    );
+
+    let args = [
+        "ai",
+        "consent",
+        "show",
+        "claude_code",
+        "--job",
+        pasted,
+        "--json",
+    ];
+    let shown = stdout_json(&run_env(&home, &args, &env));
+    assert!(
+        shown["preview"]["user"]
+            .as_str()
+            .unwrap()
+            .contains("jobs@acme.com")
+    );
+    let _ = job;
+}
+
+#[test]
+fn a_cli_too_old_or_signed_out_says_so_for_any_vendor() {
+    let (_dir, home) = fresh_home();
+    let (job, reply) = draftable(&home);
+    let bin = gemini_saying(&home, &reply);
+    let wrapper = Path::new(&bin);
+    let script = std::fs::read_to_string(wrapper).unwrap();
+    let older = if cfg!(windows) {
+        script.replace(
+            "@echo off\r\n",
+            "@echo off\r\nset MOCK_GEMINI_VERSION=0.39.0\r\n",
+        )
+    } else {
+        script.replace(
+            "#!/bin/sh\n",
+            "#!/bin/sh\nexport MOCK_GEMINI_VERSION=0.39.0\n",
+        )
+    };
+    std::fs::write(wrapper, older).unwrap();
+    let env = [
+        ("JOBPILOT_GEMINI_BIN", bin.as_str()),
+        ("JOBPILOT_CLAUDE_BIN", "not-a-path"),
+    ];
+    for args in [
+        vec!["ai", "disable", "ollama"],
+        vec!["ai", "enable", "gemini_cli"],
+        vec![
+            "ai",
+            "consent",
+            "give",
+            "gemini_cli",
+            "--categories",
+            DRAFT_CONSENT,
+            "--attest",
+        ],
+    ] {
+        assert!(run_env(&home, &args, &env).status.success(), "{args:?}");
+    }
+    let refused = run_env(&home, &["resume", "generate", &job], &env);
+    assert!(!refused.status.success());
+    let text = stderr_text(&refused);
+    assert!(
+        text.contains("The installed CLI is older than the version JobPilot checked."),
+        "{text}"
+    );
+
+    let older = std::fs::read_to_string(wrapper).unwrap();
+    let signed_out = if cfg!(windows) {
+        older.replace("0.39.0\r\n", "0.40.0\r\nset MOCK_GEMINI_EXIT=41\r\n")
+    } else {
+        older.replace("0.39.0\n", "0.40.0\nexport MOCK_GEMINI_EXIT=41\n")
+    };
+    std::fs::write(wrapper, signed_out).unwrap();
+    let refused = run_env(&home, &["resume", "generate", &job], &env);
+    let text = stderr_text(&refused);
+    assert!(
+        text.contains("This CLI is not signed in. Run it once in your own terminal"),
+        "{text}"
+    );
+}
 
 #[test]
 fn resume_generate_appears_in_agents_list() {
@@ -536,6 +998,140 @@ fn resume_generate_export_writes_to_the_exports_folder() {
     assert_eq!(path.extension().unwrap(), "pdf");
 }
 
+/// The whole app with no provider: every switch off, no CLI to find, and a proxy that goes
+/// nowhere, so a stray request would fail a step here and not reach a host.
+#[tokio::test]
+async fn no_provider_works_end_to_end() {
+    let (dir, home) = fresh_home();
+    let empty = dir.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    let dead = "http://127.0.0.1:1";
+    let step = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_jobpilot"));
+        command
+            .args(args)
+            .env("JOBPILOT_HOME", &home)
+            .env("JOBPILOT_SECRET_SERVICE", "jobpilot-test")
+            .env("HOME", dir.path())
+            .env("USERPROFILE", dir.path())
+            .env("PATH", &empty)
+            .env("HTTP_PROXY", dead)
+            .env("HTTPS_PROXY", dead)
+            .env("http_proxy", dead)
+            .env("https_proxy", dead)
+            .env_remove("SHELL")
+            // A name that is not there: `ai status` must not find an installed `claude`.
+            .env("JOBPILOT_CLAUDE_BIN", "not-a-path")
+            .env_remove("JOBPILOT_GEMINI_BIN")
+            .env_remove("JOBPILOT_CODEX_BIN")
+            .current_dir(dir.path());
+        command.output().unwrap()
+    };
+    let json = |args: &[&str]| {
+        let mut all = args.to_vec();
+        all.push("--json");
+        let output = step(&all);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            stderr_text(&output)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+
+    assert_eq!(json(&["status"])["schema_version"], app_schema_version());
+    json(&["ai", "disable", "ollama"]);
+    let ai = json(&["ai", "status"]);
+    let enabled = ai["enabled"].as_object().unwrap();
+    assert!(!enabled.is_empty());
+    assert!(enabled.values().all(|on| on == false), "{ai}");
+
+    json(&["doc", "add", "Cover note", "--body", "zebra stripes"]);
+    assert_eq!(
+        json(&["doc", "search", "zebra"]).as_array().unwrap().len(),
+        1
+    );
+    json(&[
+        "profile",
+        "set",
+        "--name",
+        "Ada",
+        "--email",
+        "ada@example.com",
+    ]);
+    json(&["kb", "add", "experience", "Shipped the Rust compiler"]);
+    let posting = fixture("ollama_tags.json");
+    let job = json(&["job", "paste", "Rust role", "--file", &posting]);
+    let job = job["id"].as_str().unwrap();
+
+    let generated = step(&["resume", "generate", job]);
+    assert_eq!(generated.status.code(), Some(1));
+    let said = stderr_text(&generated);
+    assert!(said.starts_with("error[manual_required]"), "{said}");
+    assert!(said.contains("no_ai") || said.contains("No AI"), "{said}");
+
+    let app = json(&["app", "add", "--company", "Acme", "--role", "Dev"]);
+    let app = app["id"].as_str().unwrap();
+    json(&["app", "status", app, "applied", "--on", "2026-11-01"]);
+    json(&["memory", "add-question", "Why this job?"]);
+    assert_eq!(
+        json(&["memory", "search", "job"]).as_array().unwrap().len(),
+        1
+    );
+    json(&["analytics", "report"]);
+    assert!(json(&["backup", "create"])["path"].is_string());
+    assert!(json(&["data", "export"])["path"].is_string());
+
+    let db = Db::open(&AppPaths::new(&home)).await.unwrap();
+    let reasons: Vec<String> =
+        sqlx::query_scalar("SELECT coalesce(reason, outcome) FROM task_runs WHERE provider = ?")
+            .bind("no_ai")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert!(reasons.iter().any(|r| r == "no_ai"), "{reasons:?}");
+    let calls: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = 'ai_external_call'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(calls, 0, "nothing left the machine");
+    db.close().await;
+}
+
+#[test]
+fn a_wrong_stored_cli_path_is_named_in_status() {
+    let (dir, home) = fresh_home();
+    let file = if cfg!(windows) {
+        "gemini.cmd"
+    } else {
+        "gemini"
+    };
+    let wrong = dir.path().join("wrong").join(file);
+    std::fs::create_dir_all(&wrong).unwrap();
+    let env = [
+        ("PATH", ""),
+        ("JOBPILOT_GEMINI_BIN", ""),
+        ("JOBPILOT_CLAUDE_BIN", "not-a-path"),
+    ];
+    let args = ["ai", "cli-path", "gemini_cli", wrong.to_str().unwrap()];
+    let stored = run_env(&home, &args, &env);
+    assert!(stored.status.success(), "{}", stderr_text(&stored));
+
+    let status = stdout_json(&run_env(&home, &["ai", "status", "--json"], &env));
+    let rows = status["external"].as_array().unwrap();
+    let row = rows.iter().find(|row| row["name"] == "gemini_cli").unwrap();
+    assert_eq!(row["reason"], "wrong_path", "{row}");
+
+    let text = run_env(&home, &["ai", "status"], &env);
+    let text = String::from_utf8_lossy(&text.stdout).to_string();
+    assert!(
+        text.contains("the path set for it is not that program"),
+        "{text}"
+    );
+    assert!(!text.contains("wrong_path"), "{text}");
+}
+
 #[test]
 fn memory_refresh_with_no_ai_reports_skipped() {
     let (_dir, home) = fresh_home();
@@ -581,13 +1177,14 @@ fn memory_refresh_prints_the_count_and_waits_for_yes() {
     let text = String::from_utf8_lossy(&asked.stdout);
     assert!(
         text.contains(
-            "This will make up to 3 Claude calls, limit 20. \
+            "This will make at most 3 paid or subscription calls for 3 questions \
+             (a press checks 20 questions at most). \
              Run `jobpilot memory refresh --yes` to go ahead."
         ),
         "{text}"
     );
     let json = stdout_json(&run_env(&home, &["memory", "refresh", "--json"], &env));
-    assert_eq!(json["claude_calls"], 3);
+    assert_eq!(json["external_calls"], 3);
     let runs = stdout_json(&run(&home, &["agents", "list", "--json"]));
     assert!(runs.as_array().unwrap().is_empty(), "no run started");
 
@@ -598,7 +1195,7 @@ fn memory_refresh_prints_the_count_and_waits_for_yes() {
     ));
     assert_eq!(done["classified"]["checked"], 3);
     assert_eq!(done["classified"]["raised"], 3);
-    assert_eq!(done["claude_calls"], 3, "the count it acted on");
+    assert_eq!(done["external_calls"], 3, "the count it acted on");
     let text = run_env(&home, &["memory", "refresh", "--yes"], &env);
     let text = String::from_utf8_lossy(&text.stdout);
     assert!(text.contains("Checked 0, raised 0, indexed 0"), "{text}");
@@ -698,6 +1295,294 @@ async fn consent_give_then_revoke_writes_audit_rows() {
         actions.contains(&"consent_revoked".to_string()),
         "{actions:?}"
     );
+}
+
+#[test]
+fn consent_show_says_what_is_sent_for_each_provider() {
+    let (_dir, home) = fresh_home();
+    for (name, words) in [
+        ("openai", "Services Agreement 4.2"),
+        ("anthropic", "Customer Content"),
+        ("google", "billing on"),
+        ("openrouter", "Prompt logging"),
+        ("endpoint", "up to that server"),
+        ("gemini_cli", "free Gemini API key"),
+        ("codex_cli", "cannot prove it has no tools"),
+        ("claude_code", "Consumer Terms"),
+    ] {
+        let output = ok(&home, &["ai", "consent", "show", name]);
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains(words), "{name}: {text}");
+        assert!(text.contains("draft_resume"), "{name}: {text}");
+        assert!(text.contains("terms read 2026-11-01"), "{name}: {text}");
+    }
+
+    let shown = stdout_json(&run(
+        &home,
+        &["ai", "consent", "show", "codex_cli", "--json"],
+    ));
+    assert_eq!(shown["key"], "codex_cli/cli_login");
+    assert_eq!(shown["tasks"][0]["skipped_because"], "no_tools");
+
+    let local = run(&home, &["ai", "consent", "show", "ollama"]);
+    assert!(!local.status.success());
+    let text = stderr_text(&local);
+    assert!(text.starts_with("error[validation]"), "{text}");
+    assert!(!text.contains("claude_code only"), "{text}");
+}
+
+#[test]
+fn consent_show_with_a_job_prints_the_prompt() {
+    let (_dir, home) = fresh_home();
+    ok(&home, &["kb", "add", "note", "Shipped the Rust compiler"]);
+    let posting = home.parent().unwrap().join("posting.txt");
+    std::fs::write(&posting, "We need a Rust engineer.").unwrap();
+    let file = posting.to_str().unwrap();
+    ok(&home, &["job", "paste", "Rust role", "--file", file]);
+    let jobs = stdout_json(&run(&home, &["job", "list", "--json"]));
+    let id = jobs[0]["id"].as_str().unwrap();
+
+    let output = ok(&home, &["ai", "consent", "show", "openai", "--job", id]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("<<<UNTRUSTED_POSTING>>>"), "{text}");
+    assert!(text.contains("Shipped the Rust compiler"), "{text}");
+}
+
+#[tokio::test]
+async fn consent_give_needs_attest_for_google() {
+    let (_dir, home) = fresh_home();
+    let args = [
+        "ai",
+        "consent",
+        "give",
+        "google",
+        "--categories",
+        "job_text",
+    ];
+    let refused = run(&home, &args);
+    assert!(!refused.status.success());
+    let text = stderr_text(&refused);
+    assert!(text.contains("billing on"), "{text}");
+    assert!(text.contains("logged for a limited period"), "{text}");
+    assert!(text.contains("--attest"), "{text}");
+    assert!(text.contains("error[refused]"), "{text}");
+
+    let mut attested = args.to_vec();
+    attested.push("--attest");
+    ok(&home, &attested);
+
+    let db = Db::open(&AppPaths::new(&home)).await.unwrap();
+    let given = jobpilot_core::ai::consent::active(&db, "google/paid_key").await;
+    db.close().await;
+    assert_eq!(given.unwrap().unwrap().len(), 1);
+    ok(&home, &["ai", "consent", "revoke", "google"]);
+}
+
+#[test]
+fn anthropic_and_google_take_a_model_and_consent() {
+    let (_dir, home) = fresh_home();
+    let env = [("JOBPILOT_CLAUDE_BIN", "not-a-path")];
+    let row = |home: &Path, name: &str| {
+        let shown = stdout_json(&run_env(home, &["ai", "status", "--json"], &env));
+        let rows = shown["external"].as_array().unwrap().clone();
+        rows.into_iter().find(|row| row["name"] == name).unwrap()
+    };
+    for name in ["anthropic", "google"] {
+        assert_eq!(row(&home, name)["reason"], "no_api_model");
+        ok(&home, &["ai", "model", name, "vendor-model-1"]);
+        ok(&home, &["ai", "enable", name]);
+        let give = ["ai", "consent", "give", name, "--categories", DRAFT_CONSENT];
+        if name == "google" {
+            let refused = run(&home, &give);
+            assert_eq!(refused.status.code(), Some(1));
+            assert!(stderr_text(&refused).contains("--attest"));
+            assert!(
+                row(&home, name)["consent"].is_null(),
+                "no attestation, no record"
+            );
+            let mut attested = give.to_vec();
+            attested.push("--attest");
+            ok(&home, &attested);
+        } else {
+            ok(&home, &give);
+        }
+        let shown = row(&home, name);
+        assert_eq!(shown["model"], "vendor-model-1");
+        assert_eq!(shown["reason"], "no_key");
+        assert_eq!(shown["consent"].as_array().unwrap().len(), 3);
+    }
+
+    let refused = run(&home, &["ai", "model", "google", "models/x"]);
+    assert!(stderr_text(&refused).contains("validation"));
+    assert_eq!(row(&home, "google")["model"], "vendor-model-1");
+}
+
+#[test]
+fn panel_refuses_new_ai_commands() {
+    let (_dir, home) = fresh_home();
+    let panel = [("JOBPILOT_PANEL", "1")];
+    for args in [
+        vec!["ai", "enable", "openai"],
+        vec!["ai", "disable", "openai"],
+        vec!["ai", "order", "openai"],
+        vec!["ai", "model", "openai", "m"],
+        vec!["ai", "endpoint", "http://127.0.0.1:1"],
+        vec![
+            "ai",
+            "consent",
+            "give",
+            "openai",
+            "--categories",
+            "job_text",
+        ],
+    ] {
+        let refused = run_env(&home, &args, &panel);
+        assert!(!refused.status.success(), "{args:?}");
+        assert!(stderr_text(&refused).contains("panel_refused"), "{args:?}");
+    }
+    for args in [
+        vec!["ai", "consent", "show", "openai"],
+        vec!["ai", "consent", "revoke", "openai"],
+    ] {
+        let allowed = run_env(&home, &args, &panel);
+        assert!(allowed.status.success(), "{args:?}");
+    }
+}
+
+#[test]
+fn endpoint_drafts_end_to_end_against_a_fake() {
+    const PATH: &str = "/v1/chat/completions";
+    let (_dir, home) = fresh_home();
+    let (job, reply) = draftable(&home);
+    let content = reply.to_string();
+    let answer = serde_json::json!({
+        "choices": [{"message": {"role": "assistant", "content": content},
+                     "finish_reason": "stop"}],
+    });
+    let fake = Fake::start(vec![(PATH, Canned::json(200, &answer))]);
+    let env = [("JOBPILOT_CLAUDE_BIN", "not-a-path")];
+
+    ok(&home, &["ai", "endpoint", &format!("{}/v1/", fake.url)]);
+    ok(&home, &["ai", "model", "endpoint", "m"]);
+    ok(&home, &["ai", "enable", "endpoint"]);
+    ok(&home, &["ai", "disable", "ollama"]);
+    let shown = stdout_json(&run_env(&home, &["ai", "status", "--json"], &env));
+    let rows = shown["external"].as_array().unwrap();
+    let row = rows.iter().find(|row| row["name"] == "endpoint").unwrap();
+    assert_eq!(row["available"], true);
+    assert_eq!(row["path"], format!("{}/v1", fake.url));
+    assert_eq!(row["model"], "m");
+
+    let refused = run(&home, &["resume", "generate", &job]);
+    assert!(
+        stderr_text(&refused).contains("consent"),
+        "no consent, no send"
+    );
+    assert!(fake.hits(PATH).is_empty());
+
+    ok(
+        &home,
+        &[
+            "ai",
+            "consent",
+            "give",
+            "endpoint",
+            "--categories",
+            DRAFT_CONSENT,
+        ],
+    );
+    let made = stdout_json(&run(&home, &["resume", "generate", &job, "--json"]));
+    assert_eq!(made["provider"], "endpoint");
+    assert_eq!(made["blocked"], 0);
+    assert_eq!(fake.hits(PATH).len(), 1);
+    assert_eq!(fake.hits(PATH)[0]["model"], "m");
+
+    let runs = stdout_json(&run(&home, &["agents", "list", "--json"]));
+    let id = runs[0]["id"].as_str().unwrap();
+    let log = ok(&home, &["agents", "log", id]);
+    let log = String::from_utf8_lossy(&log.stdout).to_string();
+    assert!(log.contains("endpoint/loopback"), "{log}");
+
+    let moved = Fake::start(vec![(PATH, Canned::json(200, &answer))]);
+    ok(&home, &["ai", "endpoint", &format!("{}/v1", moved.url)]);
+    let stopped = run(&home, &["resume", "generate", &job]);
+    assert!(
+        stderr_text(&stopped).contains("endpoint address changed"),
+        "{}",
+        stderr_text(&stopped)
+    );
+    assert!(moved.hits(PATH).is_empty());
+}
+
+#[test]
+fn an_endpoint_refused_or_cleared_leaves_the_row_saying_why() {
+    let (_dir, home) = fresh_home();
+    let env = [("JOBPILOT_CLAUDE_BIN", "not-a-path")];
+    let reason = |home: &Path| {
+        let shown = stdout_json(&run_env(home, &["ai", "status", "--json"], &env));
+        let rows = shown["external"].as_array().unwrap().clone();
+        let row = rows.iter().find(|row| row["name"] == "endpoint").cloned();
+        row.unwrap()["reason"].clone()
+    };
+    assert_eq!(reason(&home), "no_endpoint");
+
+    let refused = run(&home, &["ai", "endpoint", "https://api.example.com/v1"]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(stderr_text(&refused).contains("not_loopback"));
+
+    ok(&home, &["ai", "endpoint", "http://127.0.0.1:9/v1"]);
+    assert_eq!(reason(&home), "no_api_model");
+    let shown = ok(&home, &["ai", "consent", "show", "endpoint"]);
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    assert!(shown.contains("Address: http://127.0.0.1:9/v1"), "{shown}");
+    assert!(!shown.contains("Program:"), "{shown}");
+    ok(&home, &["ai", "endpoint", ""]);
+    assert_eq!(reason(&home), "no_endpoint");
+}
+
+#[test]
+fn ai_model_explains_a_refused_openrouter_model() {
+    let (_dir, home) = fresh_home();
+    let refused = run(&home, &["ai", "model", "openrouter", "meta-llama/llama-x"]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(
+        stderr_text(&refused).contains("not eligible through OpenRouter"),
+        "{}",
+        stderr_text(&refused)
+    );
+    ok(&home, &["ai", "model", "openrouter", "anthropic/claude-x"]);
+    let refused = run(&home, &["ai", "model", "ollama", "m"]);
+    assert!(stderr_text(&refused).contains("validation"));
+    let refused = run(&home, &["ai", "model", "openai", "gpt-4o-search-preview"]);
+    assert!(stderr_text(&refused).contains("searches by itself"));
+}
+
+#[test]
+fn every_provider_shows_in_status() {
+    let (_dir, home) = fresh_home();
+    let env = [("JOBPILOT_CLAUDE_BIN", "not-a-path")];
+    let shown = run_env(&home, &["ai", "status"], &env);
+    let text = String::from_utf8_lossy(&shown.stdout);
+    for label in [
+        "OpenAI",
+        "Anthropic",
+        "Google Gemini",
+        "OpenRouter",
+        "Codex CLI",
+    ] {
+        assert!(text.contains(label), "{label}: {text}");
+    }
+    assert!(
+        run_env(&home, &["ai", "enable", "openrouter"], &env)
+            .status
+            .success()
+    );
+    let shown = run_env(&home, &["status"], &env);
+    let text = String::from_utf8_lossy(&shown.stdout);
+    assert!(text.contains("OpenRouter"), "{text}");
+    assert!(!text.contains("Codex CLI"), "only what is on: {text}");
+    let json = stdout_json(&run_env(&home, &["status", "--json"], &env));
+    assert_eq!(json["ai"]["external"].as_array().unwrap().len(), 7);
 }
 
 #[tokio::test]
@@ -1940,4 +2825,197 @@ async fn ai_index_while_paused_says_paused() {
     assert_eq!(refused.status.code(), Some(1));
     let text = stderr_text(&refused);
     assert!(text.starts_with("error[paused]"), "{text}");
+}
+
+/// A run with `input` piped in, as a script would give a key.
+fn run_with_stdin(home: &Path, args: &[&str], input: &str) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jobpilot"))
+        .args(args)
+        .env("JOBPILOT_HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // A command that refuses before reading closes the pipe, which is no failure here.
+    let _ = child.stdin.take().unwrap().write_all(input.as_bytes());
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn key_set_refuses_argv_by_shape() {
+    let (_dir, home) = fresh_home();
+    for args in [
+        vec!["ai", "key", "set", "openai", "sk-ZXQ-argv"],
+        vec!["ai", "key", "set", "openai", "--key=sk-ZXQ-argv"],
+        vec!["ai", "key", "set", "sk-ZXQ-argv"],
+        vec!["ai", "--json", "key", "set", "openai", "sk-ZXQ-argv"],
+        vec!["--json", "ai", "key", "remove", "openai", "sk-ZXQ-argv"],
+    ] {
+        let refused = run(&home, &args);
+        assert_eq!(refused.status.code(), Some(2), "{args:?}");
+        assert!(refused.stdout.is_empty(), "{args:?}");
+        let text = stderr_text(&refused);
+        assert!(text.starts_with("error[usage]"), "{args:?}: {text}");
+        assert!(!text.contains("ZXQ"), "{args:?}: {text}");
+    }
+    assert!(
+        !home.exists(),
+        "refused while parsing, before any data opened"
+    );
+}
+
+#[test]
+fn only_a_key_command_hides_what_clap_says() {
+    let (_dir, home) = fresh_home();
+    let help = run(&home, &["ai", "key", "set", "--help"]);
+    assert_eq!(help.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(text.contains("Usage"), "{text}");
+
+    let other = run(&home, &["doc", "nosuch"]);
+    assert_eq!(other.status.code(), Some(2));
+    let text = stderr_text(&other);
+    assert!(text.contains("nosuch"), "{text}");
+    assert!(!text.contains("error[usage]"), "{text}");
+}
+
+/// Refused before stdin is read: the pipe stays open, and nothing is ever written to it.
+#[test]
+fn a_provider_with_no_key_is_refused_before_any_key_is_asked_for() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let (_dir, home) = fresh_home();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jobpilot"))
+        .args(["ai", "key", "set", "gemini_cli"])
+        .env("JOBPILOT_HOME", &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let held_open = child.stdin.take();
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            child.kill().unwrap();
+            panic!("waited for a key this provider cannot take");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    drop(held_open);
+    assert_eq!(status.code(), Some(1));
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    assert!(stderr.starts_with("error[refused]"), "{stderr}");
+}
+
+#[test]
+fn key_set_with_a_bad_key_echoes_nothing() {
+    let (_dir, home) = fresh_home();
+    let refused = run_with_stdin(&home, &["ai", "key", "set", "openai"], "two words here\n");
+    assert_eq!(refused.status.code(), Some(1));
+    let text = stderr_text(&refused);
+    assert!(text.starts_with("error[validation]"), "{text}");
+    assert!(!text.contains("two words here"), "{text}");
+    assert!(refused.stdout.is_empty());
+    let secrets = run(&home, &["ai", "status", "--json"]);
+    let status = stdout_json(&secrets);
+    assert_eq!(status["external"][0]["key_stored"], false);
+}
+
+#[test]
+fn key_set_with_nothing_piped_is_not_a_key() {
+    let (_dir, home) = fresh_home();
+    let refused = run_with_stdin(&home, &["ai", "key", "set", "openai"], "");
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(stderr_text(&refused).starts_with("error[validation]"));
+}
+
+#[test]
+fn key_set_refuses_a_provider_that_takes_no_key() {
+    let (_dir, home) = fresh_home();
+    for provider in ["ollama", "claude_code", "gemini_cli", "codex_cli"] {
+        let refused = run_with_stdin(&home, &["ai", "key", "set", provider], "sk-abcdefgh\n");
+        assert_eq!(refused.status.code(), Some(1), "{provider}");
+        let text = stderr_text(&refused);
+        assert!(text.starts_with("error[refused]"), "{provider}: {text}");
+        assert!(!text.contains("sk-abcdefgh"), "{text}");
+    }
+}
+
+#[test]
+fn key_remove_with_no_key_is_not_found() {
+    let (_dir, home) = fresh_home();
+    let refused = run(&home, &["ai", "key", "remove", "openai"]);
+    assert_eq!(refused.status.code(), Some(1));
+    let text = stderr_text(&refused);
+    assert!(text.starts_with("error[not_found]"), "{text}");
+}
+
+/// The test names the stored value by reading the data folder back through `ai status`.
+fn cli_row(home: &Path, name: &str) -> serde_json::Value {
+    let status = stdout_json(&run(home, &["ai", "status", "--json"]));
+    status["external"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == name)
+        .cloned()
+        .unwrap()
+}
+
+#[test]
+fn cli_path_refuses_another_program() {
+    let (dir, home) = fresh_home();
+    let program = if cfg!(windows) {
+        "gemini.cmd"
+    } else {
+        "gemini"
+    };
+    let mock = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../core/tests/mock-gemini")
+        .join(program);
+    // Another program, a relative path, and another provider's name are all refused.
+    for (provider, path) in [
+        ("gemini_cli", "/bin/sh"),
+        ("gemini_cli", "gemini"),
+        ("gemini_cli", "/x/gemini-evil"),
+        ("codex_cli", mock.to_str().unwrap()),
+        ("claude_code", mock.to_str().unwrap()),
+        ("openai", mock.to_str().unwrap()),
+    ] {
+        let out = run(&home, &["ai", "cli-path", provider, path]);
+        assert!(!out.status.success(), "{provider} {path}");
+    }
+    let refused = run(&home, &["ai", "cli-path", "gemini_cli", "/bin/sh"]);
+    let message = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(
+        message.contains("full path to a program named gemini"),
+        "{message}"
+    );
+
+    // The right program is stored and shows on the row; an empty path clears it.
+    let set = run(
+        &home,
+        &[
+            "ai",
+            "cli-path",
+            "gemini_cli",
+            mock.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(stdout_json(&set)["gemini_cli_path"], mock.to_str().unwrap());
+    assert_eq!(cli_row(&home, "gemini_cli")["path"], mock.to_str().unwrap());
+    let cleared = run(&home, &["ai", "cli-path", "gemini_cli", "", "--json"]);
+    assert_eq!(stdout_json(&cleared)["gemini_cli_path"], "");
+    drop(dir);
 }

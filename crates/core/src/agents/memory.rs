@@ -215,8 +215,13 @@ async fn asked_since(
     .bind(since)
     .fetch_all(&db.pool)
     .await?;
-    let named = |id: ProviderId| used.contains(&id.to_string()).then_some(id);
-    let provider = named(ProviderId::ClaudeCode).or_else(|| named(ProviderId::Ollama));
+    let named = || {
+        let known = ProviderId::ALL.into_iter();
+        known.filter(|id| used.contains(&id.to_string()))
+    };
+    let provider = named()
+        .find(|id| *id != ProviderId::Ollama)
+        .or_else(|| named().next());
     let categories = if provider.is_some() {
         spec(TaskType::ClassifyAnswer).categories
     } else {

@@ -40,6 +40,7 @@ pub fn run() {
             focus_main_window(app);
         }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(PtyState::default())
         .menu(menu::build)
         .on_menu_event(menu::on_event)

@@ -11,10 +11,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use jobpilot_core::agents::MemoryRefreshed;
-use jobpilot_core::ai::claude_code::{self, TERMS_DATE};
 use jobpilot_core::ai::ollama::Ollama;
+use jobpilot_core::ai::register::{self, ProviderInfo};
 use jobpilot_core::ai::router::{Router, ollama_from_settings};
-use jobpilot_core::ai::{self, AiStatus, CancellationToken, DataCategory, ProviderId, consent};
+use jobpilot_core::ai::{
+    self, AiStatus, CancellationToken, DataCategory, Sharing, TaskType, consent,
+};
+use jobpilot_core::ai::{api, child, claude_code};
 use jobpilot_core::analytics::{self, Report};
 use jobpilot_core::applications::{self, Application, ApplicationEvent, ApplicationInput};
 use jobpilot_core::audit::{self, AuditEntry};
@@ -23,7 +26,7 @@ use jobpilot_core::crypto::{self, KeyState};
 use jobpilot_core::documents::{self, Document, SearchHit};
 use jobpilot_core::drafts::{self, ClaimInput, Compare, Draft, ExportFormat};
 use jobpilot_core::embed::{self, Hit};
-use jobpilot_core::generate::Generated;
+use jobpilot_core::generate::{self, Generated, PromptPreview};
 use jobpilot_core::knowledge::{self, JobText, KnowledgeItem};
 use jobpilot_core::memory::{
     self, Answer, AppliedAnswer, AuthorizationAnswer, Class, MemoryHit, Question, QuestionRow,
@@ -35,6 +38,7 @@ use jobpilot_core::profile::{self, Profile, ProfileBasic, WorkAuthorization};
 use jobpilot_core::recovery::{self, RecoveryReceipt};
 use jobpilot_core::render::{ResumeDoc, Template};
 use jobpilot_core::runner::{self, ExportChoice, RunDetail, RunSummary};
+use jobpilot_core::secrets::Zeroizing;
 use jobpilot_core::{Db, Error, Result, agents, secrets, settings, transfer};
 use serde_json::{Value, json};
 use tauri::ipc::Invoke;
@@ -55,8 +59,6 @@ pub struct Exported {
 /// Settings core keeps for itself: what the router runs, and the recovery reminder's mark.
 /// The first has a command for each key, and the second is only ever core's to write.
 const OWNED_SETTINGS: &[&str] = &["ai.", "recovery_key_exported_"];
-/// Consent is recorded for the one external provider, under `ProviderId`'s text.
-const CONSENT_PROVIDER: &str = "claude_code";
 
 pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
@@ -146,9 +148,17 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         ai_enable,
         ai_set_claude_path,
         ai_clear_claude_path,
+        ai_set_cli_path,
+        ai_clear_cli_path,
         ai_set_ollama_url,
+        ai_set_api_model,
+        ai_set_endpoint,
         ai_consent_give,
         ai_consent_revoke,
+        ai_sharing,
+        ai_preview,
+        ai_key_from_clipboard,
+        ai_key_remove,
         ai_index,
         ai_cancel,
         key_state,
@@ -837,7 +847,7 @@ pub async fn memory_refresh_plan(state: State<'_, AppState>) -> Result<RefreshPl
     memory::refresh_plan(&db, &router).await
 }
 
-/// Only a person's press starts it. With Claude calls ahead, the count is named in a native
+/// Only a person's press starts it. With outside calls ahead, the count is named in a native
 /// dialog first, with no `work` held, and the plan is read again after the answer: a count
 /// that moved in between is refused, so the yes covers what ran.
 #[tauri::command]
@@ -845,14 +855,17 @@ pub async fn memory_refresh<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, AppState>,
 ) -> Result<MemoryRefreshed> {
-    let asked = {
+    let plan = {
         let db = state.work().await?;
         let router = Router::from_settings(&db).await?;
-        memory::refresh_plan(&db, &router).await?.claude_calls
+        memory::refresh_plan(&db, &router).await?
     };
+    let asked = plan.external_calls;
     if asked > 0 {
         let message = format!(
-            "This will make up to {asked} Claude calls, limit {}.",
+            "This will make at most {asked} paid or subscription calls for {} questions \
+             (a press checks {} questions at most).",
+            plan.pending,
             memory::CLASSIFY_BATCH
         );
         native::confirmed(&app, "Refresh career memory", message, "Refresh").await?;
@@ -860,9 +873,9 @@ pub async fn memory_refresh<R: Runtime>(
     let running = state.ai.begin()?;
     let db = state.work().await?;
     let router = Router::from_settings(&db).await?;
-    if memory::refresh_plan(&db, &router).await?.claude_calls != asked {
+    if memory::refresh_plan(&db, &router).await?.external_calls != asked {
         return Err(Error::Validation(
-            "the number of Claude calls changed since you were asked; press Refresh again".into(),
+            "the number of outside calls changed since you were asked; press Refresh again".into(),
         ));
     }
     agents::memory_refresh(&db, &router, ACTOR, running.token.clone()).await
@@ -1073,6 +1086,61 @@ pub async fn ai_clear_claude_path<R: Runtime>(
     settings::set(&db, claude_code::PATH_SETTING, &json!("")).await
 }
 
+/// The program that runs as the Gemini or Codex CLI. The picker is the confirmation, as for
+/// Claude: the webview names the provider and never a path.
+#[tauri::command]
+pub async fn ai_set_cli_path<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    provider: String,
+) -> Result<()> {
+    drop(state.work().await?);
+    let spec = child::spec_for(&provider)
+        .ok_or_else(|| Error::Validation("choose a program for gemini_cli or codex_cli".into()))?;
+    let dialog = FileDialog {
+        title: &format!("Choose the {} program", spec.program),
+        filter: "Program",
+        extensions: &[],
+        file_name: None,
+    };
+    let path = native::open_file(&app, dialog).await?;
+    if !(path.is_absolute() && child::accepts_name(&path, spec, cfg!(windows))) {
+        return Err(Error::Validation(format!(
+            "choose a program named {}",
+            child::bin_names(spec.program, cfg!(windows)).join(" or ")
+        )));
+    }
+    let path = path
+        .to_str()
+        .ok_or_else(|| Error::Validation("this path cannot be stored".into()))?;
+    let db = state.work().await?;
+    child::set_cli_path(&db, &provider, path).await
+}
+
+/// Back to finding the program by itself, which changes what runs, so it is confirmed too.
+#[tauri::command]
+pub async fn ai_clear_cli_path<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    provider: String,
+) -> Result<()> {
+    let spec = child::spec_for(&provider)
+        .ok_or_else(|| Error::Validation("choose a program for gemini_cli or codex_cli".into()))?;
+    let stored = settings::get(&*state.work().await?, spec.setting).await?;
+    let stored = stored.as_ref().and_then(Value::as_str).unwrap_or_default();
+    if stored.trim().is_empty() {
+        // Already automatic: nothing changes, so there is nothing to confirm.
+        return Ok(());
+    }
+    let message = format!(
+        "Stop using this program as {}, and find {} automatically?\n\n{stored}",
+        spec.program, spec.program
+    );
+    native::confirmed(&app, "Provider program", message, "Clear").await?;
+    let db = state.work().await?;
+    child::set_cli_path(&db, &provider, "").await
+}
+
 /// Where Ollama listens. Core refuses anything off this machine (M-21) before anyone is
 /// asked; the dialog is for another program that listens here.
 #[tauri::command]
@@ -1089,13 +1157,69 @@ pub async fn ai_set_ollama_url<R: Runtime>(
     settings::set(&db, "ai.ollama_url", &json!(url)).await
 }
 
-fn consent_provider(provider: &str) -> Result<String> {
-    if provider != CONSENT_PROVIDER {
-        return Err(Error::Validation(
-            "consent applies to claude_code only".into(),
-        ));
-    }
-    Ok(ProviderId::ClaudeCode.to_string())
+/// The model an API provider or the endpoint runs. No dialog: the consent record is the gate,
+/// and `check_model` holds the origin rules.
+#[tauri::command]
+pub async fn ai_set_api_model(
+    state: State<'_, AppState>,
+    provider: String,
+    model: String,
+) -> Result<()> {
+    api::set_model(&*state.work().await?, &provider, &model).await
+}
+
+/// Where the compatible endpoint listens. Core refuses anything off this machine before anyone
+/// is asked; the dialog is for another program that listens here. An empty address clears it.
+#[tauri::command]
+pub async fn ai_set_endpoint<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    url: String,
+) -> Result<()> {
+    drop(state.work().await?);
+    let (message, button) = if url.trim().is_empty() {
+        let message = "Stop using the compatible endpoint, and forget its address, model, and \
+                       any stored key?";
+        (message.to_string(), "Clear")
+    } else {
+        let stored = api::check_endpoint(&url)?;
+        let message = format!(
+            "Send AI requests to this address?\n\n{stored}\n\nA different address ends the \
+             consent given for the old one, and removes any key stored for it."
+        );
+        (message, "Use this address")
+    };
+    native::confirmed(&app, "Compatible endpoint", message, button).await?;
+    api::set_endpoint(&*state.work().await?, &url).await
+}
+
+/// A provider in the table. Ollama is not one: it runs here and needs no record, and a name
+/// the owner decisions leave out has no row.
+fn consent_provider(provider: &str) -> Result<&'static ProviderInfo> {
+    register::info(provider)
+        .ok_or_else(|| Error::Validation("consent does not apply to this provider".into()))
+}
+
+/// What the native dialog says. It states the data use and the attestation itself, as a yes
+/// to this text is the consent: script in the webview cannot change what it reads.
+fn consent_message(sharing: &Sharing, categories: &[DataCategory]) -> String {
+    let (label, destination) = (&sharing.label, &sharing.destination);
+    let names = json!(categories);
+    let word = if sharing.name == "endpoint" {
+        "Address"
+    } else {
+        "Program"
+    };
+    let program = sharing.path.as_ref();
+    let program = program.map_or_else(String::new, |path| format!("\n\n{word}: {path}"));
+    let attestation = sharing.attestation.as_ref();
+    let attestation = attestation.map_or_else(String::new, |line| format!("\n\n{line}"));
+    format!(
+        "Allow JobPilot to send this data to {label}?\n\n{names}{program}\n\n\
+         Where it goes: {destination}\n\n\
+         How {label} uses it: {}{attestation}",
+        sharing.data_use
+    )
 }
 
 /// The record that lets data leave this machine (FR-3.30), so it is confirmed outside the
@@ -1108,29 +1232,89 @@ pub async fn ai_consent_give<R: Runtime>(
     provider: String,
     categories: Vec<DataCategory>,
 ) -> Result<()> {
-    let id = consent_provider(&provider)?;
-    drop(state.work().await?);
-    let names = json!(categories);
-    let message = format!(
-        "Allow JobPilot to send this data to Claude Code on your own login?\n\n{names}\n\n\
-         It leaves this computer. Consumer Terms allow training unless you opt out."
-    );
-    native::confirmed(&app, "Claude Code consent", message, "Allow").await?;
+    consent_provider(&provider)?;
+    let sharing = ai::sharing(&*state.work().await?, &provider).await?;
+    let title = format!("{} consent", sharing.label);
+    let message = consent_message(&sharing, &categories);
+    native::confirmed(&app, &title, message, "Allow").await?;
     let db = state.work().await?;
-    consent::give(&db, &id, &categories, TERMS_DATE, ACTOR).await
+    // Pressing Allow on that text attests, when the provider asks for it.
+    consent::give_for(&db, &provider, &categories, true, ACTOR).await
 }
 
 /// Revoked first, so a run that has not yet reached the consent check cannot pass it, and the
 /// token fires whatever the write did: a run the user wants stopped stops.
 #[tauri::command]
 pub async fn ai_consent_revoke(state: State<'_, AppState>, provider: String) -> Result<()> {
-    let id = consent_provider(&provider)?;
+    let id = consent_provider(&provider)?.id.to_string();
     let revoked = match state.work().await {
         Ok(db) => consent::revoke(&db, &id, ACTOR).await,
         Err(error) => Err(error),
     };
     state.ai.cancel();
     revoked
+}
+
+/// What the consent dialog shows.
+#[tauri::command]
+pub async fn ai_sharing(state: State<'_, AppState>, provider: String) -> Result<Sharing> {
+    consent_provider(&provider)?;
+    ai::sharing(&*state.work().await?, &provider).await
+}
+
+/// The exact resume prompt for a pasted posting. Builds it and sends nothing.
+#[tauri::command]
+pub async fn ai_preview(
+    state: State<'_, AppState>,
+    job_text_id: String,
+    provider: String,
+) -> Result<PromptPreview> {
+    let db = state.work().await?;
+    generate::preview(&db, TaskType::DraftResume, &job_text_id, &provider).await
+}
+
+/// A key comes from the system clipboard, so it never enters the webview, which sends only a
+/// provider name. Script there cannot answer the dialog, and what it shows is what is stored:
+/// the clipboard is read once, before the dialog. No lock is held while it is open.
+#[tauri::command]
+pub async fn ai_key_from_clipboard<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    provider: String,
+) -> Result<()> {
+    let label = secrets::key_provider(&provider)?.label;
+    drop(state.work().await?);
+    let copied = native::clipboard_text(&app).await?.map(Zeroizing::new);
+    // Any other text is someone's posting or password, so it is not repeated back.
+    let not_a_key = || Error::Validation("the clipboard does not hold a key".into());
+    let copied = copied.ok_or_else(not_a_key)?;
+    let key = secrets::check_api_key(&copied).map_err(|_| not_a_key())?;
+    let last_four = &key[key.len() - 4..];
+    let message = format!(
+        "Store the key ending in {last_four} as your {label} key? It goes to the system \
+         keychain. The clipboard is cleared after."
+    );
+    native::confirmed(&app, &format!("{label} key"), message, "Store key").await?;
+    secrets::set_api_key(&*state.work().await?, &provider, &key, ACTOR).await?;
+    // The text as copied: a key with a line break after it is still that text.
+    native::clear_clipboard(&app, &copied).await
+}
+
+/// Confirmed outside the webview, as script there must not be able to end the user's access.
+#[tauri::command]
+pub async fn ai_key_remove<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    provider: String,
+) -> Result<()> {
+    let label = secrets::key_provider(&provider)?.label;
+    let stored = secrets::names(&*state.work().await?).await?;
+    if !stored.contains(&secrets::api_key_name(&provider)) {
+        return Err(Error::NotFound);
+    }
+    let message = format!("Remove your {label} key from the system keychain?");
+    native::confirmed(&app, &format!("{label} key"), message, "Remove key").await?;
+    secrets::delete_api_key(&*state.work().await?, &provider, ACTOR).await
 }
 
 #[tauri::command]
@@ -1343,7 +1527,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use jobpilot_core::recovery::RecoveryReceipt;
-    use jobpilot_core::{AppPaths, Db, Error, backup, crypto};
+    use jobpilot_core::{AppPaths, Db, Error, backup, crypto, secrets};
     use serde_json::{Value, json};
     use tauri::ipc::{CallbackFn, InvokeBody};
     use tauri::test::{
@@ -1354,7 +1538,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::handler;
-    use crate::native::NativeHook;
+    use crate::native::{self, NativeHook};
     use crate::pty::{self, MAX_WRITE_BYTES, PtyState};
     use crate::state::{AppState, StartupError};
 
@@ -1486,6 +1670,30 @@ mod tests {
         fn answer(&self, yes: bool) {
             let hook = self.app.state::<NativeHook>();
             hook.confirm.store(yes, Ordering::SeqCst);
+        }
+
+        /// What the system clipboard holds from here on.
+        fn copy(&self, text: &str) {
+            let hook = self.app.state::<NativeHook>();
+            *hook.clipboard.lock().unwrap() = Some(text.to_owned());
+        }
+
+        fn clipboard(&self) -> Option<String> {
+            let hook = self.app.state::<NativeHook>();
+            hook.clipboard.lock().unwrap().clone()
+        }
+
+        /// A `secret_index` row, as a stored key leaves, with no keychain entry behind it.
+        fn list_secret(&self, name: &str) {
+            let state = self.app.state::<AppState>();
+            block_on(async {
+                let db = state.work().await.unwrap();
+                sqlx::query("INSERT INTO secret_index (name, created_at) VALUES (?, 't')")
+                    .bind(name)
+                    .execute(&db.pool)
+                    .await
+                    .unwrap();
+            });
         }
 
         /// What the user picks in the next file dialog.
@@ -2316,6 +2524,33 @@ mod tests {
         assert_eq!(h.app.state::<PtyState>().pid(), Some(pid));
     }
 
+    /// macOS CI lost the interrupt in one run of eight and no run here repeats it. The mock's
+    /// trap is set before it says it is ready, so a failure prints who was running and in which
+    /// state. Dropped before the panel, which ends them.
+    #[cfg(unix)]
+    struct GroupTableOnPanic(u32);
+
+    #[cfg(unix)]
+    impl Drop for GroupTableOnPanic {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                return;
+            }
+            let table = std::process::Command::new("ps")
+                .args(["-axo", "pid=,pgid=,tpgid=,stat=,command="])
+                .output();
+            let text = table.map_or(String::new(), |table| {
+                String::from_utf8_lossy(&table.stdout).into_owned()
+            });
+            let group = self.0.to_string();
+            for row in text.lines() {
+                if row.split_whitespace().nth(1) == Some(group.as_str()) {
+                    eprintln!("{row}");
+                }
+            }
+        }
+    }
+
     /// Ctrl-C is a byte until the terminal driver makes it a signal, so this needs the PTY.
     #[cfg(unix)]
     #[test]
@@ -2327,6 +2562,7 @@ mod tests {
         );
         let panel = Panel::open(&h);
         let pid = h.app.state::<PtyState>().pid().unwrap();
+        let _table = GroupTableOnPanic(pid);
         panel.line("claude");
         panel.wait_for("claude-ready");
         panel.send(b"\x03").unwrap();
@@ -2507,9 +2743,17 @@ mod tests {
         "ai_enable",
         "ai_set_claude_path",
         "ai_clear_claude_path",
+        "ai_set_cli_path",
+        "ai_clear_cli_path",
         "ai_set_ollama_url",
+        "ai_set_api_model",
+        "ai_set_endpoint",
         "ai_consent_give",
         "ai_consent_revoke",
+        "ai_sharing",
+        "ai_preview",
+        "ai_key_from_clipboard",
+        "ai_key_remove",
         "ai_index",
         "ai_cancel",
         "key_state",
@@ -2565,6 +2809,248 @@ mod tests {
             .filter(|name| name.starts_with("dialog:"))
             .collect();
         assert_eq!(dialogs, ["dialog:allow-open"]);
+    }
+
+    /// Every capability file, as Tauri loads them all, and the config, which can hold one inline.
+    #[test]
+    fn the_webview_gains_no_clipboard_capability() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = vec![root.join("tauri.conf.json")];
+        for entry in fs::read_dir(root.join("capabilities")).unwrap() {
+            files.push(entry.unwrap().path());
+        }
+        assert!(files.len() > 1, "no capability file was read");
+        for file in files {
+            let text = fs::read_to_string(&file).unwrap().to_lowercase();
+            assert!(!text.contains("clipboard"), "{}", file.display());
+        }
+    }
+
+    /// Fake, and the last four are what a dialog may show of it.
+    const SECRET_KEY: &str = "sk-ZXQ-sentinel-WXYZ";
+    const SECRET_LAST4: &str = "WXYZ";
+
+    #[test]
+    fn clipboard_that_is_not_a_key_stores_nothing_and_echoes_nothing() {
+        let h = ready();
+        let posting = "Senior Rust engineer wanted, remote, Zebra Labs, apply today";
+        let args = json!({ "provider": "openai" });
+        h.copy(posting);
+
+        let error = h.call("ai_key_from_clipboard", args.clone()).unwrap_err();
+
+        assert_eq!(error["code"], "validation");
+        let text = error.to_string();
+        assert!(text.contains("the clipboard does not hold a key"), "{text}");
+        for word in posting.split_whitespace() {
+            assert!(!text.contains(word), "{word}: {text}");
+        }
+        assert!(h.asked().is_empty());
+        assert_eq!(h.ok("secret_names", json!({})), json!([]));
+        assert_eq!(h.clipboard().as_deref(), Some(posting), "left alone");
+
+        *h.app.state::<NativeHook>().clipboard.lock().unwrap() = None;
+        assert_eq!(h.code("ai_key_from_clipboard", args), "validation");
+        assert!(h.asked().is_empty());
+    }
+
+    #[test]
+    fn the_dialog_shows_only_the_last_four() {
+        let h = ready();
+        // A key copied from a web page often brings its line break along.
+        let copied = format!("{SECRET_KEY}\n");
+        h.copy(&copied);
+        h.answer(false);
+
+        let code = h.code("ai_key_from_clipboard", json!({ "provider": "openai" }));
+
+        assert_eq!(code, "confirmation_required");
+        let asked = h.asked();
+        assert_eq!(
+            asked,
+            [format!(
+                "OpenAI key: Store the key ending in {SECRET_LAST4} as your OpenAI key? It goes \
+                 to the system keychain. The clipboard is cleared after."
+            )]
+        );
+        assert!(!asked[0].contains(&SECRET_KEY[..SECRET_KEY.len() - 4]));
+        assert_eq!(h.ok("secret_names", json!({})), json!([]));
+        assert_eq!(h.clipboard().as_deref(), Some(copied.as_str()));
+        let hook = h.app.state::<NativeHook>();
+        assert_eq!(*hook.work_at_dialog.lock().unwrap(), [false]);
+    }
+
+    #[test]
+    fn key_commands_take_no_value_argument() {
+        let source = include_str!("commands.rs");
+        for command in ["ai_key_from_clipboard", "ai_key_remove"] {
+            let (_, rest) = source
+                .split_once(&format!("pub async fn {command}<R: Runtime>("))
+                .unwrap();
+            let (arguments, _) = rest.split_once(") -> ").unwrap();
+            let names: Vec<&str> = arguments
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, _)| name.trim())
+                .collect();
+            assert_eq!(names, ["app", "state", "provider"], "{command}");
+        }
+    }
+
+    #[test]
+    fn secret_set_refuses_a_provider_key_name() {
+        let h = ready();
+        for name in ["ai-key-openai", "AI-KEY-openai"] {
+            let set = json!({ "name": name, "value": "sk-from-script" });
+            assert_eq!(h.code("secret_set", set), "refused", "{name}");
+            assert_eq!(
+                h.code("secret_delete", json!({ "name": name })),
+                "refused",
+                "{name}"
+            );
+        }
+        assert_eq!(h.ok("secret_names", json!({})), json!([]));
+    }
+
+    #[test]
+    fn a_provider_with_no_key_asks_and_reads_nothing() {
+        let h = ready();
+        h.copy(SECRET_KEY);
+        for provider in ["ollama", "claude_code", "gemini_cli", "codex_cli", "nope"] {
+            let args = json!({ "provider": provider });
+            assert_eq!(
+                h.code("ai_key_from_clipboard", args.clone()),
+                "refused",
+                "{provider}"
+            );
+            assert_eq!(h.code("ai_key_remove", args), "refused", "{provider}");
+        }
+        assert!(h.asked().is_empty());
+    }
+
+    #[test]
+    fn key_commands_are_unavailable_in_recovery() {
+        let h = recovery(OPENS);
+        h.copy(SECRET_KEY);
+        for command in ["ai_key_from_clipboard", "ai_key_remove"] {
+            let args = json!({ "provider": "openai" });
+            assert_eq!(h.code(command, args), "unavailable", "{command}");
+        }
+        assert!(h.asked().is_empty());
+    }
+
+    #[test]
+    fn key_remove_confirms_natively_and_a_no_keeps_the_key() {
+        let h = ready();
+        let args = json!({ "provider": "anthropic" });
+        assert_eq!(h.code("ai_key_remove", args.clone()), "not_found");
+        assert!(h.asked().is_empty(), "nothing to ask about");
+
+        h.list_secret("ai-key-anthropic");
+        h.answer(false);
+        assert_eq!(h.code("ai_key_remove", args), "confirmation_required");
+        assert!(h.asked()[0].contains("Anthropic"), "{:?}", h.asked());
+        assert_eq!(h.ok("secret_names", json!({})), json!(["ai-key-anthropic"]));
+        let hook = h.app.state::<NativeHook>();
+        assert_eq!(*hook.work_at_dialog.lock().unwrap(), [false]);
+    }
+
+    #[test]
+    fn clear_clipboard_clears_only_what_is_still_there() {
+        let h = ready();
+        h.copy("copied since");
+        let app = h.app.handle();
+        block_on(native::clear_clipboard(app, "the key")).unwrap();
+        assert_eq!(h.clipboard().as_deref(), Some("copied since"));
+
+        block_on(native::clear_clipboard(app, "copied since")).unwrap();
+        assert_eq!(h.clipboard(), None);
+
+        block_on(native::clear_clipboard(app, "copied since")).unwrap();
+    }
+
+    #[test]
+    fn a_clipboard_that_cannot_be_read_says_so_and_asks_nothing() {
+        let h = ready();
+        h.copy(SECRET_KEY);
+        let hook = h.app.state::<NativeHook>();
+        hook.clipboard_fails.store(true, Ordering::SeqCst);
+
+        let args = json!({ "provider": "openai" });
+        assert_eq!(h.code("ai_key_from_clipboard", args), "failed");
+        assert!(h.asked().is_empty());
+    }
+
+    /// The dialog promised a clear, so a key that may still be there must not read as done.
+    #[test]
+    fn a_failed_read_after_storing_tells_the_person_to_clear_it() {
+        let h = ready();
+        h.copy(SECRET_KEY);
+        let hook = h.app.state::<NativeHook>();
+        hook.clipboard_fails.store(true, Ordering::SeqCst);
+
+        let error = block_on(native::clear_clipboard(h.app.handle(), SECRET_KEY)).unwrap_err();
+
+        assert_eq!(error.code(), "failed");
+        let text = error.to_string();
+        assert!(text.contains("the key is stored"), "{text}");
+        assert!(text.contains("Clear it yourself"), "{text}");
+        assert!(!text.contains(SECRET_LAST4), "{text}");
+    }
+
+    #[test]
+    fn the_endpoint_takes_a_key_from_the_clipboard_too() {
+        let h = ready();
+        h.copy(SECRET_KEY);
+        h.answer(false);
+        let args = json!({ "provider": "endpoint" });
+        assert_eq!(
+            h.code("ai_key_from_clipboard", args),
+            "confirmation_required"
+        );
+        assert!(h.asked()[0].contains(SECRET_LAST4), "{:?}", h.asked());
+    }
+
+    /// The whole path, so the keychain. `.cargo/config.toml` and CI name throwaway services,
+    /// and nothing else runs here, the real one least of all.
+    #[test]
+    #[ignore = "touches the OS keychain"]
+    fn a_pasted_key_is_stored_and_the_clipboard_cleared() {
+        let service = std::env::var("JOBPILOT_SECRET_SERVICE").unwrap();
+        assert!(
+            matches!(service.as_str(), "jobpilot-test" | "jobpilot-ci"),
+            "{service}"
+        );
+        let h = ready();
+        let args = json!({ "provider": "openai" });
+
+        h.copy(&format!("{SECRET_KEY}\n"));
+        h.ok("ai_key_from_clipboard", args.clone());
+        assert_eq!(h.ok("secret_names", json!({})), json!(["ai-key-openai"]));
+        assert_eq!(h.clipboard(), None, "cleared, line break and all");
+        assert_eq!(
+            secrets::get("ai-key-openai").unwrap().as_deref(),
+            Some(SECRET_KEY)
+        );
+
+        // Copied over while the dialog was open: stored as shown, and the new text stays.
+        h.copy(SECRET_KEY);
+        let hook = h.app.state::<NativeHook>();
+        let app = h.app.handle().clone();
+        *hook.on_ask.lock().unwrap() = Some(Box::new(move || {
+            let app = app.clone();
+            Box::pin(async move {
+                let hook = app.state::<NativeHook>();
+                *hook.clipboard.lock().unwrap() = Some("copied since".into());
+            })
+        }));
+        h.ok("ai_key_from_clipboard", args.clone());
+        assert_eq!(h.clipboard().as_deref(), Some("copied since"));
+
+        *hook.on_ask.lock().unwrap() = None;
+        h.ok("ai_key_remove", args);
+        assert_eq!(h.ok("secret_names", json!({})), json!([]));
+        assert_eq!(secrets::get("ai-key-openai").unwrap(), None);
     }
 
     #[test]
@@ -2860,11 +3346,15 @@ mod tests {
         let h = ready();
         for key in [
             "ai.claude_path",
+            "ai.gemini_path",
+            "ai.codex_path",
             "ai.ollama_url",
             "ai.enabled",
             "ai.order",
             "ai.drafting_model",
             "ai.embedding_model",
+            "ai.model.openai",
+            "ai.endpoint.url",
             "ai.anything_later",
             "recovery_key_exported_0123456789abcdef",
         ] {
@@ -2911,6 +3401,216 @@ mod tests {
 
         h.answer(true);
         h.ok("ai_clear_claude_path", json!({}));
+        assert_eq!(h.ok("settings_get", key), "");
+    }
+
+    #[test]
+    fn cli_picker_refuses_another_program() {
+        let h = ready();
+        let key = |provider: &str| {
+            let setting = if provider == "gemini_cli" {
+                "ai.gemini_path"
+            } else {
+                "ai.codex_path"
+            };
+            json!({ "key": setting })
+        };
+        // The picker is closed: no path from the webview stands in for it.
+        let args = json!({ "provider": "gemini_cli", "path": "/tmp/evil/gemini" });
+        assert_eq!(h.code("ai_set_cli_path", args), "cancelled");
+
+        for (provider, name) in [
+            ("gemini_cli", "codex"),
+            ("gemini_cli", "sh"),
+            ("gemini_cli", "gemini-evil"),
+            ("codex_cli", "gemini"),
+        ] {
+            h.pick(&h._tmp.path().join(name));
+            assert_eq!(
+                h.code("ai_set_cli_path", json!({ "provider": provider })),
+                "validation",
+                "{provider} {name}"
+            );
+            assert_eq!(h.ok("settings_get", key(provider)), Value::Null);
+        }
+        // Not a program provider at all: refused before any picker opens.
+        h.pick(&h._tmp.path().join("claude"));
+        assert_eq!(
+            h.code("ai_set_cli_path", json!({ "provider": "claude_code" })),
+            "validation"
+        );
+        assert_eq!(
+            h.code("ai_clear_cli_path", json!({ "provider": "openai" })),
+            "validation"
+        );
+    }
+
+    /// Every provider off is a state the app runs in, not an error: the screen loads, a task
+    /// ends on the manual path, and nothing is sent.
+    #[test]
+    fn no_provider_screen_is_a_normal_state() {
+        let h = ready();
+        // A setting that names another program stops discovery: no installed `claude` runs.
+        with_db(&h, |db| async move {
+            let claude = json!("/bin/sh");
+            jobpilot_core::settings::set(&db, "ai.claude_path", &claude)
+                .await
+                .unwrap();
+        });
+        h.ok(
+            "ai_enable",
+            json!({ "provider": "ollama", "enabled": false }),
+        );
+
+        let status = h.ok("ai_status", json!({}));
+        let enabled = status["enabled"].as_object().unwrap();
+        assert!(enabled.values().all(|on| on == false), "{status}");
+        h.assert_ready();
+
+        let job = h.ok(
+            "job_paste",
+            json!({ "title": "Rust role", "raw": "Write Rust" }),
+        );
+        h.ok(
+            "kb_add",
+            json!({ "kind": "experience", "body": "Shipped the Rust compiler" }),
+        );
+        let error = h
+            .call(
+                "resume_generate",
+                json!({ "jobTextId": job["id"], "export": null }),
+            )
+            .unwrap_err();
+        assert_eq!(error["code"], "manual_required", "{error}");
+        assert!(
+            error["message"].as_str().unwrap().contains("no_ai"),
+            "{error}"
+        );
+        h.assert_ready();
+        h.ok(
+            "draft_save",
+            json!({ "kind": "resume", "lineageId": null, "doc": {} }),
+        );
+
+        let calls: i64 = with_db(&h, |db| async move {
+            sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = 'ai_external_call'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap()
+        });
+        assert_eq!(calls, 0);
+    }
+
+    /// Off, so found and not started, and a posting can go to it: it declares no tools.
+    #[test]
+    fn ai_status_lists_gemini_with_its_path() {
+        let h = ready();
+        {
+            // A setting that names another program stops discovery: no installed `claude` runs.
+            let state = h.app.state::<AppState>();
+            let db = block_on(state.db.read());
+            let claude = json!("/bin/sh");
+            let set = jobpilot_core::settings::set(db.as_ref().unwrap(), "ai.claude_path", &claude);
+            block_on(set).unwrap();
+        }
+        let mock = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../crates/core/tests/mock-gemini")
+            .join(if cfg!(windows) {
+                "gemini.cmd"
+            } else {
+                "gemini"
+            });
+        h.pick(&mock);
+        h.ok("ai_set_cli_path", json!({ "provider": "gemini_cli" }));
+
+        let status = h.ok("ai_status", json!({}));
+        let rows = status["external"].as_array().unwrap();
+        let row = rows.iter().find(|row| row["name"] == "gemini_cli").unwrap();
+        assert_eq!(row["path"], json!(mock));
+        assert_eq!(row["available"], true);
+        assert_eq!(row["reason"], Value::Null);
+        assert_eq!(row["runs_job_text"], true);
+    }
+
+    /// Found and not started, and the row says it runs no job text: no tools are proven.
+    #[test]
+    fn ai_status_says_codex_runs_no_job_text() {
+        let h = ready();
+        {
+            // A setting that names another program stops discovery: no installed `claude` runs.
+            let state = h.app.state::<AppState>();
+            let db = block_on(state.db.read());
+            let claude = json!("/bin/sh");
+            let set = jobpilot_core::settings::set(db.as_ref().unwrap(), "ai.claude_path", &claude);
+            block_on(set).unwrap();
+        }
+        let mock = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../crates/core/tests/mock-codex")
+            .join(if cfg!(windows) { "codex.cmd" } else { "codex" });
+        h.pick(&mock);
+        h.ok("ai_set_cli_path", json!({ "provider": "codex_cli" }));
+
+        let status = h.ok("ai_status", json!({}));
+        let rows = status["external"].as_array().unwrap();
+        let row = rows.iter().find(|row| row["name"] == "codex_cli").unwrap();
+        assert_eq!(row["path"], json!(mock));
+        assert_eq!(row["available"], true);
+        assert_eq!(row["runs_job_text"], false);
+        let gemini = rows.iter().find(|row| row["name"] == "gemini_cli").unwrap();
+        assert_eq!(gemini["runs_job_text"], true);
+    }
+
+    #[test]
+    fn clearing_a_cli_path_that_is_not_set_asks_nothing() {
+        let h = ready();
+        // A refusing dialog would fail the call; there is nothing to confirm.
+        h.answer(false);
+        h.ok("ai_clear_cli_path", json!({ "provider": "codex_cli" }));
+        assert!(h.asked().is_empty());
+    }
+
+    /// What the macOS panel returns for npm's `gemini` link. Windows resolves no link: its npm
+    /// folder holds `gemini.cmd`, a `.ps1`, and an sh script, and only the `.cmd` can start.
+    #[test]
+    fn cli_picker_accepts_a_resolved_npm_entry() {
+        let h = ready();
+        let args = json!({ "provider": "gemini_cli" });
+        let key = json!({ "key": "ai.gemini_path" });
+        let entry = h
+            ._tmp
+            .path()
+            .join("lib/node_modules/@google/gemini-cli/bundle/gemini.js");
+        let plain = if cfg!(windows) {
+            for name in ["gemini", "gemini.ps1"] {
+                h.pick(&h._tmp.path().join(name));
+                let error = h.call("ai_set_cli_path", args.clone()).unwrap_err();
+                assert_eq!(error["code"], "validation", "{name}");
+                let message = error["message"].as_str().unwrap();
+                assert!(message.contains("gemini.cmd"), "{message}");
+            }
+            h.pick(&entry);
+            assert_eq!(h.code("ai_set_cli_path", args.clone()), "validation");
+            assert_eq!(h.ok("settings_get", key.clone()), Value::Null);
+            h._tmp.path().join("gemini.cmd")
+        } else {
+            h.pick(&entry);
+            h.ok("ai_set_cli_path", args.clone());
+            assert_eq!(h.ok("settings_get", key.clone()), json!(entry));
+            h._tmp.path().join("gemini")
+        };
+
+        h.pick(&plain);
+        h.ok("ai_set_cli_path", json!({ "provider": "gemini_cli" }));
+        assert_eq!(h.ok("settings_get", key.clone()), json!(plain));
+
+        // Clearing changes what runs, so a native dialog confirms it.
+        h.answer(false);
+        let code = h.code("ai_clear_cli_path", json!({ "provider": "gemini_cli" }));
+        assert_eq!(code, "confirmation_required");
+        assert!(h.asked().last().unwrap().contains(plain.to_str().unwrap()));
+        assert_eq!(h.ok("settings_get", key.clone()), json!(plain));
+        h.answer(true);
+        h.ok("ai_clear_cli_path", json!({ "provider": "gemini_cli" }));
         assert_eq!(h.ok("settings_get", key), "");
     }
 
@@ -2968,6 +3668,117 @@ mod tests {
     }
 
     #[test]
+    fn ai_set_endpoint_refuses_before_any_dialog() {
+        let h = ready();
+        let key = json!({ "key": "ai.endpoint.url" });
+        for url in [
+            "https://api.example.com/v1",
+            "http://192.168.1.2:1234/v1",
+            "https://127.0.0.1:1234/v1",
+        ] {
+            let args = json!({ "url": url });
+            assert_eq!(h.code("ai_set_endpoint", args), "refused", "{url}");
+        }
+        for url in [
+            "http://user:secret@127.0.0.1:1234/v1",
+            "http://127.0.0.1:1234/v1?key=x",
+            "http://127.0.0.1:1234/sk-secret/v1",
+        ] {
+            let args = json!({ "url": url });
+            assert_eq!(h.code("ai_set_endpoint", args), "validation", "{url}");
+        }
+        assert!(h.asked().is_empty(), "a refused address asks nothing");
+        assert_eq!(h.ok("settings_get", key), Value::Null);
+    }
+
+    #[test]
+    fn the_endpoint_address_is_natively_confirmed_and_reaches_status() {
+        let h = ready();
+        let key = json!({ "key": "ai.endpoint.url" });
+        let args = json!({ "url": "http://127.0.0.1:1234/v1/" });
+
+        h.answer(false);
+        assert_eq!(
+            h.code("ai_set_endpoint", args.clone()),
+            "confirmation_required"
+        );
+        // The stored form, and what a change costs.
+        assert!(
+            h.asked()[0].contains("http://127.0.0.1:1234/v1\n"),
+            "{:?}",
+            h.asked()
+        );
+        assert!(!h.asked()[0].contains("/v1/"), "{:?}", h.asked());
+        assert!(h.asked()[0].contains("consent"), "{:?}", h.asked());
+        assert_eq!(h.ok("settings_get", key.clone()), Value::Null);
+
+        h.answer(true);
+        h.ok("ai_set_endpoint", args);
+        assert_eq!(
+            h.ok("settings_get", key.clone()),
+            "http://127.0.0.1:1234/v1"
+        );
+        let row = |status: &Value| {
+            let rows = status["external"].as_array().unwrap();
+            let row = rows.iter().find(|row| row["name"] == "endpoint");
+            row.unwrap().clone()
+        };
+        let status = h.ok("ai_status", json!({}));
+        assert_eq!(row(&status)["path"], "http://127.0.0.1:1234/v1");
+        assert_eq!(row(&status)["reason"], "no_api_model");
+
+        let shown = h.asked().len();
+        let give = json!({ "provider": "endpoint", "categories": ["job_text"] });
+        h.ok("ai_consent_give", give);
+        let asked = h.asked();
+        assert!(
+            asked[shown].contains("Address: http://127.0.0.1:1234/v1"),
+            "{asked:?}"
+        );
+        assert!(!asked[shown].contains("Program:"), "{asked:?}");
+
+        h.answer(false);
+        let clear = json!({ "url": "" });
+        assert_eq!(
+            h.code("ai_set_endpoint", clear.clone()),
+            "confirmation_required"
+        );
+        h.answer(true);
+        h.ok("ai_set_endpoint", clear);
+        let status = h.ok("ai_status", json!({}));
+        assert_eq!(row(&status)["reason"], "no_endpoint");
+    }
+
+    #[test]
+    fn api_model_reaches_core() {
+        let h = ready();
+        let key = json!({ "key": "ai.model.openrouter" });
+        let args = json!({ "provider": "openrouter", "model": "anthropic/claude-x" });
+
+        h.ok("ai_set_api_model", args);
+
+        assert_eq!(h.ok("settings_get", key.clone()), "anthropic/claude-x");
+        assert!(h.asked().is_empty(), "the consent record is the gate");
+        let bad = json!({ "provider": "openrouter", "model": "meta-llama/llama-x" });
+        let error = h.call("ai_set_api_model", bad).unwrap_err();
+        assert_eq!(error["code"], "refused");
+        assert_eq!(error["message"], "refused: origin_refused");
+        assert_eq!(h.ok("settings_get", key), "anthropic/claude-x");
+        let cli = json!({ "provider": "gemini_cli", "model": "m" });
+        assert_eq!(h.code("ai_set_api_model", cli), "validation");
+        for provider in ["anthropic", "google"] {
+            h.ok(
+                "ai_set_api_model",
+                json!({ "provider": provider, "model": "m-1" }),
+            );
+            let key = json!({ "key": format!("ai.model.{provider}") });
+            assert_eq!(h.ok("settings_get", key), "m-1");
+        }
+        let path = json!({ "provider": "google", "model": "models/x" });
+        assert_eq!(h.code("ai_set_api_model", path), "validation");
+    }
+
+    #[test]
     fn consent_is_natively_confirmed_and_names_its_categories() {
         let h = ready();
         let args = json!({ "provider": "claude_code", "categories": ["job_text"] });
@@ -3004,6 +3815,82 @@ mod tests {
         assert_eq!(h.code("ai_consent_give", other), "validation");
         let other = json!({ "provider": "ollama" });
         assert_eq!(h.code("ai_consent_revoke", other), "validation");
+    }
+
+    #[test]
+    fn consent_dialog_names_data_use_and_attestation() {
+        let h = ready();
+        let args = json!({ "provider": "google", "categories": ["job_text"] });
+
+        h.answer(false);
+        assert_eq!(
+            h.code("ai_consent_give", args.clone()),
+            "confirmation_required"
+        );
+        let asked = h.asked().remove(0);
+        assert!(asked.contains("Google Gemini"), "{asked}");
+        assert!(asked.contains("job_text"), "{asked}");
+        assert!(
+            asked.contains("generativelanguage.googleapis.com"),
+            "{asked}"
+        );
+        assert!(asked.contains("logged for a limited period"), "{asked}");
+        assert!(asked.contains("billing on"), "{asked}");
+
+        h.answer(true);
+        h.ok("ai_consent_give", args);
+        let sharing = h.ok("ai_sharing", json!({ "provider": "google" }));
+        assert_eq!(sharing["given"], json!(["job_text"]));
+        assert_eq!(sharing["suspended"], false);
+        assert_eq!(sharing["terms_date"], "2026-11-01");
+        h.ok("ai_consent_revoke", json!({ "provider": "google" }));
+        let sharing = h.ok("ai_sharing", json!({ "provider": "google" }));
+        assert_eq!(sharing["given"], Value::Null);
+    }
+
+    #[test]
+    fn a_left_out_provider_is_refused_at_ipc() {
+        let h = ready();
+        h.answer(true);
+        for name in ["vertex_ai", "antigravity", "ollama", "gemini_free"] {
+            let give = json!({ "provider": name, "categories": ["job_text"] });
+            assert_eq!(h.code("ai_consent_give", give), "validation", "{name}");
+            let one = json!({ "provider": name });
+            assert_eq!(
+                h.code("ai_consent_revoke", one.clone()),
+                "validation",
+                "{name}"
+            );
+            assert_eq!(h.code("ai_sharing", one), "validation", "{name}");
+        }
+        for name in ["vertex_ai", "antigravity"] {
+            let args = json!({ "provider": name, "enabled": true });
+            assert_eq!(h.code("ai_enable", args), "validation", "{name}");
+        }
+        assert!(h.asked().is_empty(), "nothing to ask about");
+    }
+
+    #[test]
+    fn ai_preview_shows_the_prompt_and_sends_nothing() {
+        let h = ready();
+        let job = h.ok(
+            "job_paste",
+            json!({ "title": "Role", "raw": "ZXQ-POSTING <script>x</script>" }),
+        );
+        h.ok(
+            "kb_add",
+            json!({ "kind": "note", "body": "Shipped a compiler" }),
+        );
+        let args = json!({ "jobTextId": job["id"], "provider": "claude_code" });
+        let preview = h.ok("ai_preview", args);
+        assert_eq!(preview["task"], "draft_resume");
+        assert!(preview["user"].as_str().unwrap().contains("ZXQ-POSTING"));
+        assert!(
+            preview["system"]
+                .as_str()
+                .unwrap()
+                .contains("Never fabricate")
+        );
     }
 
     #[test]
@@ -3237,10 +4124,9 @@ mod tests {
     #[test]
     fn enable_and_consent_alone_reach_claude() {
         let h = ready();
-        let doc = json!({ "name": "", "contact": [], "summary": ["Builds"], "sections": [] });
-        let claims = json!([{ "text": "Builds", "evidence_ids": [] }]);
+        let summary = json!([{ "text": "Builds", "evidence_ids": [] }]);
         let reply = json!({ "type": "result", "subtype": "success", "is_error": false,
-            "permission_denials": [], "structured_output": { "doc": doc, "claims": claims } });
+            "permission_denials": [], "structured_output": { "summary": summary, "sections": [] } });
         let job = claude_is_set_up(&h, &format!("cat > /dev/null\nprintf '%s' '{reply}'"));
 
         assert_eq!(
@@ -4132,10 +5018,9 @@ mod tests {
     #[cfg(unix)]
     fn drafting_with_claude(h: &Harness) -> Value {
         let item = h.ok("kb_add", json!({ "kind": "skill", "body": "Rust" }));
-        let doc = json!({ "name": "", "contact": [], "summary": ["Rust"], "sections": [] });
-        let claims = json!([{ "text": "Rust", "evidence_ids": [item["id"]] }]);
+        let summary = json!([{ "text": "Rust", "evidence_ids": [item["id"]] }]);
         let reply = json!({ "type": "result", "subtype": "success", "is_error": false,
-            "permission_denials": [], "structured_output": { "doc": doc, "claims": claims } });
+            "permission_denials": [], "structured_output": { "summary": summary, "sections": [] } });
         fake_claude(
             h,
             &format!("[ \"$1\" = --version ] && exit 0\ncat > /dev/null\nprintf '%s' '{reply}'"),
@@ -4203,7 +5088,7 @@ mod tests {
         claude_on_with_questions(&h);
         let plan = h.ok("memory_refresh_plan", json!({}));
         assert_eq!(
-            (plan["pending"].clone(), plan["claude_calls"].clone()),
+            (plan["pending"].clone(), plan["external_calls"].clone()),
             (json!(2), json!(2))
         );
 
@@ -4213,7 +5098,10 @@ mod tests {
         let dialog = asked.last().unwrap();
         assert!(
             dialog.contains("Refresh career memory")
-                && dialog.contains("This will make up to 2 Claude calls, limit 20."),
+                && dialog.contains(
+                    "This will make at most 2 paid or subscription calls for 2 questions \
+                     (a press checks 20 questions at most)."
+                ),
             "{asked:?}"
         );
         assert_eq!(
@@ -4244,21 +5132,27 @@ mod tests {
         h.answer(true);
         let refused = h.call("memory_refresh", json!({}));
         assert_eq!(code_of(refused), "validation");
-        assert!(h.asked().last().unwrap().contains("up to 2 Claude calls"));
+        let asked = h.asked();
+        assert!(
+            asked
+                .last()
+                .unwrap()
+                .contains("at most 2 paid or subscription calls")
+        );
         assert_eq!(h.ok("agents_list", json!({ "limit": 10 })), json!([]));
         let plan = h.ok("memory_refresh_plan", json!({}));
-        assert_eq!(plan["claude_calls"], 3, "the new question is counted now");
+        assert_eq!(plan["external_calls"], 3, "the new question is counted now");
     }
 
     #[test]
-    fn memory_refresh_asks_nothing_when_no_claude_call_is_ahead() {
+    fn memory_refresh_asks_nothing_when_no_external_call_is_ahead() {
         let h = ready();
         h.ok(
             "memory_add_question",
             json!({ "text": "Describe project one", "country": null }),
         );
         let plan = h.ok("memory_refresh_plan", json!({}));
-        assert_eq!(plan["claude_calls"], 0);
+        assert_eq!(plan["external_calls"], 0);
         h.answer(false);
         let done = h.ok("memory_refresh", json!({}));
         assert_eq!(done["classified"]["skipped"], true);

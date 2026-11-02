@@ -13,7 +13,6 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# The repository is private, so macOS runner minutes are billed at a higher multiple.
 jobs:
   check:
     strategy:
@@ -49,8 +48,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --no-fail-fast
 
-      # The real `claude` smoke is never run in CI (it spends the owner's subscription), and
-      # make_fixtures would rewrite committed fixtures, so both are skipped by name.
+      # The real `claude` and `gemini` smokes are never run in CI (they spend the owner's
+      # subscription), real_tls_handshake has its own step below, and make_fixtures would
+      # rewrite committed fixtures, so all are skipped by name.
       # A locked keychain waits for an unlock dialog on a headless Mac and never returns.
       - name: Keychain tests (macOS)
         if: runner.os == 'macOS'
@@ -60,11 +60,18 @@ jobs:
           security default-keychain -s ci.keychain
           security unlock-keychain -p ci ci.keychain
           security set-keychain-settings ci.keychain
-          cargo test --workspace -- --ignored --skip real_claude --skip make_fixtures
+          cargo test --workspace -- --ignored --skip real_claude --skip real_gemini --skip real_tls --skip make_fixtures
 
       - name: Keychain tests (Windows)
         if: runner.os == 'Windows'
         timeout-minutes: 10
-        run: cargo test --workspace -- --ignored --skip real_claude --skip make_fixtures
+        run: cargo test --workspace -- --ignored --skip real_claude --skip real_gemini --skip real_tls --skip make_fixtures
+
+      # Four keyless connections, one to each vendor host, any HTTP status counts. On Windows
+      # this is the Schannel proof.
+      - name: TLS handshake
+        run: cargo test -p jobpilot-core --test net -- --ignored real_tls_handshake
+        env:
+          JOBPILOT_REAL_TLS: 1
 
       - run: pnpm tauri build --no-bundle

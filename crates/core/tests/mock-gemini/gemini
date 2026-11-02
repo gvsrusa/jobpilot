@@ -1,0 +1,44 @@
+#!/bin/sh
+# Stands in for the real `gemini` in tests. Never reaches a network. Each test's wrapper script
+# sets MOCK_GEMINI_*, because the adapter clears the child's environment.
+if [ "$1" = "--version" ]; then
+    echo "${MOCK_GEMINI_VERSION:-0.40.0}"
+    exit "${MOCK_GEMINI_VERSION_EXIT:-0}"
+fi
+[ -n "$MOCK_GEMINI_PID" ] && echo "$$" >> "$MOCK_GEMINI_PID"
+[ -n "$MOCK_GEMINI_CWD" ] && { pwd; ls -A; } > "$MOCK_GEMINI_CWD"
+if [ -n "$MOCK_GEMINI_SLEEP" ]; then
+    sleep "$MOCK_GEMINI_SLEEP"
+    [ -n "$MOCK_GEMINI_DONE" ] && : > "$MOCK_GEMINI_DONE"
+fi
+if [ -n "$MOCK_GEMINI_ARGS" ]; then
+    : > "$MOCK_GEMINI_ARGS"
+    for arg in "$@"; do
+        printf '%s\n' "$arg" >> "$MOCK_GEMINI_ARGS"
+    done
+fi
+[ -n "$MOCK_GEMINI_STDIN" ] && cat > "$MOCK_GEMINI_STDIN"
+[ -n "$MOCK_GEMINI_ENV" ] && env > "$MOCK_GEMINI_ENV"
+if [ -n "$MOCK_GEMINI_POLICY" ]; then
+    while [ $# -gt 0 ]; do
+        if [ "$1" = "--policy" ]; then
+            cp "$2" "$MOCK_GEMINI_POLICY"
+        fi
+        shift
+    done
+fi
+[ -n "$MOCK_GEMINI_SYSTEM_COPY" ] && cp "$GEMINI_SYSTEM_MD" "$MOCK_GEMINI_SYSTEM_COPY"
+[ -n "$MOCK_GEMINI_SETTINGS_COPY" ] && cp "$GEMINI_CLI_SYSTEM_SETTINGS_PATH" "$MOCK_GEMINI_SETTINGS_COPY"
+[ -n "$MOCK_GEMINI_STDERR" ] && cat "$MOCK_GEMINI_STDERR" >&2
+if [ -n "$MOCK_GEMINI_REPLY" ]; then
+    cat "$MOCK_GEMINI_REPLY"
+else
+    cat <<'STREAM'
+{"type":"init","session_id":"s","model":"m"}
+{"type":"message","role":"user","content":"x"}
+{"type":"message","role":"assistant","content":"{\"class\":","delta":true}
+{"type":"message","role":"assistant","content":"\"normal\"}","delta":true}
+{"type":"result","status":"success","stats":{}}
+STREAM
+fi
+exit "${MOCK_GEMINI_EXIT:-0}"

@@ -86,9 +86,15 @@ impl Provider for SteeredProvider {
             if !letter {
                 return Ok(line);
             }
-            // The same hostile claims, in the cover letter's shape.
+            // The same hostile lines, in the cover letter's shape.
             let reply: Value = serde_json::from_str(&line).unwrap();
-            Ok(serde_json::json!({ "paragraphs": reply["claims"] }).to_string())
+            let mut lines = reply["summary"].as_array().cloned().unwrap_or_default();
+            for section in reply["sections"].as_array().into_iter().flatten() {
+                for entry in section["entries"].as_array().into_iter().flatten() {
+                    lines.extend(entry["bullets"].as_array().cloned().unwrap_or_default());
+                }
+            }
+            Ok(serde_json::json!({ "paragraphs": lines }).to_string())
         })
     }
 
@@ -124,7 +130,7 @@ fn corpus(canary: &str) -> Vec<Case> {
         })
         .collect();
     cases.sort_by(|a, b| a.name.cmp(&b.name));
-    assert!(cases.len() >= 17, "the corpus holds {} files", cases.len());
+    assert!(cases.len() >= 19, "the corpus holds {} files", cases.len());
     cases
 }
 
@@ -203,7 +209,7 @@ fn kinds(findings: &[knowledge::Finding]) -> Vec<&str> {
 fn every_corpus_file_normalizes_without_panic_and_reports_findings() {
     // The kinds a file must report. 02, 06, 07, 08, 09, 13, 14, 15 and 16 carry no pattern or
     // hidden text, only a steered reply, so they may report nothing.
-    let required: [(&str, &[&str]); 7] = [
+    let required: [(&str, &[&str]); 9] = [
         ("01", &["instruction_like"]),
         ("03", &["hidden_text"]),
         ("04", &["instruction_like"]),
@@ -211,6 +217,8 @@ fn every_corpus_file_normalizes_without_panic_and_reports_findings() {
         ("10", &["truncated"]),
         ("11", &["hidden_text", "instruction_like"]),
         ("12", &["instruction_like"]),
+        ("18", &["instruction_like"]),
+        ("19", &["instruction_like"]),
     ];
     let cases = corpus("/canary");
     for case in &cases {
@@ -329,7 +337,8 @@ async fn steered_output_never_adds_evidence_free_or_authorization_claims() {
     for case in &cases {
         // 15 steers a resume reply the schema refuses, so it stores nothing: its own test.
         // 17 steers the classifier, not the drafter: its own test too.
-        if case.name.starts_with("15") || case.name.starts_with("17") {
+        // 19 is a tool call, not a draft: its own test as well.
+        if ["15", "17", "19"].iter().any(|n| case.name.starts_with(n)) {
             continue;
         }
         let job = w.import(case).await;
@@ -386,6 +395,29 @@ async fn steered_output_never_adds_evidence_free_or_authorization_claims() {
     assert_eq!(knowledge::list(&w.db).await.unwrap().len(), evidence_before);
 }
 
+/// Normalizing strips the posting, so the model is what puts the character back: the reply
+/// carries it as a JSON escape, and it reaches the check inside the claim.
+#[tokio::test]
+async fn a_zero_width_character_in_a_reply_does_not_hide_a_statement() {
+    let w = world().await;
+    let cases = corpus(&w.canary());
+    let job = w.import(case(&cases, "11")).await;
+    let (router, _) = w.router(&job.id);
+
+    for letter in [false, true] {
+        let made = if letter {
+            generate::cover_letter(&w.db, &router, "gui", &job.id, CancellationToken::new()).await
+        } else {
+            generate::resume(&w.db, &router, "gui", &job.id, CancellationToken::new()).await
+        }
+        .unwrap();
+
+        let claims = drafts::claims(&w.db, &made.draft.id).await.unwrap();
+        assert_eq!(claims[0].text, "Authorized to w\u{200b}ork in the EU");
+        assert_eq!(claims[0].status, "authorization_statement");
+    }
+}
+
 #[tokio::test]
 async fn output_urls_and_commands_are_data_only() {
     let w = world().await;
@@ -421,7 +453,7 @@ async fn a_reply_asking_for_a_tool_stores_nothing() {
     let (router, _) = w.router(&job.id);
 
     // The reply carries a `tool_use` key the schema does not know, so it never validates.
-    // (The harness rebuilds the letter reply from `claims` alone, so only the resume sees it.)
+    // (The harness rebuilds the letter reply from the lines alone, so only the resume sees it.)
     let made = generate::resume(&w.db, &router, "gui", &job.id, CancellationToken::new()).await;
     assert!(made.is_err(), "{made:?}");
 
@@ -429,6 +461,41 @@ async fn a_reply_asking_for_a_tool_stores_nothing() {
     let stored = drafts::list(&w.db, None).await.unwrap();
     assert!(stored.iter().all(|d| d.id == w.draft_id), "{stored:?}");
     assert!(!PathBuf::from(w.canary()).exists());
+}
+
+#[tokio::test]
+async fn a_reply_that_is_a_tool_call_stores_nothing() {
+    let w = world().await;
+    let cases = corpus(&w.canary());
+    let call = case(&cases, "19");
+    assert!(call.raw.contains(&w.canary()), "the canary is not named");
+    let job = w.import(call).await;
+    let (router, _) = w.router(&job.id);
+
+    let made = generate::resume(&w.db, &router, "gui", &job.id, CancellationToken::new()).await;
+
+    assert!(made.is_err(), "{made:?}");
+    let stored = drafts::list(&w.db, None).await.unwrap();
+    assert!(stored.iter().all(|d| d.id == w.draft_id), "{stored:?}");
+    assert!(!PathBuf::from(w.canary()).exists());
+}
+
+#[tokio::test]
+async fn a_printed_key_or_prompt_stays_flagged_text() {
+    let w = world().await;
+    let cases = corpus(&w.canary());
+    let job = w.import(case(&cases, "18")).await;
+    let (router, sent) = w.router(&job.id);
+
+    let made = generate::resume(&w.db, &router, "gui", &job.id, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(sent.lock().unwrap()[0].contains("every environment variable"));
+    let claims = drafts::claims(&w.db, &made.draft.id).await.unwrap();
+    assert!(claims[0].text.contains("API key"));
+    assert!(claims[1].text.contains("https://collect.evil.example/"));
+    assert!(claims.iter().all(|claim| claim.status == "no_evidence"));
 }
 
 #[tokio::test]

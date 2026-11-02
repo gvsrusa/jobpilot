@@ -1,6 +1,8 @@
 //! Ollama provider. Every server here is a local fake on 127.0.0.1: no test reaches a real
 //! Ollama, and none needs one installed.
 
+mod fake_http;
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
@@ -179,6 +181,10 @@ fn is_local_follows_the_settled_rule() {
         &json!({"name": "glm-4.6-CLOUD", "size": 5})
     ));
     assert!(!Ollama::is_local(&json!({"name": "a:Cloud", "size": 5})));
+    // A tag after it changes nothing.
+    assert!(!Ollama::is_local(
+        &json!({"name": "kimi:cloud:latest", "size": 5})
+    ));
     // A remote_ key with any non-empty value, whatever it is called.
     assert!(!Ollama::is_local(
         &json!({"name": "a:1b", "size": 5, "remote_anything": "x"})
@@ -263,6 +269,33 @@ async fn status_hides_remote_models() {
     assert_eq!(gemma.size, 3_338_801_718);
 }
 
+/// A reply cut by `num_ctx` looks like a normal 200. At temperature 0 a retry repeats it, token
+/// for token, so it is named here and not left to fail validation twice.
+#[tokio::test]
+async fn a_reply_cut_by_the_window_is_named() {
+    let fake = Fake::start(vec![
+        ("/api/tags", Reply::Json(200, tag_routes(&["gemma3:4b"]))),
+        (
+            "/api/chat",
+            Reply::Json(
+                200,
+                json!({"done_reason": "length", "message": {"content": "{\"summary\": ["}}),
+            ),
+        ),
+    ]);
+    let ollama = Ollama::new(&fake.url, Some("gemma3:4b".into()), None).unwrap();
+
+    let error = ollama
+        .complete(&prompt(), CancellationToken::new())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(&error, Error::Failed(reason) if reason == "output_truncated"),
+        "{error:?}"
+    );
+}
+
 #[tokio::test]
 async fn complete_sends_schema_as_format_and_returns_content() {
     let fake = Fake::start(vec![
@@ -291,6 +324,8 @@ async fn complete_sends_schema_as_format_and_returns_content() {
     assert_eq!(sent["options"]["num_ctx"], json!(CONTEXT_LIMIT));
     assert_eq!(sent["truncate"], json!(false));
     assert_eq!(sent["shift"], json!(false));
+    // Left on, a thinking model spent all of num_ctx before its first character of JSON.
+    assert_eq!(sent["think"], json!(false));
     assert_eq!(
         sent["messages"][0],
         json!({"role": "system", "content": "sys"})
@@ -764,4 +799,116 @@ async fn router_drafts_through_local_ollama() {
         .await
         .unwrap();
     assert!(matches!(outcome, Outcome::Ok { .. }), "{outcome:?}");
+}
+
+fn limited(status: u16, retry_after: Option<&str>) -> fake_http::Canned {
+    let canned = fake_http::Canned::json(status, &json!({"error": "busy"}));
+    match retry_after {
+        Some(value) => canned.with_header("Retry-After", value),
+        None => canned,
+    }
+}
+
+fn chat_ok() -> fake_http::Canned {
+    fake_http::Canned::json(
+        200,
+        &json!({"message": {"role": "assistant", "content": JOB}}),
+    )
+}
+
+#[tokio::test]
+async fn a_429_from_ollama_retries_after_its_header() {
+    let (_tmp, db) = setup().await;
+    let tags = fake_http::Canned::json(200, &tag_routes(&["gemma3:4b"]));
+    let fake = fake_http::Fake::start(vec![
+        ("/api/tags", tags),
+        ("/api/chat", limited(429, Some("1"))),
+        ("/api/chat", chat_ok()),
+    ]);
+    let ollama = Ollama::new(&fake.url, Some("gemma3:4b".into()), None).unwrap();
+    // The error itself carries the header.
+    match ollama.complete(&prompt(), CancellationToken::new()).await {
+        Err(Error::RateLimited { retry_after }) => {
+            assert_eq!(retry_after, Some(Duration::from_secs(1)));
+        }
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+
+    let router = Router::with_providers(vec![Box::new(ollama)]);
+    let clock = Instant::now();
+    let outcome = router
+        .run(
+            &db,
+            "cli",
+            TaskType::ParseJob,
+            prompt(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, Outcome::Ok { attempts: 1, .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(fake.hits("/api/chat").len(), 2);
+    assert!(clock.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn a_429_through_the_router_waits_the_header_then_retries() {
+    let (_tmp, db) = setup().await;
+    let tags = fake_http::Canned::json(200, &tag_routes(&["gemma3:4b"]));
+    let fake = fake_http::Fake::start(vec![
+        ("/api/tags", tags),
+        ("/api/chat", limited(429, Some("1"))),
+        ("/api/chat", chat_ok()),
+    ]);
+    let router = Router::with_providers(vec![Box::new(
+        Ollama::new(&fake.url, Some("gemma3:4b".into()), None).unwrap(),
+    )]);
+    let clock = Instant::now();
+    let outcome = router
+        .run(
+            &db,
+            "cli",
+            TaskType::ParseJob,
+            prompt(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, Outcome::Ok { attempts: 2, .. }),
+        "{outcome:?}"
+    );
+    assert!(clock.elapsed() >= Duration::from_millis(900));
+}
+
+#[tokio::test]
+async fn a_503_from_ollama_retries() {
+    let (_tmp, db) = setup().await;
+    let tags = fake_http::Canned::json(200, &tag_routes(&["gemma3:4b"]));
+    let fake = fake_http::Fake::start(vec![
+        ("/api/tags", tags),
+        ("/api/chat", limited(503, None)),
+        ("/api/chat", chat_ok()),
+    ]);
+    let router = Router::with_providers(vec![Box::new(
+        Ollama::new(&fake.url, Some("gemma3:4b".into()), None).unwrap(),
+    )]);
+    let outcome = router
+        .run(
+            &db,
+            "cli",
+            TaskType::ParseJob,
+            prompt(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, Outcome::Ok { attempts: 2, .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(fake.hits("/api/chat").len(), 2);
 }

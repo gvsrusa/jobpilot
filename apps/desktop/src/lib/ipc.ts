@@ -158,8 +158,8 @@ export type Answer = {
 
 export type QuestionRow = { question: Question; answers: Answer[] };
 
-/** At most 20 questions go to a model per press, and Claude is asked about each. */
-export type RefreshPlan = { pending: number; claude_calls: number };
+/** At most 20 questions go to a model per press, and an outside provider may be asked about each. */
+export type RefreshPlan = { pending: number; external_calls: number };
 
 /** `skipped`: no AI took the classifying, so classes are the rules'. */
 export type MemoryRefreshed = {
@@ -333,7 +333,7 @@ export type Compare = {
 export type Generated = {
   draft: Draft;
   blocked: number;
-  provider: "ollama" | "claude_code" | "no_ai";
+  provider: ProviderId;
   /** Where the file went, when an export was asked for and no claim was blocked. */
   exported: string | null;
   /** Set when an export was asked for and refused: a line, the name, a contact, or a heading. */
@@ -367,14 +367,69 @@ export type DataCategory =
   | "career_memory"
   | "sensitive";
 
-export type Provider = "ollama" | "claude_code";
+export type Provider =
+  | "ollama"
+  | "claude_code"
+  | "openai"
+  | "anthropic"
+  | "google"
+  | "openrouter"
+  | "endpoint"
+  | "gemini_cli"
+  | "codex_cli";
+
+/** Core's `ProviderId` as JSON. */
+export type ProviderId = Provider | "no_ai";
+
+export type ExternalStatus = {
+  name: Provider;
+  label: string;
+  kind: "api" | "cli" | "endpoint";
+  available: boolean;
+  /** A reason code. Plain words are the screen's. */
+  reason: string | null;
+  model: string | null;
+  key_stored: boolean;
+  /** The program a CLI row runs, or the address an endpoint row sends to. */
+  path: string | null;
+  consent: DataCategory[] | null;
+  suspended: boolean;
+  runs_job_text: boolean;
+  newer_than_checked: boolean;
+};
+
+export type TaskSharing = {
+  task: "parse_job" | "draft_resume" | "draft_cover_letter" | "classify_answer";
+  categories: DataCategory[];
+  runs: boolean;
+  skipped_because: string | null;
+};
+
+export type Sharing = {
+  name: Provider;
+  label: string;
+  key: string;
+  destination: string;
+  path: string | null;
+  tasks: TaskSharing[];
+  data_use: string;
+  terms_date: string;
+  attestation: string | null;
+  suspended: boolean;
+  given: DataCategory[] | null;
+};
+
+/** Holds the posting and evidence. Render it as text only. */
+export type PromptPreview = { task: "draft_resume" | "draft_cover_letter"; system: string; user: string };
 
 export type AiStatus = {
   ollama: OllamaStatus;
-  claude_code: { available: boolean; path: string | null; consent: DataCategory[] | null };
+  claude_code: { available: boolean; path: string | null; consent: DataCategory[] | null; suspended: boolean };
+  external: ExternalStatus[];
+  register_date: string;
   hardware: { total_memory: number; cpus: number; gpu: string; free_disk: number };
   order: string[];
-  enabled: { ollama: boolean; claude_code: boolean };
+  enabled: { ollama: boolean; claude_code: boolean } & Partial<Record<Provider, boolean>>;
   drafting_model: string | null;
   embedding_model: string | null;
 };
@@ -514,7 +569,7 @@ export const ipc = {
     invoke<MemoryHit[]>("memory_search", { query, limit }),
   /** What a press of Refresh would spend. Reads only. */
   memoryRefreshPlan: () => invoke<RefreshPlan>("memory_refresh_plan"),
-  /** Rust names the Claude count in its own dialog first, when any call is ahead. */
+  /** Rust names the count in its own dialog first, when any outside call is ahead. */
   memoryRefresh: () => invoke<MemoryRefreshed>("memory_refresh"),
 
   /** Rust opens the picker. Rejects with `cancelled` when the user closes it. */
@@ -548,12 +603,29 @@ export const ipc = {
   aiSetClaudePath: () => invoke<void>("ai_set_claude_path"),
   /** Back to finding `claude` by itself. Rust confirms in a native dialog. */
   aiClearClaudePath: () => invoke<void>("ai_clear_claude_path"),
+  /** Rust opens the picker for the `gemini` or `codex` program: only the provider crosses. */
+  aiSetCliPath: (provider: Provider) => invoke<void>("ai_set_cli_path", { provider }),
+  /** Back to finding the program by itself. Rust confirms in a native dialog. */
+  aiClearCliPath: (provider: Provider) => invoke<void>("ai_clear_cli_path", { provider }),
   /** Rust confirms in a native dialog. */
   aiSetOllamaUrl: (url: string) => invoke<void>("ai_set_ollama_url", { url }),
   /** Rust confirms in a native dialog. */
-  aiConsentGive: (provider: "claude_code", categories: DataCategory[]) =>
+  aiConsentGive: (provider: Provider, categories: DataCategory[]) =>
     invoke<void>("ai_consent_give", { provider, categories }),
-  aiConsentRevoke: (provider: "claude_code") => invoke<void>("ai_consent_revoke", { provider }),
+  aiConsentRevoke: (provider: Provider) => invoke<void>("ai_consent_revoke", { provider }),
+  /** Rust reads the clipboard and confirms in a native dialog. The key never comes here. */
+  aiKeyFromClipboard: (provider: Provider) => invoke<void>("ai_key_from_clipboard", { provider }),
+  /** Rust confirms in a native dialog. */
+  aiKeyRemove: (provider: Provider) => invoke<void>("ai_key_remove", { provider }),
+  /** The consent record is the gate, so there is no dialog. Core holds the origin rules. */
+  aiSetApiModel: (provider: Provider, model: string) =>
+    invoke<void>("ai_set_api_model", { provider, model }),
+  /** Rust refuses anything off this machine, then confirms in its own dialog. Empty clears. */
+  aiSetEndpoint: (url: string) => invoke<void>("ai_set_endpoint", { url }),
+  aiSharing: (provider: Provider) => invoke<Sharing>("ai_sharing", { provider }),
+  /** Builds the prompt and sends nothing. */
+  aiPreview: (jobTextId: string, provider: string) =>
+    invoke<PromptPreview>("ai_preview", { jobTextId, provider }),
   aiIndex: () => invoke<number>("ai_index"),
   aiCancel: () => invoke<void>("ai_cancel"),
 

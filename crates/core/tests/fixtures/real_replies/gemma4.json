@@ -1,0 +1,110 @@
+{
+ "sections": [
+  {
+   "entries": [
+    {
+     "bullets": [
+      {
+       "evidence_ids": [
+        "$EVIDENCE_ID"
+       ],
+       "text": "Built a Rust order-routing service handling 40,000 requests per minute and cut p99 latency by 35 percent."
+      },
+      {
+       "evidence_ids": [
+        "$EVIDENCE_ID"
+       ],
+       "text": "Led a team of four engineers and migrated PostgreSQL 12 to 15 with no downtime."
+      }
+     ],
+     "dates": "March 2021 to June 2024",
+     "evidence_ids": [
+      "$EVIDENCE_ID"
+     ],
+     "subtitle": "Northwind Logistics",
+     "title": "Senior Backend Engineer"
+    },
+    {
+     "bullets": [
+      {
+       "evidence_ids": [
+        "$EVIDENCE_ID"
+       ],
+       "text": "Wrote Python data pipelines on AWS Lambda that processed 2 million claims per day, and added integration tests that reduced production incidents by 20 percent."
+      }
+     ],
+     "dates": "January 2018 to February 2021",
+     "evidence_ids": [
+      "$EVIDENCE_ID"
+     ],
+     "subtitle": "Fabrikam Health",
+     "title": "Software Engineer"
+    },
+    {
+     "bullets": [
+      {
+       "evidence_ids": [
+        "$EVIDENCE_ID"
+       ],
+       "text": "B.S. Computer Science"
+      }
+     ],
+     "dates": "2017",
+     "evidence_ids": [
+      "$EVIDENCE_ID"
+     ],
+     "subtitle": "University of Texas at Austin",
+     "title": "B.S. Computer Science"
+    }
+   ],
+   "heading": "work experience"
+  },
+  {
+   "entries": [
+    {
+     "bullets": [
+      {
+       "evidence_ids": [
+        "Rust",
+        "Python",
+        "PostgreSQL",
+        "Kubernetes",
+        "AWS",
+        "gRPC"
+       ],
+       "text": "Proficient in languages and technologies including Rust, Python, PostgreSQL, Kubernetes, AWS, and gRPC."
+      }
+     ],
+     "dates": "",
+     "evidence_ids": [
+      "$EVIDENCE_ID"
+     ],
+     "subtitle": "",
+     "title": "Skills"
+    }
+   ],
+   "heading": "skills"
+  }
+ ],
+ "summary": [
+  {
+   "evidence_ids": [
+    "$EVIDENCE_ID"
+   ],
+   "text": "Experience building low-latency services using Rust, including handling 40,000 requests per minute."
+  },
+  {
+   "evidence_ids": [
+    "$EVIDENCE_ID",
+    "$EVIDENCE_ID"
+   ],
+   "text": "Skilled in core backend technologies required, such as Rust, PostgreSQL, AWS, and gRPC."
+  },
+  {
+   "evidence_ids": [
+    "$EVIDENCE_ID"
+   ],
+   "text": "Proven ability to lead engineering efforts, including a major database migration with zero downtime."
+  }
+ ]
+}

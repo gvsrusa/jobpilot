@@ -13,8 +13,7 @@ use jobpilot_core::ai::{
     Availability, CancellationToken, Capability, DataCategory, Declaration, Outcome, Prompt,
     Provider, ProviderId, TaskSpec, TaskType, consent, spec,
 };
-use jobpilot_core::render::ResumeDoc;
-use jobpilot_core::{AppPaths, Db, Error, Result, audit, settings, transfer};
+use jobpilot_core::{AppPaths, Db, Error, Result, audit, pause, settings, transfer};
 use serde_json::json;
 use sqlx::SqlitePool;
 use tempfile::TempDir;
@@ -31,6 +30,7 @@ enum Reply {
     Refused,
     TooLarge,
     Unavailable,
+    RateLimited(Option<Duration>),
     Hang,
     Vectors(Vec<Vec<f32>>),
 }
@@ -156,6 +156,7 @@ impl Provider for Mock {
                 Some(Reply::Refused) => Err(Error::Refused("not_allowed".into())),
                 Some(Reply::TooLarge) => Err(Error::Refused("prompt_too_large".into())),
                 Some(Reply::Unavailable) => Err(Error::Unavailable),
+                Some(Reply::RateLimited(retry_after)) => Err(Error::RateLimited { retry_after }),
                 Some(Reply::Hang) => {
                     let _guard = DropCount(self.counters.clone());
                     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -200,8 +201,8 @@ fn prompt() -> Prompt {
 
 fn draft() -> String {
     json!({
-        "doc": {"name": "", "contact": [], "summary": [], "sections": []},
-        "claims": [{"text": "Built parsers", "evidence_ids": ["a"]}],
+        "summary": [{"text": "Built parsers", "evidence_ids": ["a"]}],
+        "sections": [],
     })
     .to_string()
 }
@@ -552,6 +553,72 @@ async fn external_provider_without_consent_is_skipped_and_consent_unlocks_it() {
 }
 
 #[tokio::test]
+async fn a_suspended_consent_skips_and_says_so() {
+    let (_tmp, db) = setup().await;
+    consent::give(&db, CLAUDE, &[DataCategory::JobText], "2026-11-01", "gui")
+        .await
+        .unwrap();
+    sqlx::query("UPDATE consent SET register_row = 'older words'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let claude = Mock::claude(vec![text(JOB)]);
+    let counters = claude.counters();
+    let router = Router::with_providers(vec![claude.boxed()]);
+
+    let outcome = parse_job(&router, &db).await;
+
+    assert_eq!(outcome, manual("consent_suspended"));
+    assert_eq!(counters.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(skip_reasons(&db, CLAUDE).await, ["consent_suspended"]);
+}
+
+/// What a real attempt found outranks what a review could change, as `consent_needed` does.
+#[tokio::test]
+async fn a_real_failure_outranks_a_later_suspended_consent() {
+    let (_tmp, db) = setup().await;
+    let job_text = [DataCategory::JobText];
+    for provider in [CLAUDE, "openai/api_key"] {
+        consent::give(&db, provider, &job_text, "2026-11-01", "gui")
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE consent SET register_row = 'older words' WHERE provider = ?")
+        .bind(CLAUDE)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let capabilities = [Capability::StructuredOutput, Capability::NoTools];
+    let busy = Mock::new(
+        ProviderId::OpenAi,
+        false,
+        &capabilities,
+        vec![Reply::RateLimited(None)],
+    );
+    let waiting = Mock::claude(vec![text(JOB)]);
+    let router = Router::with_providers(vec![busy.boxed(), waiting.boxed()]);
+
+    assert_eq!(parse_job(&router, &db).await, manual("rate_limited"));
+}
+
+/// A provider that could never run the task must not send the user to re-confirm for it.
+#[tokio::test]
+async fn a_suspended_consent_says_so_only_when_it_would_unlock_something() {
+    let (_tmp, db) = setup().await;
+    consent::give(&db, CLAUDE, &[DataCategory::JobText], "2026-11-01", "gui")
+        .await
+        .unwrap();
+    sqlx::query("UPDATE consent SET register_row = ''")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let mut mock = Mock::claude(vec![text(JOB)]);
+    mock.declaration.capabilities.clear();
+    let router = Router::with_providers(vec![mock.boxed()]);
+    assert_eq!(parse_job(&router, &db).await, manual("no_ai"));
+}
+
+#[tokio::test]
 async fn fallback_never_widens_consent() {
     let (_tmp, db) = setup().await;
     let job_text = [DataCategory::JobText];
@@ -781,7 +848,7 @@ async fn second_validation_failure_ends_the_provider_with_attempts_left() {
         .run_spec(&db, "gui", &generous, prompt(), CancellationToken::new())
         .await
         .unwrap();
-    assert_eq!(outcome, manual("no_ai"));
+    assert_eq!(outcome, manual("unusable_reply"));
     assert_eq!(calls(&counters), 2);
 }
 
@@ -806,7 +873,7 @@ async fn output_is_checked_against_the_task_schema_not_the_prompt() {
         )
         .await
         .unwrap();
-    assert_eq!(outcome, manual("no_ai"));
+    assert_eq!(outcome, manual("unusable_reply"));
     assert_eq!(
         *counters.schema.lock().unwrap(),
         spec(TaskType::ParseJob).schema
@@ -1168,30 +1235,25 @@ fn parse_job_schema_enforces_its_bounds() {
     assert!(validate(schema, &missing.to_string()).is_err());
 }
 
-/// Each level of `ResumeDoc` is `deny_unknown_fields`, so the schema must refuse the same
-/// extras, or a reply could pass the router and fail to deserialize later.
+/// A field the schema let through would be text no line carries, so no claim would judge it.
 #[test]
 fn draft_schemas_refuse_extras_at_every_level() {
     let resume = spec(TaskType::DraftResume).schema;
+    let line = json!({"text": "B", "evidence_ids": ["id"]});
     let valid = json!({
-        "doc": {"name": "A", "contact": ["c"], "summary": ["s"], "sections": [
-            {"heading": "H", "entries": [
-                {"title": "T", "subtitle": "S", "dates": "D", "bullets": ["B"]}
-            ]}
-        ]},
-        "claims": [{"text": "B", "evidence_ids": ["id"]}],
+        "summary": [line],
+        "sections": [{"heading": "skills", "entries": [{
+            "title": "T", "subtitle": "S", "dates": "D", "evidence_ids": ["id"], "bullets": [line],
+        }]}],
     });
     validate(resume, &valid.to_string()).unwrap();
-    let doc: ResumeDoc = serde_json::from_value(valid["doc"].clone()).unwrap();
-    let round_trip = json!({"doc": doc, "claims": []});
-    validate(resume, &round_trip.to_string()).unwrap();
 
     for pointer in [
         "",
-        "/doc",
-        "/doc/sections/0",
-        "/doc/sections/0/entries/0",
-        "/claims/0",
+        "/summary/0",
+        "/sections/0",
+        "/sections/0/entries/0",
+        "/sections/0/entries/0/bullets/0",
     ] {
         let mut extra = valid.clone();
         extra.pointer_mut(pointer).unwrap()["x"] = json!(1);
@@ -1204,9 +1266,41 @@ fn draft_schemas_refuse_extras_at_every_level() {
         );
     }
 
-    let mut long = valid.clone();
-    long["claims"][0]["text"] = json!("x".repeat(601));
-    assert!(validate(resume, &long.to_string()).is_err());
+    let entry = "/sections/0/entries/0";
+    for pointer in [
+        "/summary/0/text",
+        "/sections/0/entries/0/title",
+        "/sections/0/entries/0/subtitle",
+        "/sections/0/entries/0/dates",
+        "/sections/0/entries/0/bullets/0/text",
+    ] {
+        let mut long = valid.clone();
+        *long.pointer_mut(pointer).unwrap() = json!("x".repeat(601));
+        assert!(validate(resume, &long.to_string()).is_err(), "{pointer}");
+    }
+    // What a model cannot leave out: an entry's lines always have a citation to carry.
+    let mut uncited = valid.clone();
+    uncited
+        .pointer_mut(entry)
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("evidence_ids");
+    assert!(validate(resume, &uncited.to_string()).is_err());
+    // A hostile or wandering model cannot name a section, in any case.
+    for heading in ["Work Authorization", "work authorization", "Experience:"] {
+        let mut invented = valid.clone();
+        invented["sections"][0]["heading"] = json!(heading);
+        assert!(
+            validate(resume, &invented.to_string()).is_err(),
+            "{heading}"
+        );
+    }
+    // A stock heading is one, however it is cased.
+    let mut cased = valid.clone();
+    cased["sections"][0]["heading"] = json!("SKILLS");
+    let checked = validate(resume, &cased.to_string()).unwrap();
+    assert_eq!(checked["sections"][0]["heading"], json!("skills"));
 
     let letter = spec(TaskType::DraftCoverLetter).schema;
     let valid = json!({"paragraphs": [{"text": "T", "evidence_ids": []}]});
@@ -1647,6 +1741,11 @@ async fn runs_and_consent_reach_the_export() {
     let data: serde_json::Value = serde_json::from_str(&text).unwrap();
 
     assert_eq!(data["tables"]["consent"][0]["provider"], CLAUDE);
+    let row = data["tables"]["consent"][0]["register_row"].as_str();
+    assert!(
+        row.is_some_and(|row| row.contains("Claude Code")),
+        "{row:?}"
+    );
     assert_eq!(data["tables"]["task_runs"][0]["outcome"], "manual_required");
 }
 
@@ -1856,4 +1955,218 @@ async fn ollama_is_still_retried_after_a_timeout() {
     let outcome = parse_job(&router, &db).await;
 
     assert!(is_ok(&outcome, ProviderId::Ollama, 2), "{outcome:?}");
+}
+
+async fn with_claude_consent(db: &Db) {
+    let job_text = [DataCategory::JobText];
+    consent::give(db, CLAUDE, &job_text, "2026-11-01", "gui")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_429_with_retry_after_waits_then_retries_once() {
+    let (_tmp, db) = setup().await;
+    with_claude_consent(&db).await;
+    let secs = Some(Duration::from_secs(1));
+    let claude = Mock::claude(vec![Reply::RateLimited(secs), text(JOB)]);
+    let counters = claude.counters();
+    let router = Router::with_providers(vec![claude.boxed()]);
+
+    let clock = Instant::now();
+    let outcome = parse_job(&router, &db).await;
+
+    assert!(is_ok(&outcome, ProviderId::ClaudeCode, 2), "{outcome:?}");
+    assert!(clock.elapsed() >= Duration::from_millis(900));
+    assert_eq!(counters.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_long_retry_after_moves_on_at_once() {
+    let (_tmp, db) = setup().await;
+    with_claude_consent(&db).await;
+    let long = Some(Duration::from_secs(31));
+    let claude = Mock::claude(vec![Reply::RateLimited(long), text(JOB)]);
+    let counters = claude.counters();
+    let ollama = Mock::ollama(vec![text(JOB)]);
+    let router = Router::with_providers(vec![claude.boxed(), ollama.boxed()]);
+
+    let clock = Instant::now();
+    let outcome = parse_job(&router, &db).await;
+
+    assert!(clock.elapsed() < Duration::from_secs(2));
+    assert!(is_ok(&outcome, ProviderId::Ollama, 1), "{outcome:?}");
+    assert_eq!(counters.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_429_with_no_header_is_not_retried_on_an_external_provider() {
+    let (_tmp, db) = setup().await;
+    with_claude_consent(&db).await;
+    let claude = Mock::claude(vec![Reply::RateLimited(None), text(JOB)]);
+    let counters = claude.counters();
+    let router = Router::with_providers(vec![claude.boxed()]);
+
+    let outcome = parse_job(&router, &db).await;
+
+    assert_eq!(counters.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(outcome, manual("rate_limited"));
+    let first = rows(&db).await.remove(0);
+    assert_eq!(first.3.as_deref(), Some("rate_limited"));
+}
+
+#[tokio::test]
+async fn a_429_with_no_header_waits_a_second_and_retries_on_ollama() {
+    let (_tmp, db) = setup().await;
+    let ollama = Mock::ollama(vec![Reply::RateLimited(None), text(JOB)]);
+    let counters = ollama.counters();
+    let router = Router::with_providers(vec![ollama.boxed()]);
+
+    let clock = Instant::now();
+    let outcome = parse_job(&router, &db).await;
+
+    assert!(is_ok(&outcome, ProviderId::Ollama, 2), "{outcome:?}");
+    assert!(clock.elapsed() >= Duration::from_millis(900));
+    assert_eq!(counters.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_cancel_during_the_wait_ends_within_a_poll() {
+    let (_tmp, db) = setup().await;
+    with_claude_consent(&db).await;
+    let wait = Some(Duration::from_secs(20));
+    let claude = Mock::claude(vec![Reply::RateLimited(wait), text(JOB)]);
+    let counters = claude.counters();
+    let router = Router::with_providers(vec![claude.boxed()]);
+    let cancel = CancellationToken::new();
+    let stopper = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        stopper.cancel();
+    });
+
+    let clock = Instant::now();
+    let outcome = router
+        .run(&db, "gui", TaskType::ParseJob, prompt(), cancel)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, Outcome::Cancelled);
+    assert!(clock.elapsed() < Duration::from_secs(2));
+    assert_eq!(counters.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_pause_during_the_wait_stops_the_retry() {
+    let (_tmp, db) = setup().await;
+    with_claude_consent(&db).await;
+    let wait = Some(Duration::from_secs(1));
+    let claude = Mock::claude(vec![Reply::RateLimited(wait), text(JOB)]);
+    let counters = claude.counters();
+    let router = Router::with_providers(vec![claude.boxed()]);
+    let pool = db.pool.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        sqlx::query("INSERT INTO emergency_pause (id, set_at, set_by) VALUES ('me', 'now', 'gui')")
+            .execute(&pool)
+            .await
+            .unwrap();
+    });
+
+    let outcome = parse_job(&router, &db).await;
+
+    assert_eq!(outcome, Outcome::Cancelled);
+    assert_eq!(counters.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn classify_stays_one_attempt_on_a_429() {
+    let (_tmp, db) = setup().await;
+    with_claude_consent(&db).await;
+    let wait = Some(Duration::ZERO);
+    let claude = Mock::claude(vec![Reply::RateLimited(wait), text(JOB)]);
+    let counters = claude.counters();
+    let router = Router::with_providers(vec![claude.boxed()]);
+
+    let outcome = router
+        .run(
+            &db,
+            "gui",
+            TaskType::ClassifyAnswer,
+            prompt(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(counters.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(outcome, manual("rate_limited"));
+}
+
+#[tokio::test]
+async fn a_pause_that_fires_the_token_mid_wait_ends_the_run_at_once() {
+    let (_tmp, db) = setup().await;
+    with_claude_consent(&db).await;
+    let wait = Some(Duration::from_secs(20));
+    let claude = Mock::claude(vec![Reply::RateLimited(wait), text(JOB)]);
+    let counters = claude.counters();
+    let router = Router::with_providers(vec![claude.boxed()]);
+    let cancel = CancellationToken::new();
+    let pool = db.pool.clone();
+    let setter = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        sqlx::query("INSERT INTO emergency_pause (id, set_at, set_by) VALUES ('me', 'now', 'gui')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pause::watch(&db, &cancel).await;
+    };
+    let run = router.run(&db, "gui", TaskType::ParseJob, prompt(), cancel.clone());
+
+    let clock = Instant::now();
+    let (outcome, ()) = tokio::join!(run, setter);
+
+    assert_eq!(outcome.unwrap(), Outcome::Cancelled);
+    assert!(
+        clock.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        clock.elapsed()
+    );
+    assert_eq!(counters.calls.load(Ordering::SeqCst), 1);
+}
+
+/// 30 s is the longest wait obeyed, so it waits (and a cancel ends it); 31 s moves on.
+#[tokio::test]
+async fn a_retry_after_of_exactly_the_limit_waits_and_one_past_it_does_not() {
+    for (secs, waits) in [(30, true), (31, false)] {
+        let (_tmp, db) = setup().await;
+        with_claude_consent(&db).await;
+        let claude = Mock::claude(vec![
+            Reply::RateLimited(Some(Duration::from_secs(secs))),
+            text(JOB),
+        ]);
+        let counters = claude.counters();
+        let router = Router::with_providers(vec![claude.boxed()]);
+        let cancel = CancellationToken::new();
+        let stopper = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            stopper.cancel();
+        });
+
+        let clock = Instant::now();
+        let outcome = router
+            .run(&db, "gui", TaskType::ParseJob, prompt(), cancel)
+            .await
+            .unwrap();
+
+        if waits {
+            assert_eq!(outcome, Outcome::Cancelled, "{secs}");
+            assert!(clock.elapsed() >= Duration::from_millis(600), "{secs}");
+        } else {
+            assert_eq!(outcome, manual("rate_limited"), "{secs}");
+            assert!(clock.elapsed() < Duration::from_millis(600), "{secs}");
+        }
+        assert_eq!(counters.calls.load(Ordering::SeqCst), 1, "{secs}");
+    }
 }

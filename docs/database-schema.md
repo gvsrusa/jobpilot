@@ -1,6 +1,6 @@
 # JobPilot AI: Database Schema
 
-Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md), [PRD](prd.md), [architecture](architecture.md). Requirement IDs (`FR-<section>.<n>`) come from the PRD. Sections 1 (release 0.1), 2 (release 0.2), and 3 (release 0.3) are implemented; section 5 is still a proposal. `schema_version` is 11 on a fresh database, and migration `0011` is the last.
+Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md), [PRD](prd.md), [architecture](architecture.md). Requirement IDs (`FR-<section>.<n>`) come from the PRD. Sections 1 (release 0.1), 2 (release 0.2), 3 (release 0.3), and 3a (release 0.4) are implemented; section 5 is still a proposal. `schema_version` is 12 on a fresh database, and migration `0012` is the last.
 
 The database is SQLite accessed through SQLx (FR-2.1) and managed by versioned migrations (FR-2.5). It lives at `<data root>/jobpilot.db`, in WAL mode with foreign keys on. Full-text search uses FTS5 (FR-2.2).
 
@@ -240,6 +240,16 @@ Migrations `0006` to `0011` add the tables below, on top of the 0.2 tables. Each
 | `0011_emergency_pause.sql` | `emergency_pause`, and `drafts.run_id` | `emergency_pause` has one row while the pause is on: who set it and when, no personal data. A restore never clears it. `drafts.run_id` is the id of the run that made a generated version, so a run that repeats its draft step after a failed checkpoint write finds its version and calls no model again. |
 
 Other rules the migrations follow: runtime SQL only, LF line endings, and no file edited after it shipped.
+
+## 3a. Release 0.4 change (decided, shipped)
+
+One migration, `0012_consent_register_row.sql`, adds a column to the 0.2 `consent` table:
+
+| Migration | Change | Class and handling |
+|---|---|---|
+| `0012_consent_register_row.sql` | `consent.register_row TEXT NOT NULL DEFAULT ''` | Rule 7: the column holds the provider's register row text (the vendor row's cells except the date read, plus the owner decision line), which is public register text and not personal data. Backup copies it with the row, export writes it, delete-all removes it with the root. The default `''` equals no build's text, so a record from before the column is suspended until the user confirms again (decision 12): the owner's existing Claude consent needs one re-confirm after upgrade. A record is read as active only when its stored text equals the current build's text for that provider; no write happens at that moment. The endpoint's stored text also holds its address, so changing the address suspends it. |
+
+Everything else 0.4 stores uses existing places and adds no table: the settings `ai.model.<provider>`, `ai.endpoint.url`, `ai.model.endpoint`, `ai.gemini_path`, and `ai.codex_path` (all under the `ai.` prefix), the `ai.enabled` and `ai.order` lists, and `secret_index` rows named `ai-key-<provider>` that hold only the name. A key value is never in the database. `a_fresh_database_is_schema_12` and `a_0_3_database_upgrades_to_0_4` pin the version and the upgrade from a schema 11 database.
 
 ## 4. Migration rules
 

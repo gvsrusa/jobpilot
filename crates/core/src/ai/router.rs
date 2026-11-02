@@ -3,12 +3,19 @@
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
+use super::api::ApiProvider;
 use super::claude_code::ClaudeCode;
+use super::codex_cli::CodexCli;
+use super::consent::ConsentState;
+use super::gemini_cli::GeminiCli;
+use super::net::MAX_RETRY_WAIT;
 use super::noai::NoAi;
 use super::ollama::{DEFAULT_URL, Ollama};
 use super::validate::validate;
@@ -24,14 +31,36 @@ use crate::settings;
 
 const CANCEL_POLL: Duration = Duration::from_millis(100);
 const NOT_LOGGED_IN: &str = "not_logged_in";
+const RATE_LIMITED: &str = "rate_limited";
+const AUTH_FAILED: &str = "auth_failed";
+const NO_KEY: &str = "no_key";
+const NO_API_MODEL: &str = "no_api_model";
+const MODEL_NOT_FOUND: &str = "model_not_found";
+const MODEL_REFUSED: &str = "model_refused";
+const MODEL_HAS_TOOLS: &str = "model_has_tools";
+const ENDPOINT_CHANGED: &str = "endpoint_changed";
+const ORIGIN_REFUSED: &str = "origin_refused";
+const QUOTA_EXHAUSTED: &str = "quota_exhausted";
 const PROMPT_TOO_LARGE: &str = "prompt_too_large";
+const CLI_ACCOUNT_REFUSED: &str = "cli_account_refused";
 const CONSENT: &str = "consent";
 const CONSENT_NEEDED: &str = "consent_needed";
+const CONSENT_SUSPENDED: &str = "consent_suspended";
 const PROVIDER_UNAVAILABLE: &str = "provider_unavailable";
 const NO_MODEL_SET: &str = "no_model_set";
 const MODEL_NOT_INSTALLED: &str = "model_not_installed";
+const CLI_TOO_OLD: &str = "cli_too_old";
+const UNUSABLE_REPLY: &str = "unusable_reply";
+const OUTPUT_TRUNCATED: &str = "output_truncated";
 const OLLAMA: &str = "ollama";
 const CLAUDE_CODE: &str = "claude_code";
+const OPENAI: &str = "openai";
+const ANTHROPIC: &str = "anthropic";
+const GOOGLE: &str = "google";
+const OPENROUTER: &str = "openrouter";
+const ENDPOINT: &str = "endpoint";
+const GEMINI_CLI: &str = "gemini_cli";
+const CODEX_CLI: &str = "codex_cli";
 
 /// Providers in user order. No-AI is not in the list: it runs last, outside the checks.
 /// Holds no `Db`, so build one per call and nothing blocks a restore.
@@ -75,7 +104,8 @@ enum Step<T> {
 impl Router {
     /// Settings: `ai.order` (`["ollama","claude_code"]`, default `["ollama"]`) and `ai.enabled`
     /// (`{ollama: bool, claude_code: bool}`), as [`provider_settings`] reads them, then
-    /// `ai.ollama_url`, `ai.drafting_model`, `ai.embedding_model`.
+    /// `ai.ollama_url`, `ai.drafting_model`, `ai.embedding_model`, `ai.model.<name>`,
+    /// `ai.endpoint.url`.
     /// Spawns nothing and opens no socket: availability is checked when a task runs.
     pub async fn from_settings(db: &Db) -> Result<Router> {
         let (order, enabled) = provider_settings(db).await?;
@@ -95,6 +125,26 @@ impl Router {
                         .await
                         .unwrap_or_else(|_| ClaudeCode::with_binary(PathBuf::new(), None));
                     providers.push(Box::new(claude));
+                }
+                GEMINI_CLI => {
+                    // As Claude: no binary stays listed, and the run log shows it unavailable.
+                    let gemini = GeminiCli::locate_in(db)
+                        .await
+                        .unwrap_or_else(|_| GeminiCli::with_binary(PathBuf::new()));
+                    providers.push(Box::new(gemini));
+                }
+                CODEX_CLI => {
+                    // Listed so the run log shows why it was skipped: no task qualifies today.
+                    let codex = CodexCli::locate_in(db)
+                        .await
+                        .unwrap_or_else(|_| CodexCli::with_binary(PathBuf::new()));
+                    providers.push(Box::new(codex));
+                }
+                OPENAI | ANTHROPIC | GOOGLE | OPENROUTER | ENDPOINT => {
+                    match ApiProvider::from_settings(db, name).await? {
+                        Some(provider) => providers.push(Box::new(provider)),
+                        None => eprintln!("{name}: no usable address, provider left out"),
+                    }
                 }
                 _ => {}
             }
@@ -125,6 +175,11 @@ impl Router {
         ids.chain([ProviderId::NoAi]).collect()
     }
 
+    /// What each provider declares, in routing order. No-AI declares nothing to check.
+    pub fn declarations(&self) -> Vec<Declaration> {
+        self.providers.iter().map(|p| p.declaration()).collect()
+    }
+
     pub async fn run(
         &self,
         db: &Db,
@@ -136,6 +191,22 @@ impl Router {
         self.run_spec(db, actor, spec(task), prompt, cancel).await
     }
 
+    /// `run`, with `check` as part of each attempt after the schema: its `Err(Validation)` is
+    /// a validation failure like the schema's, so it retries and is logged the same way. Any
+    /// other `Err` ends the task with that error: the check did not run, so no reply is judged.
+    pub async fn run_checked<Check: Future<Output = Result<()>>>(
+        &self,
+        db: &Db,
+        actor: &str,
+        task: TaskType,
+        prompt: Prompt,
+        cancel: CancellationToken,
+        check: impl Fn(Value) -> Check,
+    ) -> Result<Outcome> {
+        self.run_inner(db, actor, spec(task), prompt, cancel, check)
+            .await
+    }
+
     /// `run` with a chosen spec, so tests can prove a rule holds for a spec that does not
     /// ship. `run` is the only production caller.
     #[doc(hidden)]
@@ -144,8 +215,21 @@ impl Router {
         db: &Db,
         actor: &str,
         spec: &TaskSpec,
+        prompt: Prompt,
+        cancel: CancellationToken,
+    ) -> Result<Outcome> {
+        self.run_inner(db, actor, spec, prompt, cancel, |_| async { Ok(()) })
+            .await
+    }
+
+    async fn run_inner<Check: Future<Output = Result<()>>>(
+        &self,
+        db: &Db,
+        actor: &str,
+        spec: &TaskSpec,
         mut prompt: Prompt,
         cancel: CancellationToken,
+        check: impl Fn(Value) -> Check,
     ) -> Result<Outcome> {
         prompt.schema = spec.schema;
         let task = Task {
@@ -167,11 +251,39 @@ impl Router {
 
         for provider in &self.providers {
             let provider = provider.as_ref();
+            // Set by a reply, so a provider's own `Validation` is not blamed on its output.
+            let unusable = AtomicBool::new(false);
+            // A check that could not run, which blames neither the reply nor the provider.
+            let broken = Mutex::new(None);
             let call = || async {
                 let raw = provider.complete(&prompt, cancel.clone()).await?;
-                validate(spec.schema, &raw)
+                let checked = async {
+                    let output = validate(spec.schema, &raw)?;
+                    match check(output.clone()).await {
+                        Err(error) if !matches!(error, Error::Validation(_)) => {
+                            *broken.lock().unwrap() = Some(error);
+                            Err(Error::Failed("the check did not run".into()))
+                        }
+                        checked => checked.map(|()| output),
+                    }
+                };
+                let checked = checked.await;
+                if matches!(checked, Err(Error::Validation(_))) {
+                    unusable.store(true, Ordering::Relaxed);
+                }
+                checked
             };
-            match self.try_provider(&task, provider, call).await? {
+            let step = self.try_provider(&task, provider, call).await?;
+            if !matches!(step, Step::Cancelled)
+                && let Some(error) = broken.lock().unwrap().take()
+            {
+                return Err(error);
+            }
+            let step = match step {
+                Step::Next if unusable.load(Ordering::Relaxed) => Step::Manual(UNUSABLE_REPLY),
+                step => step,
+            };
+            match step {
                 Step::Done {
                     value: output,
                     attempts,
@@ -364,10 +476,44 @@ impl Router {
             log(task, record).await?;
 
             // A timed-out or broken external attempt may already have spent the user's usage.
+            // A 429 spent nothing, so it may wait and retry, within the attempts the task has.
             match error {
+                Error::RateLimited { retry_after } if attempt < task.spec.attempts => {
+                    let wait = match (retry_after, is_external(&declaration)) {
+                        (Some(wait), _) if wait <= MAX_RETRY_WAIT => wait,
+                        (None, false) => Duration::from_secs(1),
+                        _ => return Ok(Step::Manual(RATE_LIMITED)),
+                    };
+                    let sleep = async {
+                        tokio::time::sleep(wait).await;
+                        Ok(())
+                    };
+                    if bounded(sleep, wait + CANCEL_POLL, task.cancel)
+                        .await
+                        .is_err()
+                    {
+                        log(task, row(&name, attempt, "cancelled", None, task.db).await?).await?;
+                        return Ok(Step::Cancelled);
+                    }
+                }
+                Error::RateLimited { .. } => return Ok(Step::Manual(RATE_LIMITED)),
                 Error::Timeout | Error::Io(_) if !is_external(&declaration) => {}
                 Error::Validation(_) if !validation_failed => validation_failed = true,
-                _ if reason == NOT_LOGGED_IN || reason == PROMPT_TOO_LARGE => {
+                _ if [
+                    NOT_LOGGED_IN,
+                    PROMPT_TOO_LARGE,
+                    AUTH_FAILED,
+                    QUOTA_EXHAUSTED,
+                    NO_KEY,
+                    ORIGIN_REFUSED,
+                    MODEL_HAS_TOOLS,
+                    MODEL_NOT_FOUND,
+                    MODEL_REFUSED,
+                    CLI_ACCOUNT_REFUSED,
+                    OUTPUT_TRUNCATED,
+                ]
+                .contains(&reason) =>
+                {
                     return Ok(Step::Manual(reason));
                 }
                 _ => return Ok(Step::Next),
@@ -396,6 +542,8 @@ fn after_skip<T>(task: &Task<'_>, declaration: &Declaration, reason: &str) -> St
     match reason {
         PROMPT_TOO_LARGE => Step::Manual(PROMPT_TOO_LARGE),
         CONSENT if unfit(task, declaration).is_none() => Step::Manual(CONSENT_NEEDED),
+        CONSENT_SUSPENDED if unfit(task, declaration).is_none() => Step::Manual(CONSENT_SUSPENDED),
+        ENDPOINT_CHANGED if unfit(task, declaration).is_none() => Step::Manual(ENDPOINT_CHANGED),
         _ => Step::Next,
     }
 }
@@ -404,18 +552,22 @@ fn after_skip<T>(task: &Task<'_>, declaration: &Declaration, reason: &str) -> St
 /// what the user can grant here, then a provider that is simply not there right now.
 fn weight(reason: &str) -> u8 {
     match reason {
-        PROVIDER_UNAVAILABLE | NO_MODEL_SET | MODEL_NOT_INSTALLED => 0,
-        CONSENT_NEEDED => 1,
+        PROVIDER_UNAVAILABLE | NO_MODEL_SET | MODEL_NOT_INSTALLED | NO_KEY | NO_API_MODEL
+        | CLI_TOO_OLD => 0,
+        CONSENT_NEEDED | CONSENT_SUSPENDED | ENDPOINT_CHANGED => 1,
         _ => 2,
     }
 }
 
-/// The words an Ollama probe gives for what is missing, in the user's terms. Anything else
-/// is the generic reason, so provider text never leaves.
+/// The words a probe gives for what is missing, in the user's terms. Anything else is the
+/// generic reason, so provider text never leaves.
 fn unavailable_reason(why: &str) -> &'static str {
     match why {
         "no_model" => NO_MODEL_SET,
         "model_missing" => MODEL_NOT_INSTALLED,
+        NO_KEY => NO_KEY,
+        NO_API_MODEL => NO_API_MODEL,
+        CLI_TOO_OLD => CLI_TOO_OLD,
         _ => PROVIDER_UNAVAILABLE,
     }
 }
@@ -445,7 +597,7 @@ pub(crate) fn run_reason(error: &Error) -> &'static str {
 }
 
 /// Data leaves the machine. Fails closed: anything but Ollama counts, whatever it declares.
-fn is_external(declaration: &Declaration) -> bool {
+pub(crate) fn is_external(declaration: &Declaration) -> bool {
     declaration.id != ProviderId::Ollama
 }
 
@@ -453,7 +605,8 @@ fn is_external(declaration: &Declaration) -> bool {
 ///
 /// 1. Owner decisions: `ProviderId` is the allow-list, so nothing ineligible constructs.
 /// 2. Ollama needs a confirmed local model, and consent cannot stand in for one. Everything
-///    else needs a consent record covering every category of the task.
+///    else needs a consent record, given under this build's register text, covering every
+///    category of the task.
 /// 3. Mode: every task in 0.2 is `reviewed`, so there is nothing to refuse. `TaskSpec` gains
 ///    a mode with the first `unreviewed` task.
 /// 4. Every required capability is declared. Absent means false, so this fails closed, and
@@ -463,11 +616,18 @@ fn is_external(declaration: &Declaration) -> bool {
 /// 5. Availability, in `try_provider`.
 async fn ineligible(task: &Task<'_>, declaration: &Declaration) -> Result<Option<String>> {
     if is_external(declaration) {
-        let granted = consent::active(task.db, &declaration.id.to_string()).await?;
-        let covered =
-            granted.is_some_and(|granted| task.spec.categories.iter().all(|c| granted.contains(c)));
-        if !covered {
-            return Ok(Some(CONSENT.into()));
+        match consent::state(task.db, &declaration.id.to_string()).await? {
+            ConsentState::None => return Ok(Some(CONSENT.into())),
+            // The endpoint's record is bound to its address, the likelier change by far.
+            ConsentState::Suspended(_) if declaration.id == ProviderId::Endpoint => {
+                return Ok(Some(ENDPOINT_CHANGED.into()));
+            }
+            ConsentState::Suspended(_) => return Ok(Some(CONSENT_SUSPENDED.into())),
+            ConsentState::Active(granted) => {
+                if !task.spec.categories.iter().all(|c| granted.contains(c)) {
+                    return Ok(Some(CONSENT.into()));
+                }
+            }
         }
     } else if !declaration.local {
         return Ok(Some("model_not_local".into()));
@@ -477,20 +637,21 @@ async fn ineligible(task: &Task<'_>, declaration: &Declaration) -> Result<Option
 
 /// Check 4: what the provider cannot do for this task, whatever the user allows.
 fn unfit(task: &Task<'_>, declaration: &Declaration) -> Option<String> {
-    let declares = |capability| declaration.capabilities.contains(&capability);
-    if carries_untrusted_text(task.spec) && !declares(Capability::NoTools) {
-        return Some(code(&Capability::NoTools));
-    }
-    let missing = task
-        .spec
-        .required
-        .iter()
-        .find(|capability| !declares(**capability))
-        .map(code);
+    let missing = lacking(task.spec, &declaration.capabilities);
     if missing.is_none() && task.tokens > declaration.context_limit {
         return Some(PROMPT_TOO_LARGE.into());
     }
     missing
+}
+
+/// The capability a spec needs that `capabilities` leaves out, as a reason code. The consent
+/// screen reads this too, so it and the router cannot differ on what a provider runs.
+pub(super) fn lacking(spec: &TaskSpec, capabilities: &[Capability]) -> Option<String> {
+    if carries_untrusted_text(spec) && !capabilities.contains(&Capability::NoTools) {
+        return Some(code(&Capability::NoTools));
+    }
+    let missing = spec.required.iter().find(|c| !capabilities.contains(c));
+    missing.map(code)
 }
 
 /// Ends `work` at the timeout or within one poll of the cancel, whichever is first.

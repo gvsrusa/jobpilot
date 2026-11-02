@@ -1,0 +1,130 @@
+{
+ "sections": [
+  {
+   "entries": [
+    {
+     "bullets": [
+      {
+       "evidence_ids": [
+        "$EVIDENCE_ID"
+       ],
+       "text": "Built a Rust order-routing service handling 40,000 requests per minute and cut p99 latency by 35 percent"
+      },
+      {
+       "evidence_ids": [
+        "$EVIDENCE_ID"
+       ],
+       "text": "Led a team of four engineers and migrated PostgreSQL 12 to 15 with no downtime"
+      }
+     ],
+     "dates": "",
+     "evidence_ids": [
+      "$EVIDENCE_ID"
+     ],
+     "subtitle": "Northwind Logistics",
+     "title": "Senior Backend Engineer"
+    },
+    {
+     "bullets": [
+      {
+       "evidence_ids": [
+        "$EVIDENCE_ID"
+       ],
+       "text": "Wrote Python data pipelines on AWS Lambda that processed 2 million claims per day, and added integration tests that reduced production incidents by 20 percent"
+      }
+     ],
+     "dates": "",
+     "evidence_ids": [
+      "$EVIDENCE_ID"
+     ],
+     "subtitle": "Fabrikam Health",
+     "title": "Software Engineer"
+    }
+   ],
+   "heading": "experience"
+  },
+  {
+   "entries": [
+    {
+     "bullets": [
+      {
+       "evidence_ids": [
+        "$EVIDENCE_ID"
+       ],
+       "text": "Proficient in Rust, Python, PostgreSQL, Kubernetes, AWS, and gRPC"
+      }
+     ],
+     "dates": "",
+     "evidence_ids": [
+      "$EVIDENCE_ID"
+     ],
+     "subtitle": "",
+     "title": "Skills"
+    }
+   ],
+   "heading": "skills"
+  },
+  {
+   "entries": [
+    {
+     "bullets": [
+      {
+       "evidence_ids": [
+        "$EVIDENCE_ID"
+       ],
+       "text": "B.S. Computer Science from University of Texas at Austin (2017)"
+      }
+     ],
+     "dates": "",
+     "evidence_ids": [
+      "$EVIDENCE_ID"
+     ],
+     "subtitle": "",
+     "title": "Education"
+    }
+   ],
+   "heading": "education"
+  },
+  {
+   "entries": [
+    {
+     "bullets": [
+      {
+       "evidence_ids": [
+        "$EVIDENCE_ID"
+       ],
+       "text": "Led a team of four engineers and migrated PostgreSQL 12 to 15 with no downtime"
+      }
+     ],
+     "dates": "",
+     "evidence_ids": [
+      "$EVIDENCE_ID"
+     ],
+     "subtitle": "",
+     "title": "Team Leadership"
+    }
+   ],
+   "heading": "achievements"
+  }
+ ],
+ "summary": [
+  {
+   "evidence_ids": [
+    "$EVIDENCE_ID"
+   ],
+   "text": "Senior Backend Engineer with 3+ years of Rust and PostgreSQL experience"
+  },
+  {
+   "evidence_ids": [
+    "$EVIDENCE_ID"
+   ],
+   "text": "Software Engineer with 3+ years of AWS Lambda and Python data pipelines"
+  },
+  {
+   "evidence_ids": [
+    "$EVIDENCE_ID"
+   ],
+   "text": "Proficient in Rust, Python, PostgreSQL, Kubernetes, AWS, and gRPC"
+  }
+ ]
+}

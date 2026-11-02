@@ -2,11 +2,11 @@
 
 JobPilot AI is a personal, non-commercial, open-source, local-first desktop application for international job seekers. The long-term goal covers the job-search lifecycle: discover, analyze, match, personalize, apply, track, improve. This is one person's project, not a product with support or a roadmap guarantee.
 
-Your data stays on your machine. There are no mandatory API keys, no API credits, no hosted backend, and no proprietary cloud account. The only network use in 0.3 is a local Ollama server on this machine and the `claude` program you already have installed, and only when you turn them on.
+Your data stays on your machine. There are no mandatory API keys, no API credits, no hosted backend, and no proprietary cloud account. The only network use in 0.4 is a local Ollama server on this machine, the `claude` and optional `gemini` programs you already have installed, and, only if you add your own key and consent, a hosted provider's API (OpenAI, Anthropic, Google, or OpenRouter) or a server you name on your own computer. Every one of these is off until you turn it on.
 
-## What works today (0.3)
+## What works today (0.4)
 
-Release 0.1 is the foundation. Release 0.2 adds your candidate profile and a first resume tool. Release 0.3 adds application tracking, career memory, a workflow runner with agent logs, a small analytics report, and an emergency pause. The 0.3 build is a candidate: its tests pass, but several things were never run by a person, on Windows or on a Mac (see the [0.3 release notes](docs/releases/0.3.0.md) and the [0.2 release notes](docs/releases/0.2.0.md)).
+Release 0.1 is the foundation. Release 0.2 adds your candidate profile and a first resume tool. Release 0.3 adds application tracking, career memory, a workflow runner with agent logs, a small analytics report, and an emergency pause. Release 0.4 adds more AI backends, all optional and all behind your consent. The 0.4 build is a candidate: its tests pass, but the hosted APIs and the Gemini CLI were checked against local fakes and documents, and several things were never run by a person (see the [0.4 release notes](docs/releases/0.4.0.md), the [0.3 release notes](docs/releases/0.3.0.md), and the [0.2 release notes](docs/releases/0.2.0.md)).
 
 - Desktop app with status, documents, data, recovery, profile, resumes, AI, applications, memory, and agents views (Ctrl/Cmd+1 to 9), and a terminal panel (Ctrl+` shows it, F6 leaves it).
 - Applications you track by hand: status, history, and notes, offline. A summary of counts and rates on request.
@@ -16,11 +16,13 @@ Release 0.1 is the foundation. Release 0.2 adds your candidate profile and a fir
 - Backup, restore, export, and delete-all of your data, with an audit log.
 - A profile with several countries, cities, currencies, languages, and work modes. Work authorization is stored as you state it, encrypted, and never inferred. A recovery key file lets you reopen encrypted fields if your keychain is lost.
 - Resume import from PDF and DOCX into a knowledge base; resumes and cover letters for a pasted posting, with each line tied to your own evidence. A line without evidence is flagged and blocks export. Export to DOCX and PDF.
-- AI is optional and every feature works with none. Backends: Ollama on this machine (loopback only; you start any download), and Claude Code through the official `claude` CLI on your own login, which gets job text only with every tool turned off and only after you consent. No-AI is always last.
+- AI is optional and every feature works with none. Backends: Ollama on this machine (loopback only; you start any download); Claude Code through the official `claude` CLI on your own login; the optional Gemini CLI, run with every tool denied; OpenAI, Anthropic, Google (paid key), and OpenRouter on your own key; and one server you name on a loopback address. Job text goes only to a backend that has no tools, and only after you consent to that backend. The Codex CLI adapter is present and inert: it cannot prove it has no tools, so no task uses it. Keys live in your OS keychain and never reach the app window. No-AI is always last.
 - The `jobpilot` command line (`status`, `doc`, `backup`, `data`, `profile`, `prefs`, `kb`, `job`, `resume`, `letter`, `app`, `memory`, `agents`, `analytics`, `ai`, `pause`), bundled with the app and also usable in a normal terminal.
 - OS keychain access for secrets. Secret values never reach the webview, logs, or exports.
 
 Claude Code note: JobPilot starts your installed `claude` and never reads or stores its login. Anthropic's consumer terms may allow training on your content unless you opt out; the consent screen says so. The owner of this project has waived subscription-policy concerns for personal use and accepts that risk. You should decide that for yourself.
+
+Gemini CLI note: the CLI keeps a transcript of every prompt under `~/.gemini/tmp` for 30 days and has no setting to turn that off, so a posting you send through it sits there in plain text. The consent screen says so. A Gemini key must belong to a project with billing on: a free key can send your data to human reviewers, and JobPilot cannot tell the two apart, so you attest to it.
 
 ### First run with Claude Code
 
@@ -31,7 +33,7 @@ Claude Code note: JobPilot starts your installed `claude` and never reads or sto
 5. In Knowledge, read the imported lines. Mark anything about visas, citizenship, or pay as sensitive, then use Approve all from this resume, or approve line by line. A draft can only use approved lines.
 6. Choose Paste a job posting, then Generate. Check each line against its evidence, then export.
 
-Not built yet: job discovery, matching, application automation, other AI providers. Memory refresh spends your Claude usage and only runs when you press it. See [milestones](docs/milestones.md).
+Not built yet: job discovery, matching, and application automation. Memory refresh spends paid or subscription usage and only runs when you press it; it states the most calls it can make first. See [milestones](docs/milestones.md).
 
 ## Installing (unsigned)
 
@@ -53,6 +55,7 @@ See [docs/development.md](docs/development.md) and [CONTRIBUTING.md](CONTRIBUTIN
 - [PRD](docs/prd.md)
 - [Milestones](docs/milestones.md)
 - [Connector SDK (stub)](docs/connector-sdk.md)
+- [Release notes 0.4.0](docs/releases/0.4.0.md)
 - [Release notes 0.3.0](docs/releases/0.3.0.md)
 - [Release notes 0.2.0](docs/releases/0.2.0.md)
 - [AI providers](docs/ai-providers.md) and [threat model](docs/security/threat-model.md)

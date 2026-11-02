@@ -4,7 +4,7 @@ Status: draft for owner approval. Register date: 2026-11-01. Source: [master spe
 
 **This is an engineering terms review, not legal advice.** It records what the vendors' own documents say and what the product does as a result. Nobody here is a lawyer, and a vendor or court may read a clause differently.
 
-**Terms change.** Several sources below changed within the last two months, and OpenAI's Usage Policies change again on 2026-11-20. Every entry is true only for its date read. Each release must re-read the entries it depends on before it ships (see [Release re-check](#release-re-check)).
+**Terms change.** Several sources below changed within the last two months, and OpenAI's Usage Policies change again on 2026-11-20. Every entry is true only for its date read. Each release re-reads the site rows it depends on before it ships (see [Release re-check](#release-re-check)). The owner waived that re-read for the AI provider rows, so a release no longer re-reads them, and a changed vendor term can go unnoticed there.
 
 ## Owner decisions (2026-11-01)
 
@@ -94,7 +94,7 @@ Rules for this register:
 |---|---|---|---|---|---|---|
 | Gemini CLI | Consumer sign-in (Code Assist for individuals, Google AI Pro, Ultra) | https://developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals | 2026-11-01 | "you can no longer use the Login with Google option to access the IDE extensions or Gemini CLI" | `blocked` | This path no longer exists, so no subscription login remains for individuals. FR-3.10 cannot be met as a subscription integration. |
 | Gemini CLI | Third-party software reaches the services behind the CLI, or reuses its OAuth | https://geminicli.com/docs/resources/tos-privacy | 2026-11-01 | "Directly accessing the services powering Gemini CLI (for example, the Gemini Code Assist service) using third-party software, tools, or services (for example, using OpenClaw with Gemini CLI OAuth) is a violation of applicable terms and policies." | `blocked` | Not built, on desktop or hosted. The page adds this "may be grounds for suspension or termination of your account." |
-| Gemini CLI | JobPilot runs `gemini` with the user's paid Gemini API key | https://ai.google.dev/gemini-api/terms | 2026-11-01 | "Use of Google AI Studio and Gemini API is for developers building with Google AI models for professional or business purposes, not for consumer use." | `unknown` | Off until resolved. API-key sign-in is supported by the CLI, but no primary clause covers an individual using a key for personal job search. Same verdict and same rule as the direct API rows below. |
+| Gemini CLI | JobPilot runs `gemini` with the user's paid Gemini API key | https://ai.google.dev/gemini-api/terms | 2026-11-01 | "Use of Google AI Studio and Gemini API is for developers building with Google AI models for professional or business purposes, not for consumer use." | `unknown` | Off until resolved. API-key sign-in is supported by the CLI, but no primary clause covers an individual using a key for personal job search. Same verdict and same rule as the direct API rows below. The CLI keeps its own transcript of each prompt and reply under ~/.gemini/tmp, 30 days by default, and no setting turns that off. |
 | Gemini CLI | JobPilot runs `gemini` with a free Gemini API key | https://ai.google.dev/gemini-api/terms | 2026-11-01 | "Do not submit sensitive, confidential, or personal information to the Unpaid Services." | `blocked` | Resumes and profiles are personal information. Free keys are refused for any task that sends them. Also: "You may use only Paid Services when making API Clients available to users in the European Economic Area, Switzerland, or the United Kingdom." |
 | Gemini CLI | Sign-in with a Code Assist Standard or Enterprise licence | https://developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals | 2026-11-01 | "subject to a separate deprecation schedule" | `unknown` | Not built. Employer-licensed seats are not the target user, and the schedule page and its terms were not read. |
 
@@ -246,7 +246,7 @@ An answer is recorded in the row it changes, with date, sender, and text.
 
 ## Release re-check
 
-Before each release, for every row that release depends on:
+Before each release, for every site row that release depends on (the connector rows 0.5 and 0.6 rely on). **The owner waived this re-read for the AI provider rows** (the OpenAI, Anthropic, Google, OpenRouter, Gemini CLI, Codex CLI, Claude Code, and endpoint rows), accepting that a changed vendor term can go unnoticed. The rows below stay as the record of what vendors said on their dates read; no release step edits them, because any change to a provider row's text suspends every consent record for that provider (decision 12 in the [AI providers](ai-providers.md#as-built-in-04) build). A re-read dated after the fact belongs in a new written-answer entry, not in a row.
 
 1. Re-read the source URL. Record the new date read.
 2. Compare the quoted clause. If it changed, re-decide the verdict and its consequence.

@@ -176,10 +176,14 @@ fn refusal() -> String {
 
 /// Parses in this process and runs the command; the reply is the text to print.
 async fn jobpilot(args: Vec<String>) -> String {
-    let cli = match Cli::try_parse_from(std::iter::once("jobpilot".to_string()).chain(args)) {
+    let cli = match Cli::try_parse_from(std::iter::once("jobpilot".to_string()).chain(args.clone()))
+    {
         Ok(cli) => cli,
         // Clap's message echoes the typed word: strip escapes from it too.
-        Err(error) => return crate::text::sanitize(&error.to_string()),
+        Err(error) => {
+            return crate::parse_error(&args, &error)
+                .map_or_else(|| crate::text::sanitize(&error.to_string()), str::to_owned);
+        }
     };
     // Checked here, not left to the environment marker: this prompt is the panel.
     if matches!(cli.command, Jobpilot::Shell) || cli.command.refused_in_panel() {

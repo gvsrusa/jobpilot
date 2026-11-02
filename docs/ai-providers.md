@@ -1,8 +1,8 @@
 # JobPilot AI: AI Provider Integration Specification
 
-Status: draft for owner approval, with the 0.2 implementation noted inline. Date: 2026-11-01. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) section 3, [PRD](prd.md), and [policy register](policy-register.md). Release 0.2 implements the router for Ollama, Claude Code, and No-AI; `Router` in `crates/core/src/ai/router.rs` is the Rust form of `TaskRouter` below. The other backends arrive in 0.4.
+Status: draft for owner approval, with the 0.2 implementation noted inline. Date: 2026-11-01. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) section 3, [PRD](prd.md), and [policy register](policy-register.md). Release 0.2 implements the router for Ollama, Claude Code, and No-AI; `Router` in `crates/core/src/ai/router.rs` is the Rust form of `TaskRouter` below. Release 0.4 adds OpenAI, Anthropic, Google (paid key), OpenRouter, a loopback endpoint, and the optional Gemini CLI and Codex CLI adapters; see [As built in 0.4](#as-built-in-04). Codex ships inert.
 
-Every statement about what a vendor permits comes from the [policy register](policy-register.md), which holds the quotes, URLs, and dates. That register is engineering review, not legal advice, and its entries must be re-read at each release. The owner decided on 2026-11-01 that JobPilot is a personal, non-commercial app and waived AI subscription policy concerns, accepting any account risk (decisions D1 and D4). The register's [owner decisions](policy-register.md#owner-decisions-2026-11-01) set what the product does with AI provider rows. The waiver covers vendor terms only: `no_tools`, the mode check, and consent all still apply.
+Every statement about what a vendor permits comes from the [policy register](policy-register.md), which holds the quotes, URLs, and dates. That register is engineering review, not legal advice, and its entries were to be re-read at each release. The owner waived that re-read for the AI provider rows (it stays for the site rows 0.5 and 0.6 rely on), so no release step re-reads a provider's terms. The owner decided on 2026-11-01 that JobPilot is a personal, non-commercial app and waived AI subscription policy concerns, accepting any account risk (decisions D1 and D4). The register's [owner decisions](policy-register.md#owner-decisions-2026-11-01) set what the product does with AI provider rows. The waiver covers vendor terms only: `no_tools`, the mode check, and consent all still apply.
 
 ## The four backends
 
@@ -94,13 +94,14 @@ For each backend in fallback order, a provider is eligible only if all of these 
 
 Ineligible providers are skipped, and the reason is logged. Fallback never widens consent: a task the user approved for Ollama does not move to a remote provider because Ollama failed.
 
-Providers run in the stored `ai.order`, then every enabled provider it leaves out, so enabling a provider is enough to route it and the AI screen shows the same order the router uses. When every provider passes, `manual_required` names what would change the result: the reason from a real attempt (`not_logged_in`, `prompt_too_large`), else `consent_needed` when consent alone held a provider back, else `no_model_set` or `model_not_installed` when Ollama is on but lacks a drafting model or the chosen one, else `provider_unavailable` when one is on but cannot be reached, else `no_ai`.
+Providers run in the stored `ai.order`, then every enabled provider it leaves out, so enabling a provider is enough to route it and the AI screen shows the same order the router uses. When every provider passes, `manual_required` names what would change the result: the reason from a real attempt (`not_logged_in`, `prompt_too_large`, `unusable_reply`, `output_truncated`), else `consent_needed` when consent alone held a provider back, else `no_model_set` or `model_not_installed` when Ollama is on but lacks a drafting model or the chosen one, else `provider_unavailable` when one is on but cannot be reached, else `no_ai`.
 
 ### Timeouts and retries
 
 - A timeout cancels the attempt and kills any child process.
-- Proposed retry limit: two attempts per provider.
-- Retry: for a local provider, network errors, 429 and 5xx responses, and one output-validation failure. Honor `Retry-After`. For an external provider, one output-validation failure only.
+- Retry limit: the task's `attempts` per provider (two for parsing and drafting, one for `classify_answer`).
+- Retry, local provider (Ollama): network errors, 429 and 503 (after the `Retry-After` wait, else one second, at most 30 seconds), and one output-validation failure. Other 5xx responses move to the next provider. At temperature 0 a retry usually repeats the reply, so this rarely rescues a local model.
+- Retry, external provider (decision 11): one retry on 429, 503, or 529, only when `Retry-After` gives whole seconds and at most 30. No header, a date form, or a longer wait ends that provider with `rate_limited`. Quota and spend-cap errors never retry, and neither do timeouts, network errors, or other 5xx responses, because the attempt may already have spent usage. One output-validation failure is retried. A task with one attempt (`classify_answer`) never retries.
 - Do not retry: a timeout or network error on an external provider (the attempt may already have spent usage), authentication failures, policy refusals, consent refusals, cancellation, or a second validation failure. Move to the next provider.
 - A prompt whose estimate (UTF-8 bytes / 2, with system text and schema) passes a provider's context limit skips that provider, as does an overflow the provider reports. If nothing else takes the task, it ends `manual_required` with reason `prompt_too_large`. Ollama calls send `num_ctx`, `truncate: false`, and `shift: false`, so an overflow is an error and not a silent cut.
 - Usage-limit errors from a ChatGPT plan (`subscription_sharing_usage_limit_exceeded`) end that provider for the task and show the user a **Manage usage** link, as OpenAI's UI guidelines require.
@@ -138,7 +139,9 @@ The names below are the Rust names in `crates/core/src/ai/`. The vocabulary abov
 
 `--tools ""` removes every built-in tool. `--allowedTools StructuredOutput` keeps the one tool `--json-schema` needs to hand the reply back; `--disallowedTools "*"` was tried and turns the reply into free text (real run, 2.1.316). `--bare` is never used, because it ignores the OAuth login. The child runs in an empty temporary directory with an allow-listed environment, 180 seconds per attempt. A test pins the list (`argv_is_exactly_the_verified_list`), and an ignored smoke test (`real_claude_has_no_tools_smoke`, which also needs `JOBPILOT_REAL_CLAUDE_SMOKE=1`) checks a real `init` event for the tool list. The plugins the owner installed still appear in `init`; see the [threat model](security/threat-model.md#7-cli-adapters-and-untrusted-text).
 
-**Retries as built.** Ollama is retried on network errors, 429, 5xx, and one validation failure. Claude Code is retried once after a validation failure only, never after a timeout or a broken call, because the attempt may already have spent usage. A prompt over a provider's context limit skips it with `prompt_too_large`; Ollama reports an overflow as an error because the call sends `num_ctx`, `truncate: false`, and `shift: false`. The overflow wording was tested against a fake server only.
+**Thinking and truncation on Ollama.** Calls send `think: false`. Left on, thinking counts against `num_ctx`: `qwen3:4b` spent all 8,192 tokens on it in about 90 s and returned no content. `done_reason: length` is `Failed("output_truncated")`, as on the hosted wires, and is not retried: at temperature 0 a retry repeats the same cut. The drafting prompt also caps a resume at 3 summary items, 5 entries in a section, and 4 bullets in an entry, because `gemma4` otherwise wrote out a twelve-job knowledge base and ran out of window. The caps hold for every provider, so a tailored draft can leave out older jobs. These were measured on Ollama 0.33.1 with `gemma4:latest` and `qwen3:4b`, on 2026-11-02.
+
+**Retries as built.** Ollama is retried on network errors, 429, 503, and one validation failure. Claude Code is retried once after a validation failure only, never after a timeout or a broken call, because the attempt may already have spent usage. A prompt over a provider's context limit skips it with `prompt_too_large`; Ollama reports an overflow as an error because the call sends `num_ctx`, `truncate: false`, and `shift: false`. The overflow wording was tested against a fake server only.
 
 ## Output validation
 
@@ -147,7 +150,7 @@ All model output is untrusted (FR-12.6). Validation runs on every backend, inclu
 1. Size check, then parse as JSON. Output outside the schema fails.
 2. Validate against the task's JSON schema. Provider-side structured output helps but never replaces this step.
 3. Run task-specific checks:
-   - Every line of generated material is a claim that cites evidence ids from the list the prompt supplied (FR-7.11, FR-7.12). A reply whose claims do not match the document's lines, or that invents a heading, stores nothing and fails validation. A claim that cites no usable evidence (an id outside the list counts as none), or that states work authorization, is **stored flagged** (`no_evidence`, `authorization_statement`) and blocks export until the user edits or removes it. It is not rejected and not retried. Matching is by id and by word, so a paraphrase can pass; the user's review is the final control.
+   - Every line of generated material is a claim that cites evidence ids from the list the prompt supplied (FR-7.11, FR-7.12). A model writes each line once with what it cites (`schemas/draft_resume.json`: `summary`, and `sections` of entries whose title, subtitle, and dates share the entry's `evidence_ids` and whose bullets cite their own), and Rust builds the document and its claims from that one tree, so the claims are the lines by construction. The name and contact are the profile's: the schema has no field for them. A section heading comes from the schema's `enum`, compared after ASCII lower-casing, so "Experience" from a provider that only reads the schema as text passes and an invented heading does not. Before any check, the assembly cuts evidence ids out of every line of a resume or letter: bracketed tokens that are a listed id or shaped like one (32 hex digits), and listed ids standing alone. Other brackets stay. Only `evidence_ids` cites, so a line whose only id was in its prose is still flagged. A reply outside this shape, or with no text, stores nothing and fails validation inside the attempt, so the router retries it once and then ends with `unusable_reply`. `create_version` still compares claims to lines for every generated or edited version. A claim that cites no usable evidence (an id outside the list counts as none), or that states work authorization, is **stored flagged** (`no_evidence`, `authorization_statement`) and blocks export until the user edits or removes it. It is not rejected and not retried. Matching is by id and by word, so a paraphrase can pass; the user's review is the final control.
    - No output may state or imply work authorization or visa eligibility beyond what the user recorded (FR-4.10).
    - Answers classed sensitive or legally consequential go to the user for confirmation (FR-8.8).
    - URLs, file paths, and commands in output are data. Nothing in output triggers a tool, a shell command, or a navigation.
@@ -247,3 +250,96 @@ The case for reading it differently: with a user's own key, the user, not JobPil
 Unchanged by either option: free Gemini keys stay `blocked`, non-loopback endpoints and OpenRouter's other models stay `unknown`, Vertex AI stays unread, and consent (FR-3.30), the mode check, and `no_tools` all still apply. The CLI adapters are settled separately by [Decision D1](#decision-d1-subscription-ai), and the [threat model](security/threat-model.md#7-cli-adapters-and-untrusted-text) keeps `codex exec` away from job text.
 
 Recommended, and chosen: standard BYOK for direct API calls, with the [written questions](policy-register.md#open-written-questions) optional. A key the user created and pays for is the ordinary way these APIs are used, the spec asks for these providers, and the consent screen puts the terms in front of the person who carries the risk. Choosing strict is a reasonable answer if the owner prefers no terms exposure for users.
+## As built in 0.4
+Names are the Rust names in `crates/core/src/ai/`. `ProviderId` now has ten variants: `Ollama`, `ClaudeCode`, `NoAi`, `OpenAi`, `Anthropic`, `Google`, `OpenRouter`, `Endpoint`, `GeminiCli`, and `CodexCli`. A provider the owner decisions leave out (free Gemini key, Vertex AI, a non-loopback endpoint, Ollama cloud models) has no variant, so a setting cannot name it. Every new provider defaults off. The AI screen is headed "AI providers", with a section of the same name.
+
+**Hosted client** (`net.rs`, `hosted_client`). Native TLS (Schannel on Windows, Security.framework on macOS), HTTPS only, TLS 1.2 or later, no environment proxy, no redirect, and a response read capped at 64 KiB for error bodies. macOS native TLS tops out at TLS 1.2, a residual if a vendor goes 1.3-only. The loopback client (`loopback_client`) serves Ollama and the endpoint, follows no redirect, and refuses every address that is not loopback over `http`. `real_tls_handshake` (ignored, `JOBPILOT_REAL_TLS=1`) sends an unauthenticated `GET` with no body to the four vendor hosts and accepts any HTTP status; CI runs it as the `TLS handshake` step on both systems, and it is the Schannel proof.
+
+**Wires** (`api.rs`). No body carries `tools`, `tool_choice`, `functions`, or a search option, and every schema loses `maxLength` first (`provider_schema`) because Anthropic returns 400 on it. The router still enforces it.
+
+| Provider | Request | Auth | Reply text |
+|---|---|---|---|
+| OpenAI | `POST https://api.openai.com/v1/chat/completions`, `response_format` `json_schema` with `strict: true`, `store: false`, no `temperature`, no token limit | `Authorization: Bearer` | `choices[0].message.content` |
+| OpenRouter | `POST https://openrouter.ai/api/v1/chat/completions`, same body without `store`, with `provider: {data_collection: "deny", require_parameters: true}` | `Authorization: Bearer` | same; a `200` may hold a top-level `error` |
+| Endpoint | `POST <url>/chat/completions`, same body without `store` or `provider`; the path is empty or `/v<1-2 digits>` | `Authorization: Bearer` only when a key is stored | same |
+| Anthropic | `POST https://api.anthropic.com/v1/messages`, `max_tokens: 16000`, `output_config.format` `json_schema` | `x-api-key`, `anthropic-version: 2023-06-01` | the `text` block; thinking blocks are skipped |
+| Google | `POST https://generativelanguage.googleapis.com/v1beta/models/<model>:generateContent`, `generationConfig` with `responseMimeType` and `responseJsonSchema` | `x-goog-api-key` | the `text` parts, joined; thought parts are skipped |
+
+Header values holding a key are `set_sensitive`, and a key is never in a URL. A reply is a clean answer only when it ends normally: a tool call (`tool_calls` non-empty, a `tool_use` block, a `functionCall` or other tool part) is `permission_denied`; a refusal or safety block is `model_refused`; a length stop is `output_truncated`; a missing finish on the Anthropic and Google wires, or an error beside valid text, is `bad_reply`. The chat wire reads a missing finish as clean, because some local servers omit it. These shapes are checked against local fakes only; the real APIs have not accepted them (see the [0.4 release note](releases/0.4.0.md)).
+
+**Statuses** (`classify_status`, which takes the wire):
+
+| Status | Reason |
+|---|---|
+| 401, 403 | `auth_failed` |
+| 402, or 429 holding `insufficient_quota`, `credit_balance_exhausted`, or `usage_limit` | `quota_exhausted` |
+| 400 or 429 on the Anthropic wire holding `enforced_spend_limit_reached` or "you have reached your specified api usage limits" | `quota_exhausted` |
+| 400 on the Google wire holding `API_KEY_INVALID` | `auth_failed`; any other Google 400 stays `http_400` |
+| 404 | `model_not_found` |
+| 400 or 413 holding `context_length_exceeded`, `maximum context length`, `prompt is too long`, or `exceeds the maximum number of tokens` | `prompt_too_large` |
+| 429, 503, 529 | `rate_limited` after the retry rule above |
+| anything else, 3xx included | `http_<n>` (task row: `failed`) |
+
+`spend_limit` is no longer a quota word: the plan listed it, and it matched by accident. The spend-cap words are matched on the Anthropic wire alone and `API_KEY_INVALID` on the Google wire alone, so a local server's echoed text cannot steer routing there. `QUOTA_WORDS` and the overflow words still match on the endpoint wire: a hostile local server can pick `quota_exhausted` or `prompt_too_large`, which changes the reason shown and moves no data. `usage_limit` has no vendor source I can name. Google's bad-key body (a 400 with `API_KEY_INVALID`) is known only from forum sources, not from Google's documents, and no real key has produced it. `model_not_found` and `model_refused` end the task with their own reason on screen, not `no_ai`, because model ids are typed by hand. Provider error text and reply text never reach a log, a message, or `task_runs`; bodies are read only to match these fixed words.
+
+**Models** (decision 23). The user types the vendor's id, per provider, from a safe character set. There is no default and no list. OpenRouter accepts an `openai/`, `anthropic/`, or `google/` prefix, no `:free`, `:online`, or other suffix except `:nitro` and `:floor`. Ids naming search, deep research, or computer use are refused on every provider but the endpoint (`model_has_tools`). The endpoint refuses `:cloud` and `-cloud` names.
+
+**Timeouts and limits.** 120 s per attempt for hosted API providers, 180 s for CLIs, 300 s for the endpoint and Ollama. Context limit 200,000 estimated tokens for hosted providers, 8,192 for the endpoint.
+
+**Keys** (decisions 2 and 3). A key lives in the OS credential store as `ai-key-<name>` and nowhere else: not in the database (`secret_index` holds the name), logs, `task_runs`, audit rows, exports, backups, argv, or a child's environment. Reads happen inside a send, never for status. In the app, a button reads the clipboard in Rust, shows a native dialog naming the provider and the key's last four characters, stores the key, and clears the clipboard; the webview sends only a provider name. In the terminal, `jobpilot ai key set <provider>` reads a hidden prompt, or one line on piped stdin; it is refused in the panel and takes no key in argv. The generic `secret_set` and `secret_delete` refuse the `ai-key-` prefix, so script cannot swap a key. A key is length-capped at 512 bytes, under the Windows blob limit. Deleting everything removes provider keys for every root on the OS account.
+
+**The endpoint** (decisions 5 and 6). One address, `ai.endpoint.url` with `ai.model.endpoint`. A loopback address does not prove local execution (a proxy on that port can forward), so it needs consent and counts as external. A username, password, query, or fragment is refused and a trailing `/` is trimmed. Changing or clearing the address suspends its consent, drops its key, and reads `endpoint_changed`; returning to the exact consented address reactivates the consent but not the key.
+
+**CLI discovery** (`child.rs`). `JOBPILOT_GEMINI_BIN` or `JOBPILOT_CODEX_BIN`, the `ai.gemini_path` or `ai.codex_path` setting, `PATH`, the usual install folders (`gemini.cmd`, `gemini.exe`, `codex.cmd`, `codex.exe`, `%APPDATA%\npm`, Volta, scoop, nodejs, nvm and fnm newest first), then one login-shell lookup. The resolved absolute path shows on the row and in the native consent dialog. It is not pinned to the record. A CLI that is off is not started: status reports its path and probes only an enabled one, so an old CLI reads fine until it is turned on. A wrong stored path reads `wrong_path`. The child's `PATH` starts with the CLI's own folder (and `<prefix>/bin` for a picked npm entry file) so an nvm install finds `node` from a GUI launch.
+
+**Child environment** (decision 17). The allow-list keeps the variables that name the CLI's sign-in, copied by name; the app never looks at a value. For Gemini that is `GEMINI_API_KEY` and `GEMINI_CLI_HOME` only. `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION` were in the plan's list and were dropped, because they could point the CLI at Vertex AI. `GOOGLE_API_KEY`, `GOOGLE_GENAI_USE_VERTEXAI`, and `GOOGLE_APPLICATION_CREDENTIALS` are dropped too. For Codex it is `CODEX_HOME` and `CODEX_API_KEY`; `CODEX_API_KEY` is on the child allow-list although Codex is inert. `~/.gemini/.env` and `~/.env` can still select Vertex, which the app cannot see.
+
+**Gemini CLI** (`gemini_cli.rs`). Declared `no_tools` at version 0.40.0 or later, on the documented flags and a deny-all policy, with a run-time guard. Per attempt the adapter writes `deny-all.toml` (`toolName = "*"`, `decision = "deny"`, `priority = 999`), `system.md`, and `settings.json` to a temporary folder, runs in an empty `work/` folder inside it, and sends the prompt on stdin with no `-p`. Argv, exact, pinned by `argv_is_exactly_the_documented_list`:
+
+```text
+--output-format stream-json --approval-mode default --policy <dir>/deny-all.toml
+--admin-policy <dir>/deny-all.toml --extensions none
+--allowed-mcp-server-names jobpilot-none --skip-trust
+```
+
+Set on top of the allow-list: `GEMINI_SYSTEM_MD=<dir>/system.md`, `GEMINI_CLI_SYSTEM_SETTINGS_PATH=<dir>/settings.json` holding `{"hooksConfig":{"enabled":false},"tools":{"sandbox":false}}`, and `GEMINI_SANDBOX=false`. A `GEMINI_SANDBOX` already in the child's environment fails the attempt (`refuse_sandbox`). No `-m` is passed, so the CLI picks the model. Rules the adapter holds:
+- The stream is read as an allow-list. Any non-blank line that is not a parsed known event in the expected shape fails the attempt with `bad_reply`, a `tool_use` or `tool_result` event fails it first and outranks every other outcome, and an `error` event fails with its mapped code. Empty text is `bad_reply`. If the real CLI prints anything else on stdout, every run ends `bad_reply`; it fails closed.
+- Every `@` in the prompt is sent as `\@` (the CLI's own literal form), by ruling: a headless `@path` reads a file with no policy check, so job text could pull in a local file. A draft may repeat the backslash; validation or an edit catches it. The consent screen's "Show exactly what will be sent" shows this wire text, `\@` included.
+- A prompt that opens with `/` never starts the child; both prompt builders open with fixed text.
+- A temporary folder path with a comma or non-UTF-8 fails closed, because `--policy` splits on commas.
+- A version below 0.40.0 (a pre-release of it counts as below) is `cli_too_old`. A version past 0.40.0 is allowed and the row says it is newer than checked.
+- An account the CLI refuses (`IneligibleTierError` and its kin) gives `cli_account_refused`, with copy that names a possible cause as a hint: Google's docs now carry a banner that Gemini CLI was replaced by Antigravity CLI for unpaid-tier and Google One users on June 18th, 2026. The error class is unverified, so the copy stays a hint. Exit 41 is `not_logged_in`.
+
+Not proven by a real run: `GEMINI_SANDBOX=false` and the `tools.sandbox` override, the stream shape and exit 41 (read from the 0.40.0 bundle, not the docs), the `\@` escape, and the deny rule's real effect. `real_gemini_has_no_tools_smoke` re-checks them once, with `JOBPILOT_REAL_GEMINI_SMOKE=1` and `--ignored`. Windows policy path handling is unrun.
+
+**Gemini CLI keeps a transcript.** The CLI records the full prompt under `~/.gemini/tmp/<id>/chats` for 30 days by default. It has no off switch (checked in 0.40.0 and on main). Moving it needs `GEMINI_CLI_HOME`, which moves the sign-in with it. So the consent text for `gemini_cli/cli_login` says so, in the register row's Notes cell, and a record given before that text is suspended.
+
+**The Code Assist licence path.** The register's row for a Gemini CLI sign-in with a Code Assist Standard or Enterprise licence is `unknown` and not built: employer-licensed seats are not the target user, and its schedule page and terms were not read. Dropping `GOOGLE_CLOUD_PROJECT` from the child (decision 17) means a licence sign-in that needs the project fails inside the CLI with `ProjectIdRequiredError`, which reads as `cli_account_refused`; the hint copy names plans, not the project. The path is accepted as unsupported. The consent for `gemini_cli/cli_login` carries the required attestation either way.
+
+**Codex CLI** (`codex_cli.rs`). Ships inert. It declares `StructuredOutput` only, because no OpenAI page documents a way to remove `apply_patch` (a file tool the hooks docs name beside `Bash`), and the non-interactive page lists no tool switch at all. Every task that ships needs `no_tools`, so the router skips it with no child started (`every_task_that_ships_skips_it_and_starts_no_child`), and the AI screen says "No task can use this yet: it cannot prove it has no tools." It still runs, for a future task with no untrusted text, with every documented switch off. Argv, exact:
+
+```text
+exec --ephemeral --skip-git-repo-check --ignore-user-config --ignore-rules --sandbox read-only
+--disable shell_tool --disable apps --disable multi_agent --disable hooks
+-c web_search="disabled" -c tools.view_image=false -c approval_policy="never"
+--output-schema <dir>/schema.json --output-last-message <dir>/reply.txt -
+```
+
+The run path and these flags are unverified: nothing reaches Codex while every task needs no tools, and the adapter was written from OpenAI's reference pages (Codex CLI 0.125.0) and tested against a mock only. They need checking before the first task that qualifies.
+
+**Consent keys.** The key is the provider name and sign-in method, and it is the `consent.provider` value. A record carries the register row's text (`consent.register_row`, migration 0012, decision 12); a build whose row text differs reads the record as suspended, with no write. The date read is not part of that text.
+
+| Provider | Consent key | Attestation | Terms disclosed |
+|---|---|---|---|
+| Claude Code | `claude_code/cli_login` | none | Consumer Terms allow training unless the user opts out |
+| OpenAI | `openai/api_key` | none | Not used to improve services unless the customer opts in |
+| Anthropic | `anthropic/api_key` | none | "Anthropic may not train models on Customer Content from Services." |
+| Google | `google/paid_key` | required: the key belongs to a project with billing on | Not used to improve products; logged for a limited period |
+| OpenRouter | `openrouter/api_key` | none | The chosen model's terms apply; prompt logging stays off |
+| Endpoint | `endpoint/loopback` | none | Goes to the server you named; what it does with it is its business |
+| Gemini CLI | `gemini_cli/cli_login` | required | The sign-in's terms; the CLI keeps a transcript with no off switch |
+| Codex CLI | `codex_cli/cli_login` | none | The sign-in's terms; no task can use it yet |
+
+A free Gemini key cannot be told from a paid one (the docs name no marker), so the attestation is the only honest gate; a wrong one sends personal data under free-tier terms, and the owner accepts that. Fallback never widens consent. A restore revokes every external consent. A suspended record skips the provider with `consent_suspended`, and the AI screen explains it in an alert with one `Review consent...` button.
+
+**Refresh ceiling.** `memory::refresh_plan` returns `pending` (at most 20 questions, `CLASSIFY_BATCH`) and `external_calls`, which is `pending` times the external providers that declare `no_tools` and hold an active consent covering `job_text`. A reply that fails goes on to the next provider, so each can be asked once per question. The GUI dialog and the CLI text state `external_calls`, with the 20-question limit given separately.

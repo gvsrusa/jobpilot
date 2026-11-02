@@ -24,7 +24,7 @@ Only the first five screens (shell, recovery, status, documents, data) belong to
 | 11 | Application review and pause state | 0.6 | FR-9.2 to FR-9.6, FR-9.16 to FR-9.21 |
 | 12 | Terminal panel | 0.2 | FR-10.1, FR-10.2, FR-12.5 |
 | 13 | AI provider consent | 0.2 (Claude Code row), 0.4 (other providers) | FR-3.12, FR-3.30 |
-| 14 | AI: Ollama and models | 0.2 | FR-2.13, FR-3.2 to FR-3.8 |
+| 14 | AI providers: Ollama and models | 0.2 | FR-2.13, FR-3.2 to FR-3.8 |
 | 16 | Applications | 0.3 | FR-2.12, FR-8.8, FR-10.9, FR-10.11 |
 | 17 | Career memory | 0.3 | FR-8.1 to FR-8.8, FR-10.10 |
 | 18 | Agents | 0.3 | FR-11.12, FR-11.15, FR-11.16, FR-10.12, FR-12.8 |
@@ -87,7 +87,7 @@ Later releases extend the navigation. Each entry appears only in the release tha
  Data               0.1       6
  Profile            0.2       7
  Resumes            0.2       10 (resume compare)
- AI                 0.2       14 (Ollama, models, Claude Code consent); 13 grows in 0.4
+ AI                 0.2       14 (Ollama, models, Claude Code consent); 13 grew in 0.4 (providers, keys, endpoint, CLIs)
  Applications       0.3       16 (history and summary); review screen 11 joins in 0.6
  Memory             0.3       17 (career memory)
  Agents             0.3       18 (runs and logs)
@@ -566,35 +566,47 @@ A bottom panel running xterm.js over a Rust PTY. It is a restricted terminal, no
 
 ## 13. AI provider consent (release 0.2 for Claude Code, 0.4 for the rest)
 
-Providers are listed with the register verdict, the reason, and the owner-decision status. An ineligible provider (free Gemini key, non-loopback endpoints, Vertex AI, Ollama cloud models, Antigravity) shows the reason and has **no enable control at all**: no switch, no key field, no sign-in button. No setting overrides that. Providers the owner decisions make eligible show [Review...] and the vendor's terms on the consent dialog. Verdicts and quoted reasons come from the [policy register](policy-register.md) at the date shown, and the screen shows that date.
+**As built in 0.4.** Providers are listed with a status and the reason a provider cannot run. An ineligible provider (free Gemini key, non-loopback endpoints, Vertex AI, Ollama cloud models, Antigravity) appears under **Not available** as text, with **no control at all**: no switch, no key button, no sign-in button. No setting overrides that. The list shows no register verdict and no Manage usage link. The page shows the register date (read from the register's third line) for the rows' terms. Each external provider has a row: Claude Code in its own section, then the API providers, the endpoint, and the two CLIs under **AI providers**. A key never goes through this screen: **Paste key from clipboard...** makes Rust read the clipboard, show a native dialog naming the provider and the key's last four characters, store the key, and clear the clipboard. There is no key field and no ChatGPT row (decision 24, Sign in with ChatGPT is not in 0.4).
 
 ```text
 +-------------+----------------------------------------------------------------+
-| ...         | AI providers                         Register date 2026-11-01  |
+| ...         | AI providers                                                   |
 | AI          +----------------------------------------------------------------+
-|             | No provider is needed. JobPilot works with none.               |
-|             | Always on, always last: No-AI (rules, search, manual editing). |
+|             | No AI is needed. JobPilot works with none. Local models run on |
+|             | this computer, so your data stays here. Ollama cloud models    |
+|             | are off.                                                       |
+|             | (None enabled: "JobPilot works without one. Tasks that need AI |
+|             |  end with a manual path.")                                     |
 |             +----------------------------------------------------------------+
-|             | Ollama on this computer (localhost)         [x] On             |
+|             | Ollama                                      [x] On             |
 |             |   Data stays on this machine. No consent needed.               |
-|             | Your own local server (localhost address)   [Add endpoint...]  |
-|             |   Eligible: runs on your machine. No presets.                  |
 |             +----------------------------------------------------------------+
-|             | Claude Code (your own login)                [Review...]        |
-|             |   Headless backend and terminal session. No tools for job text.|
-|             |   Not found? Shows "Unavailable: install claude".              |
-|             | Sign in with ChatGPT                        [Review...]        |
-|             |   Allowed, if you are eligible (Plus or Pro). Preview.         |
-|             | OpenAI, Anthropic, Google (paid), OpenRouter  [Add key...]     |
-|             |   Your own key. The vendor's terms are shown before you agree. |
-|             | Gemini CLI, Codex CLI (optional)            [Review...]        |
-|             |   Uses the installed CLI's sign-in. Unavailable if not found.  |
+|             | Claude Code (your own login)                                   |
+|             |   Off. Used only after you consent.            [Review consent...] |
+|             |   Not found? "Unavailable: install claude" [Choose claude...]  |
+|             +----------------------------------------------------------------+
+|             | AI providers                          Register date 2026-11-01 |
+|             | OpenAI | Anthropic | Google Gemini | OpenRouter                |
+|             |   Model: [ vendor id ]  No key / Key stored                    |
+|             |   [Paste key from clipboard...]  [Remove key]                  |
+|             |   Consent given for: ...  [x] Use {provider}  [Review...]      |
+|             |   [Revoke consent]   (Google: "Free keys are not supported.")  |
+|             | Compatible endpoint                                            |
+|             |   [Add endpoint...] / [Change endpoint...]  model, optional key|
+|             | Gemini CLI | Codex CLI                                         |
+|             |   {path}  [Choose gemini...] [Use automatic]                   |
+|             |   Gemini: "Runs job text with every tool denied." and the      |
+|             |   transcript note. Codex: "No task can use this yet: it cannot |
+|             |   prove it has no tools."                                      |
 |             +----------------------------------------------------------------+
 |             | Not available                                                  |
-|             |  Google Gemini key    free key: no personal data allowed.      |
-|             |  Antigravity CLI      No launcher. Run it in your own terminal.|
-|             |  Web endpoints (not   Not supported. Only localhost works.     |
-|             |  on your computer)                                             |
+|             |  Google Gemini key, free key: no personal data allowed.        |
+|             |  Antigravity CLI: no launcher. Run it in your own terminal.    |
+|             |  Web endpoints (not on your computer): not supported.          |
+|             |  Vertex AI: not supported.                                     |
+|             |  Ollama cloud models: not supported.                           |
+|             +----------------------------------------------------------------+
+|             | Order                                                          |
 +-------------+----------------------------------------------------------------+
 ```
 
@@ -625,24 +637,26 @@ Consent dialog (opened by Review on an eligible, non-local provider). Nothing is
 ```
 
 - Consent is per provider, per sign-in method, and per category. [Allow selected] stays disabled until at least one category is ticked. No category is ticked by default.
-- A verdict change in a release suspends the affected consent until the user confirms again, and the list row says "Suspended: terms changed".
+- A changed register row, or an upgrade from a build that did not record the row, suspends the affected consent until the user confirms again. The row shows an alert: "Suspended: this consent was given before the terms on file now. Review it once to turn it back on." (the endpoint's says the address changed, or the terms did), with one **Review consent...** button. The dialog opens with the old categories ticked, so **Allow selected** is the one click, and Rust's native confirmation stays behind it. The owner's existing Claude consent is suspended this way once on upgrade to 0.4. The Resumes screen also says why Generate is gone while a consent is suspended.
+- **Show exactly what will be sent** shows the real prompt for the newest pasted posting as inert text, from the same function a run uses. For Gemini CLI it shows the wire text, with each `@` as `\@`.
+- A provider that needs an attestation (Google paid key, Gemini CLI) shows it in the dialog, and Allow selected stays disabled until it is ticked.
 - Consent records, timestamps, and revocations are listed under the provider and shown in audit entries (FR-12.7).
-- **Release:** 0.2 for the Claude Code row, 0.4 for the other providers. Subscription rows follow decision D1 and hosted API rows decision D4, both decided 2026-11-01.
+- **Release:** 0.2 for the Claude Code row, 0.4 for the other providers. Subscription rows follow decision D1 and hosted API rows decision D4, both decided 2026-11-01. An unreleased control (Sign in with ChatGPT) is not drawn.
 - **Keyboard:** the provider list is one tab stop with arrows. Enter on a row opens its detail. Ineligible rows are focusable so their reason is read. In the dialog, the checkboxes take Space, the focus stays inside, and Esc cancels.
-- **Focus order:** Ollama toggle, Add endpoint, Review, then the Not available list (read-only rows, in order). Dialog: Cancel, category checkboxes, Show exactly what will be sent, Allow selected.
+- **Focus order:** Ollama toggle, the Claude Code section, each provider row's controls, then the Not available list (read-only rows, in order). Dialog: Cancel, category checkboxes, Show exactly what will be sent, Allow selected.
 - **Empty state:** no provider enabled other than No-AI: "JobPilot works without one. Tasks that need AI end with a manual path." This is a normal state, not an error.
-- **Error state:** a revoked or suspended consent shows an alert on the row and blocks calls. A provider that returns a usage-limit error shows "Manage usage" with the vendor link and stops for that task. A user-not-eligible response ends that provider for the session with an explanation and no retry loop.
+- **Error state:** a revoked or suspended consent shows an alert on the row and blocks calls. A provider that fails shows its reason in plain words (`quota_exhausted`, `auth_failed`, `model_not_found`, `cli_too_old`, `wrong_path`, and the rest) with its code. A usage-limit or spend-cap response stops that provider for the task and is not retried.
 
-## 14. AI: Ollama and models (release 0.2)
+## 14. AI providers: Ollama and models (release 0.2)
 
-This is the first AI screen. It sets up Ollama on this computer (FR-3.2 to FR-3.8). The Claude Code consent row (screen 13) joins this view in 0.2; the other providers join in 0.4. A local model under loopback Ollama needs no consent, because data stays on the machine. Ollama cloud models are not offered: they are hidden, and refused by routing check 2 in docs/ai-providers.md.
+This is the first AI screen. It sets up Ollama on this computer (FR-3.2 to FR-3.8) under the heading "AI providers". The Claude Code consent row (screen 13) joined this view in 0.2; the other providers joined in 0.4. A local model under loopback Ollama needs no consent, because data stays on the machine. Ollama cloud models are not offered: they are hidden, and refused by routing check 2 in docs/ai-providers.md.
 
 ```text
 +-------------+----------------------------------------------------------------+
-| ...         | AI: Ollama and models                                          |
+| ...         | AI providers                                                   |
 | AI          +----------------------------------------------------------------+
 |             | No AI is needed. JobPilot works with none. Local models run on |
-|             | this computer, so your data stays here. Cloud models are off.  |
+|             | this computer, so your data stays here. Ollama cloud models are off. |
 |             +----------------------------------------------------------------+
 |             | Ollama         Running at {loopback address}     [Check again] |
 |             | This computer  {memory} memory, {GPU or "no GPU found"},       |
@@ -755,7 +769,8 @@ Questions you are asked again and again, with answers you approve (FR-8.1 to FR-
 | ...         | Career memory                                                  |
 | Memory      +----------------------------------------------------------------+
 |             | Search memory [                    ] [Search] [Refresh index]  |
-|             |   Up to {n} Claude calls, limit 20 / No Claude calls           |
+|             |   At most {n} paid or subscription calls for {p} questions     |
+|             |   (20 questions a press) / No outside calls                    |
 |             |   {Checked n, raised n, indexed n}                             |
 |             +----------------------------------------------------------------+
 |             | Filter by class [ All v ]                                      |

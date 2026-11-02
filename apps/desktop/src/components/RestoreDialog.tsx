@@ -43,8 +43,8 @@ export function RestoreDialog({ target, onClose }: { target: RestoreTarget; onCl
         that snapshot. A backup from an older version is updated to this version.
       </p>
       <p>
-        Any consent you gave to Claude Code is revoked by a restore, so nothing leaves this computer
-        until you give it again on the AI screen.
+        Any consent you gave to any AI provider is revoked by a restore, so nothing leaves this
+        computer until you give it again on the AI screen.
       </p>
     </ConfirmDialog>
   );

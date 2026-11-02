@@ -1,20 +1,15 @@
 import { useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { ConsentDialog, DRAFTING, labelOf } from "@/components/ConsentDialog";
 import { ErrorAlert } from "@/components/ErrorAlert";
 import { PageHeading } from "@/components/PageHeading";
+import { ProviderRow } from "@/components/ProviderRow";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { ipc, toAppError, type AiStatus, type DataCategory, type Fit, type Provider } from "@/lib/ipc";
+import { ipc, toAppError, type AiStatus, type Fit, type Provider } from "@/lib/ipc";
+import { SUSPENDED } from "@/lib/reasons";
 
 const FIT: Record<Fit, string> = {
   fits: "Fits this computer",
@@ -46,20 +41,26 @@ function fitFor(bytes: number, memory: number): Fit {
 // ponytail: Task 20 has no network-specific code; these are the ones a failed connection can produce.
 const NETWORK_CODES = new Set(["io", "timeout"]);
 
-const CATEGORIES: [DataCategory, string][] = [
-  ["job_text", "Job text"],
-  ["company_text", "Company text"],
-  ["profile_basic", "Basic profile"],
-  ["resume_text", "Resume text"],
-  ["career_memory", "Career memory answers"],
+const PROVIDERS: Record<Provider, string> = {
+  ollama: "Ollama",
+  claude_code: "Claude Code",
+  openai: "OpenAI",
+  anthropic: "Anthropic",
+  google: "Google Gemini",
+  openrouter: "OpenRouter",
+  endpoint: "Compatible endpoint",
+  gemini_cli: "Gemini CLI",
+  codex_cli: "Codex CLI",
+};
+
+/** Text, with no control: no setting overrides these. */
+const NOT_AVAILABLE = [
+  "Google Gemini key, free key: no personal data allowed.",
+  "Antigravity CLI: no launcher. Run it in your own terminal.",
+  "Web endpoints (not on your computer): not supported. Only localhost works.",
+  "Vertex AI: not supported.",
+  "Ollama cloud models: not supported.",
 ];
-
-/** Core's `DRAFT_DATA`. Claude Code is skipped for drafting unless consent covers all three. */
-const DRAFTING: DataCategory[] = ["job_text", "profile_basic", "resume_text"];
-
-const labelOf = (category: DataCategory) => CATEGORIES.find(([value]) => value === category)?.[1] ?? category;
-
-const PROVIDERS: Record<Provider, string> = { ollama: "Ollama", claude_code: "Claude Code" };
 
 function Section(props: { id: string; title: string; children: ReactNode }) {
   return (
@@ -69,97 +70,6 @@ function Section(props: { id: string; title: string; children: ReactNode }) {
       </h2>
       {props.children}
     </section>
-  );
-}
-
-/** `given` is the active record: `ai_consent_give` replaces it, so what it holds starts ticked. */
-function ConsentDialog({ given, onClose }: { given: DataCategory[]; onClose(): void }) {
-  const client = useQueryClient();
-  const [picked, setPicked] = useState<DataCategory[]>(given);
-  const toggle = (c: DataCategory, on: boolean) => setPicked(on ? [...picked, c] : picked.filter((p) => p !== c));
-  // Rust shows its own native confirmation inside `ai_consent_give`; enabling follows it.
-  const give = useMutation({
-    mutationFn: async (categories: DataCategory[]) => {
-      await ipc.aiConsentGive("claude_code", categories);
-      await ipc.aiEnable("claude_code", true);
-    },
-    onSuccess: async () => {
-      await client.resetQueries({ queryKey: ["ai"] });
-      onClose();
-    },
-  });
-  const allowDrafting = () => {
-    const categories = [...picked, ...DRAFTING.filter((c) => !picked.includes(c))];
-    setPicked(categories);
-    give.mutate(categories);
-  };
-  return (
-    <Dialog open onOpenChange={(open) => !open && !give.isPending && onClose()}>
-      <DialogContent showCloseButton={false}>
-        <DialogHeader>
-          <DialogTitle>Share data with Claude Code (your own login)</DialogTitle>
-          <DialogDescription>
-            Nothing is sent until you confirm. Only what you already allowed starts ticked.
-          </DialogDescription>
-        </DialogHeader>
-        <form
-          className="grid gap-3"
-          onSubmit={(e) => {
-            e.preventDefault();
-            give.mutate(picked);
-          }}
-        >
-          <div className="grid justify-items-start gap-1.5 text-sm">
-            <p>
-              Resumes and cover letters need {DRAFTING.slice(0, -1).map(labelOf).join(", ")}, and{" "}
-              {labelOf(DRAFTING[DRAFTING.length - 1])}. With fewer, Claude Code is skipped for them.
-            </p>
-            <Button type="button" variant="outline" size="sm" disabled={give.isPending} onClick={allowDrafting}>
-              Allow what drafting needs
-            </Button>
-          </div>
-          <fieldset className="grid gap-1.5">
-            <legend className="mb-1 text-sm">Allow these kinds of data to be sent:</legend>
-            {CATEGORIES.map(([value, label]) => (
-              <label key={value} className="flex items-center gap-2 text-sm">
-                <input type="checkbox" checked={picked.includes(value)} onChange={(e) => toggle(value, e.target.checked)} />
-                {label}
-              </label>
-            ))}
-            <label className="flex items-start gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={picked.includes("sensitive")}
-                onChange={(e) => toggle("sensitive", e.target.checked)}
-              />
-              <span>
-                Sensitive
-                <span className="block text-xs text-muted-foreground">
-                  Work authorization, pay history, answers marked sensitive. Off unless you tick it
-                  separately.
-                </span>
-              </span>
-            </label>
-          </fieldset>
-          <p className="text-sm">
-            How Claude Code uses it: Consumer Terms allow training unless the user opts out.
-          </p>
-          <p className="text-sm">
-            Job text goes to Claude Code with no tools and is treated as data. You can revoke this
-            any time. Revoking stops calls at once but cannot recall data already sent.
-          </p>
-          <ErrorAlert error={give.error} />
-          <DialogFooter>
-            <Button type="button" variant="outline" disabled={give.isPending} onClick={onClose}>
-              Cancel
-            </Button>
-            <Button type="submit" disabled={picked.length === 0 || give.isPending}>
-              {give.isPending ? "Waiting for confirmation..." : "Allow selected"}
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
   );
 }
 
@@ -173,7 +83,7 @@ export function AiView() {
   const client = useQueryClient();
   const ai = useQuery({ queryKey: ["ai"], queryFn: ipc.aiStatus });
   const [downloading, setDownloading] = useState<{ name: string; bytes: number; fit: Fit } | null>(null);
-  const [consent, setConsent] = useState(false);
+  const [consent, setConsent] = useState<Provider | null>(null);
   const [address, setAddress] = useState("");
   const reset = () => client.resetQueries({ queryKey: ["ai"] });
   const enable = useAction(({ provider, on }: { provider: Provider; on: boolean }) => ipc.aiEnable(provider, on));
@@ -183,9 +93,9 @@ export function AiView() {
   const setOrder = useAction((order: Provider[]) => ipc.aiSetOrder(order));
   const pickClaude = useAction<void>(() => ipc.aiSetClaudePath());
   const clearClaude = useAction<void>(() => ipc.aiClearClaudePath());
-  const revoke = useAction<void>(async () => {
-    await ipc.aiConsentRevoke("claude_code");
-    await ipc.aiEnable("claude_code", false);
+  const revoke = useAction(async (provider: Provider) => {
+    await ipc.aiConsentRevoke(provider);
+    await ipc.aiEnable(provider, false);
   });
   const setUrl = useAction((url: string) => ipc.aiSetOllamaUrl(url));
   const pull = useMutation({ mutationFn: (name: string) => ipc.aiPull(name), onSettled: reset });
@@ -205,11 +115,14 @@ export function AiView() {
 
   return (
     <div className="grid max-w-4xl gap-4">
-      <PageHeading>AI: Ollama and models</PageHeading>
+      <PageHeading>AI providers</PageHeading>
       <p className="text-sm">
         No AI is needed. JobPilot works with none. Local models run on this computer, so your data
-        stays here. Cloud models are off.
+        stays here. Ollama cloud models are off.
       </p>
+      {s && !Object.values(s.enabled).some(Boolean) && (
+        <p className="text-sm">JobPilot works without one. Tasks that need AI end with a manual path.</p>
+      )}
       <ErrorAlert
         error={
           ai.error ?? enable.error ?? setModels.error ?? setOrder.error ?? pickClaude.error ?? clearClaude.error ?? revoke.error ?? setUrl.error
@@ -383,7 +296,19 @@ export function AiView() {
                 Use automatic
               </Button>
             </div>
-            {s.claude_code.consent ? (
+            {s.claude_code.suspended ? (
+              <div className="grid justify-items-start gap-2 text-sm">
+                <p role="alert">{SUSPENDED}</p>
+                <div className="flex items-center gap-3">
+                  <Button size="sm" variant="outline" onClick={() => setConsent("claude_code")}>
+                    Review consent...
+                  </Button>
+                  <Button size="sm" variant="outline" onClick={() => revoke.mutate("claude_code")}>
+                    Revoke consent
+                  </Button>
+                </div>
+              </div>
+            ) : s.claude_code.consent ? (
               <div className="grid gap-2 text-sm">
                 <p>
                   Consent given for: {s.claude_code.consent.join(", ") || "nothing"}. Consumer Terms
@@ -399,7 +324,7 @@ export function AiView() {
                       size="sm"
                       variant="outline"
                       disabled={!s.claude_code.available}
-                      onClick={() => setConsent(true)}
+                      onClick={() => setConsent("claude_code")}
                     >
                       Review consent...
                     </Button>
@@ -415,7 +340,7 @@ export function AiView() {
                     />
                     Use Claude Code
                   </label>
-                  <Button size="sm" variant="outline" onClick={() => revoke.mutate()}>
+                  <Button size="sm" variant="outline" onClick={() => revoke.mutate("claude_code")}>
                     Revoke consent
                   </Button>
                 </div>
@@ -423,11 +348,35 @@ export function AiView() {
             ) : (
               <div className="flex items-center gap-3 text-sm">
                 <span>Off. Claude Code is used only after you consent below.</span>
-                <Button size="sm" variant="outline" disabled={!s.claude_code.available} onClick={() => setConsent(true)}>
+                <Button size="sm" variant="outline" disabled={!s.claude_code.available} onClick={() => setConsent("claude_code")}>
                   Review consent...
                 </Button>
               </div>
             )}
+          </Section>
+
+          <Section id="providers" title="AI providers">
+            <h3 className="text-sm">Register date {s.register_date}</h3>
+            <ul className="grid gap-2">
+              {s.external.map((row) => (
+                <ProviderRow
+                  key={row.name}
+                  row={row}
+                  enabled={s.enabled[row.name] ?? false}
+                  onUse={(on) => enable.mutate({ provider: row.name, on })}
+                  onReview={() => setConsent(row.name)}
+                  onRevoke={() => revoke.mutate(row.name)}
+                />
+              ))}
+            </ul>
+          </Section>
+
+          <Section id="not-available" title="Not available">
+            <ul className="grid gap-1 text-sm">
+              {NOT_AVAILABLE.map((line) => (
+                <li key={line}>{line}</li>
+              ))}
+            </ul>
           </Section>
 
           <Section id="order" title="Order">
@@ -483,7 +432,7 @@ export function AiView() {
           )}
         </ConfirmDialog>
       )}
-      {consent && <ConsentDialog given={s?.claude_code.consent ?? []} onClose={() => setConsent(false)} />}
+      {consent && <ConsentDialog provider={consent} onClose={() => setConsent(null)} />}
     </div>
   );
 }

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type {
   AiStatus,
   Compare,
+  ExternalStatus,
   Draft,
   JobText,
   KeyState,
@@ -11,7 +12,8 @@ import type {
   ProfileBasic,
   Status,
 } from "../lib/ipc";
-import { backend, count, READY, renderApp } from "../test-utils";
+import { explainReason } from "../lib/reasons";
+import { backend, count, READY, renderApp, sharing } from "../test-utils";
 
 const NOTHING: ProfileBasic = {
   name: "",
@@ -37,7 +39,9 @@ const profile = (over: Partial<Profile> = {}, basic: Partial<ProfileBasic> = {})
 
 const AI_OFF: AiStatus = {
   ollama: { state: "not_running", url: "http://127.0.0.1:11434" },
-  claude_code: { available: false, path: null, consent: null },
+  claude_code: { available: false, path: null, consent: null, suspended: false },
+  external: [],
+  register_date: "2026-11-01",
   hardware: { total_memory: 16 * 2 ** 30, cpus: 8, gpu: "no GPU found", free_disk: 100 * 2 ** 30 },
   order: ["ollama"],
   enabled: { ollama: true, claude_code: false },
@@ -309,11 +313,31 @@ describe("resumes", () => {
     expect(screen.queryByText(/kb approve/)).toBeNull();
   });
 
+  it("an_unreachable_provider_is_told_in_general_words", async () => {
+    resumeBackend({
+      resume_list: () => [],
+      ai_status: () => OLLAMA_UP,
+      resume_generate: () => {
+        throw { code: "manual_required", message: "this needs manual work: provider_unavailable" };
+      },
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    await user.click(await screen.findByRole("button", { name: "Generate" }));
+    const said = await screen.findByText(/cannot be reached/);
+    expect(said).toHaveTextContent("Check it on the AI screen, or write this one yourself.");
+    expect(said.textContent).not.toMatch(/Ollama|claude/i);
+  });
+
   it.each([
     ["consent_needed", /does not cover this task/],
+    ["consent_suspended", /so it is paused and nothing is sent/],
     ["provider_unavailable", /cannot be reached/],
     ["no_model_set", /No local model is chosen/],
     ["model_not_installed", /not installed in Ollama/],
+    ["rate_limited", /busy and asked to wait/],
+    ["auth_failed", /refused the key/],
+    ["quota_exhausted", /usage or credit has run out/],
   ])("manual_required_%s_is_not_called_switched_off", async (reason, text) => {
     resumeBackend({
       resume_list: () => [],
@@ -329,6 +353,35 @@ describe("resumes", () => {
     expect(screen.queryByText(/switched on/)).toBeNull();
   });
 
+  it.each(["consent_needed", "consent_suspended"])("%s_points_to_the_ai_screen_and_no_terminal", async (reason) => {
+    resumeBackend({
+      resume_list: () => [],
+      ai_status: () => OLLAMA_UP,
+      resume_generate: () => {
+        throw { code: "manual_required", message: `this needs manual work: ${reason}` };
+      },
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    await user.click(await screen.findByRole("button", { name: "Generate" }));
+    expect(await screen.findByText(/AI screen/)).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/jobpilot ai|claude_code/);
+  });
+
+  it("consent_needed_says_what_to_press", async () => {
+    resumeBackend({
+      resume_list: () => [],
+      ai_status: () => OLLAMA_UP,
+      resume_generate: () => {
+        throw { code: "manual_required", message: "this needs manual work: consent_needed" };
+      },
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    await user.click(await screen.findByRole("button", { name: "Generate" }));
+    expect(await screen.findByText(/choose Review, then Allow what drafting needs/)).toBeInTheDocument();
+  });
+
   it("failure_reasons_are_explained", async () => {
     resumeBackend({
       resume_list: () => [],
@@ -342,7 +395,9 @@ describe("resumes", () => {
     await go(user, "Resumes", "Resumes");
     await user.click(await screen.findByRole("button", { name: "Generate" }));
     expect(
-      await screen.findByText("Sign in by running `claude` once in the terminal panel"),
+      await screen.findByText(
+        "This CLI is not signed in. Run it once in your own terminal to sign in, then try again.",
+      ),
     ).toBeInTheDocument();
   });
 
@@ -377,7 +432,7 @@ describe("knowledge", () => {
     ...over,
   });
   const CLAUDE_READY = aiWith({
-    claude_code: { available: true, path: "/opt/claude", consent: ["job_text", "profile_basic", "resume_text"] },
+    claude_code: { available: true, path: "/opt/claude", consent: ["job_text", "profile_basic", "resume_text"], suspended: false },
     enabled: { ollama: true, claude_code: true },
     order: ["ollama", "claude_code"],
   });
@@ -618,6 +673,34 @@ describe("knowledge", () => {
 });
 
 describe("ai", () => {
+  it("the_page_names_every_provider_and_says_only_ollama_cloud_is_off", async () => {
+    backend({ ai_status: () => AI_OFF });
+    const { user } = renderApp();
+    await go(user, "AI", "AI providers");
+    const intro = await screen.findByText(/No AI is needed\. JobPilot works with none\./);
+    expect(intro).toHaveTextContent("Ollama cloud models are off.");
+    expect(intro.textContent).not.toMatch(/ Cloud models are off/);
+  });
+
+  it("the_empty_state_reads_as_normal", async () => {
+    const none = aiWith({ enabled: { ollama: false, claude_code: false } });
+    backend({ ai_status: () => none });
+    const { user } = renderApp();
+    await go(user, "AI", "AI providers");
+    expect(
+      await screen.findByText("JobPilot works without one. Tasks that need AI end with a manual path."),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("the_empty_state_stays_away_while_a_provider_is_on", async () => {
+    backend({ ai_status: () => AI_OFF });
+    const { user } = renderApp();
+    await go(user, "AI", "AI providers");
+    await screen.findByText(/No AI is needed/);
+    expect(screen.queryByText(/JobPilot works without one/)).toBeNull();
+  });
+
   it("ai_not_running_state_hides_models_and_keeps_no_ai_text", async () => {
     backend({ ai_status: () => AI_OFF });
     const { user } = renderApp();
@@ -676,7 +759,7 @@ describe("ai", () => {
   it("ai_claude_row_shows_path_and_consent_terms", async () => {
     const b = backend({
       ai_status: () =>
-        aiWith({ claude_code: { available: true, path: "/usr/local/bin/claude", consent: null } }),
+        aiWith({ claude_code: { available: true, path: "/usr/local/bin/claude", consent: null, suspended: false } }),
       ai_consent_give: () => undefined,
       ai_enable: () => undefined,
     });
@@ -700,9 +783,14 @@ describe("ai", () => {
   });
 
   const claudeUp = (consent: AiStatus["claude_code"]["consent"]) =>
-    aiWith({ claude_code: { available: true, path: "/opt/claude", consent } });
+    aiWith({ claude_code: { available: true, path: "/opt/claude", consent, suspended: false } });
   const consentBackend = (consent: AiStatus["claude_code"]["consent"]) =>
-    backend({ ai_status: () => claudeUp(consent), ai_consent_give: () => undefined, ai_enable: () => undefined });
+    backend({
+      ai_status: () => claudeUp(consent),
+      ai_sharing: () => sharing({ given: consent }),
+      ai_consent_give: () => undefined,
+      ai_enable: () => undefined,
+    });
 
   it("consent_names_what_drafting_needs_and_ticks_nothing_until_pressed", async () => {
     const b = consentBackend(null);
@@ -758,6 +846,803 @@ describe("ai", () => {
     });
   });
 
+  const external = (over: Partial<ExternalStatus>): ExternalStatus => ({
+    name: "openai",
+    label: "OpenAI",
+    kind: "api",
+    available: false,
+    reason: "not_built",
+    model: null,
+    key_stored: false,
+    path: null,
+    consent: null,
+    suspended: false,
+    runs_job_text: true,
+    newer_than_checked: false,
+    ...over,
+  });
+  const SUSPENDED_LINE =
+    "Suspended: this consent was given before the terms on file now. Review it once to turn it back on.";
+  const CODEX = sharing({
+    name: "codex_cli",
+    label: "Codex CLI",
+    key: "codex_cli/cli_login",
+    destination: "OpenAI, through the codex program on this computer",
+    data_use: "The terms of whatever sign-in the installed CLI uses.",
+    tasks: sharing().tasks.map((t) => ({ ...t, runs: false, skipped_because: "no_tools" })),
+  });
+  const GOOGLE = sharing({
+    name: "google",
+    label: "Google Gemini",
+    key: "google/paid_key",
+    destination: "Google's Gemini API, at generativelanguage.googleapis.com",
+    data_use: "Not used to improve products; logged for a limited period for abuse detection.",
+    attestation: "This key belongs to a Google project with billing on. A free Gemini key is refused for personal data.",
+  });
+  const reviewOf = async (user: ReturnType<typeof renderApp>["user"], label: string) => {
+    await go(user, "AI", /AI/);
+    await user.click(await screen.findByRole("button", { name: `Review ${label}...` }));
+    return within(await screen.findByRole("dialog"));
+  };
+
+  it("consent_dialog_shows_tasks_destination_and_terms", async () => {
+    backend({
+      ai_status: () => aiWith({ external: [external({ name: "google", label: "Google Gemini" })] }),
+      ai_sharing: () => GOOGLE,
+    });
+    const { user } = renderApp();
+    const dialog = await reviewOf(user, "Google Gemini");
+    expect(dialog.getByRole("heading", { name: "Share data with Google Gemini (your own paid key)" })).toBeInTheDocument();
+    expect(dialog.getByRole("heading", { name: "What will be sent" })).toBeInTheDocument();
+    expect(dialog.getByText("Resume: Job text, Basic profile, Resume text")).toBeInTheDocument();
+    expect(dialog.getByText(GOOGLE.destination)).toBeInTheDocument();
+    expect(dialog.getByRole("heading", { name: "How Google Gemini uses it (terms read 2026-11-01)" })).toBeInTheDocument();
+    expect(dialog.getByText(GOOGLE.data_use)).toBeInTheDocument();
+    expect(dialog.getByText(GOOGLE.attestation!)).toBeInTheDocument();
+    expect(dialog.getByText("Paste a posting to see this.")).toBeInTheDocument();
+    expect(dialog.queryByRole("button", { name: "Show exactly what will be sent" })).toBeNull();
+    for (const box of dialog.getAllByRole("checkbox")) expect(box).not.toBeChecked();
+  });
+
+  it("google_consent_shows_the_paid_key_line", async () => {
+    backend({
+      ai_status: () => aiWith({ external: [external({ name: "google", label: "Google Gemini" }), external({})] }),
+      ai_sharing: () => GOOGLE,
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "Google Gemini" }));
+    expect(row.getByText("Free keys are not supported.")).toBeInTheDocument();
+    const other = within(screen.getByRole("listitem", { name: "OpenAI" }));
+    expect(other.queryByText("Free keys are not supported.")).toBeNull();
+    await user.click(row.getByRole("button", { name: "Review Google Gemini..." }));
+    const dialog = within(await screen.findByRole("dialog"));
+    expect(dialog.getByRole("heading", { name: "Share data with Google Gemini (your own paid key)" })).toBeInTheDocument();
+    expect(dialog.getByText(GOOGLE.attestation!)).toBeInTheDocument();
+  });
+
+  it("consent_dialog_says_why_a_task_is_skipped", async () => {
+    backend({
+      ai_status: () => aiWith({ external: [external({ name: "codex_cli", label: "Codex CLI", runs_job_text: false })] }),
+      ai_sharing: () => CODEX,
+    });
+    const { user } = renderApp();
+    const dialog = await reviewOf(user, "Codex CLI");
+    expect(dialog.getByText("Resume: Skipped: this provider cannot prove it has no tools")).toBeInTheDocument();
+    expect(dialog.queryByRole("button", { name: "Allow what drafting needs" })).toBeNull();
+    expect(dialog.queryByText(/Job text goes to/)).toBeNull();
+  });
+
+  it("a_missing_cli_shows_unavailable_and_a_chooser", async () => {
+    const b = backend({
+      ai_status: () =>
+        aiWith({
+          external: [external({ name: "gemini_cli", label: "Gemini CLI", kind: "cli", reason: "not_installed" })],
+        }),
+      ai_set_cli_path: () => undefined,
+      ai_clear_cli_path: () => undefined,
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "Gemini CLI" }));
+    expect(row.getByText("Unavailable: not installed")).toBeInTheDocument();
+    expect(row.queryByRole("button", { name: /Use automatic/ })).toBeNull();
+    await user.click(row.getByRole("button", { name: "Choose gemini..." }));
+    await waitFor(() => expect(count(b, "ai_set_cli_path")).toBe(1));
+    // Only the provider name crosses: the picker is Rust's.
+    expect(b.calls.find((c) => c.cmd === "ai_set_cli_path")?.args).toEqual({ provider: "gemini_cli" });
+  });
+
+  it("a_found_cli_shows_its_path_and_goes_back_to_automatic", async () => {
+    const b = backend({
+      ai_status: () =>
+        aiWith({
+          external: [
+            external({ name: "codex_cli", label: "Codex CLI", kind: "cli", available: true, reason: null, path: "/opt/codex" }),
+          ],
+        }),
+      ai_clear_cli_path: () => undefined,
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "Codex CLI" }));
+    expect(row.getByText("/opt/codex")).toBeInTheDocument();
+    expect(row.queryByRole("button", { name: "Choose codex..." })).toBeNull();
+    await user.click(row.getByRole("button", { name: "Use automatic" }));
+    await waitFor(() => expect(count(b, "ai_clear_cli_path")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_clear_cli_path")?.args).toEqual({ provider: "codex_cli" });
+  });
+
+  const keyRow = async (user: ReturnType<typeof renderApp>["user"]) => {
+    await go(user, "AI", /AI/);
+    return within(await screen.findByRole("listitem", { name: "OpenAI" }));
+  };
+
+  it("paste_key_sends_only_the_provider_name", async () => {
+    const b = backend({
+      ai_status: () => aiWith({ external: [external({})] }),
+      ai_key_from_clipboard: () => null,
+    });
+    const { user } = renderApp();
+    const row = await keyRow(user);
+    expect(row.getByText("No key")).toBeInTheDocument();
+    expect(row.getByText("Copy your key first. The key stays out of this window.")).toBeInTheDocument();
+    expect(row.queryByRole("button", { name: /Remove key/ })).toBeNull();
+    await user.click(row.getByRole("button", { name: /Paste key from clipboard\.\.\./ }));
+    await waitFor(() => expect(count(b, "ai_key_from_clipboard")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_key_from_clipboard")?.args).toEqual({ provider: "openai" });
+  });
+
+  it("remove_key_sends_only_the_provider_name", async () => {
+    const b = backend({
+      ai_status: () => aiWith({ external: [external({ key_stored: true })] }),
+      ai_key_remove: () => null,
+    });
+    const { user } = renderApp();
+    const row = await keyRow(user);
+    expect(row.getByText("Key stored")).toBeInTheDocument();
+    await user.click(row.getByRole("button", { name: /Remove key/ }));
+    await waitFor(() => expect(count(b, "ai_key_remove")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_key_remove")?.args).toEqual({ provider: "openai" });
+  });
+
+  it("a_refused_paste_shows_its_code", async () => {
+    backend({
+      ai_status: () => aiWith({ external: [external({})] }),
+      ai_key_from_clipboard: () => {
+        throw { code: "validation", message: "invalid input: the clipboard does not hold a key" };
+      },
+    });
+    const { user } = renderApp();
+    const row = await keyRow(user);
+    await user.click(row.getByRole("button", { name: /Paste key from clipboard\.\.\./ }));
+    const alert = await row.findByRole("alert");
+    expect(alert).toHaveTextContent("the clipboard does not hold a key");
+    expect(alert).toHaveTextContent("code: validation");
+  });
+
+  it("an_endpoint_row_takes_a_key_too", async () => {
+    const b = backend({
+      ai_status: () =>
+        aiWith({ external: [external({ name: "endpoint", label: "Compatible endpoint", kind: "endpoint" })] }),
+      ai_key_from_clipboard: () => null,
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "Compatible endpoint" }));
+    await user.click(row.getByRole("button", { name: /Paste key from clipboard\.\.\./ }));
+    await waitFor(() => expect(count(b, "ai_key_from_clipboard")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_key_from_clipboard")?.args).toEqual({ provider: "endpoint" });
+  });
+
+  it("a_key_stored_with_a_clipboard_failure_shows_both", async () => {
+    let stored = false;
+    backend({
+      ai_status: () => aiWith({ external: [external({ key_stored: stored })] }),
+      ai_key_from_clipboard: () => {
+        stored = true;
+        throw { code: "failed", message: "the key is stored, but the clipboard could not be cleared. Clear it yourself" };
+      },
+    });
+    const { user } = renderApp();
+    const row = await keyRow(user);
+    await user.click(row.getByRole("button", { name: /Paste key from clipboard\.\.\./ }));
+    expect(await screen.findByText("Key stored")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("Clear it yourself");
+  });
+
+  it("gemini_row_shows_it_runs_job_text_with_no_tools", async () => {
+    backend({
+      ai_status: () =>
+        aiWith({
+          external: [
+            external({
+              name: "gemini_cli",
+              label: "Gemini CLI",
+              kind: "cli",
+              available: true,
+              reason: null,
+              path: "/opt/bin/gemini",
+            }),
+            external({ name: "codex_cli", label: "Codex CLI", kind: "cli", runs_job_text: false }),
+          ],
+        }),
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const gemini = within(await screen.findByRole("listitem", { name: "Gemini CLI" }));
+    expect(gemini.getByText("/opt/bin/gemini")).toBeInTheDocument();
+    expect(gemini.getByText("Runs job text with every tool denied.")).toBeInTheDocument();
+    const codex = within(screen.getByRole("listitem", { name: "Codex CLI" }));
+    expect(codex.queryByText("Runs job text with every tool denied.")).toBeNull();
+  });
+
+  it("a_cli_past_the_checked_version_says_so_and_no_hard_stop", async () => {
+    backend({
+      ai_status: () =>
+        aiWith({
+          external: [
+            external({
+              name: "gemini_cli",
+              label: "Gemini CLI",
+              kind: "cli",
+              available: true,
+              reason: null,
+              newer_than_checked: true,
+            }),
+          ],
+        }),
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "Gemini CLI" }));
+    expect(row.getByText("Runs job text with every tool denied.")).toBeInTheDocument();
+    expect(row.getByText("This version is newer than the one JobPilot checked.")).toBeInTheDocument();
+  });
+
+  it("the_gemini_row_says_the_cli_keeps_a_transcript", async () => {
+    backend({
+      ai_status: () =>
+        aiWith({
+          external: [
+            external({ name: "gemini_cli", label: "Gemini CLI", kind: "cli", reason: null, available: true }),
+            external({ name: "codex_cli", label: "Codex CLI", kind: "cli", runs_job_text: false }),
+          ],
+        }),
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const text = /keeps its own transcript of each prompt under ~\/\.gemini\/tmp, 30 days by default/;
+    expect(within(await screen.findByRole("listitem", { name: "Gemini CLI" })).getByText(text)).toBeInTheDocument();
+    expect(within(screen.getByRole("listitem", { name: "Codex CLI" })).queryByText(text)).toBeNull();
+  });
+
+  it("an_off_cli_past_the_quick_look_can_be_turned_on_and_comes_up", async () => {
+    let on = false;
+    const row = () =>
+      external({
+        name: "gemini_cli",
+        label: "Gemini CLI",
+        kind: "cli",
+        consent: ["job_text"],
+        available: on,
+        reason: on ? null : "not_searched",
+        path: on ? "/home/me/.nvm/bin/gemini" : null,
+      });
+    const b = backend({
+      ai_status: () => aiWith({ external: [row()], enabled: { ollama: true, claude_code: false, gemini_cli: on } }),
+      ai_enable: () => {
+        on = true;
+        return null;
+      },
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const shown = within(await screen.findByRole("listitem", { name: "Gemini CLI" }));
+    expect(shown.getByText("Unavailable: turn on to look for it")).toBeInTheDocument();
+    expect(shown.queryByText(/not installed/)).toBeNull();
+    const use = shown.getByLabelText("Use Gemini CLI");
+    expect(use).toBeEnabled();
+    await user.click(use);
+    expect(b.calls.find((c) => c.cmd === "ai_enable")?.args).toEqual({ provider: "gemini_cli", enabled: true });
+    expect(await screen.findByText("/home/me/.nvm/bin/gemini")).toBeInTheDocument();
+    expect(within(screen.getByRole("listitem", { name: "Gemini CLI" })).queryByText(/Unavailable/)).toBeNull();
+  });
+
+  it("an_enabled_cli_that_is_gone_can_be_unchecked", async () => {
+    const gone = external({
+      name: "gemini_cli",
+      label: "Gemini CLI",
+      kind: "cli",
+      consent: ["job_text"],
+      available: false,
+      reason: "not_installed",
+    });
+    const b = backend({
+      ai_status: () => aiWith({ external: [gone], enabled: { ollama: true, claude_code: false, gemini_cli: true } }),
+      ai_enable: () => null,
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const use = within(await screen.findByRole("listitem", { name: "Gemini CLI" })).getByLabelText("Use Gemini CLI");
+    expect(use).toBeEnabled();
+    await user.click(use);
+    expect(b.calls.find((c) => c.cmd === "ai_enable")?.args).toEqual({ provider: "gemini_cli", enabled: false });
+  });
+
+  it("an_off_cli_that_is_gone_stays_unavailable_to_tick", async () => {
+    const gone = external({
+      name: "gemini_cli",
+      label: "Gemini CLI",
+      kind: "cli",
+      consent: ["job_text"],
+      available: false,
+      reason: "not_installed",
+    });
+    backend({ ai_status: () => aiWith({ external: [gone] }) });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "Gemini CLI" }));
+    expect(row.getByLabelText("Use Gemini CLI")).toBeDisabled();
+  });
+
+  it("a_wrong_stored_path_says_so_and_can_be_cleared", async () => {
+    const wrong = external({
+      name: "gemini_cli",
+      label: "Gemini CLI",
+      kind: "cli",
+      consent: ["job_text"],
+      available: false,
+      reason: "wrong_path",
+    });
+    const b = backend({ ai_status: () => aiWith({ external: [wrong] }), ai_clear_cli_path: () => null });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "Gemini CLI" }));
+    expect(row.getByText("Unavailable: the path set for it is not that program")).toBeInTheDocument();
+    expect(row.queryByText(/turn on to look/)).toBeNull();
+    // Turning it on would find nothing either: the path has to change first.
+    expect(row.getByLabelText("Use Gemini CLI")).toBeDisabled();
+    expect(row.getByRole("button", { name: "Choose gemini..." })).toBeInTheDocument();
+    await user.click(row.getByRole("button", { name: "Use automatic" }));
+    expect(b.calls.find((c) => c.cmd === "ai_clear_cli_path")?.args).toEqual({ provider: "gemini_cli" });
+  });
+
+  it("codex_row_says_it_runs_no_task_today", async () => {
+    backend({
+      ai_status: () =>
+        aiWith({
+          external: [
+            external({ name: "codex_cli", label: "Codex CLI", kind: "cli", available: true, reason: null, runs_job_text: false }),
+          ],
+        }),
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "Codex CLI" }));
+    expect(row.getByText("No task can use this yet: it cannot prove it has no tools.")).toBeInTheDocument();
+    expect(row.queryByText("Runs job text with every tool denied.")).toBeNull();
+  });
+
+  it("an_off_codex_only_the_login_shell_finds_says_why_and_can_still_be_turned_on", async () => {
+    let on = false;
+    const row = () =>
+      external({
+        name: "codex_cli",
+        label: "Codex CLI",
+        kind: "cli",
+        consent: ["profile_basic"],
+        available: on,
+        reason: on ? null : "not_searched",
+        path: on ? "/home/me/.nvm/bin/codex" : null,
+        runs_job_text: false,
+      });
+    const b = backend({
+      ai_status: () => aiWith({ external: [row()], enabled: { ollama: true, claude_code: false, codex_cli: on } }),
+      ai_enable: () => {
+        on = true;
+        return null;
+      },
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const shown = within(await screen.findByRole("listitem", { name: "Codex CLI" }));
+    expect(shown.getByText("Unavailable: turn on to look for it")).toBeInTheDocument();
+    expect(shown.getByText("No task can use this yet: it cannot prove it has no tools.")).toBeInTheDocument();
+    const use = shown.getByLabelText("Use Codex CLI");
+    expect(use).toBeEnabled();
+    await user.click(use);
+    expect(b.calls.find((c) => c.cmd === "ai_enable")?.args).toEqual({ provider: "codex_cli", enabled: true });
+    expect(await screen.findByText("/home/me/.nvm/bin/codex")).toBeInTheDocument();
+  });
+
+  it("the_account_refused_reason_is_a_hint_naming_antigravity", async () => {
+    resumeBackend({
+      resume_list: () => [],
+      ai_status: () =>
+        aiWith({ ollama: { state: "running", url: "http://127.0.0.1:11434", version: "1", models: [] } }),
+      resume_generate: () => {
+        throw { code: "failed", message: "failed: cli_account_refused" };
+      },
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    await user.click(await screen.findByRole("button", { name: "Generate" }));
+    expect(await screen.findByText(/may have moved to Antigravity CLI/)).toBeInTheDocument();
+  });
+
+  it("a_cli_too_old_says_why", async () => {
+    backend({
+      ai_status: () =>
+        aiWith({
+          external: [external({ name: "gemini_cli", label: "Gemini CLI", kind: "cli", reason: "cli_too_old" })],
+        }),
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "Gemini CLI" }));
+    expect(row.getByText("Unavailable: older than the version JobPilot checked")).toBeInTheDocument();
+  });
+
+  it("a_cli_row_has_no_key_controls", async () => {
+    backend({
+      ai_status: () => aiWith({ external: [external({ name: "gemini_cli", label: "Gemini CLI", kind: "cli" })] }),
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "Gemini CLI" }));
+    expect(row.queryByRole("button", { name: /Paste key/ })).toBeNull();
+    expect(row.queryByText("No key")).toBeNull();
+  });
+
+  it("a_key_field_does_not_exist", async () => {
+    backend({ ai_status: () => aiWith({ external: [external({ key_stored: true })] }) });
+    const { user } = renderApp();
+    await keyRow(user);
+    expect(document.querySelector("input[type=password]")).toBeNull();
+  });
+
+  it("an_api_row_sets_a_model", async () => {
+    const b = backend({
+      ai_status: () => aiWith({ external: [external({ reason: "no_api_model", model: "gpt-old" })] }),
+      ai_set_api_model: () => null,
+    });
+    const { user } = renderApp();
+    const row = await keyRow(user);
+    expect(row.getByText("Unavailable: no model chosen")).toBeInTheDocument();
+    const field = row.getByLabelText("Model id");
+    expect(field).toHaveValue("gpt-old");
+    await user.clear(field);
+    await user.type(field, "gpt-new");
+    await user.click(row.getByRole("button", { name: "OpenAI: Save model id" }));
+    await waitFor(() => expect(count(b, "ai_set_api_model")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_set_api_model")?.args).toEqual({ provider: "openai", model: "gpt-new" });
+  });
+
+  it("a_refused_model_shows_its_code", async () => {
+    backend({
+      ai_status: () => aiWith({ external: [external({ name: "openrouter", label: "OpenRouter" })] }),
+      ai_set_api_model: () => {
+        throw { code: "refused", message: "refused: origin_refused" };
+      },
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "OpenRouter" }));
+    await user.type(row.getByLabelText("Model id"), "meta-llama/x");
+    await user.click(row.getByRole("button", { name: "OpenRouter: Save model id" }));
+    const alert = await row.findByRole("alert");
+    expect(alert).toHaveTextContent("code: refused");
+    expect(alert).toHaveTextContent("not eligible through OpenRouter");
+  });
+
+  it("a_cli_row_has_no_model_field", async () => {
+    backend({
+      ai_status: () => aiWith({ external: [external({ name: "gemini_cli", label: "Gemini CLI", kind: "cli" })] }),
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "Gemini CLI" }));
+    expect(row.queryByLabelText("Model id")).toBeNull();
+    expect(row.queryByRole("button", { name: "Add endpoint..." })).toBeNull();
+  });
+
+  const endpointRow = async (user: ReturnType<typeof renderApp>["user"]) => {
+    await go(user, "AI", /AI/);
+    return within(await screen.findByRole("listitem", { name: "Compatible endpoint" }));
+  };
+  const ENDPOINT = { name: "endpoint", label: "Compatible endpoint", kind: "endpoint" } as const;
+
+  it("the_endpoint_row_explains_loopback_only", async () => {
+    const b = backend({
+      ai_status: () => aiWith({ external: [external({ ...ENDPOINT, reason: "no_endpoint" })] }),
+      ai_set_endpoint: () => null,
+    });
+    const { user } = renderApp();
+    const row = await endpointRow(user);
+    expect(row.getByText("Unavailable: no address set")).toBeInTheDocument();
+    expect(row.getByText(/Loopback only: a server you run on this computer/)).toBeInTheDocument();
+    expect(row.getByText(/It still needs your consent/)).toBeInTheDocument();
+    expect(row.queryByLabelText("Endpoint address (loopback only)")).toBeNull();
+    await user.click(row.getByRole("button", { name: "Add endpoint..." }));
+    await user.type(row.getByLabelText("Endpoint address (loopback only)"), "http://127.0.0.1:1234/v1");
+    await user.click(row.getByRole("button", { name: "Use this address..." }));
+    await waitFor(() => expect(count(b, "ai_set_endpoint")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_set_endpoint")?.args).toEqual({ url: "http://127.0.0.1:1234/v1" });
+  });
+
+  it("a_refused_endpoint_shows_its_code_and_keeps_the_address", async () => {
+    backend({
+      ai_status: () => aiWith({ external: [external({ ...ENDPOINT, reason: "no_endpoint" })] }),
+      ai_set_endpoint: () => {
+        throw { code: "refused", message: "refused: not_loopback" };
+      },
+    });
+    const { user } = renderApp();
+    const row = await endpointRow(user);
+    await user.click(row.getByRole("button", { name: "Add endpoint..." }));
+    const field = row.getByLabelText("Endpoint address (loopback only)");
+    await user.type(field, "https://api.example.com/v1");
+    await user.click(row.getByRole("button", { name: "Use this address..." }));
+    expect(await row.findByRole("alert")).toHaveTextContent("code: refused");
+    expect(field).toHaveValue("https://api.example.com/v1");
+  });
+
+  it("a_set_endpoint_shows_its_address_and_can_be_cleared", async () => {
+    const b = backend({
+      ai_status: () => aiWith({ external: [external({ ...ENDPOINT, reason: null, available: true, path: "http://127.0.0.1:1234/v1" })] }),
+      ai_set_endpoint: () => null,
+    });
+    const { user } = renderApp();
+    const row = await endpointRow(user);
+    expect(row.getByText("http://127.0.0.1:1234/v1")).toBeInTheDocument();
+    expect(row.getByRole("button", { name: "Change endpoint..." })).toBeInTheDocument();
+    await user.click(row.getByRole("button", { name: "Clear endpoint..." }));
+    await waitFor(() => expect(count(b, "ai_set_endpoint")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_set_endpoint")?.args).toEqual({ url: "" });
+  });
+
+  it("a_suspended_endpoint_says_its_address_changed", async () => {
+    backend({
+      ai_status: () =>
+        aiWith({ external: [external({ ...ENDPOINT, reason: null, available: true, suspended: true, path: "http://127.0.0.1:1/v1" })] }),
+    });
+    const { user } = renderApp();
+    const row = await endpointRow(user);
+    expect(row.getByRole("alert")).toHaveTextContent(/endpoint address changed/);
+    expect(row.getByRole("alert")).not.toHaveTextContent("Suspended: this consent was given before the terms");
+  });
+
+  it("the_consent_dialog_names_the_endpoint_address", async () => {
+    backend({
+      ai_status: () => aiWith({ external: [external({ ...ENDPOINT })] }),
+      ai_sharing: () => sharing({ name: "endpoint", label: "Compatible endpoint", key: "endpoint/loopback", path: "http://127.0.0.1:1/v1" }),
+    });
+    const { user } = renderApp();
+    const dialog = await reviewOf(user, "Compatible endpoint");
+    expect(dialog.getByText("Address: http://127.0.0.1:1/v1")).toBeInTheDocument();
+    expect(dialog.queryByText(/^Program:/)).toBeNull();
+  });
+
+  it("the_api_failure_reasons_read_in_plain_words", () => {
+    const said = (word: string) => explainReason({ code: "manual_required", message: `this needs manual work: ${word}` });
+    expect(said("no_key")).toMatch(/No key is stored/);
+    expect(said("no_api_model")).toMatch(/No model is chosen/);
+    expect(said("no_endpoint")).toMatch(/No endpoint address/);
+    expect(said("origin_refused")).toMatch(/not eligible through OpenRouter/);
+    expect(said("model_has_tools")).toMatch(/searches by itself/);
+    expect(said("model_has_tools")).toMatch(/:online/);
+    expect(said("model_has_tools")).toMatch(/computer-use/);
+    expect(said("model_not_found")).toMatch(/does not know that model id/);
+    expect(said("model_not_found")).toMatch(/Model id/);
+    expect(said("model_refused")).toMatch(/declined this task/);
+    expect(said("endpoint_changed")).toMatch(/endpoint address changed/);
+  });
+
+  it("consent_focus_starts_on_cancel", async () => {
+    consentBackend(null);
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    await user.click(await screen.findByRole("button", { name: "Review consent..." }));
+    const dialog = within(await screen.findByRole("dialog"));
+    expect(dialog.getByRole("button", { name: "Cancel" })).toHaveFocus();
+  });
+
+  it("show_exactly_what_will_be_sent_is_inert_text", async () => {
+    const b = backend({
+      ai_status: () => aiWith({ external: [external({})] }),
+      ai_sharing: () => sharing({ name: "openai", label: "OpenAI" }),
+      job_list: () => [JOB],
+      ai_preview: () => ({
+        task: "draft_resume",
+        system: "ZXQ-SYSTEM",
+        user: '<script>window.pwned = true</script><a href="https://x">link</a>',
+      }),
+    });
+    const { user } = renderApp();
+    const dialog = await reviewOf(user, "OpenAI");
+    await user.click(await dialog.findByRole("button", { name: "Show exactly what will be sent" }));
+    const shown = await dialog.findByText(/ZXQ-SYSTEM/);
+    expect(shown.tagName).toBe("PRE");
+    expect(shown.textContent).toContain("<script>window.pwned = true</script>");
+    expect(shown.querySelector("script, a")).toBeNull();
+    expect(b.calls.find((c) => c.cmd === "ai_preview")?.args).toEqual({ jobTextId: "j1", provider: "openai" });
+    expect(count(b, "ai_consent_give")).toBe(0);
+  });
+
+  it("a_suspended_row_says_so_and_offers_review", async () => {
+    const b = backend({
+      ai_status: () => aiWith({ external: [external({ suspended: true })] }),
+      ai_sharing: () => sharing({ name: "openai", label: "OpenAI", suspended: true, given: ["job_text"] }),
+      ai_consent_revoke: () => undefined,
+      ai_enable: () => undefined,
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "OpenAI" }));
+    expect(row.getByRole("alert")).toHaveTextContent(SUSPENDED_LINE);
+    expect(row.getByText("Unavailable: not built yet")).toBeInTheDocument();
+    await user.click(row.getByRole("button", { name: "Revoke consent for OpenAI" }));
+    await waitFor(() => expect(count(b, "ai_consent_revoke")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_consent_revoke")?.args).toEqual({ provider: "openai" });
+    await user.click(row.getByRole("button", { name: "Review OpenAI..." }));
+    expect(within(await screen.findByRole("dialog")).getByLabelText("Job text")).toBeChecked();
+  });
+
+  it("a_provider_row_shows_what_was_allowed_and_can_be_used", async () => {
+    const b = backend({
+      ai_status: () => aiWith({ external: [external({ available: true, reason: null, consent: ["job_text"] })] }),
+      ai_enable: () => undefined,
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    expect(await screen.findByText("Consent given for: Job text.")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Register date 2026-11-01" })).toBeInTheDocument();
+    await user.click(screen.getByLabelText("Use OpenAI"));
+    await waitFor(() => expect(count(b, "ai_enable")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_enable")?.args).toEqual({ provider: "openai", enabled: true });
+  });
+
+  it("claude_suspended_on_upgrade_says_why_and_review_starts_ticked", async () => {
+    const b = backend({
+      ai_status: () =>
+        aiWith({
+          claude_code: { available: true, path: "/opt/claude", consent: null, suspended: true },
+          enabled: { ollama: true, claude_code: true },
+        }),
+      ai_sharing: () => sharing({ suspended: true, given: ["job_text", "profile_basic", "resume_text"] }),
+      ai_consent_give: () => undefined,
+      ai_enable: () => undefined,
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    expect(await screen.findByRole("alert")).toHaveTextContent(SUSPENDED_LINE);
+    expect(screen.queryByText("Off. Claude Code is used only after you consent below.")).toBeNull();
+    expect(screen.getAllByRole("button", { name: "Review consent..." })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "Revoke consent" })).toHaveLength(1);
+    expect(screen.queryByLabelText("Use Claude Code")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Review consent..." }));
+    const dialog = within(await screen.findByRole("dialog"));
+    for (const name of ["Job text", "Basic profile", "Resume text"]) expect(dialog.getByLabelText(name)).toBeChecked();
+    await user.click(dialog.getByRole("button", { name: "Allow selected" }));
+    await waitFor(() => expect(count(b, "ai_consent_give")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_consent_give")?.args).toEqual({
+      provider: "claude_code",
+      categories: ["job_text", "profile_basic", "resume_text"],
+    });
+  });
+
+  it("a_suspended_claude_can_be_revoked_and_that_turns_it_off", async () => {
+    const b = backend({
+      ai_status: () =>
+        aiWith({
+          claude_code: { available: true, path: "/opt/claude", consent: null, suspended: true },
+          enabled: { ollama: true, claude_code: true },
+        }),
+      ai_consent_revoke: () => undefined,
+      ai_enable: () => undefined,
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    await user.click(await screen.findByRole("button", { name: "Revoke consent" }));
+    await waitFor(() => expect(count(b, "ai_enable")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_consent_revoke")?.args).toEqual({ provider: "claude_code" });
+    expect(b.calls.find((c) => c.cmd === "ai_enable")?.args).toEqual({ provider: "claude_code", enabled: false });
+  });
+
+  it("every_kind_of_row_offers_review_and_revoke_while_suspended", async () => {
+    const rows = [
+      external({ suspended: true }),
+      external({ name: "endpoint", label: "Compatible endpoint", kind: "endpoint", suspended: true }),
+      external({ name: "gemini_cli", label: "Gemini CLI", kind: "cli", suspended: true }),
+    ];
+    const b = backend({
+      ai_status: () => aiWith({ external: rows }),
+      ai_consent_revoke: () => undefined,
+      ai_enable: () => undefined,
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    for (const { label } of rows) {
+      const row = within(await screen.findByRole("listitem", { name: label }));
+      expect(row.getByRole("button", { name: `Review ${label}...` })).toBeInTheDocument();
+      expect(row.getByRole("button", { name: `Revoke consent for ${label}` })).toBeInTheDocument();
+      expect(row.queryByLabelText(`Use ${label}`)).toBeNull();
+    }
+    await user.click(screen.getByRole("button", { name: "Revoke consent for Gemini CLI" }));
+    await waitFor(() => expect(count(b, "ai_enable")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_consent_revoke")?.args).toEqual({ provider: "gemini_cli" });
+    expect(b.calls.find((c) => c.cmd === "ai_enable")?.args).toEqual({ provider: "gemini_cli", enabled: false });
+  });
+
+  it("use_stays_disabled_on_a_consented_row_that_cannot_run", async () => {
+    backend({ ai_status: () => aiWith({ external: [external({ consent: ["job_text"] })] }) });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    expect(await screen.findByLabelText("Use OpenAI")).toBeDisabled();
+  });
+
+  it("resumes_view_says_why_generate_is_gone_while_suspended", async () => {
+    for (const ai of [
+      aiWith({
+        claude_code: { available: true, path: "/opt/claude", consent: null, suspended: true },
+        enabled: { ollama: false, claude_code: true },
+      }),
+      aiWith({ external: [external({ suspended: true })], enabled: { ollama: false, claude_code: false, openai: true } }),
+    ]) {
+      resumeBackend({ resume_list: () => [], ai_status: () => ai });
+      const { user, unmount } = renderApp();
+      await go(user, "Resumes", "Resumes");
+      expect(await screen.findByRole("alert")).toHaveTextContent(`${SUSPENDED_LINE} Open the AI screen to review it.`);
+      expect(screen.queryByRole("button", { name: "Generate" })).toBeNull();
+      unmount();
+    }
+  });
+
+  it("a_suspended_provider_that_is_off_says_nothing_on_resumes", async () => {
+    resumeBackend({
+      resume_list: () => [],
+      ai_status: () => aiWith({ external: [external({ suspended: true })] }),
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    await screen.findByText("No generated resume for this job yet.");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("the_not_available_list_has_no_controls", async () => {
+    backend({ ai_status: () => AI_OFF });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const section = within(await screen.findByRole("region", { name: "Not available" }));
+    expect(section.getByText("Vertex AI: not supported.")).toBeInTheDocument();
+    expect(section.getByText("Ollama cloud models: not supported.")).toBeInTheDocument();
+    expect(section.getByText(/Antigravity CLI/)).toBeInTheDocument();
+    expect(section.getByText(/free key: no personal data allowed/)).toBeInTheDocument();
+    expect(section.getByText(/Only localhost works/)).toBeInTheDocument();
+    expect(section.queryByText(/Sign in with ChatGPT/)).toBeNull();
+    for (const role of ["button", "checkbox", "textbox", "link"]) expect(section.queryByRole(role)).toBeNull();
+  });
+
+  it("resumes_view_counts_a_hosted_provider_as_a_backend", async () => {
+    const ready = external({ available: true, reason: null, consent: ["job_text", "profile_basic", "resume_text"] });
+    const on = { ollama: false, claude_code: false, openai: true };
+    resumeBackend({ resume_list: () => [], ai_status: () => aiWith({ external: [ready], enabled: on }) });
+    const first = renderApp();
+    await go(first.user, "Resumes", "Resumes");
+    expect(await screen.findByRole("button", { name: "Generate" })).toBeInTheDocument();
+    first.unmount();
+
+    for (const row of [{ ...ready, runs_job_text: false }, { ...ready, consent: null }, { ...ready, available: false }]) {
+      resumeBackend({ resume_list: () => [], ai_status: () => aiWith({ external: [row], enabled: on }) });
+      const { user, unmount } = renderApp();
+      await go(user, "Resumes", "Resumes");
+      await screen.findByText("No generated resume for this job yet.");
+      expect(screen.queryByRole("button", { name: "Generate" })).toBeNull();
+      unmount();
+    }
+  });
+
   it("full_consent_asks_for_nothing_more", async () => {
     consentBackend(["job_text", "profile_basic", "resume_text"]);
     const { user } = renderApp();
@@ -779,7 +1664,7 @@ describe("ai", () => {
   it("ai_use_automatic_clears_the_claude_path", async () => {
     const b = backend({
       ai_status: () =>
-        aiWith({ claude_code: { available: true, path: "/opt/claude", consent: null } }),
+        aiWith({ claude_code: { available: true, path: "/opt/claude", consent: null, suspended: false } }),
       ai_clear_claude_path: () => undefined,
     });
     const { user } = renderApp();
@@ -919,20 +1804,22 @@ describe("data", () => {
     const { user } = renderApp();
     await go(user, "Data", "Data and privacy");
     await user.click((await screen.findAllByRole("button", { name: /^Restore/ }))[0]);
-    expect(await screen.findByText(/consent you gave to Claude Code is revoked/i)).toBeInTheDocument();
+    const said = await screen.findByText(/consent you gave to any AI provider is revoked/i);
+    expect(said).toBeInTheDocument();
+    expect(said.textContent).not.toMatch(/Claude/);
   });
 
   it("ai_view_after_restore_shows_claude_off_and_asks_for_consent", async () => {
     const info = { path: "/home/me/jobpilot/backups/manual-1", created_at: "2026-11-01T10:00:00Z", schema_version: 5 };
     let restored = false;
     const on = aiWith({
-      claude_code: { available: true, path: "/opt/claude", consent: ["job_text", "profile_basic", "resume_text"] },
+      claude_code: { available: true, path: "/opt/claude", consent: ["job_text", "profile_basic", "resume_text"], suspended: false },
       enabled: { ollama: true, claude_code: true },
       order: ["ollama", "claude_code"],
     });
     // As core leaves it: consent revoked, and Claude Code switched off with it.
     const off = aiWith({
-      claude_code: { available: true, path: "/opt/claude", consent: null },
+      claude_code: { available: true, path: "/opt/claude", consent: null, suspended: false },
       enabled: { ollama: true, claude_code: false },
       order: ["ollama", "claude_code"],
     });

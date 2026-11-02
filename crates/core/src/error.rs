@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::ser::{Serialize, SerializeStruct, Serializer};
 
@@ -60,6 +61,9 @@ pub enum Error {
     Failed(String),
     #[error("emergency pause is on")]
     Paused,
+    /// A provider answered 429 or 503. `retry_after` is its header, when it gave whole seconds.
+    #[error("rate limited")]
+    RateLimited { retry_after: Option<Duration> },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -93,6 +97,7 @@ impl Error {
             Error::TooLarge { .. } => "too_large",
             Error::Failed(_) => "failed",
             Error::Paused => "paused",
+            Error::RateLimited { .. } => "rate_limited",
         }
     }
 }
@@ -141,6 +146,7 @@ mod tests {
             (Error::TooLarge { limit: 1 }, "too_large"),
             (Error::Failed("x".into()), "failed"),
             (Error::Paused, "paused"),
+            (Error::RateLimited { retry_after: None }, "rate_limited"),
         ];
         for (error, code) in cases {
             assert_eq!(error.code(), code);

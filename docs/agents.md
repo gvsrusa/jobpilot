@@ -19,6 +19,7 @@ From the [milestones](milestones.md). Each agent lands with its feature.
 |---|---|---|
 | 0.2 | None (external backends start with Claude Code) | Task router, Claude Code headless adapter, consent record |
 | 0.3 | Resume, cover letter, career memory, tracking, analytics | Workflow runner, execution logs, emergency pause |
+| 0.4 | None | External backends widen what the router can reach: four hosted APIs, a loopback endpoint, and the Gemini CLI (Codex CLI ships inert). No agent changes. The refresh count states the true ceiling. |
 | 0.5 | Discovery, matching, research | Connector SDK |
 | 0.6 | Browser application | Playwright runtime, permissions engine |
 
@@ -58,7 +59,7 @@ Enforcement:
 
 ## 4. The nine agents
 
-Timeouts exclude time waiting for a person. "Router policy" means the [retry rules](ai-providers.md#timeouts-and-retries): two attempts per provider on network errors, 429, 5xx, and one validation failure, honoring `Retry-After`, with no retry on authentication, policy, or consent refusals, cancellation, or a second validation failure. "Per attempt" means 60 seconds for remote and 300 seconds for local.
+Timeouts exclude time waiting for a person. "Router policy" means the [retry rules](ai-providers.md#timeouts-and-retries): the task's attempts per provider. A local provider retries network errors, 429, 503, and one validation failure. A hosted one retries 429, 503, and 529 once, and only when `Retry-After` gives whole seconds up to 30 (decision 11), plus one validation failure; it never retries a timeout, a network error, another 5xx, or a quota error. No retry follows authentication, policy, or consent refusals, cancellation, or a second validation failure. "Per attempt" means 120 seconds for a hosted API provider, 180 seconds for a CLI, and 300 seconds for local and for the endpoint.
 
 | Agent | Release | Inputs | Outputs | Allowed tools | Permission scope | Timeout | Retry policy | Checkpoint | Cancellation |
 |---|---|---|---|---|---|---|---|---|---|
@@ -78,7 +79,7 @@ Notes that bind the table:
 - **Matching.** Stated authorization values are compared deterministically and only per country. A missing value is reported as "not stated", never as eligible or ineligible (FR-4.10).
 - **Resume and cover letter.** Only user-entered or user-approved material counts as evidence. A draft does not become evidence by being saved. Neither agent holds `read:sensitive`. `read:resume_text` withholds user-marked documents and lines. Unmarked text can still state visa status, citizenship, or salary ([threat model](security/threat-model.md#11-residual-risks)).
 - **Career memory.** Only the user approves an answer or lowers a class (FR-8.4). Sensitive answers are not embedded. Work-authorization answers are found by exact country key, not by similarity.
-  - As built in 0.3, `classify_answer` is one attempt per question, no retry, and at most 20 questions (`CLASSIFY_BATCH`) per refresh. Only a person starts a refresh: there is no timer, no startup run, and no hook on adding a question. Before any Claude call the GUI and the CLI show how many calls the press will make. Resuming a halted refresh makes none. A refresh that finds no usable model finishes with the class the rules gave.
+  - As built in 0.3, `classify_answer` is one attempt per question, no retry, and at most 20 questions (`CLASSIFY_BATCH`) per refresh. Only a person starts a refresh: there is no timer, no startup run, and no hook on adding a question. Before any paid or subscription call the GUI and the CLI state the most calls the press can make: the pending questions (at most 20) times the external providers that could take each, since a failed reply goes on to the next provider. The 20-question limit is stated separately. Resuming a halted refresh makes none. A refresh that finds no usable model finishes with the class the rules gave.
   - **A person's sensitivity class is final.** `classify_answer` skips every question whose `class_source` is `user`, so a class a person set, raised or lowered, is never changed by a model. A model may still raise a class the rules or a model set. The classifier sees question text only, never an answer.
   - A work-authorization answer is not stored in memory. It is read from the encrypted profile row for one exact country, and a country with no stated value reads "not stated".
 - **Browser application.** `map_form_field` sees form text and candidate answer ids, never answer values. The model returns an id, and Rust fills the value. This keeps Sensitive-class values out of a prompt that holds untrusted text. `classify_answer` in the career memory agent likewise sees question text only. Both tasks declare `job_text`, in every release and whatever the question's source, so stored form questions cannot escape the no-tools rule.

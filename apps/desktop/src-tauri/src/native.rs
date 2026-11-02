@@ -1,10 +1,12 @@
 //! Dialogs Rust opens itself (M-13). The webview can ask for an action and can never answer
 //! for the user: what is confirmed or picked comes back here, not through IPC, so no webview
 //! capability is involved. Each dialog waits on a blocking thread, and no caller may hold a
-//! state lock while one is open.
+//! state lock while one is open. The clipboard is read here for the same reason: a key comes
+//! to Rust from the system, and the webview has no clipboard permission at all.
 
 use std::path::PathBuf;
 
+use jobpilot_core::secrets::Zeroizing;
 use jobpilot_core::{Error, Result};
 use tauri::{AppHandle, Runtime};
 
@@ -38,6 +40,54 @@ pub async fn open_file<R: Runtime>(app: &AppHandle<R>, dialog: FileDialog<'_>) -
 /// `Err(Cancelled)` when the user closes the picker.
 pub async fn save_file<R: Runtime>(app: &AppHandle<R>, dialog: FileDialog<'_>) -> Result<PathBuf> {
     pick(app, dialog, true).await?.ok_or(Error::Cancelled)
+}
+
+/// `None` when it holds no text, an image for one. `Failed` when it could not be read.
+#[cfg(not(test))]
+pub async fn clipboard_text<R: Runtime>(app: &AppHandle<R>) -> Result<Option<String>> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+
+    // ponytail: the plugin flattens arboard's errors to strings, so its `ContentNotAvailable`
+    // is told by its words. If they change, an empty clipboard reads as a failed one, which
+    // refuses a paste and asks for a clear that was not needed. No key is lost either way.
+    const NO_TEXT: &str = "not available";
+    let app = app.clone();
+    off_the_main_thread(move || match app.clipboard().read_text() {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.to_string().contains(NO_TEXT) => Ok(None),
+        // The words are the plugin's, so they stay here.
+        Err(_) => Err(Error::Failed("the clipboard could not be read".into())),
+    })
+    .await?
+}
+
+/// The dialog promised a clear, and the key may still be on the clipboard.
+fn not_cleared() -> Error {
+    Error::Failed(
+        "the key is stored, but the clipboard could not be cleared. Clear it yourself".into(),
+    )
+}
+
+/// Clears the clipboard only if it still holds `was`: what the user copied since is theirs.
+// ponytail: the check and the clear are two calls, as the system has no compare-and-clear.
+// A copy landing between them is lost.
+pub async fn clear_clipboard<R: Runtime>(app: &AppHandle<R>, was: &str) -> Result<()> {
+    let now = clipboard_text(app).await.map_err(|_| not_cleared())?;
+    match now.map(Zeroizing::new) {
+        Some(now) if now.as_str() == was => wipe_clipboard(app).await,
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(test))]
+async fn wipe_clipboard<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+
+    let app = app.clone();
+    off_the_main_thread(move || app.clipboard().clear().is_ok())
+        .await?
+        .then_some(())
+        .ok_or_else(not_cleared)
 }
 
 #[cfg(not(test))]
@@ -104,6 +154,10 @@ async fn pick<R: Runtime>(
 pub struct NativeHook {
     pub confirm: std::sync::atomic::AtomicBool,
     pub picked: std::sync::Mutex<Option<PathBuf>>,
+    /// What the system clipboard holds, as the mock runtime has none.
+    pub clipboard: std::sync::Mutex<Option<String>>,
+    /// The next clipboard reads fail, as a busy clipboard does.
+    pub clipboard_fails: std::sync::atomic::AtomicBool,
     /// Every dialog opened, as title and message.
     pub asked: std::sync::Mutex<Vec<String>>,
     /// For each confirmation, whether a `Work` was open while it waited.
@@ -121,11 +175,37 @@ impl Default for NativeHook {
         Self {
             confirm: true.into(),
             picked: Default::default(),
+            clipboard: Default::default(),
+            clipboard_fails: false.into(),
             asked: Default::default(),
             work_at_dialog: Default::default(),
             on_ask: Default::default(),
         }
     }
+}
+
+#[cfg(test)]
+pub async fn clipboard_text<R: Runtime>(app: &AppHandle<R>) -> Result<Option<String>> {
+    use tauri::Manager;
+
+    let hook = app.state::<NativeHook>();
+    if hook
+        .clipboard_fails
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(Error::Failed("the clipboard could not be read".into()));
+    }
+    let text = hook.clipboard.lock().unwrap().clone();
+    Ok(text)
+}
+
+#[cfg(test)]
+async fn wipe_clipboard<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
+    use tauri::Manager;
+
+    let hook = app.state::<NativeHook>();
+    hook.clipboard.lock().unwrap().take();
+    Ok(())
 }
 
 #[cfg(test)]

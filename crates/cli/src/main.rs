@@ -102,7 +102,11 @@ impl Command {
             Command::Backup(BackupCommand::Restore { .. })
                 | Command::Ai(
                     AiCommand::ClaudePath { .. }
+                        | AiCommand::CliPath { .. }
                         | AiCommand::Consent(ConsentCommand::Give { .. })
+                        | AiCommand::Key(_)
+                        | AiCommand::Model { .. }
+                        | AiCommand::Endpoint { .. }
                         | AiCommand::Enable { .. }
                         | AiCommand::Disable { .. }
                         | AiCommand::Order { .. }
@@ -149,7 +153,19 @@ pub fn out(value: impl serde::Serialize, text: String) -> Result<Output> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let args: Vec<String> = std::env::args_os()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            let Some(line) = parse_error(&args, &error) else {
+                error.exit()
+            };
+            eprintln!("{line}");
+            return ExitCode::from(2);
+        }
+    };
     if matches!(cli.command, Command::Shell) {
         // Not through `run`: the panel itself starts this, marker set.
         let input = tokio::io::BufReader::new(tokio::io::stdin());
@@ -188,6 +204,22 @@ async fn main() -> ExitCode {
     }
 }
 
+/// clap repeats the word it could not use, and after `ai key` that word can be a key. So
+/// those errors get this line, naming no argument. `None` leaves clap's own text, which
+/// `--help` needs. Flags are passed over, as `--json` may stand between the two words.
+pub fn parse_error(args: &[String], error: &clap::Error) -> Option<&'static str> {
+    let words: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|arg| !arg.starts_with('-'))
+        .collect();
+    let key_command = words.windows(2).any(|pair| pair == ["ai", "key"]);
+    (key_command && error.use_stderr()).then_some(
+        "error[usage]: use `jobpilot ai key set <provider>` or `jobpilot ai key remove \
+         <provider>`. A key is never an argument: `set` asks for it.",
+    )
+}
+
 /// Stored and parsed text is untrusted: no escape reaches the terminal.
 pub fn render(output: Output, json: bool) -> String {
     if json {
@@ -212,12 +244,33 @@ fn message(error: &Error) -> String {
                           `jobpilot pause clear` in an ordinary terminal, or from the title bar."
             .into(),
         Error::ManualRequired(reason) if reason == "not_logged_in" => {
-            "Claude Code is not signed in. Run `claude` once to log in, then try again.".into()
+            "This CLI is not signed in. Run it once in your own terminal to sign in, then try \
+             again."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "cli_account_refused" => {
+            "Gemini CLI refused this account. Its plan may have moved to Antigravity CLI, which \
+             JobPilot does not run. A paid Gemini API key in the CLI may work, or use another \
+             provider."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "cli_too_old" => {
+            "The installed CLI is older than the version JobPilot checked. Update it, then try \
+             again."
+                .into()
         }
         Error::ManualRequired(reason) if reason == "consent_needed" => {
-            "Claude Code is on, but your consent does not cover this task. Give consent with \
-             `jobpilot ai consent give claude_code --categories \
-             job_text,profile_basic,resume_text` in an ordinary terminal, or on the AI screen."
+            "An AI provider is on, but your consent does not cover this task. See `jobpilot ai \
+             status`, then give consent in an ordinary terminal, for example `jobpilot ai \
+             consent give claude_code --categories job_text,profile_basic,resume_text`, or on \
+             the AI screen."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "consent_suspended" => {
+            "Your consent for this provider was given before the terms on file now, so it is \
+             paused and nothing is sent. Review it once on the AI screen. Or read it with \
+             `jobpilot ai consent show`, then give it again with `jobpilot ai consent give` in \
+             an ordinary terminal."
                 .into()
         }
         Error::ManualRequired(reason) if reason == "provider_unavailable" => {
@@ -232,6 +285,73 @@ fn message(error: &Error) -> String {
         }
         Error::ManualRequired(reason) if reason == "model_not_installed" => {
             "The chosen model is not installed in Ollama. Check `jobpilot ai models`.".into()
+        }
+        Error::ManualRequired(reason) if reason == "unusable_reply" => {
+            "The AI model answered, but not in a form JobPilot could use, so nothing was saved. \
+             Try again, choose a larger model, or write this one yourself."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "output_truncated" => {
+            "The AI model ran out of room before it finished, so nothing was saved. Remove some \
+             knowledge items, shorten the posting, or write this one yourself."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "rate_limited" => {
+            "The AI provider is busy and asked to wait. Try again shortly, or write this one \
+             yourself."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "auth_failed" => {
+            "The AI provider refused the key. Check it on the AI screen.".into()
+        }
+        Error::ManualRequired(reason) if reason == "quota_exhausted" => {
+            "The AI provider says your usage or credit has run out. Add credit with the vendor, \
+             then try again."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "no_key" => {
+            "No key is stored for this provider. Add one with `jobpilot ai key set <provider>` \
+             in an ordinary terminal, or on the AI screen."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "no_api_model" => {
+            "No model is chosen for this provider. Set one with `jobpilot ai model <provider> \
+             <id>`, or on the AI screen."
+                .into()
+        }
+        Error::ManualRequired(reason) | Error::Refused(reason) if reason == "origin_refused" => {
+            "That model is not eligible through OpenRouter. Use an openai/, anthropic/, or \
+             google/ model, not a free one, with no suffix but :nitro or :floor."
+                .into()
+        }
+        Error::ManualRequired(reason) | Error::Refused(reason) if reason == "model_has_tools" => {
+            "That model searches by itself or drives a computer, so JobPilot cannot keep it from \
+             tools while it reads a job posting. Choose one without search, research, or \
+             computer-use in its name, and without :online."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "model_not_found" => {
+            "The provider does not know that model id. Check it, then set it with `jobpilot ai \
+             model <provider> <id>`, or `jobpilot ai set-model --drafting <name>` for Ollama, in \
+             an ordinary terminal, or on the AI screen."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "model_refused" => {
+            "The AI model declined this task, so nothing was generated. Try another model, or \
+             write this one yourself."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "endpoint_changed" => {
+            "The endpoint address changed since you gave consent, or the terms on file did, so \
+             nothing is sent. Read it with `jobpilot ai consent show endpoint`, then give it \
+             with `jobpilot ai consent give endpoint` in an ordinary terminal, or on the AI \
+             screen."
+                .into()
+        }
+        Error::Refused(reason) if reason == "attestation_needed" => {
+            "This provider needs you to state the line above. If it is true, run this again \
+             with --attest."
+                .into()
         }
         Error::Refused(reason) if reason == "use_profile_by_country" => {
             "Work authorization is answered from your profile, for one country at a time. If \
@@ -394,8 +514,20 @@ mod tests {
         ("ai enable claude_code", true),
         ("ai disable claude_code", true),
         ("ai claude-path /c", true),
+        ("ai cli-path gemini_cli /c", true),
+        ("ai enable openai", true),
+        ("ai disable openai", true),
+        ("ai order openai", true),
+        ("ai key set openai", true),
+        ("ai key remove openai", true),
+        ("ai model openai m", true),
+        ("ai endpoint http://127.0.0.1:1", true),
         ("ai consent give claude_code --categories job_text", true),
+        ("ai consent give openai --categories job_text", true),
         ("ai consent revoke claude_code", false),
+        ("ai consent revoke openai", false),
+        ("ai consent show openai", false),
+        ("ai consent show openai --job j", false),
         ("ai index", false),
     ];
 
@@ -440,6 +572,21 @@ mod tests {
     }
 
     #[test]
+    fn consent_reasons_name_no_one_provider() {
+        let needed = message(&Error::ManualRequired("consent_needed".into()));
+        assert!(needed.starts_with("An AI provider is on"), "{needed}");
+        let suspended = message(&Error::ManualRequired("consent_suspended".into()));
+        assert!(
+            suspended.contains("jobpilot ai consent give"),
+            "{suspended}"
+        );
+        assert!(
+            suspended.contains("jobpilot ai consent show"),
+            "{suspended}"
+        );
+    }
+
+    #[test]
     fn model_reasons_say_what_to_do() {
         let none = message(&Error::ManualRequired("no_model_set".into()));
         assert!(
@@ -448,6 +595,59 @@ mod tests {
         );
         let gone = message(&Error::ManualRequired("model_not_installed".into()));
         assert!(gone.contains("jobpilot ai models"), "{gone}");
+    }
+
+    #[test]
+    fn hosted_failure_reasons_say_what_happened() {
+        for (reason, words) in [
+            ("rate_limited", "busy and asked to wait"),
+            ("auth_failed", "refused the key"),
+            ("quota_exhausted", "usage or credit has run out"),
+        ] {
+            let text = message(&Error::ManualRequired(reason.into()));
+            assert!(text.contains(words), "{reason}: {text}");
+        }
+    }
+
+    #[test]
+    fn api_reasons_say_what_to_do() {
+        let text = message(&Error::ManualRequired("no_key".into()));
+        assert_eq!(
+            text,
+            "No key is stored for this provider. Add one with `jobpilot ai key set <provider>` \
+             in an ordinary terminal, or on the AI screen."
+        );
+        let text = message(&Error::ManualRequired("no_api_model".into()));
+        assert_eq!(
+            text,
+            "No model is chosen for this provider. Set one with `jobpilot ai model <provider> \
+             <id>`, or on the AI screen."
+        );
+        let origin = "That model is not eligible through OpenRouter. Use an openai/, anthropic/, \
+                      or google/ model, not a free one, with no suffix but :nitro or :floor.";
+        assert_eq!(message(&Error::Refused("origin_refused".into())), origin);
+        for error in [
+            Error::Refused("model_has_tools".into()),
+            Error::ManualRequired("model_has_tools".into()),
+        ] {
+            let text = message(&error);
+            assert!(text.contains("searches by itself"), "{text}");
+            assert!(text.contains(":online"), "{text}");
+            assert!(text.contains("computer-use"), "{text}");
+        }
+        let text = message(&Error::ManualRequired("model_not_found".into()));
+        assert!(text.contains("does not know that model id"), "{text}");
+        assert!(text.contains("jobpilot ai model <provider> <id>"), "{text}");
+        assert!(text.contains("jobpilot ai set-model"), "{text}");
+        let text = message(&Error::ManualRequired("model_refused".into()));
+        assert!(text.contains("declined this task"), "{text}");
+        let text = message(&Error::ManualRequired("endpoint_changed".into()));
+        assert!(text.contains("endpoint address changed"), "{text}");
+        assert!(text.contains("jobpilot ai consent give endpoint"), "{text}");
+        assert_eq!(
+            message(&Error::ManualRequired("origin_refused".into())),
+            origin
+        );
     }
 
     #[test]

@@ -350,6 +350,7 @@ async fn tracking_stops_before_the_update_once_the_token_fired() {
 // ---- scripted providers -----------------------------------------------------------------
 
 const CLAUDE: &str = "claude_code/cli_login";
+const OPENAI: &str = "openai/api_key";
 const BULLET: &str = "Shipped the Rust compiler";
 
 /// A provider that answers from a list and counts what it is asked. `Ollama` is local and
@@ -406,7 +407,7 @@ impl Provider for Script {
             capabilities.extend([Capability::Embeddings, Capability::LocalExecution]);
         }
         Declaration {
-            id: self.id.clone(),
+            id: self.id,
             capabilities,
             local,
             context_limit: 100_000,
@@ -518,17 +519,15 @@ async fn world() -> World {
 }
 
 fn resume_reply(bullet: &str, ids: &[&str]) -> String {
+    let line = json!({"text": bullet, "evidence_ids": ids});
     json!({
-        "doc": {
-            "name": "Mallory Model",
-            "contact": [],
-            "summary": [],
-            "sections": [{
-                "heading": "Experience",
-                "entries": [{"title": "", "subtitle": "", "dates": "", "bullets": [bullet]}],
+        "summary": [],
+        "sections": [{
+            "heading": "experience",
+            "entries": [{
+                "title": "", "subtitle": "", "dates": "", "evidence_ids": [], "bullets": [line],
             }],
-        },
-        "claims": [{"text": bullet, "evidence_ids": ids}],
+        }],
     })
     .to_string()
 }
@@ -697,6 +696,38 @@ impl Workflow for HaltAtRender<'_> {
         }
         self.inner.step(ctx, index)
     }
+}
+
+/// A checkpoint holds the draft's id only, so `rebuild` reads the provider back from its text.
+#[tokio::test]
+async fn a_resumed_run_knows_a_hosted_provider() {
+    let w = world().await;
+    let data = [
+        DataCategory::JobText,
+        DataCategory::ProfileBasic,
+        DataCategory::ResumeText,
+    ];
+    consent::give(&w.db, "openai/api_key", &data, "2026-11-01", "cli")
+        .await
+        .unwrap();
+    let reply = resume_reply(BULLET, &[&w.item.id]);
+    let (provider, handles) = script(ProviderId::OpenAi, vec![reply]);
+    let router = router_of(provider);
+    let workflow = HaltAtRender {
+        inner: DraftWorkflow::new(TaskType::DraftResume, &w.job.id, pdf(), &router),
+        tripped: AtomicBool::new(false),
+    };
+    let halted = runner::start(&w.db, "cli", &workflow, token())
+        .await
+        .unwrap();
+    assert_eq!(halted.state, RunState::Halted);
+
+    let done = agents::resume_run(&w.db, &router, "cli", &halted.run_id, token()).await;
+
+    assert!(done.is_ok(), "{:?}", done.err());
+    assert_eq!(handles.calls(), 1);
+    let run = runner::list(&w.db, 1).await.unwrap().remove(0);
+    assert_eq!(run.state, RunState::Completed);
 }
 
 #[tokio::test]
@@ -1077,7 +1108,7 @@ async fn refresh_stops_at_the_batch_limit() {
 }
 
 #[tokio::test]
-async fn refresh_makes_at_most_twenty_claude_calls() {
+async fn refresh_makes_at_most_twenty_external_calls() {
     let (_tmp, db) = open().await;
     consent_to(&db, &[DataCategory::JobText]).await;
     questions(&db, 25).await;
@@ -1106,33 +1137,81 @@ async fn refresh_makes_at_most_twenty_claude_calls() {
 }
 
 #[tokio::test]
-async fn refresh_plan_counts_claude_calls_and_calls_no_provider() {
+async fn refresh_plan_counts_external_calls_and_calls_no_provider() {
     let (_tmp, db) = open().await;
     questions(&db, 25).await;
     let (provider, handles) = script(ProviderId::ClaudeCode, vec![]);
     let router = router_of(provider);
 
     let none = refresh_plan(&db, &router).await.unwrap();
-    assert_eq!((none.pending, none.claude_calls), (20, 0), "no consent");
+    assert_eq!((none.pending, none.external_calls), (20, 0), "no consent");
     consent_to(&db, &[DataCategory::JobText]).await;
     let plan = refresh_plan(&db, &router).await.unwrap();
-    assert_eq!((plan.pending, plan.claude_calls), (20, 20));
+    assert_eq!((plan.pending, plan.external_calls), (20, 20));
 
     consent_to(&db, &[DataCategory::ResumeText]).await;
-    assert_eq!(refresh_plan(&db, &router).await.unwrap().claude_calls, 0);
+    assert_eq!(refresh_plan(&db, &router).await.unwrap().external_calls, 0);
 
     let (local, _) = script(ProviderId::Ollama, vec![]);
     consent_to(&db, &[DataCategory::JobText]).await;
     let plan = refresh_plan(&db, &router_of(local)).await.unwrap();
     assert_eq!(
-        (plan.pending, plan.claude_calls),
+        (plan.pending, plan.external_calls),
         (20, 0),
-        "no Claude in the order"
+        "nothing external in the order"
     );
     assert_eq!(
         handles.calls() + handles.embed_calls.load(Ordering::SeqCst),
         0
     );
+}
+
+/// Whichever provider it is: the count follows the rule the router runs by, not a name.
+#[tokio::test]
+async fn refresh_plan_counts_any_external_provider_that_can_take_the_task() {
+    let (_tmp, db) = open().await;
+    questions(&db, 3).await;
+    let openai = |no_tools: bool| {
+        let (mut provider, _) = script(ProviderId::OpenAi, vec![]);
+        provider.no_tools = no_tools;
+        router_of(provider)
+    };
+    let calls = async |router: Router| refresh_plan(&db, &router).await.unwrap().external_calls;
+
+    assert_eq!(calls(openai(true)).await, 0, "no consent");
+    consent::give(
+        &db,
+        OPENAI,
+        &[DataCategory::ResumeText],
+        "2026-11-01",
+        "cli",
+    )
+    .await
+    .unwrap();
+    assert_eq!(calls(openai(true)).await, 0, "consent without job text");
+    consent::give(&db, OPENAI, &[DataCategory::JobText], "2026-11-01", "cli")
+        .await
+        .unwrap();
+    assert_eq!(calls(openai(true)).await, 3);
+    assert_eq!(calls(openai(false)).await, 0, "the router would skip it");
+
+    // Behind a provider that takes nothing, it still counts.
+    let (claude, _) = script(ProviderId::ClaudeCode, vec![]);
+    let (openai, _) = script(ProviderId::OpenAi, vec![]);
+    let both = Router::with_providers(vec![Box::new(claude), Box::new(openai)]);
+    assert_eq!(calls(both).await, 3);
+
+    // A failed reply goes on to the next provider, so two eligible providers can make two
+    // calls for one question: the ceiling is pending times the providers that can take it.
+    let (claude, _) = script(ProviderId::ClaudeCode, vec![]);
+    let (openai, _) = script(ProviderId::OpenAi, vec![]);
+    let both = Router::with_providers(vec![Box::new(claude), Box::new(openai)]);
+    consent_to(&db, &[DataCategory::JobText]).await;
+    assert_eq!(calls(both).await, 6, "3 questions, 2 eligible providers");
+
+    consent::revoke(&db, OPENAI, "cli").await.unwrap();
+    let (gone, _) = script(ProviderId::OpenAi, vec![]);
+    assert_eq!(calls(router_of(gone)).await, 0, "revoked");
 }
 
 /// A halt the first time classify is asked, before it does anything: a refresh stopped at
@@ -1414,6 +1493,40 @@ async fn the_log_names_the_claude_call_that_succeeded() {
     let row = classify_row(&db).await;
     assert_eq!(row.provider.as_deref(), Some(CLAUDE));
     assert_eq!(row.data_categories, [DataCategory::JobText]);
+}
+
+#[tokio::test]
+async fn the_log_names_a_hosted_call() {
+    let (_tmp, db) = open().await;
+    consent::give(&db, OPENAI, &[DataCategory::JobText], "2026-11-01", "cli")
+        .await
+        .unwrap();
+    questions(&db, 1).await;
+    let (provider, _) = script(ProviderId::OpenAi, vec![class_reply("normal")]);
+    agents::memory_refresh(&db, &router_of(provider), "cli", token())
+        .await
+        .unwrap();
+    let row = classify_row(&db).await;
+    assert_eq!(row.provider.as_deref(), Some(OPENAI));
+    assert_eq!(row.data_categories, [DataCategory::JobText]);
+}
+
+/// Ollama answered badly and the hosted provider then took the text, so that is what left.
+#[tokio::test]
+async fn the_log_names_a_hosted_call_over_a_local_one() {
+    let (_tmp, db) = open().await;
+    consent::give(&db, OPENAI, &[DataCategory::JobText], "2026-11-01", "cli")
+        .await
+        .unwrap();
+    questions(&db, 1).await;
+    let (local, _) = script(ProviderId::Ollama, vec!["not json".into()]);
+    let (hosted, handles) = script(ProviderId::OpenAi, vec![class_reply("normal")]);
+    let router = Router::with_providers(vec![Box::new(local), Box::new(hosted)]);
+    agents::memory_refresh(&db, &router, "cli", token())
+        .await
+        .unwrap();
+    assert_eq!(handles.calls(), 1);
+    assert_eq!(classify_row(&db).await.provider.as_deref(), Some(OPENAI));
 }
 
 #[tokio::test]

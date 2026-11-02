@@ -341,6 +341,34 @@ async fn offline_restore_revokes_external_consent_too() {
     db.close().await;
 }
 
+#[tokio::test]
+async fn restore_turns_every_consented_provider_off() {
+    const OPENAI: &str = "openai/api_key";
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let job_text = [DataCategory::JobText];
+    for provider in ["claude_code", "openai", "anthropic"] {
+        ai::set_enabled(&db, provider, true).await.unwrap();
+    }
+    consent::give(&db, CLAUDE, &job_text, "2026-11-01", "gui")
+        .await
+        .unwrap();
+    consent::give(&db, OPENAI, &job_text, "2026-11-01", "gui")
+        .await
+        .unwrap();
+    let info = backup::create(&db, "test").await.unwrap();
+
+    let db = backup::restore(db, &info.path, "test").await.unwrap().db;
+
+    let enabled = settings::get(&db, "ai.enabled").await.unwrap().unwrap();
+    assert_eq!(enabled["claude_code"], false);
+    assert_eq!(enabled["openai"], false);
+    assert_eq!(enabled["anthropic"], true, "no consent, so left as it was");
+    assert_eq!(consent::active(&db, CLAUDE).await.unwrap(), None);
+    assert_eq!(consent::active(&db, OPENAI).await.unwrap(), None);
+    db.close().await;
+}
+
 /// A restore that revokes nothing writes nothing about consent.
 #[tokio::test]
 async fn restore_with_no_consent_writes_no_consent_row() {

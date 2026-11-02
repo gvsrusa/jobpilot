@@ -1,0 +1,31 @@
+#!/bin/sh
+# Stands in for the real `codex` in tests. Never reaches a network. Each test's wrapper script
+# sets MOCK_CODEX_*, because the adapter clears the child's environment.
+if [ "$1" = "--version" ]; then
+    echo "0.0.0 (mock)"
+    exit "${MOCK_CODEX_VERSION_EXIT:-0}"
+fi
+[ -n "$MOCK_CODEX_CWD" ] && { pwd; ls -A; } > "$MOCK_CODEX_CWD"
+if [ -n "$MOCK_CODEX_ARGS" ]; then
+    : > "$MOCK_CODEX_ARGS"
+    for arg in "$@"; do
+        printf '%s\n' "$arg" >> "$MOCK_CODEX_ARGS"
+    done
+fi
+[ -n "$MOCK_CODEX_STDIN" ] && cat > "$MOCK_CODEX_STDIN" || cat > /dev/null
+[ -n "$MOCK_CODEX_ENV" ] && env > "$MOCK_CODEX_ENV"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --output-schema) [ -n "$MOCK_CODEX_SCHEMA" ] && cp "$2" "$MOCK_CODEX_SCHEMA" ;;
+        --output-last-message) last="$2" ;;
+    esac
+    shift
+done
+if [ -z "$MOCK_CODEX_NO_REPLY" ] && [ -n "$last" ]; then
+    if [ -n "$MOCK_CODEX_REPLY" ]; then
+        cp "$MOCK_CODEX_REPLY" "$last"
+    else
+        printf '%s' '{"class":"normal"}' > "$last"
+    fi
+fi
+exit "${MOCK_CODEX_EXIT:-0}"
