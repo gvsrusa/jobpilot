@@ -51,6 +51,7 @@ pub enum Agent {
     Analytics,
     Discovery,
     Matching,
+    Research,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +122,10 @@ pub enum RunInput {
     Matching {
         job_ids: Vec<String>,
         ai: bool,
+    },
+    /// A hex company id: no text.
+    Research {
+        company_id: String,
     },
 }
 

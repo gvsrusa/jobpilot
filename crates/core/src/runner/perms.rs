@@ -106,6 +106,17 @@ static MATCHING: AgentSpec = AgentSpec {
     run_timeout: Duration::from_secs(30 * 60),
 };
 
+static RESEARCH: AgentSpec = AgentSpec {
+    agent: Agent::Research,
+    permissions: &[
+        ReadJobText,
+        ReadCompanyText,
+        Model(TaskType::SummarizeCompany),
+        WriteCompanyNotes,
+    ],
+    run_timeout: Duration::from_secs(10 * 60),
+};
+
 pub fn spec_of(agent: Agent) -> &'static AgentSpec {
     match agent {
         Agent::Resume => &RESUME,
@@ -115,5 +126,6 @@ pub fn spec_of(agent: Agent) -> &'static AgentSpec {
         Agent::Analytics => &ANALYTICS,
         Agent::Discovery => &DISCOVERY,
         Agent::Matching => &MATCHING,
+        Agent::Research => &RESEARCH,
     }
 }

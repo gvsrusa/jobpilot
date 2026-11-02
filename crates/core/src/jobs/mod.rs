@@ -2,6 +2,7 @@
 //! text. A job imported before schema 13 and one pasted now share their text's id, so a draft's
 //! `job_text_id` and a job id name the same thing.
 
+pub mod company;
 pub mod dedupe;
 pub mod geo;
 pub mod link;
@@ -1042,8 +1043,8 @@ pub struct JobDetail {
     pub authorization: AuthNote,
     /// The posting speaks of work authorization at all. Nothing reads its words.
     pub mentions_authorization: bool,
-    // Replaced by `CompanyNote` in Task 10.
-    pub notes: Vec<serde_json::Value>,
+    /// The company's pasted notes and the model's summary, in the order they were added.
+    pub notes: Vec<company::CompanyNote>,
 }
 
 pub async fn detail(db: &Db, id: &str) -> Result<JobDetail> {
@@ -1074,29 +1075,15 @@ pub async fn detail(db: &Db, id: &str) -> Result<JobDetail> {
         .bind(&job.id)
         .fetch_one(&db.pool)
         .await?;
-    let notes: Vec<(String, String, Option<String>, String)> = match &job.company_id {
-        Some(company) => {
-            sqlx::query_as(
-                "SELECT text, origin, source_ref, created_at FROM company_notes \
-                 WHERE company_id = ? ORDER BY seq",
-            )
-            .bind(company)
-            .fetch_all(&db.pool)
-            .await?
-        }
+    let notes = match &job.company_id {
+        Some(company) => company::notes(db, company).await?,
         None => Vec::new(),
     };
     Ok(JobDetail {
         group: group(db, &job.id).await?,
         authorization: authorization_note(db, job.country.as_deref()).await?,
         mentions_authorization: flagged != 0,
-        notes: notes
-            .into_iter()
-            .map(|(text, origin, source_ref, at)| {
-                serde_json::json!({"text": text, "origin": origin, "source_ref": source_ref,
-                                   "created_at": at})
-            })
-            .collect(),
+        notes,
         text: text.normalized,
         findings: text.findings,
         explanation,

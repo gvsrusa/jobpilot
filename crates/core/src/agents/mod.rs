@@ -14,6 +14,7 @@ pub mod discovery;
 pub mod draft;
 pub mod matching;
 pub mod memory;
+pub mod research;
 pub mod tracking;
 
 use crate::analytics::Report;
@@ -26,6 +27,8 @@ use matching::MatchingWorkflow;
 pub use matching::{AiPlan, MATCH_BATCH, MatchReport, MatchRequest, match_jobs, match_plan};
 use memory::MemoryWorkflow;
 pub use memory::{MemoryRefreshed, memory_refresh};
+use research::ResearchWorkflow;
+pub use research::{CompanyResearch, research_company, research_plan};
 use tracking::Tracking;
 
 /// Bad input gets its plain error and no run, which also keeps a run's stored input to a
@@ -158,6 +161,10 @@ async fn resume_from(
         }
         RunInput::Matching { job_ids, ai } => {
             let workflow = MatchingWorkflow::new(router, job_ids, ai, true);
+            runner::resume(db, actor, run_id, &workflow, cancel).await
+        }
+        RunInput::Research { company_id } => {
+            let workflow = ResearchWorkflow::new(router, company_id, true);
             runner::resume(db, actor, run_id, &workflow, cancel).await
         }
         RunInput::MemoryRefresh => {
