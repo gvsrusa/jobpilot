@@ -497,14 +497,24 @@ async fn a_job_that_cannot_score_starts_no_second_run() {
             .await
             .unwrap();
     }
-    assert_eq!(rules_score(&db, &job.id).await, None, "an empty profile has no score");
-    assert_eq!(runner::list(&db, 10).await.unwrap().len(), 1, "the second pass starts no run");
+    assert_eq!(
+        rules_score(&db, &job.id).await,
+        None,
+        "an empty profile has no score"
+    );
+    assert_eq!(
+        runner::list(&db, 10).await.unwrap().len(),
+        1,
+        "the second pass starts no run"
+    );
     // Nothing to score, so a person asking for the same job by id still gets a run.
     let by_id = MatchRequest {
         job_ids: vec![job.id.clone()],
         ..MatchRequest::default()
     };
-    match_jobs(&db, &router, "cli", by_id, token()).await.unwrap();
+    match_jobs(&db, &router, "cli", by_id, token())
+        .await
+        .unwrap();
     assert_eq!(runner::list(&db, 10).await.unwrap().len(), 2);
 }
 

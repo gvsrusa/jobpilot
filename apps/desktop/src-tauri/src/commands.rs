@@ -692,6 +692,8 @@ pub async fn jobs_analyze<R: Runtime>(
     if ai {
         let plan = {
             let db = state.work().await?;
+            // A pause refuses the run, so no one is asked to confirm a count first.
+            pause::ensure_off(&db).await?;
             let router = Router::from_settings(&db).await?;
             agents::match_plan(&db, &router, &ids).await?
         };
@@ -731,6 +733,7 @@ pub async fn job_research<R: Runtime>(
 ) -> Result<CompanyResearch> {
     let plan = {
         let db = state.work().await?;
+        pause::ensure_off(&db).await?;
         let router = Router::from_settings(&db).await?;
         agents::research_plan(&db, &router, &company_id).await?
     };
@@ -5722,6 +5725,33 @@ mod tests {
         let app = h.ok("job_to_app", json!({ "id": job["id"] }));
         assert_eq!(app["company"], "Company not stated");
         assert_eq!(app["role"], "Backend Engineer");
+    }
+
+    #[test]
+    fn a_pause_refuses_before_a_count_dialog_is_shown() {
+        let h = ready();
+        h.ok(
+            "ai_enable",
+            json!({ "provider": "claude_code", "enabled": true }),
+        );
+        h.ok(
+            "ai_consent_give",
+            json!({ "provider": "claude_code", "categories": ["job_text"] }),
+        );
+        let id = import_job(&h, None)["id"].clone();
+        let company = h.ok("companies_list", json!({}))[0]["id"].clone();
+        h.answer(true);
+        h.ok("pause_set", json!({}));
+        let before = h.asked().len();
+        assert_eq!(
+            h.code("jobs_analyze", json!({ "ids": [id], "ai": true })),
+            "paused"
+        );
+        assert_eq!(
+            h.code("job_research", json!({ "companyId": company })),
+            "paused"
+        );
+        assert_eq!(h.asked().len(), before, "no dialog was shown");
     }
 
     #[test]
