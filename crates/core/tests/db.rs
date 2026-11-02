@@ -375,6 +375,41 @@ async fn a_0_3_database_upgrades_to_0_4() {
     db.close().await;
 }
 
+// One row the rules cannot read must not lock a person out of the rest. A job with no text
+// cannot be made with foreign keys on, so this connection turns them off.
+#[tokio::test]
+async fn a_job_the_rules_cannot_read_does_not_stop_the_open() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open_with(&paths, &MIGRATOR).await.unwrap();
+    let mut one = db.pool.acquire().await.unwrap();
+    for sql in [
+        "PRAGMA foreign_keys = OFF",
+        "INSERT INTO jobs (id, job_text_id, connector, title, first_seen_at, last_seen_at) \
+         VALUES ('bad', 'no-such-text', 'import', 'Bad', 't', 't')",
+        "PRAGMA foreign_keys = ON",
+        "INSERT INTO job_texts (id, title, raw, normalized, created_at) \
+         VALUES ('j1', 'Dev', 'raw', 'We need Rust', 't')",
+        "INSERT INTO jobs (id, job_text_id, connector, title, first_seen_at, last_seen_at) \
+         VALUES ('j1', 'j1', 'import', 'Dev', 't', 't')",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&mut *one)
+            .await
+            .unwrap();
+    }
+    drop(one);
+    db.close().await;
+
+    let db = Db::open(&paths).await.unwrap();
+
+    let by: String = sqlx::query_scalar("SELECT fields_by FROM jobs WHERE id = 'j1'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(by, "rules", "the row after the bad one is still read");
+    db.close().await;
+}
+
 // A 0.4 database (schema 12) holds a job text and a draft citing it. Opening it with 0.5
 // snapshots first, keeps every row, and adds one jobs row that carries the text's id.
 #[tokio::test]

@@ -1018,15 +1018,21 @@ pub async fn apply_rules(db: &Db, id: &str) -> Result<()> {
 }
 
 /// Runs the rules over each job they have not read. Only a job migrated from 0.4 waits here, and
-/// the rules move it to `rules`, so a later call finds nothing.
-pub(crate) async fn apply_rules_to_unread(db: &Db) -> Result<()> {
-    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM jobs WHERE fields_by = 'none'")
+/// the rules move it to `rules`, so a later call finds nothing. It runs at open, so a failure
+/// is logged and tried again at the next open: it never keeps a person from their data.
+pub(crate) async fn apply_rules_to_unread(db: &Db) {
+    let unread = sqlx::query_scalar::<_, String>("SELECT id FROM jobs WHERE fields_by = 'none'")
         .fetch_all(&db.pool)
-        .await?;
+        .await;
+    let ids = unread.unwrap_or_else(|error| {
+        eprintln!("rules: the unread jobs could not be listed: {error}");
+        Vec::new()
+    });
     for id in ids {
-        apply_rules(db, &id).await?;
+        if let Err(error) = apply_rules(db, &id).await {
+            eprintln!("rules: job {id} was not read: {error}");
+        }
     }
-    Ok(())
 }
 
 /// What the profile says about work authorization for the job's country. It is only shown: no
