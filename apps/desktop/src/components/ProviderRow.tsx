@@ -17,6 +17,7 @@ const UNAVAILABLE: Record<string, string> = {
   not_installed: "not installed",
   version_failed: "did not answer --version",
   no_answer: "did not answer in time",
+  cli_too_old: "older than the version JobPilot checked",
 };
 
 /** An AI-screen change. The row and any alert stay up while the status refreshes. */
@@ -197,6 +198,9 @@ export function ProviderRow(props: {
       {row.suspended && <p role="alert">{row.kind === "endpoint" ? ENDPOINT_SUSPENDED : SUSPENDED}</p>}
       {row.kind === "endpoint" && <EndpointControls row={row} />}
       {row.kind === "cli" && <CliControls row={row} />}
+      {row.kind === "cli" && row.runs_job_text && (
+        <p className="text-muted-foreground">Runs job text with every tool denied.</p>
+      )}
       {row.kind !== "cli" && <ModelControls row={row} />}
       {row.kind !== "cli" && <KeyControls row={row} />}
       {row.name === "google" && <p className="text-muted-foreground">Free keys are not supported.</p>}

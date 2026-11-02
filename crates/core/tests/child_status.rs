@@ -148,6 +148,34 @@ async fn detection_follows_the_override_then_the_setting_and_probes_only_enabled
     set("JOBPILOT_CODEX_BIN", gemini.as_os_str());
     assert!(find_cli(&CODEX, Some(&db)).await.is_err());
 
+    // Both CLIs on: `status` waits for one probe, not the two in a row.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let slow = tmp.path().join("slow");
+        std::fs::create_dir_all(&slow).unwrap();
+        // By full path: `PATH` here holds nothing.
+        let script = "#!/bin/sh\n/bin/sleep 2\necho 0.40.0\n";
+        for (file, provider, variable) in [
+            (GEMINI_FILE, "gemini_cli", "JOBPILOT_GEMINI_BIN"),
+            (CODEX_FILE, "codex_cli", "JOBPILOT_CODEX_BIN"),
+        ] {
+            let path = slow.join(file);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            set(variable, path.as_os_str());
+            ai::set_enabled(&db, provider, true).await.unwrap();
+        }
+        let clock = std::time::Instant::now();
+        ai::status(&db).await.unwrap();
+        assert!(
+            clock.elapsed() < std::time::Duration::from_millis(3500),
+            "probed one after the other: {:?}",
+            clock.elapsed()
+        );
+        clear("JOBPILOT_GEMINI_BIN");
+    }
+
     // Clearing goes back to discovery.
     set_cli_path(&db, "gemini_cli", "").await.unwrap();
     assert_eq!(

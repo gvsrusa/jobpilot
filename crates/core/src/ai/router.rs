@@ -11,6 +11,7 @@ use serde_json::json;
 use super::api::ApiProvider;
 use super::claude_code::ClaudeCode;
 use super::consent::ConsentState;
+use super::gemini_cli::GeminiCli;
 use super::net::MAX_RETRY_WAIT;
 use super::noai::NoAi;
 use super::ollama::{DEFAULT_URL, Ollama};
@@ -44,6 +45,7 @@ const CONSENT_SUSPENDED: &str = "consent_suspended";
 const PROVIDER_UNAVAILABLE: &str = "provider_unavailable";
 const NO_MODEL_SET: &str = "no_model_set";
 const MODEL_NOT_INSTALLED: &str = "model_not_installed";
+const CLI_TOO_OLD: &str = "cli_too_old";
 const OLLAMA: &str = "ollama";
 const CLAUDE_CODE: &str = "claude_code";
 const OPENAI: &str = "openai";
@@ -51,6 +53,7 @@ const ANTHROPIC: &str = "anthropic";
 const GOOGLE: &str = "google";
 const OPENROUTER: &str = "openrouter";
 const ENDPOINT: &str = "endpoint";
+const GEMINI_CLI: &str = "gemini_cli";
 
 /// Providers in user order. No-AI is not in the list: it runs last, outside the checks.
 /// Holds no `Db`, so build one per call and nothing blocks a restore.
@@ -115,6 +118,13 @@ impl Router {
                         .await
                         .unwrap_or_else(|_| ClaudeCode::with_binary(PathBuf::new(), None));
                     providers.push(Box::new(claude));
+                }
+                GEMINI_CLI => {
+                    // As Claude: no binary stays listed, and the run log shows it unavailable.
+                    let gemini = GeminiCli::locate_in(db)
+                        .await
+                        .unwrap_or_else(|_| GeminiCli::with_binary(PathBuf::new()));
+                    providers.push(Box::new(gemini));
                 }
                 OPENAI | ANTHROPIC | GOOGLE | OPENROUTER | ENDPOINT => {
                     match ApiProvider::from_settings(db, name).await? {
@@ -465,7 +475,7 @@ fn after_skip<T>(task: &Task<'_>, declaration: &Declaration, reason: &str) -> St
 fn weight(reason: &str) -> u8 {
     match reason {
         PROVIDER_UNAVAILABLE | NO_MODEL_SET | MODEL_NOT_INSTALLED | NO_KEY | NO_API_MODEL
-        | "cli_too_old" => 0,
+        | CLI_TOO_OLD => 0,
         CONSENT_NEEDED | CONSENT_SUSPENDED | ENDPOINT_CHANGED => 1,
         _ => 2,
     }
@@ -479,6 +489,7 @@ fn unavailable_reason(why: &str) -> &'static str {
         "model_missing" => MODEL_NOT_INSTALLED,
         NO_KEY => NO_KEY,
         NO_API_MODEL => NO_API_MODEL,
+        CLI_TOO_OLD => CLI_TOO_OLD,
         _ => PROVIDER_UNAVAILABLE,
     }
 }

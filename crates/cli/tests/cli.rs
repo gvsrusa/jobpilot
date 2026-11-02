@@ -489,6 +489,167 @@ fn draftable(home: &Path) -> (String, serde_json::Value) {
 
 const DRAFT_CONSENT: &str = "job_text,resume_text,profile_basic";
 
+/// The mock Gemini CLI, saying `reply` as its stream.
+fn gemini_saying(home: &Path, reply: &serde_json::Value) -> String {
+    let dir = home.parent().unwrap();
+    let text = serde_json::json!({"type": "message", "role": "assistant",
+        "content": reply.to_string(), "delta": true});
+    let end = serde_json::json!({"type": "result", "status": "success", "stats": {}});
+    let reply_file = dir.join("stream.jsonl");
+    std::fs::write(&reply_file, format!("{text}\n{end}\n")).unwrap();
+    let mocks = Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/tests/mock-gemini");
+    if cfg!(windows) {
+        let wrapper = dir.join("gemini.cmd");
+        let script = format!(
+            "@echo off\r\nset MOCK_GEMINI_REPLY={}\r\ncall \"{}\" %*\r\n",
+            reply_file.display(),
+            mocks.join("gemini.cmd").display()
+        );
+        std::fs::write(&wrapper, script).unwrap();
+        return wrapper.to_str().unwrap().to_owned();
+    }
+    let wrapper = dir.join("gemini");
+    let script = format!(
+        "#!/bin/sh\nexport MOCK_GEMINI_REPLY='{}'\nexec '{}' \"$@\"\n",
+        reply_file.display(),
+        mocks.join("gemini").display()
+    );
+    std::fs::write(&wrapper, script).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &wrapper,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    wrapper.to_str().unwrap().to_owned()
+}
+
+#[test]
+fn gemini_cli_drafts_through_the_mock() {
+    let (_dir, home) = fresh_home();
+    let (job, reply) = draftable(&home);
+    let bin = gemini_saying(&home, &reply);
+    let env = [
+        ("JOBPILOT_GEMINI_BIN", bin.as_str()),
+        ("JOBPILOT_CLAUDE_BIN", "not-a-path"),
+    ];
+    for args in [
+        vec!["ai", "disable", "ollama"],
+        vec!["ai", "enable", "gemini_cli"],
+        vec![
+            "ai",
+            "consent",
+            "give",
+            "gemini_cli",
+            "--categories",
+            DRAFT_CONSENT,
+            "--attest",
+        ],
+    ] {
+        let output = run_env(&home, &args, &env);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            stderr_text(&output)
+        );
+    }
+
+    let made = run_env(&home, &["resume", "generate", &job, "--json"], &env);
+    assert!(made.status.success(), "{}", stderr_text(&made));
+    let made = stdout_json(&made);
+    assert_eq!(made["provider"], "gemini_cli");
+    assert_eq!(made["blocked"], 0);
+    let shown = stdout_json(&run_env(
+        &home,
+        &["ai", "consent", "show", "gemini_cli", "--json"],
+        &env,
+    ));
+    assert_eq!(shown["key"], "gemini_cli/cli_login");
+    assert_eq!(shown["path"], bin);
+}
+
+#[test]
+fn gemini_cli_absent_shows_unavailable() {
+    let (dir, home) = fresh_home();
+    let gone = dir.path().join("gemini");
+    let env = [
+        ("JOBPILOT_GEMINI_BIN", gone.to_str().unwrap()),
+        ("JOBPILOT_CLAUDE_BIN", "not-a-path"),
+    ];
+    assert!(
+        run_env(&home, &["ai", "enable", "gemini_cli"], &env)
+            .status
+            .success()
+    );
+    let status = stdout_json(&run_env(&home, &["ai", "status", "--json"], &env));
+    let rows = status["external"].as_array().unwrap();
+    let row = rows.iter().find(|row| row["name"] == "gemini_cli").unwrap();
+    assert_eq!(row["available"], false);
+    assert_eq!(row["reason"], "not_installed");
+    assert_eq!(row["path"], serde_json::Value::Null);
+}
+
+#[test]
+fn a_cli_too_old_or_signed_out_says_so_for_any_vendor() {
+    let (_dir, home) = fresh_home();
+    let (job, reply) = draftable(&home);
+    let bin = gemini_saying(&home, &reply);
+    let wrapper = Path::new(&bin);
+    let script = std::fs::read_to_string(wrapper).unwrap();
+    let older = if cfg!(windows) {
+        script.replace(
+            "@echo off\r\n",
+            "@echo off\r\nset MOCK_GEMINI_VERSION=0.39.0\r\n",
+        )
+    } else {
+        script.replace(
+            "#!/bin/sh\n",
+            "#!/bin/sh\nexport MOCK_GEMINI_VERSION=0.39.0\n",
+        )
+    };
+    std::fs::write(wrapper, older).unwrap();
+    let env = [
+        ("JOBPILOT_GEMINI_BIN", bin.as_str()),
+        ("JOBPILOT_CLAUDE_BIN", "not-a-path"),
+    ];
+    for args in [
+        vec!["ai", "disable", "ollama"],
+        vec!["ai", "enable", "gemini_cli"],
+        vec![
+            "ai",
+            "consent",
+            "give",
+            "gemini_cli",
+            "--categories",
+            DRAFT_CONSENT,
+            "--attest",
+        ],
+    ] {
+        assert!(run_env(&home, &args, &env).status.success(), "{args:?}");
+    }
+    let refused = run_env(&home, &["resume", "generate", &job], &env);
+    assert!(!refused.status.success());
+    let text = stderr_text(&refused);
+    assert!(
+        text.contains("The installed CLI is older than the version JobPilot checked."),
+        "{text}"
+    );
+
+    let older = std::fs::read_to_string(wrapper).unwrap();
+    let signed_out = if cfg!(windows) {
+        older.replace("0.39.0\r\n", "0.40.0\r\nset MOCK_GEMINI_EXIT=41\r\n")
+    } else {
+        older.replace("0.39.0\n", "0.40.0\nexport MOCK_GEMINI_EXIT=41\n")
+    };
+    std::fs::write(wrapper, signed_out).unwrap();
+    let refused = run_env(&home, &["resume", "generate", &job], &env);
+    let text = stderr_text(&refused);
+    assert!(
+        text.contains("This CLI is not signed in. Run it once in your own terminal"),
+        "{text}"
+    );
+}
+
 #[test]
 fn resume_generate_appears_in_agents_list() {
     let (_dir, home) = fresh_home();

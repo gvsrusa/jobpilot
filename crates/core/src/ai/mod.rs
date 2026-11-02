@@ -17,6 +17,7 @@ use crate::{secrets, settings};
 use api::ApiProvider;
 use claude_code::ClaudeCode;
 use consent::ConsentState;
+use gemini_cli::GeminiCli;
 use ollama::OllamaStatus;
 use register::ProviderKind;
 
@@ -24,6 +25,7 @@ pub mod api;
 pub mod child;
 pub mod claude_code;
 pub mod consent;
+pub mod gemini_cli;
 pub mod net;
 pub mod noai;
 pub mod ollama;
@@ -485,13 +487,9 @@ async fn cli_path(db: &Db, name: &str) -> Option<String> {
 
 /// Decision 28: a CLI that is off is found but never started, because `status` runs on every
 /// refresh of the AI screen and a Node CLI takes seconds to start. Only an enabled one gets
-/// the `--version` probe.
-async fn cli_availability(
-    db: &Db,
-    info: &register::ProviderInfo,
-    enabled: bool,
-) -> (bool, Option<String>) {
-    let Some(spec) = child::spec_for(info.name) else {
+/// the `--version` probe, which for Gemini includes its version floor.
+async fn cli_availability(db: &Db, name: &str, enabled: bool) -> (bool, Option<String>) {
+    let Some(spec) = child::spec_for(name) else {
         return (false, Some("not_built".into()));
     };
     let Ok(bin) = child::find_cli(spec, Some(db)).await else {
@@ -500,6 +498,12 @@ async fn cli_availability(
     if !enabled {
         return (true, None);
     }
+    if name == "gemini_cli" {
+        return match GeminiCli::with_binary(bin).available().await {
+            Availability::Available => (true, None),
+            Availability::Unavailable(why) => (false, Some(why)),
+        };
+    }
     match child::version_of(&bin, child::child_env(spec.extra_env)).await {
         Ok(_) => (true, None),
         Err(why) => (false, Some(why.into())),
@@ -507,16 +511,12 @@ async fn cli_availability(
 }
 
 /// A provider row's availability, by the same checks routing uses. Opens no socket.
-// ponytail: an API row reads `not_built` until its adapter lands; the CLI rows are checked
-// here, and their adapters come in Tasks 7 and 8.
-async fn row_availability(
+// ponytail: an API row reads `not_built` until its adapter lands; the Codex adapter comes in
+// Task 8.
+async fn api_availability(
     db: &Db,
     info: &register::ProviderInfo,
-    enabled: bool,
 ) -> Result<(bool, Option<String>)> {
-    if info.kind == ProviderKind::Cli {
-        return Ok(cli_availability(db, info, enabled).await);
-    }
     Ok(match ApiProvider::from_settings(db, info.name).await? {
         Some(provider) => match provider.available().await {
             Availability::Available => (true, None),
@@ -531,6 +531,11 @@ async fn row_availability(
 async fn external_status(db: &Db) -> Result<Vec<ExternalStatus>> {
     let stored = secrets::names(db).await?;
     let (_, enabled) = provider_settings(db).await?;
+    // Together, so `status` waits for one probe timeout at most.
+    let (gemini, codex) = tokio::join!(
+        cli_availability(db, "gemini_cli", enabled["gemini_cli"] == true),
+        cli_availability(db, "codex_cli", enabled["codex_cli"] == true),
+    );
     let mut rows = Vec::new();
     for info in register::PROVIDERS {
         if info.id == ProviderId::ClaudeCode {
@@ -538,7 +543,11 @@ async fn external_status(db: &Db) -> Result<Vec<ExternalStatus>> {
         }
         let state = consent::state(db, &info.id.to_string()).await?;
         let suspended = matches!(state, ConsentState::Suspended(_));
-        let (available, reason) = row_availability(db, info, enabled[info.name] == true).await?;
+        let (available, reason) = match info.name {
+            "gemini_cli" => gemini.clone(),
+            "codex_cli" => codex.clone(),
+            _ => api_availability(db, info).await?,
+        };
         let model = text_setting(db, &format!("ai.model.{}", info.name)).await?;
         let path = match info.kind {
             ProviderKind::Endpoint => api::endpoint_address(db).await?,
@@ -576,25 +585,28 @@ pub async fn status(db: &Db) -> Result<AiStatus> {
     let state = consent::state(db, &ProviderId::ClaudeCode.to_string()).await?;
     let suspended = matches!(state, ConsentState::Suspended(_));
     let consent = state.allowed();
-    let claude_code = match ClaudeCode::locate_in(db, None).await {
-        Ok(claude) => ClaudeStatus {
-            available: matches!(claude.available().await, Availability::Available),
-            path: Some(claude.path().display().to_string()),
-            consent,
-            suspended,
-        },
-        Err(_) => ClaudeStatus {
-            available: false,
-            path: None,
-            consent,
-            suspended,
-        },
+    let claude_code = async {
+        match ClaudeCode::locate_in(db, None).await {
+            Ok(claude) => ClaudeStatus {
+                available: matches!(claude.available().await, Availability::Available),
+                path: Some(claude.path().display().to_string()),
+                consent,
+                suspended,
+            },
+            Err(_) => ClaudeStatus {
+                available: false,
+                path: None,
+                consent,
+                suspended,
+            },
+        }
     };
+    let (claude_code, external) = tokio::join!(claude_code, external_status(db));
     let (order, enabled) = provider_settings(db).await?;
     Ok(AiStatus {
         ollama,
         claude_code,
-        external: external_status(db).await?,
+        external: external?,
         register_date: register::register_date(),
         hardware: hardware::detect(),
         order,

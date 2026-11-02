@@ -12,7 +12,8 @@ export const ENDPOINT_SUSPENDED =
 // searched for the stable word. ponytail: add a `reason` field to the error if a word ever
 // has to be told from a provider's own text.
 const REASONS: [word: string, text: string][] = [
-  ["not_logged_in", "Sign in by running `claude` once in the terminal panel"],
+  ["not_logged_in", "This CLI is not signed in. Run it once in your own terminal to sign in, then try again."],
+  ["cli_too_old", "The installed CLI is older than the version JobPilot checked. Update it, then try again."],
   [
     "prompt_too_large",
     "The posting is too long for the model. Paste a shorter posting, such as just the duties and requirements",

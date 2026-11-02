@@ -3402,6 +3402,37 @@ mod tests {
         );
     }
 
+    /// Off, so found and not started, and a posting can go to it: it declares no tools.
+    #[test]
+    fn ai_status_lists_gemini_with_its_path() {
+        let h = ready();
+        {
+            // A setting that names another program stops discovery: no installed `claude` runs.
+            let state = h.app.state::<AppState>();
+            let db = block_on(state.db.read());
+            let claude = json!("/bin/sh");
+            let set = jobpilot_core::settings::set(db.as_ref().unwrap(), "ai.claude_path", &claude);
+            block_on(set).unwrap();
+        }
+        let mock = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../crates/core/tests/mock-gemini")
+            .join(if cfg!(windows) {
+                "gemini.cmd"
+            } else {
+                "gemini"
+            });
+        h.pick(&mock);
+        h.ok("ai_set_cli_path", json!({ "provider": "gemini_cli" }));
+
+        let status = h.ok("ai_status", json!({}));
+        let rows = status["external"].as_array().unwrap();
+        let row = rows.iter().find(|row| row["name"] == "gemini_cli").unwrap();
+        assert_eq!(row["path"], json!(mock));
+        assert_eq!(row["available"], true);
+        assert_eq!(row["reason"], Value::Null);
+        assert_eq!(row["runs_job_text"], true);
+    }
+
     /// What the macOS panel returns for npm's `gemini` link.
     #[test]
     fn cli_picker_accepts_a_resolved_npm_entry() {

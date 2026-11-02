@@ -47,7 +47,7 @@ windows_check() {
 keychain_suites() {
   # One thread: parallel keychain runs have hung here and shown macOS dialogs.
   JOBPILOT_SECRET_SERVICE=jobpilot-test cargo test --workspace -- --ignored \
-    --skip real_claude --skip make_fixtures --test-threads=1
+    --skip real_claude --skip real_gemini --skip make_fixtures --test-threads=1
 }
 
 step 'install' pnpm install --frozen-lockfile

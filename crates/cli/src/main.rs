@@ -244,7 +244,14 @@ fn message(error: &Error) -> String {
                           `jobpilot pause clear` in an ordinary terminal, or from the title bar."
             .into(),
         Error::ManualRequired(reason) if reason == "not_logged_in" => {
-            "Claude Code is not signed in. Run `claude` once to log in, then try again.".into()
+            "This CLI is not signed in. Run it once in your own terminal to sign in, then try \
+             again."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "cli_too_old" => {
+            "The installed CLI is older than the version JobPilot checked. Update it, then try \
+             again."
+                .into()
         }
         Error::ManualRequired(reason) if reason == "consent_needed" => {
             "An AI provider is on, but your consent does not cover this task. See `jobpilot ai \

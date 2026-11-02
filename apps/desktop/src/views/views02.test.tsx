@@ -379,7 +379,9 @@ describe("resumes", () => {
     await go(user, "Resumes", "Resumes");
     await user.click(await screen.findByRole("button", { name: "Generate" }));
     expect(
-      await screen.findByText("Sign in by running `claude` once in the terminal panel"),
+      await screen.findByText(
+        "This CLI is not signed in. Run it once in your own terminal to sign in, then try again.",
+      ),
     ).toBeInTheDocument();
   });
 
@@ -1002,6 +1004,45 @@ describe("ai", () => {
     await user.click(row.getByRole("button", { name: /Paste key from clipboard\.\.\./ }));
     expect(await screen.findByText("Key stored")).toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent("Clear it yourself");
+  });
+
+  it("gemini_row_shows_it_runs_job_text_with_no_tools", async () => {
+    backend({
+      ai_status: () =>
+        aiWith({
+          external: [
+            external({
+              name: "gemini_cli",
+              label: "Gemini CLI",
+              kind: "cli",
+              available: true,
+              reason: null,
+              path: "/opt/bin/gemini",
+            }),
+            external({ name: "codex_cli", label: "Codex CLI", kind: "cli", runs_job_text: false }),
+          ],
+        }),
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const gemini = within(await screen.findByRole("listitem", { name: "Gemini CLI" }));
+    expect(gemini.getByText("/opt/bin/gemini")).toBeInTheDocument();
+    expect(gemini.getByText("Runs job text with every tool denied.")).toBeInTheDocument();
+    const codex = within(screen.getByRole("listitem", { name: "Codex CLI" }));
+    expect(codex.queryByText("Runs job text with every tool denied.")).toBeNull();
+  });
+
+  it("a_cli_too_old_says_why", async () => {
+    backend({
+      ai_status: () =>
+        aiWith({
+          external: [external({ name: "gemini_cli", label: "Gemini CLI", kind: "cli", reason: "cli_too_old" })],
+        }),
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "Gemini CLI" }));
+    expect(row.getByText("Unavailable: older than the version JobPilot checked")).toBeInTheDocument();
   });
 
   it("a_cli_row_has_no_key_controls", async () => {
