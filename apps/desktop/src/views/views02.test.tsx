@@ -298,6 +298,17 @@ describe("resumes", () => {
 
   const OLLAMA_UP = aiWith({ ollama: { state: "running", url: "http://127.0.0.1:11434", version: "1", models: [] } });
 
+  it("a_draft_citing_an_older_version_of_a_posting_still_shows_with_that_text", async () => {
+    resumeBackend({
+      job_list: () => [{ ...JOB, id: "j2", normalized: "The revised text." }],
+      job_get: ({ id }) => ({ ...JOB, id, normalized: "The older text." }),
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    expect(await screen.findByText("The older text.")).toBeInTheDocument();
+    expect(screen.queryByText("This draft is not tied to a job posting.")).toBeNull();
+  });
+
   it("no_evidence_points_at_the_knowledge_section", async () => {
     resumeBackend({
       resume_list: () => [],

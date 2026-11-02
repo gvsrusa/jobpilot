@@ -341,6 +341,12 @@ export function ApplicationsView() {
     queryFn: () => ipc.appList(filter || null),
   });
   const jobs = useQuery({ queryKey: ["jobs"], queryFn: ipc.jobList });
+  // The list holds current versions only; an application can be tied to an older one.
+  const older = useQuery({
+    queryKey: ["job-text", form.job_text_id],
+    queryFn: () => ipc.jobGet(form.job_text_id!),
+    enabled: jobs.isSuccess && form.job_text_id !== null && !jobs.data.some((j) => j.id === form.job_text_id),
+  });
   const drafts = useQuery({ queryKey: ["drafts", "all"], queryFn: () => ipc.resumeList(null) });
   // Not from the filtered list: a status change can take the row out of the filter.
   const detail = useQuery({
@@ -531,7 +537,7 @@ export function ApplicationsView() {
                 <Label htmlFor="app-role">Role</Label>
                 <Input id="app-role" value={form.role} onChange={(e) => set("role", e.target.value)} />
               </div>
-              {choose("app-job", "Job posting", form.job_text_id, "job_text_id", jobs.data ?? [])}
+              {choose("app-job", "Job posting", form.job_text_id, "job_text_id", [...(jobs.data ?? []), ...(older.data ? [older.data] : [])])}
               {choose("app-resume", "Resume draft", form.resume_draft_id, "resume_draft_id", resumes)}
               {choose("app-letter", "Cover letter draft", form.letter_draft_id, "letter_draft_id", letters)}
               <div className="grid gap-1.5">

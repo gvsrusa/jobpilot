@@ -190,10 +190,19 @@ export function ResumesView() {
   const job = jobs.data?.find((j) => j.id === jobChoice) ?? jobs.data?.[0] ?? null;
   const groups = lineages(drafts.data ?? []);
   const forJob = groups.filter((g) => tied(g, job?.id ?? null));
+  // A draft on an older version of a posting: the picker lists only the current one.
+  const onOlder = groups.find((g) => jobs.isSuccess && g[0].job_text_id && !jobs.data.some((j) => j.id === g[0].job_text_id));
   const group =
-    groups.find((g) => g[0].lineage_id === lineageChoice) ?? (lineageChoice === null ? forJob[0] : undefined);
+    groups.find((g) => g[0].lineage_id === lineageChoice) ?? (lineageChoice === null ? (forJob[0] ?? onOlder) : undefined);
   const current = group ? (group.find((d) => d.id === draftChoice) ?? latest(group)) : null;
   const earlier = group && current ? group.filter((d) => d.version < current.version) : [];
+  const postingId = current?.job_text_id ?? null;
+  const listed = jobs.data?.find((j) => j.id === postingId);
+  const older = useQuery({
+    queryKey: ["job-text", postingId],
+    queryFn: () => ipc.jobGet(postingId!),
+    enabled: jobs.isSuccess && postingId !== null && !listed,
+  });
 
   const compare = useQuery({
     queryKey: ["compare", current?.id, originalId],
@@ -472,7 +481,7 @@ export function ResumesView() {
               <CompareTable
                 compare={compare.data}
                 kind={kind}
-                posting={jobs.data?.find((j) => j.id === current.job_text_id) ?? null}
+                posting={listed ?? older.data ?? null}
                 selected={Math.min(selected, claims.length - 1)}
                 onSelect={setSelected}
                 onEdit={() => claim && setClaimEditing(true)}

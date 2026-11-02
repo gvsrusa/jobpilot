@@ -318,6 +318,15 @@ async fn a_changed_posting_gets_a_new_text_and_loses_its_score() {
         .await
         .unwrap();
     assert_eq!(old, 1, "the old text stays");
+    let texts = jobpilot_core::knowledge::list_job_texts(&db).await.unwrap();
+    assert!(texts.iter().any(|text| text.id == now.job_text_id));
+    assert!(
+        texts.iter().all(|text| text.id != job.job_text_id),
+        "only the current version is listed"
+    );
+    jobpilot_core::knowledge::get_job_text(&db, &job.job_text_id)
+        .await
+        .expect("a draft citing the old text still resolves");
     let found = list(
         &db,
         &JobFilter {

@@ -1116,11 +1116,13 @@ pub async fn get_job_text(db: &Db, id: &str) -> Result<JobText> {
     row.into_job_text()
 }
 
-/// Newest first.
+/// Newest first, the current version of each. An older one is read by its id.
 pub async fn list_job_texts(db: &Db) -> Result<Vec<JobText>> {
-    let rows: Vec<JobRow> =
-        sqlx::query_as("SELECT id, title, normalized, findings FROM job_texts ORDER BY seq DESC")
-            .fetch_all(&db.pool)
-            .await?;
+    let rows: Vec<JobRow> = sqlx::query_as(
+        "SELECT id, title, normalized, findings FROM job_texts WHERE version_of IS NULL \
+         ORDER BY seq DESC",
+    )
+    .fetch_all(&db.pool)
+    .await?;
     rows.into_iter().map(JobRow::into_job_text).collect()
 }
