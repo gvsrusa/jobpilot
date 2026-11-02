@@ -8,6 +8,29 @@ Format follows Keep a Changelog. Versions follow Semantic Versioning.
 - CI on macOS and Windows, and a tag-triggered draft release workflow producing dmg, nsis, and msi installers.
 - Development guide, contributing guide, and Connector SDK stub.
 
+## [0.3.0] - unreleased
+
+Career memory, application tracking, and emergency pause. See `docs/releases/0.3.0.md` for what was and was not exercised.
+
+### Added
+- Application tracking by hand and offline: add, edit, filter, status changes with history, and notes. Commands `app add|list|show|history|edit|status|note|answers|remove`, and an Applications view.
+- Career memory: questions and answers you approve, with provenance, freshness, and sensitivity classes (`normal`, `sensitive`, `legal`, `work_authorization`). A sensitive or legal answer is sealed at rest and used only after you confirm it for one application. Work authorization is never stored in memory: it is read from your profile for one exact country, and absent reads "not stated". Search by meaning with a local embedding model, else by words. Commands `memory ...` and a Memory view.
+- Memory refresh: a model may double-check classes (one attempt each, at most 20 per press) and may only raise a class. Only you start it, and it says how many Claude calls it will make first. A class you set is final.
+- A deterministic workflow runner with static permission sets, execution logs, checkpoints, timeouts, retries, and cancellation. The resume, cover letter, career memory, tracking, and analytics agents run on it. Commands `agents list|show|log|cancel|resume` and an Agents view.
+- An analytics report of counts and rates over your applications, built on request: `analytics report|show`, and a summary in the Applications view.
+- Emergency pause from the title bar of every screen, the native Safety menu, `Ctrl/Cmd+Shift+H`, and `jobpilot pause set|status|clear`. It stops every run and every model call in every JobPilot process, survives a restart, and is audited. Clearing it asks through a native dialog in the app.
+- Migrations 0006 to 0011. Schema version 11.
+
+### Changed
+- A restore keeps the emergency pause, and a restore that revokes external consent also turns Claude Code off in settings, so the AI screen does not show it on and failing.
+- The applied date a status change stamps, and the "applied in the last 30 days" count, follow your local calendar instead of UTC.
+- The analytics text shows the median response time in days.
+- Application status changes are refused with `paused` while the emergency pause is on. Editing fields and notes stays open.
+
+### Known limits
+- On macOS, `Cmd+Shift+H` may not fire while the web view is hung (`wry` 0.57.1 passes the key to the web view first). Use the Safety menu or `jobpilot pause set`. A `claude` session you start in the terminal panel is not stopped by the pause.
+- Rule words can miss a paraphrased sensitive question. See the release notes.
+
 ## [0.2.0] - unreleased
 
 Candidate and local AI. See `docs/releases/0.2.0.md` for what was and was not exercised.

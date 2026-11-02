@@ -434,6 +434,41 @@ async fn a_person_runs_it_and_the_system_is_refused() {
 }
 
 #[tokio::test]
+async fn a_resume_after_a_dropped_report_row_fails_loudly() {
+    let (_tmp, db) = setup().await;
+    add(&db, "Acme", "R", "").await;
+    let fresh = report(&db).await;
+    let id = runner::list(&db, 1).await.unwrap().remove(0).id;
+    // A halted run with one section done, whose row was dropped (a cancel raced the resume).
+    sqlx::query(
+        "UPDATE agent_runs SET state = 'halted', finished_at = NULL, step = 1, \
+         checkpoint = json_object('report', ?) WHERE id = ?",
+    )
+    .bind(&fresh.id)
+    .bind(&id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM reports WHERE id = ?")
+        .bind(&fresh.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let router = jobpilot_core::ai::router::Router::from_settings(&db)
+        .await
+        .unwrap();
+    let resumed = agents::resume_run(&db, &router, "cli", &id, token())
+        .await
+        .unwrap();
+    assert_eq!(resumed.state, RunState::Failed);
+    match resumed.into_result() {
+        Err(jobpilot_core::Error::Failed(code)) => assert_eq!(code, "report_missing"),
+        other => panic!("expected report_missing, got {other:?}"),
+    }
+    assert!(analytics::latest(&db).await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn a_future_applied_date_is_not_in_the_last_30_days() {
     let (_tmp, db) = setup().await;
     let soon = add(&db, "A", "R", "").await;

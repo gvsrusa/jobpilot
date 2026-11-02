@@ -91,7 +91,7 @@ async fn first_applied_sets_applied_on_and_a_later_one_keeps_it() {
     let other = applications::set_status(&db, "cli", &other.id, "applied", None, "")
         .await
         .unwrap();
-    let today: (String,) = sqlx::query_as("SELECT strftime('%Y-%m-%d', 'now')")
+    let today: (String,) = sqlx::query_as("SELECT date('now', 'localtime')")
         .fetch_one(&db.pool)
         .await
         .unwrap();

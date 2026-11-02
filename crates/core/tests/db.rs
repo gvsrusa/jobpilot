@@ -238,3 +238,96 @@ async fn foundation_database_migrates_to_data_keys_without_a_key() {
     assert!(second_profile.is_err(), "one profile per root");
     db.close().await;
 }
+
+// A 0.2 database (schema 5) holds a document, a profile, a knowledge item, a job text, and a
+// draft. Opening it with 0.3 keeps every row, leaves the new tables empty, and snapshots first.
+#[tokio::test]
+async fn a_0_2_database_upgrades_to_0_3() {
+    let (_tmp, paths) = temp_root();
+    let release_0_2: Vec<Migration> = MIGRATOR
+        .iter()
+        .filter(|m| m.version <= 5)
+        .cloned()
+        .collect();
+    let db = Db::open_with(&paths, &Migrator::with_migrations(release_0_2))
+        .await
+        .unwrap();
+    assert_eq!(db.schema_version().await.unwrap(), 5);
+    for sql in [
+        "INSERT INTO documents (id, title, body, created_at, updated_at) \
+         VALUES ('d1', 'Old CV', 'document body', 't', 't')",
+        "INSERT INTO profile (id, basic, updated_at) VALUES ('me', '{\"name\":\"Ada\"}', 't')",
+        "INSERT INTO knowledge_items (id, kind, body, source, created_at, updated_at) \
+         VALUES ('k1', 'skill', 'Rust', 'user', 't', 't')",
+        "INSERT INTO job_texts (id, title, raw, normalized, created_at) \
+         VALUES ('j1', 'Dev', 'raw posting', 'normal posting', 't')",
+        "INSERT INTO drafts (id, kind, lineage_id, version, origin, title, job_text_id, body, \
+         created_at) VALUES ('dr1', 'resume', 'l1', 1, 'generated', 'Draft', 'j1', '{}', 't')",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    db.close().await;
+
+    let db = Db::open(&paths).await.unwrap();
+
+    assert_eq!(db.schema_version().await.unwrap(), 11);
+    assert_eq!(snapshots(&paths, "pre-migrate-5").len(), 1);
+    for (sql, want) in [
+        (
+            "SELECT body FROM documents WHERE id = 'd1'",
+            "document body",
+        ),
+        (
+            "SELECT basic FROM profile WHERE id = 'me'",
+            "{\"name\":\"Ada\"}",
+        ),
+        ("SELECT body FROM knowledge_items WHERE id = 'k1'", "Rust"),
+        (
+            "SELECT normalized FROM job_texts WHERE id = 'j1'",
+            "normal posting",
+        ),
+        ("SELECT title FROM drafts WHERE id = 'dr1'", "Draft"),
+    ] {
+        let got: String = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(got, want, "{sql}");
+    }
+    let run_id: Option<String> = sqlx::query_scalar("SELECT run_id FROM drafts WHERE id = 'dr1'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(run_id, None, "an old draft has no run");
+    for table in [
+        "applications",
+        "application_events",
+        "memory_questions",
+        "memory_answers",
+        "application_answers",
+        "memory_embeddings",
+        "agent_runs",
+        "agent_run_log",
+        "reports",
+    ] {
+        let rows: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0, "{table}");
+    }
+    db.close().await;
+}
+
+#[tokio::test]
+async fn a_fresh_database_is_schema_11() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    assert_eq!(db.schema_version().await.unwrap(), 11);
+    assert_eq!(app_schema_version(), 11);
+    db.close().await;
+}

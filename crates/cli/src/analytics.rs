@@ -38,7 +38,7 @@ fn median(timing: &Timing) -> String {
     };
     let n = timing.responses_counted;
     format!(
-        "{days:.1} (from {n} response{})",
+        "{days:.1} days (from {n} response{})",
         if n == 1 { "" } else { "s" }
     )
 }
@@ -112,10 +112,10 @@ mod tests {
         let text = text(&report(Some(0.5), Some(3.5), 2));
         assert!(text.starts_with("As of 2026-11-01T10:00:00.000Z"), "{text}");
         assert!(
-            text.contains("Median days to a response: 3.5 (from 2 responses)"),
+            text.contains("Median days to a response: 3.5 days (from 2 responses)"),
             "{text}"
         );
         let one = super::text(&report(None, Some(1.0), 1));
-        assert!(one.contains("1.0 (from 1 response)"), "{one}");
+        assert!(one.contains("1.0 days (from 1 response)"), "{one}");
     }
 }

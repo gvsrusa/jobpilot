@@ -28,6 +28,29 @@ Every vendor quote and verdict in this register stays as the record of what vend
 
 Other decisions recorded here: D3 accepts unsigned 0.x installers. D5 accepts the recovery-key file as the one exception to "secrets never reach exports". D6 chooses field-level AES-GCM with the key in the OS keychain.
 
+### Owner decision 2026-11-01: Claude Code apply mode (Release 0.6)
+
+Recorded 2026-11-01, for the Release 0.6 plan. **Planned, not built.** Nothing in 0.3 implements it, and no code path can reach a site under it.
+
+The owner decided that Release 0.6 adds a fourth mode, a **Claude Code apply mode**. The app starts the owner's own `claude` in its terminal panel with Playwright MCP and a visible browser. It works on **all sites**, including Indeed, LinkedIn, and Workday. Once the owner starts a run, it **submits applications with no per-application check**. It runs only on the owner's own accounts.
+
+| Item | Product behaviour (owner decision) |
+|---|---|
+| Site rows `blocked` and `unknown` (Indeed `blocked`; LinkedIn, Workday, and the rest `unknown`) | **Overridden for this mode only.** The rows stay as the record of what each vendor says. Manual, Copilot, and Autonomous still follow them. |
+| Decision D2 (Copilot only where "no clause found"; `blocked` rows stay blocked) | **Overridden for this mode only.** D2 is unchanged for every other mode. |
+| Submission | No per-application confirmation once the owner has started a run. |
+| Scope | The owner's own accounts. Not offered as a feature for anyone else. |
+
+What stays in force, with no setting that turns it off:
+
+- Only approved answers and profile facts are used. Nothing is invented, and nothing infers work authorization (FR-4.10).
+- Browser tools only. The session may reach no other file than the resume and letter chosen for that application.
+- The session stops for CAPTCHA, MFA, identity checks, and legal declarations, and there is no bypass. A person ends each of those pauses (FR-9.16 to FR-9.21).
+- Every application is logged and tracked (audit rows, execution logs, a status event).
+- Emergency pause stops the session.
+
+**Stated risk, accepted by the owner:** a site may restrict or ban the account that is used. Indeed's terms bar automated submission in a clause quoted below, LinkedIn's User Agreement was not read (only an unverified excerpt against bots is recorded), and Workday quotes a clause that may reach its sites. This register keeps those verdicts as the record. The owner accepts the account risk, as for the AI subscription rows above. The Claude Code terms for an app-driven `claude` session are the same decision the owner already made under D1.
+
 The Verdict and Consequence columns in the AI sections below describe what the vendors say. They are not changed, and the written questions stay open as optional follow-up.
 
 ## How to read this register
@@ -195,6 +218,7 @@ Re-evaluated with every verdict above and the [owner decisions](#owner-decisions
 | FR-5.10 LinkedIn | Met through the user-assisted path. | User-assisted import. |
 | FR-9.3 Copilot mode | No site has an `allowed` Copilot row. Greenhouse, Lever, Ashby, and Workday are `unknown`; Indeed is `blocked`; LinkedIn is `unknown`. | Per D2: Copilot runs on Greenhouse, Lever, and Ashby hosted forms, recorded as "no clause found". Workday, Indeed, and LinkedIn stay refused. Manual elsewhere. |
 | FR-9.4 Autonomous mode | No eligible connector. | Default off. Pauses for CAPTCHA, MFA, identity verification, and legal declarations always apply. |
+| Claude Code apply mode (owner decision 2026-11-01, planned for 0.6, not built) | Indeed `blocked`; LinkedIn, Workday, and other sites `unknown`. | Overridden for this mode only, on the owner's own accounts, with no per-application check. CAPTCHA, MFA, identity, and legal pauses, approved-facts-only, browser-only tools, logging, and emergency pause stay. Risk: account restriction or ban. |
 | Milestones 0.4 API-provider exit test | Named Google and the other providers as a fixed list. | Names Claude Code headless and terminal and the direct API providers, per D1 and D4. |
 | Milestones 0.5 read-only connector exit test | Could not pass for FR-5.2, 5.4, 5.7, 5.8, or 5.9. | Now conditional. Three connectors today. |
 | Milestones 0.6 Manual and Copilot exit test | Could not pass on any real site for Copilot. | Passes on Greenhouse, Lever, and Ashby fixtures under D2; other sites refused. |

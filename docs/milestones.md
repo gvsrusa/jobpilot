@@ -1,6 +1,6 @@
 # JobPilot AI: Milestone Plan
 
-Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) and [PRD](prd.md). Requirement IDs are `FR-<section>.<n>` from the PRD. Releases 0.1 and 0.2 are built; 0.3 onward are plans.
+Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) and [PRD](prd.md). Requirement IDs are `FR-<section>.<n>` from the PRD. Releases 0.1 to 0.3 are built; 0.4 onward are plans.
 
 ## Process
 
@@ -94,7 +94,7 @@ Exit tests not proven end to end: "Ollama discovery ... work against a local mod
 
 ## Release 0.3: Career memory and application tracking
 
-Scope: career memory, application tracking, deterministic workflow runner, execution logs, emergency pause.
+Scope: career memory, application tracking, deterministic workflow runner, execution logs, emergency pause. **Built.** The gate record follows the exit tests.
 
 Requirements: FR-2.12, FR-8.1 to FR-8.8, FR-10.9 to FR-10.12, FR-11.3, FR-11.4, FR-11.5, FR-11.7, FR-11.9, FR-11.10 to FR-11.16, FR-12.8.
 
@@ -108,6 +108,24 @@ Exit tests:
 - CLI memory search, application tracking, analytics, and agent monitoring commands call the same services as the GUI.
 
 Gates: all five apply. Build includes the workflow runner; migrations add memory, tracking, and execution-log tables and upgrade a 0.2 database; Windows and macOS means pause and cancellation work on both.
+### 0.3 gate record
+
+Recorded on 2026-11-01 at the 0.3 candidate. Details and the full lists are in [release 0.3.0](releases/0.3.0.md). Rows marked Task 11 are filled by the controller after a real run on a temporary root.
+
+| Gate | Result |
+|---|---|
+| 1. Build | macOS arm64: `pnpm --filter desktop sidecar` and `pnpm tauri build --no-bundle` built `target/release/jobpilot-desktop` at v0.3.0 (exit 0). Launching that app on a temporary root: _not yet run (Task 11)_. Windows and x86_64 builds exist only as CI runs, and none has run at the 0.3 head; Windows was type-checked only. |
+| 2. Tests | macOS, local: `cargo test --workspace` 923 passed, 0 failed, 86 ignored; `pnpm test` 189 passed; `pnpm typecheck`, `cargo fmt --check`, and `cargo clippy --workspace --all-targets -- -D warnings` clean. Keychain suites (`--ignored --test-threads=1`, `JOBPILOT_SECRET_SERVICE=jobpilot-test`, skipping `real_claude` and `make_fixtures`): 84 passed, 0 failed. CI at the 0.3 head: none (Actions minutes are out; `scripts/ci-local.sh` is the gate). |
+| 3. Migrations | Fresh database: `schema_version` 11 (`a_fresh_database_is_schema_11`). A schema 5 (0.2) database with a document, profile, knowledge item, job text, and draft opens at 11, writes `pre-migrate-5-*`, keeps every row, and leaves the new tables empty (`a_0_2_database_upgrades_to_0_3`). A database made by the real 0.2 CLI, opened by the 0.3 binary: _not yet run (Task 11)_. |
+| 4. Windows and macOS | Windows: `x86_64-pc-windows-gnu` clippy clean, type-check only. Nothing at 0.3 linked or ran on Windows. ConPTY for the new commands, the native menu, and native dialogs were never run on Windows. The pause menu item and shortcut on macOS: _not yet run by a person (Task 11)_. |
+| 5. Docs and risks | Updated: wireframes (screens 16 to 18), agents, architecture, database schema, AI providers, threat model, development guide, README, changelog, and the release notes. Risks are in the release notes. |
+
+Exit tests not proven end to end:
+- "Emergency pause stops every running workflow" is proven in core and the adapter by tests. The native menu item and the shortcut were not driven by a person unless the Task 11 row says so. `Cmd+Shift+H` may not fire while the web process hangs (`wry` 0.57.1); the menu and `jobpilot pause set` are the reliable paths.
+- "Question and answer banks support semantic retrieval" ran against a fake Ollama server. No real embedding model was installed.
+- "Pause and cancellation work on both" systems: Windows ran nothing at 0.3.
+- Sensitive-answer confirmation through the native dialog was not driven by a person unless the Task 11 row says so.
+
 ## Release 0.4: External AI backends
 
 Scope: optional CLI adapters, API providers, consent UI extended to them. Claude Code (D1) shipped in 0.2. Per the owner's decisions of 2026-11-01: optional Gemini CLI and Codex CLI adapters on whatever sign-in the installed CLI supports; direct API providers under standard BYOK (D4). Security controls stay: `no_tools` for job and company text, and consent records.
@@ -140,7 +158,9 @@ Exit tests:
 Gates: all five apply. Build includes the connector SDK; migrations add jobs, companies, and match tables; Windows and macOS means connector tests and the job CLI commands pass on both.
 ## Release 0.6: Browser automation
 
-Scope: Playwright runtime, permissions engine, Manual and Copilot modes. Per D2, Copilot runs on a site where no clause forbids it, recorded as "no clause found" (Greenhouse, Lever, Ashby); a site row that is `blocked` stays blocked. Autonomous mode is default-off and ships only for connectors that pass policy review.
+Scope: Playwright runtime, permissions engine, Manual and Copilot modes, and the Claude Code apply mode (owner decision of 2026-11-01, below). Per D2, Copilot runs on a site where no clause forbids it, recorded as "no clause found" (Greenhouse, Lever, Ashby); a site row that is `blocked` stays blocked. Autonomous mode is default-off and ships only for connectors that pass policy review.
+
+**Owner decision of 2026-11-01: Claude Code apply mode.** Release 0.6 also plans a mode in which the app starts the owner's own `claude` in its terminal panel with Playwright MCP and a visible browser, on all sites including Indeed, LinkedIn, and Workday. It overrides the `blocked` and `unknown` site rows and decision D2 for this mode only, on the owner's own accounts, and submits with no per-application check once the owner starts a run. These stay: only approved answers and profile facts; browser tools only, with files limited to the chosen resume and letter; stops for CAPTCHA, MFA, identity checks, and legal declarations, with no bypass; every application logged and tracked; and emergency pause stops the session. Stated risk: the site may restrict or ban the account. It is recorded in the [policy register](policy-register.md#owner-decision-2026-11-01-claude-code-apply-mode-release-06). **Planned, not built.** Its exit tests are written in the 0.6 plan.
 
 Requirements: FR-3.22, FR-9.1 to FR-9.21, FR-11.6, FR-12.4.
 

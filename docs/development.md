@@ -38,6 +38,14 @@ Tests that touch the real OS keychain are `#[ignore]`d. Nothing else does: `Db::
 JOBPILOT_SECRET_SERVICE=jobpilot-test cargo test --workspace -- --ignored --skip real_claude --skip make_fixtures
 ```
 
+The ignored tests live in `crates/core/tests/` (`crypto`, `recovery`, `profile`, `knowledge`, `memory`, `memory_use`, `drafts`, `backup`, `transfer`, `secrets_store`, `secrets_locked`, `embed`, `parse`, `injection`, `claude_code`), in `crates/cli/tests/cli.rs`, and in `apps/desktop/src-tauri/src/commands.rs`. Run them one process at a time, with `--test-threads=1`, on a Mac with the login keychain unlocked, because a second process, or a locked keychain, can hang or show a system dialog:
+
+```bash
+JOBPILOT_SECRET_SERVICE=jobpilot-test cargo test --workspace -- --ignored --test-threads=1 --skip real_claude --skip make_fixtures
+```
+
+Release 0.3 adds sealed answers (`memory_answers.body_enc`), so `memory`, `memory_use`, and `crypto` hold the tests that touch the keychain for them. Read paths never ask it: `plain_work_makes_no_keychain_call` in `crypto.rs` is the one test that may read the call count.
+
 `real_claude_has_no_tools_smoke` and `make_fixtures` are also ignored, and are skipped by name, so CI never calls the real `claude` or rewrites the committed resume fixtures. `locked_keychain_is_unavailable_not_missing` swaps the default macOS keychain for a throwaway one, so it runs only with `JOBPILOT_ALLOW_KEYCHAIN_SWAP=1` and is not run in CI.
 
 ### Claude Code
@@ -84,7 +92,7 @@ JOBPILOT_HOME=/tmp/jobpilot-dev cargo run -p jobpilot-cli -- status
 
 Migrations live in `crates/core/migrations/` and run through `sqlx::migrate!`.
 
-1. Add the next file, for example `0006_<name>.sql` (the last shipped is `0005`). Number sequentially.
+1. Add the next file, for example `0006_<name>.sql` (the last shipped is `0011`, schema version 11). Number sequentially.
 2. Never edit a migration that has shipped. SQLx stores a hash of each applied file; a change breaks every existing database. Fix forward with a new file.
 3. Keep line endings LF. `.gitattributes` forces `*.sql text eol=lf`, since CRLF changes the hash.
 4. Use runtime `sqlx::query`, not `query!`, so builds need no `DATABASE_URL` or `sqlx-cli`.

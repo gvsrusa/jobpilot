@@ -64,15 +64,23 @@ struct Figures {
 }
 
 pub(crate) async fn volume(db: &Db) -> Result<Volume> {
+    volume_at(db, "now").await
+}
+
+/// `volume` as of `now`, a SQLite time value in UTC. The window follows the local calendar,
+/// so an `applied_on` of today east of UTC still counts. A test passes a fixed moment.
+#[doc(hidden)]
+pub async fn volume_at(db: &Db, now: &str) -> Result<Volume> {
     let rows: Vec<(String, i64)> =
         sqlx::query_as("SELECT status, count(*) FROM applications GROUP BY status")
             .fetch_all(&db.pool)
             .await?;
     let (recent,): (i64,) = sqlx::query_as(
         "SELECT count(*) FROM applications \
-         WHERE applied_on IS NOT NULL AND applied_on >= date('now', '-30 days') \
-         AND applied_on <= date('now')",
+         WHERE applied_on IS NOT NULL AND applied_on >= date(?1, 'localtime', '-30 days') \
+         AND applied_on <= date(?1, 'localtime')",
     )
+    .bind(now)
     .fetch_one(&db.pool)
     .await?;
     Ok(Volume {

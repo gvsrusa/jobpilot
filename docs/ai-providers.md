@@ -118,11 +118,13 @@ The names below are the Rust names in `crates/core/src/ai/`. The vocabulary abov
 | Contract term | 0.2 code |
 |---|---|
 | `TaskRouter` | `Router` (`router.rs`). `Router::from_settings(&Db)` builds it from the user's order and enabled flags; `run(db, task, prompt, cancel)` and `embed(...)` take the `Db`, so the router holds none. |
-| Task types | `TaskType::{ParseJob, DraftResume, DraftCoverLetter, Embed}` with one `TaskSpec` each (`mod.rs`). `semantic_match`, `map_form_field`, and `classify_answer` have no 0.2 task. |
+| Task types | `TaskType::{ParseJob, DraftResume, DraftCoverLetter, ClassifyAnswer, Embed}` with one `TaskSpec` each (`mod.rs`). `ClassifyAnswer` arrived in 0.3. `semantic_match` and `map_form_field` have no task yet. |
 | Provider | trait `Provider` (`declaration`, `available`, `complete`, `embed`). Implementations: `Ollama`, `ClaudeCode`, `NoAi`. `ProviderId` has exactly those three variants, so a provider the owner decisions leave out has no way in. |
 | Results | `Outcome::{Ok, ManualRequired, Cancelled, Failed}`. |
 | Cancellation | one `CancellationToken` type, polled every 100 ms. Revoking consent, Ctrl-C, and app exit fire it, and a dropped attempt kills its child. |
 | Consent key | `ProviderId::ClaudeCode` displays as `claude_code/cli_login`, and that text is the `consent.provider` value. |
+
+**`classify_answer` as built in 0.3.** The task sees a question's text only, never an answer, declares `job_text` so it needs a `no_tools` provider and consent, and may only raise a class: a lower class from the model is ignored, and a question whose class a person set (`class_source = user`) is skipped before any call. It is one attempt with no retry (`schemas/classify_answer.json`), and a refresh makes at most 20 calls (`CLASSIFY_BATCH`). Only a person starts a refresh, and the GUI and CLI say how many Claude calls it will make first. Two reasons were added to the allow-list that the log and the messages use: `no_model_set` (Ollama is enabled with no drafting model chosen) and `model_not_installed` (the chosen model is not among the installed ones). The router also refuses every task while the emergency pause is on, between attempts too.
 
 **Ollama local-model detection.** A model counts as local only when its `/api/tags` row has no `remote_model` and no `remote_host` (absent or empty), `size > 0`, and a name that neither ends in `:cloud` nor contains `-cloud`. Any other row is remote: hidden from the screen and ineligible in routing check 2. The same rule gates the embedding model, so a `:cloud` embedding model cannot pass as local. A fixture test pins both cases. Evidence: https://docs.ollama.com/api/tags and https://docs.ollama.com/cloud, read 2026-11-01. Re-check at each release.
 

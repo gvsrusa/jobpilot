@@ -351,7 +351,7 @@ pub async fn set_status(
         "UPDATE applications SET status = ?1, updated_at = ",
         now!(),
         ", applied_on = CASE WHEN ?1 = 'applied' AND applied_on IS NULL \
-         THEN coalesce(?2, strftime('%Y-%m-%d', 'now')) ELSE applied_on END \
+         THEN coalesce(?2, date('now', 'localtime')) ELSE applied_on END \
          WHERE id = ?3 RETURNING ",
         columns!()
     ))

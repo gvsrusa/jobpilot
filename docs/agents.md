@@ -1,6 +1,6 @@
 # JobPilot AI: Agent Workflow Specification
 
-Status: draft for owner approval. Date: 2026-11-01. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) sections 9 and 11, [PRD](prd.md), [milestones](milestones.md), [AI providers](ai-providers.md), [policy register](policy-register.md), and [threat model](security/threat-model.md). Requirement IDs (`FR-<section>.<n>`) come from the PRD. Nothing here is implemented yet. Task type names other than `parse_job`, `semantic_match`, and `draft_cover_letter` are proposals. All timeout values are proposals for the owner to confirm, except the per-attempt defaults, which come from [AI providers](ai-providers.md#task-definition) and are also proposed there.
+Status: draft for owner approval. Date: 2026-11-01. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) sections 9 and 11, [PRD](prd.md), [milestones](milestones.md), [AI providers](ai-providers.md), [policy register](policy-register.md), and [threat model](security/threat-model.md). Requirement IDs (`FR-<section>.<n>`) come from the PRD. **Release 0.3 is built:** the workflow runner, the resume, cover letter, career memory, tracking, and analytics agents, execution logs, and emergency pause. The discovery, matching, and research agents (0.5) and the browser application agent (0.6) are not built, and what this document says about them is a plan. Task type names other than `parse_job`, `draft_resume`, `draft_cover_letter`, and `classify_answer` are proposals. All timeout values are proposals for the owner to confirm, except the per-attempt defaults, which come from [AI providers](ai-providers.md#task-definition) and are also proposed there.
 
 ## 1. What an agent is
 
@@ -78,21 +78,33 @@ Notes that bind the table:
 - **Matching.** Stated authorization values are compared deterministically and only per country. A missing value is reported as "not stated", never as eligible or ineligible (FR-4.10).
 - **Resume and cover letter.** Only user-entered or user-approved material counts as evidence. A draft does not become evidence by being saved. Neither agent holds `read:sensitive`. `read:resume_text` withholds user-marked documents and lines. Unmarked text can still state visa status, citizenship, or salary ([threat model](security/threat-model.md#11-residual-risks)).
 - **Career memory.** Only the user approves an answer or lowers a class (FR-8.4). Sensitive answers are not embedded. Work-authorization answers are found by exact country key, not by similarity.
+  - As built in 0.3, `classify_answer` is one attempt per question, no retry, and at most 20 questions (`CLASSIFY_BATCH`) per refresh. Only a person starts a refresh: there is no timer, no startup run, and no hook on adding a question. Before any Claude call the GUI and the CLI show how many calls the press will make. Resuming a halted refresh makes none. A refresh that finds no usable model finishes with the class the rules gave.
+  - **A person's sensitivity class is final.** `classify_answer` skips every question whose `class_source` is `user`, so a class a person set, raised or lowered, is never changed by a model. A model may still raise a class the rules or a model set. The classifier sees question text only, never an answer.
+  - A work-authorization answer is not stored in memory. It is read from the encrypted profile row for one exact country, and a country with no stated value reads "not stated".
 - **Browser application.** `map_form_field` sees form text and candidate answer ids, never answer values. The model returns an id, and Rust fills the value. This keeps Sensitive-class values out of a prompt that holds untrusted text. `classify_answer` in the career memory agent likewise sees question text only. Both tasks declare `job_text`, in every release and whatever the question's source, so stored form questions cannot escape the no-tools rule.
 - **Research.** An automated read of an arbitrary site is `unknown` in the register, so this agent reads no company site directly. FR-6.9 today means stored text, connector data, and text the user pastes. A site joins only with its own row.
 - **Every model task** carrying `job_text` or `company_text` requires a provider declaring `no_tools` ([threat model](security/threat-model.md#7-cli-adapters-and-untrusted-text)). Every task above is `reviewed` except each `map_form_field` step in an Autonomous run, which is `unreviewed`.
 
 ## 5. Automation modes
 
-The browser application agent runs in one of three modes. The mode must be earned by a register row, or under owner decision D2 for Copilot, by a row recording "no clause found". A user cannot override a site row that is `blocked`.
+The browser application agent runs in one of three modes in the 0.6 plan of record, and the owner has since added a fourth, planned mode (the last row below). The first three must be earned by a register row, or under owner decision D2 for Copilot, by a row recording "no clause found". A user cannot override a site row that is `blocked` in those three modes. The Claude Code apply mode is the owner's recorded exception, for the owner's own accounts only (see [the policy register](policy-register.md#owner-decision-2026-11-01-claude-code-apply-mode-release-06)).
 
 | Mode | Needs | Agent does | Today |
 |---|---|---|---|
-| Manual | A `user-assisted` apply row | Opens the link in the user's default browser, supplies files and text, records the outcome. No request to the site and no browser driven there. The user fills and submits. | Available on every `user-assisted` apply row in the register. |
-| Copilot | The site's own `allowed` Copilot row, or a Copilot row recording "no clause found" (D2) | Drives an isolated browser, fills, uploads, stops. The user reviews and clicks submit. A human click does not substitute for the row. Eligible on Greenhouse, Lever, and Ashby hosted forms, recorded as "no clause found". Workday (a clause may reach it) and LinkedIn (not read) stay refused, and Indeed is `blocked`. Pauses for CAPTCHA, MFA, identity verification, and legal declarations always apply. |
-| Autonomous | The site's own `allowed` row, verified connector permission, and explicit user authorization (FR-9.6) | Also submits, in one attempt. Stops at every mandatory pause. | **Default off. Zero eligible connectors.** Every hosted-form row for this step is `unknown` or `blocked`. |
+| Manual | A `user-assisted` apply row | Opens the link in the user's default browser, supplies files and text, records the outcome. No request to the site and no browser driven there. The user fills and submits. | Available on every `user-assisted` apply row in the register. Not built: 0.6. |
+| Copilot | The site's own `allowed` Copilot row, or a Copilot row recording "no clause found" (D2) | Drives an isolated browser, fills, uploads, stops. The user reviews and clicks submit. A human click does not substitute for the row. Eligible on Greenhouse, Lever, and Ashby hosted forms, recorded as "no clause found". Workday (a clause may reach it) and LinkedIn (not read) stay refused, and Indeed is `blocked`. Pauses for CAPTCHA, MFA, identity verification, and legal declarations always apply. | Not built: 0.6. |
+| Autonomous | The site's own `allowed` row, verified connector permission, and explicit user authorization (FR-9.6) | Also submits, in one attempt. Stops at every mandatory pause. | **Default off. Zero eligible connectors.** Every hosted-form row for this step is `unknown` or `blocked`. Not built: 0.6. |
+| Claude Code apply (**planned for 0.6, not built**) | The owner's own accounts, and the owner starting a run. No register row and no per-application check (owner decision of 2026-11-01). | The app starts the user's own `claude` in its terminal panel with Playwright MCP and a visible browser, on any site including Indeed, LinkedIn, and Workday, and the session submits applications without asking per application once the owner starts a run. It sees only approved answers and profile facts, uses browser tools only, and may read only the chosen resume and letter files. It stops for CAPTCHA, MFA, identity checks, and legal declarations, with no bypass. Every application is logged and tracked, and emergency pause stops the session. | **Not built.** Planned for 0.6. Risk the owner accepted: the site may restrict or ban the account. |
 
 Autonomous steps are `unreviewed`, so the router's [mode check](ai-providers.md#routing) refuses every OpenAI-origin model on any step of a submission, and any provider that cannot leave human confirmation in place. A site's row applies whichever model runs. Decision D2 (2026-11-01) keeps Autonomous default-off.
+
+**Claude Code apply mode, as recorded.** It overrides the `blocked` and `unknown` site rows and decision D2 for this mode only, and only for the owner's own accounts. It is the owner's call, made on 2026-11-01 for Release 0.6, and it does not change Manual, Copilot, or Autonomous. What stays in force in this mode:
+
+- Only approved answers and profile facts are used. Nothing is invented and nothing infers work authorization.
+- Browser tools only. The only files the session may reach are the resume and letter chosen for that application.
+- The mandatory pauses of section 6 for CAPTCHA, MFA, identity verification, and legal declarations apply, and nothing bypasses them.
+- Every application is logged and tracked, with the same audit and execution-log rules as any run.
+- Emergency pause (section 8) stops the session.
 
 ## 6. Mandatory pauses
 
@@ -161,8 +173,8 @@ stateDiagram-v2
 | Running | One step in progress under its timeout. |
 | Checkpointed | Step result stored. The run can resume from here. |
 | Retrying | Waiting to try again under the agent's retry policy. |
-| WaitingForHuman | A mandatory pause. The run timeout is stopped. |
-| Halted | Stopped by emergency pause. Stays here until a person acts. |
+| WaitingForHuman | A mandatory pause. The run timeout is stopped. **Reserved:** the state exists in the table and its `CHECK` list, but no 0.3 agent enters it. The first user is the browser agent in 0.6. |
+| Halted | Stopped by emergency pause, or `interrupted`. Stays here until a person acts. `interrupted` means the process that ran it died (the app was closed or crashed): its heartbeat went old, and any later read moves the run to `halted` with the reason `interrupted`, so a row never reads `running` forever. It does not resume on its own. |
 | Completed | Finished with validated results. |
 | ManualRequired | No path remains without a person. Matches the router's `manual_required`. |
 | Refused | A check failed. Nothing ran for that step. |
@@ -173,7 +185,7 @@ A step's model task is handled by the router, including provider fallback. A rou
 
 ### Execution logs
 
-Every state change writes an execution log row (FR-11.12): run id, agent, step, state, duration, provider if any, data categories, and outcome. Logs never contain prompts, outputs, secrets, or decrypted sensitive values. Page text and job text are also excluded. The `agent_run` table comes with the 0.3 migration ([schema](database-schema.md#4-proposed-later-entities-not-decided)). The CLI and GUI read the same rows (FR-10.12).
+Every state change writes an execution log row (FR-11.12): run id, agent, step, state, duration, provider if any, data categories, and outcome. Logs never contain prompts, outputs, secrets, or decrypted sensitive values. Page text and job text are also excluded. The `agent_run` table comes with the 0.3 migration ([schema](database-schema.md#3-release-03-tables-decided-shipped)). The CLI and GUI read the same rows (FR-10.12).
 
 Audit rows (FR-12.7) use actor `system` for a run's own actions, with the agent name in `detail`, and `gui` or `cli` for what a person does: external provider calls, submissions, emergency pause, resuming, and Autonomous authorization or revocation.
 
@@ -191,13 +203,16 @@ Cancellation (FR-11.16) takes effect at once: the in-flight router task is cance
 
 ## 8. Emergency pause
 
-Emergency pause (FR-12.8) lands in 0.3, and from 0.6 it also halts browsers.
+Emergency pause (FR-12.8) landed in 0.3, and from 0.6 it also halts browsers.
 
-- Reachable from a native menu and from the CLI, so a hung webview cannot block it. Command names are left to the 0.3 plan.
-- It cancels every in-flight task, kills child processes, closes browsers, and moves each run to Halted.
-- The flag is stored in the database, so the desktop app and CLI both see it, and it survives a restart. While set, no run starts and queued runs do not proceed.
+- **Where.** The title bar's Emergency pause button is the first tab stop on every screen. The native `Safety` menu has an Emergency pause item. The shortcut is `Ctrl+Shift+H` (`Cmd+Shift+H` on macOS), as a menu accelerator and as a capture listener in the webview. The CLI has `jobpilot pause set`, `jobpilot pause status`, and `jobpilot pause clear`.
+- **The shortcut is not the reliable path.** `wry` 0.57.1 passes `performKeyEquivalent` to the `WKWebView` first, so on macOS `Cmd+Shift+H` may not fire while the web process is hung. Clicking **Safety > Emergency pause** in the menu bar is the reliable path, and so is `jobpilot pause set` from any terminal. The same gap has not been looked for on Windows. Neither the key nor the menu was driven by a person in a real window for this release.
+- **What it does.** It cancels every in-flight task, kills child processes, and moves each active run to Halted. Each running process polls the stored flag every 250 ms, so a pause set from the CLI stops a run the desktop started, and the reverse. A `jobpilot` command run inside the terminal panel is stopped the same way. A `claude` session the user started in the panel is the user's own and is not stopped (M-14). From 0.6 it also closes browsers.
+- **The flag is stored in the database**, so the desktop app and CLI both see it, and it survives a restart. While set, no run starts, no model call or embedding starts, a model pull is refused, and queued runs do not proceed. A run that is started returns `paused` and writes no row.
+- **Application status edits are refused with `paused`**, because a status change runs through the tracking agent. Editing fields and notes stays open. Cancelling a run stays open.
+- **A restore keeps the flag.** A backup never clears the pause, and a restore with an unreadable pause state comes up paused, because failing closed costs one click.
 - Runs never resume on their own. The user clears the flag, then resumes or cancels each run. A resumed run passes through Checking. A browser run reopens the form, and the user reviews again.
-- Setting and clearing the pause each write an audit row.
+- Setting and clearing the pause each write an audit row (`emergency_pause_set`, `emergency_pause_cleared`), under `gui` or `cli`. Clearing from the GUI asks through a native dialog, and `pause clear` is refused inside the terminal panel for the same reason. The `system` actor cannot set or clear.
 
 ## 9. Spec section 11 coverage
 
