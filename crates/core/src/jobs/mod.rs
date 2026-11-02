@@ -551,8 +551,8 @@ pub async fn upsert_posting(
     // Another handle can store the same new posting between this read and the insert. The
     // loser then finds it on the second pass and takes the path for a stored one.
     for _ in 0..2 {
-        let existing: Option<(String, String)> = sqlx::query_as(
-            "SELECT j.id, t.raw FROM jobs j JOIN job_texts t ON t.id = j.job_text_id \
+        let existing: Option<(String, String, String, String)> = sqlx::query_as(
+            "SELECT j.id, t.raw, j.title, t.normalized FROM jobs j JOIN job_texts t ON t.id = j.job_text_id \
              WHERE j.connector = ? AND j.board = ? AND j.external_id = ?",
         )
         .bind(decl.name)
@@ -560,14 +560,17 @@ pub async fn upsert_posting(
         .bind(&posting.external_id)
         .fetch_optional(&db.pool)
         .await?;
-        if let Some((id, raw)) = &existing
+        if let Some((id, raw, title, normalized)) = &existing
             && *raw == posting.raw
         {
+            // A row the connector filled is read again, so one stored with team tags as skills
+            // is mended. What a person, a model, or the rules set stays.
             sqlx::query(concat!(
                 "UPDATE jobs SET last_seen_at = ",
                 now!(),
-                " WHERE id = ?"
+                ", skills = CASE WHEN fields_by = 'connector' THEN ? ELSE skills END WHERE id = ?"
             ))
+            .bind(skills_of(title, normalized, posting)?)
             .bind(id)
             .execute(&db.pool)
             .await?;
@@ -575,7 +578,7 @@ pub async fn upsert_posting(
         }
         let text = knowledge::import_job_text(db, &posting.title, &posting.raw).await?;
         let written = match &existing {
-            Some((id, _)) => revise(db, id, &text, posting)
+            Some((id, ..)) => revise(db, id, &text, posting)
                 .await
                 .map(|()| Some(Upserted::Updated(id.clone()))),
             None => insert_posting(db, decl, board, source_id, &text, posting)
@@ -620,8 +623,15 @@ async fn company_id(tx: &mut sqlx::SqliteConnection, name: &str) -> Result<Optio
     ))
 }
 
-fn skills_of(posting: &Posting) -> Result<String> {
-    serde_json::to_string(&posting.tags).map_err(|error| bad(&error.to_string()))
+/// The skills a posting names, read as a pasted job is: the title and text, and the tags only
+/// where they are in the vocabulary. A team or department tag is not a skill.
+fn skills_of(title: &str, text: &str, posting: &Posting) -> Result<String> {
+    let found = rules::skills_in(
+        &format!("{title}\n{text}"),
+        &posting.tags,
+        &rules::vocabulary(&[]),
+    );
+    serde_json::to_string(&found).map_err(|error| bad(&error.to_string()))
 }
 
 async fn insert_posting(
@@ -667,7 +677,7 @@ async fn insert_posting(
     .bind(pay.and_then(|pay| pay.max))
     .bind(pay.and_then(|pay| pay.currency.as_deref()))
     .bind(pay.and_then(|pay| pay.period).map(PayPeriod::column))
-    .bind(skills_of(posting)?)
+    .bind(skills_of(&text.title, &text.normalized, posting)?)
     .fetch_optional(&mut *tx)
     .await?;
     let Some(seq) = seq else {
@@ -746,7 +756,7 @@ async fn revise(db: &Db, id: &str, text: &knowledge::JobText, posting: &Posting)
     .bind(pay.and_then(|pay| pay.max))
     .bind(pay.and_then(|pay| pay.currency.as_deref()))
     .bind(pay.and_then(|pay| pay.period).map(PayPeriod::column))
-    .bind(skills_of(posting)?)
+    .bind(skills_of(&text.title, &text.normalized, posting)?)
     .bind(id)
     .fetch_one(&mut *tx)
     .await?;

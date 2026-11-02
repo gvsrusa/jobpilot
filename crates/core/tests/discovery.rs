@@ -1175,3 +1175,99 @@ async fn a_source_removed_mid_run_is_skipped() {
     assert_eq!(report.sources.len(), 1);
     assert_eq!(report.sources[0].added, 102);
 }
+
+/// A posting as each connector's own parser reads it: the team is "Engineering" and the text
+/// names Rust.
+fn team_postings() -> Vec<(&'static str, Vec<jobpilot_core::connectors::Posting>)> {
+    use jobpilot_core::connectors::{Ashby, Connector, Lever, Target};
+    let target = Target {
+        name: "acme".into(),
+    };
+    let lever = json!([{
+        "id": "l1", "text": "Platform Engineer", "country": "US", "workplaceType": "remote",
+        "categories": {"location": "Anywhere", "team": "Engineering"},
+        "description": "<p>You will write Rust services.</p>",
+        "hostedUrl": "https://jobs.lever.co/acme/l1",
+    }]);
+    let ashby = json!({"jobs": [{
+        "title": "Platform Engineer", "location": "Anywhere", "isListed": true,
+        "workplaceType": "Remote", "team": "EMEA Engineering", "department": "Engineering",
+        "jobUrl": "https://jobs.ashbyhq.com/acme/a1",
+        "descriptionHtml": "<p>You will write Rust services.</p>",
+    }]});
+    vec![
+        (
+            "lever",
+            Lever
+                .parse(&target, lever.to_string().as_bytes())
+                .unwrap()
+                .postings,
+        ),
+        (
+            "ashby",
+            Ashby
+                .parse(&target, ashby.to_string().as_bytes())
+                .unwrap()
+                .postings,
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_team_tag_is_not_a_skill_and_the_text_is_read() {
+    for (name, postings) in team_postings() {
+        let (_t, db) = open().await;
+        let connector = jobpilot_core::connectors::find(name).unwrap();
+        let posting = &postings[0];
+        assert!(!posting.tags.is_empty(), "{name} keeps its tags");
+        let up = jobpilot_core::jobs::upsert_posting(&db, connector.decl(), "acme", None, posting)
+            .await
+            .unwrap();
+        let Upserted::Added(id) = up else {
+            panic!("{up:?}")
+        };
+        let job = jobpilot_core::jobs::get(&db, &id).await.unwrap();
+        assert_eq!(job.skills, ["Rust"], "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_stored_connector_row_with_team_skills_is_read_again_on_the_next_fetch() {
+    let (_t, db) = open().await;
+    let (name, postings) = team_postings().remove(1);
+    let connector = jobpilot_core::connectors::find(name).unwrap();
+    let decl = connector.decl();
+    let up = jobpilot_core::jobs::upsert_posting(&db, decl, "acme", None, &postings[0])
+        .await
+        .unwrap();
+    let Upserted::Added(id) = up else {
+        panic!("{up:?}")
+    };
+    sqlx::query("UPDATE jobs SET skills = ? WHERE id = ?")
+        .bind(r#"["EMEA Engineering","Engineering"]"#)
+        .bind(&id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let again = jobpilot_core::jobs::upsert_posting(&db, decl, "acme", None, &postings[0])
+        .await
+        .unwrap();
+    assert!(matches!(again, Upserted::Unchanged(_)));
+    assert_eq!(
+        jobpilot_core::jobs::get(&db, &id).await.unwrap().skills,
+        ["Rust"]
+    );
+    // What a person set is kept.
+    sqlx::query("UPDATE jobs SET skills = '[\"Mine\"]', fields_by = 'user' WHERE id = ?")
+        .bind(&id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    jobpilot_core::jobs::upsert_posting(&db, decl, "acme", None, &postings[0])
+        .await
+        .unwrap();
+    assert_eq!(
+        jobpilot_core::jobs::get(&db, &id).await.unwrap().skills,
+        ["Mine"]
+    );
+}
