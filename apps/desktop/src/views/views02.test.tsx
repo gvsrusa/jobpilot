@@ -1082,12 +1082,40 @@ describe("ai", () => {
     expect(b.calls.find((c) => c.cmd === "ai_set_endpoint")?.args).toEqual({ url: "" });
   });
 
+  it("a_suspended_endpoint_says_its_address_changed", async () => {
+    backend({
+      ai_status: () =>
+        aiWith({ external: [external({ ...ENDPOINT, reason: null, available: true, suspended: true, path: "http://127.0.0.1:1/v1" })] }),
+    });
+    const { user } = renderApp();
+    const row = await endpointRow(user);
+    expect(row.getByRole("alert")).toHaveTextContent(/endpoint address changed/);
+    expect(row.getByRole("alert")).not.toHaveTextContent("Suspended: this consent was given before the terms");
+  });
+
+  it("the_consent_dialog_names_the_endpoint_address", async () => {
+    backend({
+      ai_status: () => aiWith({ external: [external({ ...ENDPOINT })] }),
+      ai_sharing: () => sharing({ name: "endpoint", label: "Compatible endpoint", key: "endpoint/loopback", path: "http://127.0.0.1:1/v1" }),
+    });
+    const { user } = renderApp();
+    const dialog = await reviewOf(user, "Compatible endpoint");
+    expect(dialog.getByText("Address: http://127.0.0.1:1/v1")).toBeInTheDocument();
+    expect(dialog.queryByText(/^Program:/)).toBeNull();
+  });
+
   it("the_api_failure_reasons_read_in_plain_words", () => {
     const said = (word: string) => explainReason({ code: "manual_required", message: `this needs manual work: ${word}` });
     expect(said("no_key")).toMatch(/No key is stored/);
     expect(said("no_api_model")).toMatch(/No model is chosen/);
     expect(said("no_endpoint")).toMatch(/No endpoint address/);
     expect(said("origin_refused")).toMatch(/not eligible through OpenRouter/);
+    expect(said("model_has_tools")).toMatch(/searches by itself/);
+    expect(said("model_has_tools")).toMatch(/:online/);
+    expect(said("model_not_found")).toMatch(/does not know that model id/);
+    expect(said("model_not_found")).toMatch(/Model id/);
+    expect(said("model_refused")).toMatch(/declined this task/);
+    expect(said("endpoint_changed")).toMatch(/endpoint address changed/);
   });
 
   it("consent_focus_starts_on_cancel", async () => {

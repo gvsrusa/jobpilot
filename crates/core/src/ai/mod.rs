@@ -56,6 +56,8 @@ pub const RUN_REASONS: &[&str] = &[
     "consent_suspended",
     "cli_too_old",
     "origin_refused",
+    "model_has_tools",
+    "endpoint_changed",
 ];
 
 /// Absent capabilities are false: a declaration lists only what the provider proves.
@@ -374,6 +376,7 @@ pub struct Sharing {
     pub label: String,
     pub key: String,
     pub destination: String,
+    /// The program a CLI runs, or the address the endpoint sends to.
     pub path: Option<String>,
     pub tasks: Vec<TaskSharing>,
     pub data_use: String,
@@ -417,6 +420,7 @@ pub async fn sharing(db: &Db, name: &str) -> Result<Sharing> {
             .await
             .ok()
             .map(|claude| claude.path().display().to_string()),
+        ProviderId::Endpoint => api::endpoint_address(db).await?,
         _ => None,
     };
     Ok(Sharing {

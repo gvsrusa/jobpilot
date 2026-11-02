@@ -356,10 +356,11 @@ impl Provider for Ollama {
     }
 }
 
-/// A cloud model is named `<name>:cloud` (docs.ollama.com/cloud); `-cloud` covers variants.
+/// A cloud model is named `<name>:cloud` (docs.ollama.com/cloud), and a tag can follow that;
+/// `-cloud` covers variants.
 pub(crate) fn name_is_local(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    !name.is_empty() && !name.ends_with(":cloud") && !name.contains("-cloud")
+    !name.is_empty() && !name.contains(":cloud") && !name.contains("-cloud")
 }
 
 /// `gemma3` means `gemma3:latest`, as in Ollama.

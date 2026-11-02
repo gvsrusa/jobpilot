@@ -29,7 +29,7 @@ import {
   type JobText,
   type Template,
 } from "@/lib/ipc";
-import { explainReason, SUSPENDED } from "@/lib/reasons";
+import { ENDPOINT_SUSPENDED, explainReason, SUSPENDED } from "@/lib/reasons";
 
 /** A generation backend is one that can answer now: Ollama running, or an external provider that is on, available, consented, and able to carry a posting. */
 function backendEnabled(ai: AiStatus | undefined): boolean {
@@ -40,6 +40,10 @@ function backendEnabled(ai: AiStatus | undefined): boolean {
     (p) => ai.enabled[p.name] && p.available && p.consent !== null && p.runs_job_text,
   );
   return ollama || claude || external;
+}
+
+function endpointSuspended(ai: AiStatus | undefined): boolean {
+  return ai?.external.some((p) => p.kind === "endpoint" && ai.enabled[p.name] && p.suspended) ?? false;
 }
 
 /** Nothing can draft, and a provider that is on is only waiting for a review. */
@@ -367,7 +371,11 @@ export function ResumesView() {
         </>
       )}
 
-      {suspendedOnly(ai.data) && <p role="alert" className="text-sm">{SUSPENDED} Open the AI screen to review it.</p>}
+      {suspendedOnly(ai.data) && (
+        <p role="alert" className="text-sm">
+          {endpointSuspended(ai.data) ? ENDPOINT_SUSPENDED : SUSPENDED} Open the AI screen to review it.
+        </p>
+      )}
 
       {drafts.isSuccess && !ai.isPending && !current && (
         <section className="grid gap-3 rounded-lg border p-4">

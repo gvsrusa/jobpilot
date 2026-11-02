@@ -31,6 +31,10 @@ const RATE_LIMITED: &str = "rate_limited";
 const AUTH_FAILED: &str = "auth_failed";
 const NO_KEY: &str = "no_key";
 const NO_API_MODEL: &str = "no_api_model";
+const MODEL_NOT_FOUND: &str = "model_not_found";
+const MODEL_REFUSED: &str = "model_refused";
+const MODEL_HAS_TOOLS: &str = "model_has_tools";
+const ENDPOINT_CHANGED: &str = "endpoint_changed";
 const ORIGIN_REFUSED: &str = "origin_refused";
 const QUOTA_EXHAUSTED: &str = "quota_exhausted";
 const PROMPT_TOO_LARGE: &str = "prompt_too_large";
@@ -416,6 +420,9 @@ impl Router {
                     QUOTA_EXHAUSTED,
                     NO_KEY,
                     ORIGIN_REFUSED,
+                    MODEL_HAS_TOOLS,
+                    MODEL_NOT_FOUND,
+                    MODEL_REFUSED,
                 ]
                 .contains(&reason) =>
                 {
@@ -448,6 +455,7 @@ fn after_skip<T>(task: &Task<'_>, declaration: &Declaration, reason: &str) -> St
         PROMPT_TOO_LARGE => Step::Manual(PROMPT_TOO_LARGE),
         CONSENT if unfit(task, declaration).is_none() => Step::Manual(CONSENT_NEEDED),
         CONSENT_SUSPENDED if unfit(task, declaration).is_none() => Step::Manual(CONSENT_SUSPENDED),
+        ENDPOINT_CHANGED if unfit(task, declaration).is_none() => Step::Manual(ENDPOINT_CHANGED),
         _ => Step::Next,
     }
 }
@@ -458,7 +466,7 @@ fn weight(reason: &str) -> u8 {
     match reason {
         PROVIDER_UNAVAILABLE | NO_MODEL_SET | MODEL_NOT_INSTALLED | NO_KEY | NO_API_MODEL
         | "cli_too_old" => 0,
-        CONSENT_NEEDED | CONSENT_SUSPENDED => 1,
+        CONSENT_NEEDED | CONSENT_SUSPENDED | ENDPOINT_CHANGED => 1,
         _ => 2,
     }
 }
@@ -521,6 +529,10 @@ async fn ineligible(task: &Task<'_>, declaration: &Declaration) -> Result<Option
     if is_external(declaration) {
         match consent::state(task.db, &declaration.id.to_string()).await? {
             ConsentState::None => return Ok(Some(CONSENT.into())),
+            // The endpoint's record is bound to its address, the likelier change by far.
+            ConsentState::Suspended(_) if declaration.id == ProviderId::Endpoint => {
+                return Ok(Some(ENDPOINT_CHANGED.into()));
+            }
             ConsentState::Suspended(_) => return Ok(Some(CONSENT_SUSPENDED.into())),
             ConsentState::Active(granted) => {
                 if !task.spec.categories.iter().all(|c| granted.contains(c)) {

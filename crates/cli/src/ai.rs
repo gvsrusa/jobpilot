@@ -453,10 +453,18 @@ fn word<T: serde::Serialize>(value: &T) -> String {
     json!(value).as_str().unwrap_or_default().to_string()
 }
 
+fn path_label(sharing: &Sharing) -> &'static str {
+    if sharing.name == "endpoint" {
+        "Address"
+    } else {
+        "Program"
+    }
+}
+
 fn sharing_text(sharing: &Sharing) -> String {
     let mut lines = vec![format!("{} ({})", sharing.label, sharing.key)];
     if let Some(path) = &sharing.path {
-        lines.push(format!("Program: {path}"));
+        lines.push(format!("{}: {path}", path_label(sharing)));
     }
     lines.push("What will be sent:".into());
     for task in &sharing.tasks {

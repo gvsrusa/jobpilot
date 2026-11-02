@@ -87,6 +87,19 @@ async fn parse(router: &Router, db: &Db) -> Outcome {
         .unwrap()
 }
 
+/// The field names of an object, sorted, so a test holds the whole set: a new field that could
+/// carry a tool or a search option fails it.
+fn keys(value: &Value) -> Vec<&str> {
+    let mut names: Vec<&str> = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    names.sort_unstable();
+    names
+}
+
 fn manual(reason: &str) -> Outcome {
     Outcome::ManualRequired {
         reason: reason.into(),
@@ -141,6 +154,19 @@ async fn openai_request_is_the_documented_shape() {
 
     let hits = fake.hits(PATH);
     let body = &hits[0];
+    assert_eq!(
+        keys(body),
+        ["messages", "model", "response_format", "store"]
+    );
+    assert_eq!(keys(&body["response_format"]), ["json_schema", "type"]);
+    assert_eq!(
+        keys(&body["response_format"]["json_schema"]),
+        ["name", "schema", "strict"]
+    );
+    assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+    for message in body["messages"].as_array().unwrap() {
+        assert_eq!(keys(message), ["content", "role"]);
+    }
     assert_eq!(body["model"], "m");
     assert_eq!(body["response_format"]["type"], "json_schema");
     let schema = &body["response_format"]["json_schema"];
@@ -179,6 +205,15 @@ async fn openrouter_denies_data_collection_and_requires_parameters() {
 
     let hits = fake.hits(PATH);
     let body = &hits[0];
+    assert_eq!(
+        keys(body),
+        ["messages", "model", "provider", "response_format"]
+    );
+    assert_eq!(
+        keys(&body["provider"]),
+        ["data_collection", "require_parameters"]
+    );
+    assert_eq!(keys(&body["response_format"]), ["json_schema", "type"]);
     assert_eq!(body["provider"]["data_collection"], "deny");
     assert_eq!(body["provider"]["require_parameters"], true);
     assert!(body.get("store").is_none());
@@ -210,6 +245,114 @@ async fn a_200_holding_an_error_moves_on() {
     assert!(!every_row(&db).await.contains("ZXQ"));
 }
 
+/// The text would pass validation, so only the error beside it can stop it.
+#[tokio::test]
+async fn an_error_beside_valid_text_is_bad_reply() {
+    let message = json!({"content": JOB});
+    let beside = json!({"choices": [{"message": message, "finish_reason": "stop"}],
+                        "error": {"message": "ZXQ"}});
+    let in_choice = json!({"choices": [{"message": message, "finish_reason": "stop",
+                                        "error": {"message": "ZXQ"}}]});
+    for reply in [beside, in_choice] {
+        let (_tmp, db) = db().await;
+        allow(&db, "openai").await;
+        let fake = Fake::start(vec![(PATH, Canned::json(200, &reply))]);
+
+        let outcome = parse(&router(vec![provider("openai", &fake)]), &db).await;
+
+        assert_eq!(outcome, manual("no_ai"), "{reply}");
+        assert_eq!(reasons(&db, "openai/api_key").await, ["bad_reply"]);
+    }
+}
+
+/// Every reply here holds text that would pass validation. None may be read as an answer.
+#[tokio::test]
+async fn a_reply_that_did_not_end_cleanly_is_not_an_answer() {
+    let good = json!({"message": {"content": JOB}, "finish_reason": "stop"});
+    let choices = |second: Value| Canned::json(200, &json!({"choices": [good, second]}));
+    let cases = [
+        // A value that is not a non-empty list is still a tool call field.
+        (
+            answer(json!({"content": JOB, "tool_calls": []}), "stop"),
+            "permission_denied",
+        ),
+        (
+            answer(json!({"content": JOB, "tool_calls": {"id": "1"}}), "stop"),
+            "permission_denied",
+        ),
+        (
+            answer(json!({"content": JOB, "tool_calls": "x"}), "stop"),
+            "permission_denied",
+        ),
+        (
+            answer(json!({"content": JOB}), "tool_calls"),
+            "permission_denied",
+        ),
+        (
+            answer(json!({"content": JOB}), "function_call"),
+            "permission_denied",
+        ),
+        (
+            answer(json!({"content": JOB, "refusal": {"text": "no"}}), "stop"),
+            "model_refused",
+        ),
+        (answer(json!({"content": JOB}), "error"), "bad_reply"),
+        (
+            answer(json!({"content": JOB}), "insufficient_system_resource"),
+            "bad_reply",
+        ),
+        (
+            choices(json!({"message": {"tool_calls": [{"id": "1"}]}, "finish_reason": "stop"})),
+            "permission_denied",
+        ),
+        (
+            choices(json!({"message": {"refusal": "no"}, "finish_reason": "stop"})),
+            "model_refused",
+        ),
+        (
+            choices(json!({"message": {}, "finish_reason": "content_filter"})),
+            "model_refused",
+        ),
+        (
+            choices(json!({"message": {}, "finish_reason": "length"})),
+            "output_truncated",
+        ),
+        (choices(json!({"error": {"message": "ZXQ"}})), "bad_reply"),
+    ];
+    for (canned, reason) in cases {
+        let body = canned.body.clone();
+        let (_tmp, db) = db().await;
+        allow(&db, "openai").await;
+        let fake = Fake::start(vec![(PATH, canned)]);
+
+        let outcome = parse(&router(vec![provider("openai", &fake)]), &db).await;
+
+        assert!(!matches!(outcome, Outcome::Ok { .. }), "{body}");
+        assert_eq!(reasons(&db, "openai/api_key").await, [reason], "{body}");
+    }
+}
+
+/// A local server may leave these out, and an empty refusal is no refusal.
+#[tokio::test]
+async fn a_clean_reply_still_reads() {
+    let cases = [
+        json!({"choices": [{"message": {"content": JOB}}]}),
+        json!({"choices": [{"message": {"content": JOB}, "finish_reason": null}]}),
+        json!({"choices": [{"message": {"content": JOB, "refusal": null, "tool_calls": null},
+                            "finish_reason": "stop"}]}),
+        json!({"choices": [{"message": {"content": JOB, "refusal": ""},
+                            "finish_reason": "stop"}]}),
+    ];
+    for reply in cases {
+        let fake = Fake::start(vec![(PATH, Canned::json(200, &reply))]);
+        let text = provider("openai", &fake)
+            .complete(&parse_prompt(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(text, JOB, "{reply}");
+    }
+}
+
 #[tokio::test]
 async fn a_200_that_is_not_json_is_bad_reply() {
     let (_tmp, db) = db().await;
@@ -237,8 +380,7 @@ async fn a_refusal_is_model_refused_and_stores_nothing() {
 
         let outcome = parse(&router(vec![provider("openai", &fake)]), &db).await;
 
-        // Pinned on purpose, by ruling: the row holds the reason, the task end says `no_ai`.
-        assert_eq!(outcome, manual("no_ai"));
+        assert_eq!(outcome, manual("model_refused"));
         assert_eq!(reasons(&db, "openai/api_key").await, ["model_refused"]);
         assert_eq!(fake.hits(PATH).len(), 1);
     }
@@ -535,10 +677,10 @@ async fn a_retry_after_the_router_can_obey_retries_once() {
     assert_eq!(fake.hits(PATH).len(), 2);
 }
 
-/// By the pre-flight ruling both move to the next provider, so the task end says `no_ai`. The
-/// row keeps the code, and a provider behind them still gets its turn.
+/// Each tells the person: a hand-typed id must not read as "no AI". The provider behind still
+/// gets its turn, and if it answers the reason never shows.
 #[tokio::test]
-async fn model_refused_and_model_not_found_end_no_ai() {
+async fn model_refused_and_model_not_found_end_with_their_own_reason() {
     let not_found = Canned::json(404, &json!({"error": "ZXQ"}));
     let refused = answer(json!({"refusal": "no"}), "stop");
     for (canned, code) in [(not_found, "model_not_found"), (refused, "model_refused")] {
@@ -548,9 +690,21 @@ async fn model_refused_and_model_not_found_end_no_ai() {
 
         let outcome = parse(&router(vec![provider("openai", &fake)]), &db).await;
 
-        assert_eq!(outcome, manual("no_ai"));
+        assert_eq!(outcome, manual(code));
         assert_eq!(reasons(&db, "openai/api_key").await, [code]);
     }
+
+    let (_tmp, db) = db().await;
+    allow(&db, "openai").await;
+    allow(&db, "openrouter").await;
+    let gone = Fake::start(vec![(PATH, Canned::json(404, &json!({})))]);
+    let good = Fake::start(vec![(PATH, says(JOB))]);
+    let router = router(vec![
+        provider("openai", &gone),
+        provider("openrouter", &good),
+    ]);
+    let outcome = parse(&router, &db).await;
+    assert!(matches!(outcome, Outcome::Ok { .. }), "{outcome:?}");
 }
 
 /// `set_model` holds these rules at the door. A restored backup comes in another way.
@@ -564,6 +718,11 @@ async fn a_stored_model_that_breaks_a_rule_sends_nothing() {
         let outcome = parse(&router(vec![bad]), &db).await;
         assert_eq!(outcome, manual("origin_refused"), "{model}");
     }
+    let bad = ApiProvider::for_test("openrouter", &fake.url, "openai/x:online", fixed()).unwrap();
+    assert_eq!(
+        parse(&router(vec![bad]), &db).await,
+        manual("model_has_tools")
+    );
     let bad = ApiProvider::for_test("openrouter", &fake.url, "../x", fixed()).unwrap();
     assert_eq!(parse(&router(vec![bad]), &db).await, manual("no_ai"));
     assert!(fake.hits(PATH).is_empty());
@@ -648,8 +807,12 @@ fn check_model_holds_the_origin_rules() {
         "openai/gpt-x:free",
         "google/x:free",
         "openai/gpt-x:FREE",
-        // This suffix turns on web search, so the reply would not be tool-free.
-        "openai/gpt-x:online",
+        "openai/gpt-x:free.",
+        "openai/gpt-x:free:nitro",
+        "openai/gpt-x:nitro:floor",
+        "openai/gpt-x:unknown",
+        "openai/gpt-x:",
+        "openai/gpt-x:NITRO",
         "x",
     ] {
         assert_eq!(
@@ -658,6 +821,42 @@ fn check_model_holds_the_origin_rules() {
             "{bad}"
         );
     }
+    for good in ["openai/gpt-x:nitro", "anthropic/claude-x:floor"] {
+        check_model("openrouter", good).unwrap();
+    }
+    // Each searches with no tools field, so `NoTools` would be false.
+    for bad in [
+        "openai/gpt-x:online",
+        "openai/gpt-x:ONLINE",
+        "openai/gpt-x:online:nitro",
+        "openai/gpt-x:nitro:online",
+        "openai/gpt-x:online/",
+        "openai/gpt-4o-search-preview",
+        "openai/o3-deep-research",
+    ] {
+        assert_eq!(
+            check_model("openrouter", bad).unwrap_err().to_string(),
+            "refused: model_has_tools",
+            "{bad}"
+        );
+    }
+    for (name, bad) in [
+        ("openai", "gpt-4o-search-preview"),
+        ("openai", "gpt-4o-mini-SEARCH-preview"),
+        ("openai", "o3-deep-research"),
+        ("anthropic", "claude-search-x"),
+        ("anthropic", "claude-deep-research-x"),
+        ("google", "deep-research-pro-preview"),
+        ("google", "gemini-search-x"),
+    ] {
+        assert_eq!(
+            check_model(name, bad).unwrap_err().to_string(),
+            "refused: model_has_tools",
+            "{name} {bad}"
+        );
+    }
+    // The server is the user's own, and its names are too.
+    check_model("endpoint", "research-search-7b").unwrap();
     check_model("openai", "gpt-5.1-mini").unwrap();
     check_model("openai", "ft:gpt-x:org/name").unwrap();
     check_model("openai", &"m".repeat(200)).unwrap();
@@ -669,7 +868,7 @@ fn check_model_holds_the_origin_rules() {
 
 #[tokio::test]
 async fn endpoint_refuses_a_cloud_model_on_any_port() {
-    for model in ["kimi:cloud", "x-cloud", "X:CLOUD"] {
+    for model in ["kimi:cloud", "x-cloud", "X:CLOUD", "kimi:cloud:latest"] {
         assert_eq!(
             check_model("endpoint", model).unwrap_err().to_string(),
             "refused: not_local"
@@ -732,8 +931,16 @@ async fn a_non_loopback_endpoint_is_refused_and_sends_nothing() {
     for url in [
         "http://user:secret@127.0.0.1:1234/v1",
         "http://user@127.0.0.1:1234/v1",
+        "http://:secret@127.0.0.1:1234/v1",
         "http://127.0.0.1:1234/v1?key=x",
         "http://127.0.0.1:1234/v1#x",
+        // A key in the path would land there too.
+        "http://127.0.0.1:1234/secret/v1",
+        "http://127.0.0.1:1234/v1/secret",
+        "http://127.0.0.1:1234/secret",
+        "http://127.0.0.1:1234/v1beta",
+        "http://127.0.0.1:1234/vsecret",
+        "http://127.0.0.1:1234/v",
     ] {
         let error = set_endpoint(&db, url).await.unwrap_err();
         assert_eq!(error.code(), "validation");
@@ -745,6 +952,13 @@ async fn a_non_loopback_endpoint_is_refused_and_sends_nothing() {
             .unwrap()
             .is_none()
     );
+    for good in [
+        "http://127.0.0.1:1234",
+        "http://127.0.0.1:1234/v1",
+        "http://[::1]:1/v2/",
+    ] {
+        set_endpoint(&db, good).await.unwrap();
+    }
 }
 
 /// A restored backup does not pass `set_endpoint`, so a read holds the same rules.
@@ -762,6 +976,7 @@ async fn a_stored_endpoint_that_breaks_a_rule_is_left_out() {
         "https://api.example.com/v1",
         "http://user:secret@127.0.0.1:1234/v1",
         "http://127.0.0.1:1234/v1?key=x",
+        "http://127.0.0.1:1234/sk-secret/v1",
         "",
     ] {
         settings::set(&db, "ai.endpoint.url", &json!(url))
@@ -801,6 +1016,79 @@ async fn clearing_the_endpoint_clears_both_settings() {
     assert_eq!(row.reason.as_deref(), Some("no_endpoint"));
     assert_eq!(row.model, None);
     assert_eq!(row.path, None);
+}
+
+async fn endpoint_row(db: &Db) -> ai::ExternalStatus {
+    let status = ai::status(db).await.unwrap();
+    let row = status
+        .external
+        .into_iter()
+        .find(|row| row.name == "endpoint");
+    row.unwrap()
+}
+
+/// Consent names an address. The router reads settings anew on each task, as each caller does.
+#[tokio::test]
+async fn a_changed_endpoint_address_gets_nothing_until_fresh_consent() {
+    let (_tmp, db) = db().await;
+    let first = Fake::start(vec![(PATH, says(JOB))]);
+    let second = Fake::start(vec![(PATH, says(JOB))]);
+    set_endpoint(&db, &first.url).await.unwrap();
+    set_model(&db, "endpoint", "m").await.unwrap();
+    ai::set_enabled(&db, "ollama", false).await.unwrap();
+    ai::set_enabled(&db, "endpoint", true).await.unwrap();
+    allow(&db, "endpoint").await;
+    let run = async |db: &Db| parse(&Router::from_settings(db).await.unwrap(), db).await;
+    assert!(matches!(run(&db).await, Outcome::Ok { .. }));
+    assert_eq!(first.hits(PATH).len(), 1);
+
+    set_endpoint(&db, &second.url).await.unwrap();
+
+    assert_eq!(run(&db).await, manual("endpoint_changed"));
+    assert!(second.hits(PATH).is_empty());
+    assert_eq!(first.hits(PATH).len(), 1);
+    assert_eq!(
+        reasons(&db, "endpoint/loopback").await.last().unwrap(),
+        "endpoint_changed"
+    );
+    let row = endpoint_row(&db).await;
+    assert!(row.suspended);
+    assert_eq!(row.consent, None);
+
+    allow(&db, "endpoint").await;
+    assert!(matches!(run(&db).await, Outcome::Ok { .. }));
+    assert_eq!(second.hits(PATH).len(), 1);
+}
+
+#[tokio::test]
+async fn clearing_the_address_suspends_its_consent_and_the_same_address_is_no_change() {
+    let (_tmp, db) = db().await;
+    let url = "http://127.0.0.1:1234/v1";
+    set_endpoint(&db, url).await.unwrap();
+    allow(&db, "endpoint").await;
+
+    set_endpoint(&db, "http://127.0.0.1:1234/v1/")
+        .await
+        .unwrap();
+    assert!(
+        !endpoint_row(&db).await.suspended,
+        "the stored form is the same"
+    );
+
+    set_endpoint(&db, "").await.unwrap();
+    assert!(endpoint_row(&db).await.suspended);
+}
+
+#[tokio::test]
+async fn the_consent_screen_names_the_stored_address() {
+    let (_tmp, db) = db().await;
+    assert_eq!(ai::sharing(&db, "endpoint").await.unwrap().path, None);
+    set_endpoint(&db, "http://127.0.0.1:1234/v1/")
+        .await
+        .unwrap();
+    let sharing = ai::sharing(&db, "endpoint").await.unwrap();
+    assert_eq!(sharing.path.as_deref(), Some("http://127.0.0.1:1234/v1"));
+    assert_eq!(ai::sharing(&db, "openai").await.unwrap().path, None);
 }
 
 #[tokio::test]
@@ -844,6 +1132,8 @@ async fn the_endpoint_runs_from_settings_with_one_slash_and_no_key() {
     };
     assert_eq!(provider, ProviderId::Endpoint);
     let hits = fake.hits(V1);
+    assert_eq!(keys(&hits[0]), ["messages", "model", "response_format"]);
+    assert_eq!(keys(&hits[0]["response_format"]), ["json_schema", "type"]);
     assert_eq!(hits[0]["model"], "local-model");
     assert!(hits[0].get("store").is_none());
     assert!(hits[0].get("provider").is_none());

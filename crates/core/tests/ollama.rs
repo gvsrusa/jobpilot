@@ -181,6 +181,10 @@ fn is_local_follows_the_settled_rule() {
         &json!({"name": "glm-4.6-CLOUD", "size": 5})
     ));
     assert!(!Ollama::is_local(&json!({"name": "a:Cloud", "size": 5})));
+    // A tag after it changes nothing.
+    assert!(!Ollama::is_local(
+        &json!({"name": "kimi:cloud:latest", "size": 5})
+    ));
     // A remote_ key with any non-empty value, whatever it is called.
     assert!(!Ollama::is_local(
         &json!({"name": "a:1b", "size": 5, "remote_anything": "x"})

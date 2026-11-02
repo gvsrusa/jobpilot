@@ -4,6 +4,10 @@ import { toAppError } from "./ipc";
 export const SUSPENDED =
   "Suspended: this consent was given before the terms on file now. Review it once to turn it back on.";
 
+/** The endpoint's record is bound to its address as well as the terms. */
+export const ENDPOINT_SUSPENDED =
+  "Suspended: the endpoint address changed since this consent was given, or the terms on file did. Review it to turn it back on.";
+
 // Task 20 reports the reason inside the message ("failed: not_logged_in"), so the message is
 // searched for the stable word. ponytail: add a `reason` field to the error if a word ever
 // has to be told from a provider's own text.
@@ -57,7 +61,20 @@ const REASONS: [word: string, text: string][] = [
   ["no_endpoint", "No endpoint address is set. Add one on the AI screen, or write this one yourself."],
   [
     "origin_refused",
-    "That model is not eligible through OpenRouter. Use an openai/, anthropic/, or google/ model, and not a free one.",
+    "That model is not eligible through OpenRouter. Use an openai/, anthropic/, or google/ model, not a free one, with no suffix but :nitro or :floor.",
+  ],
+  [
+    "model_has_tools",
+    "That model searches by itself, so JobPilot cannot keep it from tools while it reads a job posting. Choose one without search or deep-research in its name, and without :online.",
+  ],
+  [
+    "model_not_found",
+    "The provider does not know that model id. Check the Model id on the AI screen, or the model chosen for Ollama.",
+  ],
+  ["model_refused", "The AI model declined this task, so nothing was generated. Try another model, or write this one yourself."],
+  [
+    "endpoint_changed",
+    "The endpoint address changed since you gave consent, or the terms on file did, so nothing is sent. Review it on the AI screen.",
   ],
   [
     "use_profile_by_country",

@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ipc, toAppError, type ExternalStatus } from "@/lib/ipc";
-import { explainReason, SUSPENDED } from "@/lib/reasons";
+import { ENDPOINT_SUSPENDED, explainReason, SUSPENDED } from "@/lib/reasons";
 
 /** A provider's reason code, in plain words. */
 const UNAVAILABLE: Record<string, string> = {
@@ -167,7 +167,7 @@ export function ProviderRow(props: {
         {!row.available && <span>Unavailable: {UNAVAILABLE[reason] ?? reason}</span>}
         {row.path && <span className="break-all">{row.path}</span>}
       </div>
-      {row.suspended && <p role="alert">{SUSPENDED}</p>}
+      {row.suspended && <p role="alert">{row.kind === "endpoint" ? ENDPOINT_SUSPENDED : SUSPENDED}</p>}
       {row.kind === "endpoint" && <EndpointControls row={row} />}
       {row.kind !== "cli" && <ModelControls row={row} />}
       {row.kind !== "cli" && <KeyControls row={row} />}

@@ -297,7 +297,31 @@ fn message(error: &Error) -> String {
         }
         Error::ManualRequired(reason) | Error::Refused(reason) if reason == "origin_refused" => {
             "That model is not eligible through OpenRouter. Use an openai/, anthropic/, or \
-             google/ model, and not a free one."
+             google/ model, not a free one, with no suffix but :nitro or :floor."
+                .into()
+        }
+        Error::ManualRequired(reason) | Error::Refused(reason) if reason == "model_has_tools" => {
+            "That model searches by itself, so JobPilot cannot keep it from tools while it reads \
+             a job posting. Choose one without search or deep-research in its name, and without \
+             :online."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "model_not_found" => {
+            "The provider does not know that model id. Check it, then set it with `jobpilot ai \
+             model <provider> <id>`, or `jobpilot ai set-model --drafting <name>` for Ollama, in \
+             an ordinary terminal, or on the AI screen."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "model_refused" => {
+            "The AI model declined this task, so nothing was generated. Try another model, or \
+             write this one yourself."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "endpoint_changed" => {
+            "The endpoint address changed since you gave consent, or the terms on file did, so \
+             nothing is sent. Read it with `jobpilot ai consent show endpoint`, then give it \
+             with `jobpilot ai consent give endpoint` in an ordinary terminal, or on the AI \
+             screen."
                 .into()
         }
         Error::Refused(reason) if reason == "attestation_needed" => {
@@ -575,8 +599,25 @@ mod tests {
              <id>`, or on the AI screen."
         );
         let origin = "That model is not eligible through OpenRouter. Use an openai/, anthropic/, \
-                      or google/ model, and not a free one.";
+                      or google/ model, not a free one, with no suffix but :nitro or :floor.";
         assert_eq!(message(&Error::Refused("origin_refused".into())), origin);
+        for error in [
+            Error::Refused("model_has_tools".into()),
+            Error::ManualRequired("model_has_tools".into()),
+        ] {
+            let text = message(&error);
+            assert!(text.contains("searches by itself"), "{text}");
+            assert!(text.contains(":online"), "{text}");
+        }
+        let text = message(&Error::ManualRequired("model_not_found".into()));
+        assert!(text.contains("does not know that model id"), "{text}");
+        assert!(text.contains("jobpilot ai model <provider> <id>"), "{text}");
+        assert!(text.contains("jobpilot ai set-model"), "{text}");
+        let text = message(&Error::ManualRequired("model_refused".into()));
+        assert!(text.contains("declined this task"), "{text}");
+        let text = message(&Error::ManualRequired("endpoint_changed".into()));
+        assert!(text.contains("endpoint address changed"), "{text}");
+        assert!(text.contains("jobpilot ai consent give endpoint"), "{text}");
         assert_eq!(
             message(&Error::ManualRequired("origin_refused".into())),
             origin

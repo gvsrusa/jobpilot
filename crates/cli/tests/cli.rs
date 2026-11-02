@@ -909,6 +909,16 @@ fn endpoint_drafts_end_to_end_against_a_fake() {
     let log = ok(&home, &["agents", "log", id]);
     let log = String::from_utf8_lossy(&log.stdout).to_string();
     assert!(log.contains("endpoint/loopback"), "{log}");
+
+    let moved = Fake::start(vec![(PATH, Canned::json(200, &answer))]);
+    ok(&home, &["ai", "endpoint", &format!("{}/v1", moved.url)]);
+    let stopped = run(&home, &["resume", "generate", &job]);
+    assert!(
+        stderr_text(&stopped).contains("endpoint address changed"),
+        "{}",
+        stderr_text(&stopped)
+    );
+    assert!(moved.hits(PATH).is_empty());
 }
 
 #[test]
@@ -929,6 +939,10 @@ fn an_endpoint_refused_or_cleared_leaves_the_row_saying_why() {
 
     ok(&home, &["ai", "endpoint", "http://127.0.0.1:9/v1"]);
     assert_eq!(reason(&home), "no_api_model");
+    let shown = ok(&home, &["ai", "consent", "show", "endpoint"]);
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    assert!(shown.contains("Address: http://127.0.0.1:9/v1"), "{shown}");
+    assert!(!shown.contains("Program:"), "{shown}");
     ok(&home, &["ai", "endpoint", ""]);
     assert_eq!(reason(&home), "no_endpoint");
 }
@@ -946,6 +960,8 @@ fn ai_model_explains_a_refused_openrouter_model() {
     ok(&home, &["ai", "model", "openrouter", "anthropic/claude-x"]);
     let refused = run(&home, &["ai", "model", "ollama", "m"]);
     assert!(stderr_text(&refused).contains("validation"));
+    let refused = run(&home, &["ai", "model", "openai", "gpt-4o-search-preview"]);
+    assert!(stderr_text(&refused).contains("searches by itself"));
 }
 
 #[test]

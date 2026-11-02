@@ -39,11 +39,20 @@ const GOOGLE_REFUSED: [&str; 5] = [
 ];
 const ENDPOINT_URL: &str = "ai.endpoint.url";
 const ENDPOINT_MODEL: &str = "ai.model.endpoint";
+const ENDPOINT: &str = "endpoint";
+/// The most digits in `/v<digits>`, far too few to hold a key.
+const MAX_VERSION_DIGITS: usize = 2;
 const MAX_MODEL: usize = 200;
 /// An aggregator cannot widen a vendor's verdict, so only these vendors' models pass it.
 const OPENROUTER_ORIGINS: [&str; 3] = ["openai/", "anthropic/", "google/"];
-/// `:free` is the free-tier row. `:online` turns on web search, which breaks `NoTools`.
-const OPENROUTER_REFUSED: [&str; 2] = [":free", ":online"];
+/// What may follow the `:`, and nothing else may. Both only rank the vendor's hosts, under the
+/// same `data_collection` and `require_parameters`. `:free` is the free-tier row.
+const OPENROUTER_SUFFIXES: [&str; 2] = ["nitro", "floor"];
+/// OpenRouter's suffix that turns on web search. Named so the refusal can say why.
+const OPENROUTER_SEARCH_SUFFIX: &str = "online";
+/// These models search by themselves, with no `tools` field to leave out, so `NoTools` would be
+/// false. The endpoint is exempt: its names are the user's, and it has no such vendor model.
+const SEARCH_MODEL_WORDS: [&str; 2] = ["search", "deep-research"];
 const QUOTA_WORDS: [&str; 4] = [
     "insufficient_quota",
     "credit_balance_exhausted",
@@ -329,10 +338,13 @@ impl Provider for ApiProvider {
 }
 
 /// What a reply holds, whichever wire it came by.
+#[derive(Default)]
 struct Reading {
     tool_call: bool,
     refused: bool,
     truncated: bool,
+    /// An error inside a reply, or an end the wire does not call a clean one.
+    failed: bool,
     text: Option<String>,
 }
 
@@ -356,53 +368,75 @@ fn read_reply(wire: Wire, body: &[u8]) -> Result<String> {
     if reading.truncated {
         return Err(Error::Failed("output_truncated".into()));
     }
-    if !reply["error"].is_null() {
+    if reading.failed || !reply["error"].is_null() {
         return Err(bad_reply());
     }
     reading.text.ok_or_else(bad_reply)
 }
 
+/// Every choice counts, though only the first is read: no request asks for two. A `tool_calls`
+/// field of any value counts, as no request here named a tool. A missing finish reads as clean,
+/// as some local servers leave it out, and the schema check still stands.
 fn read_chat(reply: &Value) -> Reading {
-    let choice = &reply["choices"][0];
-    let message = &choice["message"];
-    let finish = choice["finish_reason"].as_str();
-    let refusal = message["refusal"].as_str();
-    Reading {
-        tool_call: !items(&message["tool_calls"]).is_empty() || !message["function_call"].is_null(),
-        refused: refusal.is_some_and(|text| !text.is_empty()) || finish == Some("content_filter"),
-        truncated: finish == Some("length"),
-        text: message["content"].as_str().map(str::to_string),
+    let mut reading = Reading::default();
+    for choice in items(&reply["choices"]) {
+        let message = &choice["message"];
+        let finish = choice["finish_reason"].as_str().unwrap_or("stop");
+        let refusal = &message["refusal"];
+        reading.tool_call |= !message["tool_calls"].is_null()
+            || !message["function_call"].is_null()
+            || matches!(finish, "tool_calls" | "function_call");
+        reading.refused |= (!refusal.is_null() && refusal != "") || finish == "content_filter";
+        reading.truncated |= finish == "length";
+        reading.failed |= !choice["error"].is_null()
+            || !matches!(
+                finish,
+                "stop" | "length" | "content_filter" | "tool_calls" | "function_call"
+            );
     }
+    let text = reply["choices"][0]["message"]["content"].as_str();
+    reading.text = text.map(str::to_string);
+    reading
 }
 
 /// `ends_with`: server and MCP tool blocks count too, and no request here asked for any.
 /// Thinking blocks are neither a tool nor the answer.
 fn read_anthropic(reply: &Value) -> Reading {
     let blocks = items(&reply["content"]);
-    let stop = reply["stop_reason"].as_str();
+    let stop = reply["stop_reason"].as_str().unwrap_or("end_turn");
     Reading {
-        tool_call: blocks.iter().any(|b| kind(b).ends_with("tool_use")),
-        refused: stop == Some("refusal"),
-        truncated: stop == Some("max_tokens"),
+        tool_call: stop == "tool_use" || blocks.iter().any(|b| kind(b).ends_with("tool_use")),
+        refused: stop == "refusal",
+        truncated: stop == "max_tokens",
+        failed: !matches!(
+            stop,
+            "end_turn" | "stop_sequence" | "tool_use" | "refusal" | "max_tokens"
+        ),
         text: joined(blocks.iter().filter(|b| kind(b) == "text")),
     }
 }
 
 /// `executableCode` is Google's code tool, called as `functionCall` is. A thought is not the
-/// answer.
+/// answer. Every candidate counts, though only the first is read: no request asks for two. A
+/// finish ending `_CALL` is a tool or function call, even a malformed one.
 fn read_google(reply: &Value) -> Reading {
-    let candidate = &reply["candidates"][0];
-    let parts = items(&candidate["content"]["parts"]);
-    let finish = candidate["finishReason"].as_str().unwrap_or_default();
-    let blocked = !reply["promptFeedback"]["blockReason"].is_null();
-    Reading {
-        tool_call: parts
-            .iter()
-            .any(|p| !p["functionCall"].is_null() || !p["executableCode"].is_null()),
-        refused: blocked || GOOGLE_REFUSED.contains(&finish),
-        truncated: finish == "MAX_TOKENS",
-        text: joined(parts.iter().filter(|p| p["thought"] != true)),
+    let mut reading = Reading {
+        refused: !reply["promptFeedback"]["blockReason"].is_null(),
+        ..Reading::default()
+    };
+    for candidate in items(&reply["candidates"]) {
+        let finish = candidate["finishReason"].as_str().unwrap_or("STOP");
+        let named = finish.ends_with("_CALL");
+        let filtered = GOOGLE_REFUSED.contains(&finish);
+        let called = |p: &Value| !p["functionCall"].is_null() || !p["executableCode"].is_null();
+        reading.tool_call |= named || items(&candidate["content"]["parts"]).iter().any(called);
+        reading.refused |= filtered;
+        reading.truncated |= finish == "MAX_TOKENS";
+        reading.failed |= !(named || filtered || matches!(finish, "STOP" | "MAX_TOKENS"));
     }
+    let parts = items(&reply["candidates"][0]["content"]["parts"]);
+    reading.text = joined(parts.iter().filter(|p| p["thought"] != true));
+    reading
 }
 
 fn kind(block: &Value) -> &str {
@@ -432,17 +466,29 @@ pub fn check_model(name: &str, model: &str) -> Result<()> {
             "a model id is 1 to 200 letters, digits, and . _ : / -".into(),
         ));
     }
-    match name {
-        "openrouter" if !openrouter_allows(model) => Err(Error::Refused("origin_refused".into())),
-        "endpoint" if !name_is_local(model) => Err(Error::Refused("not_local".into())),
-        _ => Ok(()),
+    if name == ENDPOINT {
+        return match name_is_local(model) {
+            true => Ok(()),
+            false => Err(Error::Refused("not_local".into())),
+        };
     }
-}
-
-fn openrouter_allows(model: &str) -> bool {
+    let (id, suffix) = match model.split_once(':') {
+        Some((id, suffix)) => (id, Some(suffix)),
+        None => (model, None),
+    };
     let lower = model.to_ascii_lowercase();
-    OPENROUTER_ORIGINS.iter().any(|o| model.starts_with(o))
-        && !OPENROUTER_REFUSED.iter().any(|s| lower.ends_with(s))
+    let searches = SEARCH_MODEL_WORDS.iter().any(|word| lower.contains(word));
+    let online = name == "openrouter"
+        && suffix.is_some_and(|s| s.to_ascii_lowercase().contains(OPENROUTER_SEARCH_SUFFIX));
+    if searches || online {
+        return Err(Error::Refused("model_has_tools".into()));
+    }
+    let eligible = OPENROUTER_ORIGINS.iter().any(|o| id.starts_with(o))
+        && suffix.is_none_or(|s| OPENROUTER_SUFFIXES.contains(&s));
+    if name == "openrouter" && !eligible {
+        return Err(Error::Refused("origin_refused".into()));
+    }
+    Ok(())
 }
 
 /// The task schema with every `maxLength` removed. The router's own validation still holds it.
@@ -479,25 +525,36 @@ pub async fn set_model(db: &Db, name: &str, model: &str) -> Result<()> {
     settings::set(db, &format!("ai.model.{name}"), &json!(model)).await
 }
 
-/// The address as it is stored, and a client for it. A name, password, query, or fragment would
-/// land in settings, and so in an export. The message leaves the address out for that reason.
+/// The address as it is stored, and a client for it. A name, password, query, fragment, or any
+/// path but a version would land in settings, and so in an export, and any of them can hold a
+/// key. The message leaves the address out for that reason.
 fn endpoint_client(url: &str) -> Result<(String, Client)> {
     let (parsed, client) = loopback_client(url)?;
     let bare = parsed.username().is_empty()
         && parsed.password().is_none()
         && parsed.query().is_none()
-        && parsed.fragment().is_none();
+        && parsed.fragment().is_none()
+        && is_version_path(parsed.path());
     if !bare {
         return Err(Error::Validation(
-            "an endpoint address has no name, password, query, or fragment".into(),
+            "an endpoint address is a host and port, then at most a version such as /v1".into(),
         ));
     }
     Ok((parsed.as_str().trim_end_matches('/').to_string(), client))
 }
 
-/// Refused or not, with nothing stored and nobody asked.
-pub fn check_endpoint(url: &str) -> Result<()> {
-    endpoint_client(url).map(|_| ())
+fn is_version_path(path: &str) -> bool {
+    let path = path.trim_matches('/');
+    path.is_empty()
+        || path.strip_prefix('v').is_some_and(|digits| {
+            (1..=MAX_VERSION_DIGITS).contains(&digits.len())
+                && digits.bytes().all(|b| b.is_ascii_digit())
+        })
+}
+
+/// The address as it would be stored, or why not. Nothing is stored and nobody is asked.
+pub fn check_endpoint(url: &str) -> Result<String> {
+    endpoint_client(url).map(|(url, _)| url)
 }
 
 /// A stored address passes the rules again: a restored backup comes in past `set_endpoint`.
@@ -512,14 +569,37 @@ pub async fn endpoint_address(db: &Db) -> Result<Option<String>> {
 }
 
 /// An empty address clears the address and the model. Any other is checked, then stored with
-/// trailing slashes removed, so `<url>/chat/completions` has one.
+/// trailing slashes removed, so `<url>/chat/completions` has one. A key was given for one server,
+/// so a different address drops it first: a key the keychain will not give up stops the change.
+/// Consent needs nothing here, as a record is bound to its address (`consent::state`).
 pub async fn set_endpoint(db: &Db, url: &str) -> Result<()> {
-    if url.trim().is_empty() {
-        settings::set(db, ENDPOINT_URL, &json!("")).await?;
-        return settings::set(db, ENDPOINT_MODEL, &json!("")).await;
+    let cleared = url.trim().is_empty();
+    let url = if cleared {
+        String::new()
+    } else {
+        check_endpoint(url)?
+    };
+    let stored = text_setting(db, ENDPOINT_URL).await?;
+    if stored.unwrap_or_default() != url {
+        match secrets::delete_api_key(db, ENDPOINT, "system").await {
+            Ok(()) | Err(Error::NotFound) => {}
+            Err(error) => return Err(error),
+        }
     }
-    let (url, _) = endpoint_client(url)?;
-    settings::set(db, ENDPOINT_URL, &json!(url)).await
+    settings::set(db, ENDPOINT_URL, &json!(url)).await?;
+    if cleared {
+        settings::set(db, ENDPOINT_MODEL, &json!("")).await?;
+    }
+    Ok(())
+}
+
+/// A restore can swap the address with no dialog. It already revokes consent, so only the key
+/// is left to drop. `before` is the live address, `None` when it could not be read.
+pub(crate) async fn forget_key_of_replaced_endpoint(db: &Db, before: Option<&str>) {
+    let restored = text_setting(db, ENDPOINT_URL).await.ok().flatten();
+    if restored.unwrap_or_default() != before.unwrap_or_default() {
+        secrets::forget_api_key(db, ENDPOINT).await;
+    }
 }
 
 /// A failed status as an error, matching the body only against fixed words so its text goes no
@@ -535,5 +615,30 @@ pub(crate) fn classify_status(status: u16, retry_after: Option<Duration>, body: 
         400 | 413 if holds(&OVERFLOW_WORDS) => Error::Refused("prompt_too_large".into()),
         429 | 503 | 529 => Error::RateLimited { retry_after },
         _ => Error::Failed(format!("http_{status}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Debug output of a request must never show a key, on any wire.
+    #[test]
+    fn every_key_header_is_sensitive() {
+        for (name, header) in [
+            ("openai", "authorization"),
+            ("openrouter", "authorization"),
+            ("endpoint", "authorization"),
+            ("anthropic", "x-api-key"),
+            ("google", "x-goog-api-key"),
+        ] {
+            let url = "http://127.0.0.1:1";
+            let provider = ApiProvider::for_test(name, url, "m", KeySource::None).unwrap();
+            let request = provider.client.post(url);
+            let request = provider.with_key(request, "sk-test").unwrap();
+            let built = request.build().unwrap();
+            let value = &built.headers()[header];
+            assert!(value.is_sensitive(), "{name}");
+        }
     }
 }

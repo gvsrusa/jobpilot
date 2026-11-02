@@ -1118,11 +1118,15 @@ pub async fn ai_set_endpoint<R: Runtime>(
 ) -> Result<()> {
     drop(state.work().await?);
     let (message, button) = if url.trim().is_empty() {
-        let message = "Stop using the compatible endpoint, and forget its address and model?";
+        let message = "Stop using the compatible endpoint, and forget its address, model, and \
+                       any stored key?";
         (message.to_string(), "Clear")
     } else {
-        api::check_endpoint(&url)?;
-        let message = format!("Send AI requests to this address?\n\n{url}");
+        let stored = api::check_endpoint(&url)?;
+        let message = format!(
+            "Send AI requests to this address?\n\n{stored}\n\nA different address ends the \
+             consent given for the old one, and removes any key stored for it."
+        );
         (message, "Use this address")
     };
     native::confirmed(&app, "Compatible endpoint", message, button).await?;
@@ -1141,8 +1145,13 @@ fn consent_provider(provider: &str) -> Result<&'static ProviderInfo> {
 fn consent_message(sharing: &Sharing, categories: &[DataCategory]) -> String {
     let (label, destination) = (&sharing.label, &sharing.destination);
     let names = json!(categories);
+    let word = if sharing.name == "endpoint" {
+        "Address"
+    } else {
+        "Program"
+    };
     let program = sharing.path.as_ref();
-    let program = program.map_or_else(String::new, |path| format!("\n\nProgram: {path}"));
+    let program = program.map_or_else(String::new, |path| format!("\n\n{word}: {path}"));
     let attestation = sharing.attestation.as_ref();
     let attestation = attestation.map_or_else(String::new, |line| format!("\n\n{line}"));
     format!(
@@ -3363,6 +3372,7 @@ mod tests {
         for url in [
             "http://user:secret@127.0.0.1:1234/v1",
             "http://127.0.0.1:1234/v1?key=x",
+            "http://127.0.0.1:1234/sk-secret/v1",
         ] {
             let args = json!({ "url": url });
             assert_eq!(h.code("ai_set_endpoint", args), "validation", "{url}");
@@ -3382,7 +3392,14 @@ mod tests {
             h.code("ai_set_endpoint", args.clone()),
             "confirmation_required"
         );
-        assert!(h.asked()[0].contains("http://127.0.0.1:1234/v1"));
+        // The stored form, and what a change costs.
+        assert!(
+            h.asked()[0].contains("http://127.0.0.1:1234/v1\n"),
+            "{:?}",
+            h.asked()
+        );
+        assert!(!h.asked()[0].contains("/v1/"), "{:?}", h.asked());
+        assert!(h.asked()[0].contains("consent"), "{:?}", h.asked());
         assert_eq!(h.ok("settings_get", key.clone()), Value::Null);
 
         h.answer(true);
@@ -3399,6 +3416,16 @@ mod tests {
         let status = h.ok("ai_status", json!({}));
         assert_eq!(row(&status)["path"], "http://127.0.0.1:1234/v1");
         assert_eq!(row(&status)["reason"], "no_api_model");
+
+        let shown = h.asked().len();
+        let give = json!({ "provider": "endpoint", "categories": ["job_text"] });
+        h.ok("ai_consent_give", give);
+        let asked = h.asked();
+        assert!(
+            asked[shown].contains("Address: http://127.0.0.1:1234/v1"),
+            "{asked:?}"
+        );
+        assert!(!asked[shown].contains("Program:"), "{asked:?}");
 
         h.answer(false);
         let clear = json!({ "url": "" });

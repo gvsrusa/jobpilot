@@ -3,7 +3,7 @@
 
 use serde_json::json;
 
-use super::{DataCategory, register};
+use super::{DataCategory, ProviderId, api, register};
 use crate::audit;
 use crate::db::Db;
 use crate::error::{Error, Result};
@@ -12,8 +12,9 @@ use crate::error::{Error, Result};
 pub enum ConsentState {
     None,
     Active(Vec<DataCategory>),
-    /// A record given under other register text than this build's. It allows nothing until
-    /// the user confirms again. Computed on read: a read must not write.
+    /// A record given under other register text than this build's, or for an endpoint address
+    /// that is no longer the stored one. It allows nothing until the user confirms again.
+    /// Computed on read: a read must not write.
     Suspended(Vec<DataCategory>),
 }
 
@@ -41,7 +42,7 @@ pub async fn give(
         return Err(Error::Validation("no data categories".into()));
     }
     let names = json!(categories);
-    let register_row = register::row_text(provider).unwrap_or_default();
+    let register_row = current_row(db, provider).await?.unwrap_or_default();
     let mut tx = db.pool.begin().await?;
     close_active(&mut tx, provider).await?;
     sqlx::query(
@@ -110,7 +111,21 @@ async fn close_active(tx: &mut sqlx::SqliteConnection, provider: &str) -> Result
     Ok(closed.rows_affected())
 }
 
-/// The newest open record, against the row text this build holds.
+/// What a record is bound to: the row text this build holds, and for the endpoint the address
+/// too, since that is where the data goes. A loopback address says nothing about who listens.
+async fn current_row(db: &Db, provider: &str) -> Result<Option<String>> {
+    let row = register::row_text(provider);
+    if provider != ProviderId::Endpoint.to_string() {
+        return Ok(row);
+    }
+    let address = api::endpoint_address(db).await?;
+    Ok(row.map(|row| match address {
+        Some(address) => format!("{row}\n{address}"),
+        None => row,
+    }))
+}
+
+/// The newest open record, against what it is bound to now.
 pub async fn state(db: &Db, provider: &str) -> Result<ConsentState> {
     let record: Option<(String, String)> = sqlx::query_as(
         "SELECT categories, register_row FROM consent \
@@ -124,7 +139,7 @@ pub async fn state(db: &Db, provider: &str) -> Result<ConsentState> {
     };
     let categories =
         serde_json::from_str(&categories).map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
-    Ok(match register::row_text(provider) {
+    Ok(match current_row(db, provider).await? {
         Some(current) if current == row => ConsentState::Active(categories),
         _ => ConsentState::Suspended(categories),
     })

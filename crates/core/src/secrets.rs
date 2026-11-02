@@ -93,6 +93,16 @@ async fn forget_unheld(db: &Db, holds: impl Fn(&str) -> Result<bool> + Send + Co
     }
 }
 
+/// Run after a restore, which is done and must not fail here. The row goes even when the
+/// keychain will not answer: with no row, no send reads the entry.
+pub(crate) async fn forget_api_key(db: &Db, provider: &str) {
+    let name = api_key_name(provider);
+    if names(db).await.is_ok_and(|listed| listed.contains(&name)) {
+        let _ = remove_all(vec![name.clone()]).await;
+        let _ = remove_row(db, &name).await;
+    }
+}
+
 /// Off the runtime. `None` when no entry.
 pub(crate) async fn read_api_key(provider: &str) -> Result<Option<Zeroizing<String>>> {
     let name = api_key_name(provider);

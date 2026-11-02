@@ -165,7 +165,11 @@ function ConsentForm({ sharing, onClose }: { sharing: Sharing; onClose(): void }
           <div className="grid gap-1 text-sm">
             <h3 className="font-medium">Where it goes</h3>
             <p>{sharing.destination}</p>
-            {sharing.path && <p className="break-all">Program: {sharing.path}</p>}
+            {sharing.path && (
+              <p className="break-all">
+                {sharing.name === "endpoint" ? "Address" : "Program"}: {sharing.path}
+              </p>
+            )}
           </div>
           <div className="grid gap-1 text-sm">
             <h3 className="font-medium">{`How ${label} uses it (terms read ${sharing.terms_date})`}</h3>

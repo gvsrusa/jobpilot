@@ -80,6 +80,17 @@ async fn parse(router: &Router, db: &Db) -> Outcome {
         .unwrap()
 }
 
+fn keys(value: &Value) -> Vec<&str> {
+    let mut names: Vec<&str> = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    names.sort_unstable();
+    names
+}
+
 fn manual(reason: &str) -> Outcome {
     Outcome::ManualRequired {
         reason: reason.into(),
@@ -162,6 +173,12 @@ async fn anthropic_request_is_the_documented_shape() {
 
     let hits = fake.hits(MESSAGES);
     let body = &hits[0];
+    assert_eq!(
+        keys(body),
+        ["max_tokens", "messages", "model", "output_config", "system"]
+    );
+    assert_eq!(keys(&body["output_config"]), ["format"]);
+    assert_eq!(keys(&body["output_config"]["format"]), ["schema", "type"]);
     assert_eq!(body["model"], "claude-x");
     assert_eq!(body["max_tokens"], 16000);
     assert_eq!(body["system"], "system text");
@@ -212,7 +229,11 @@ async fn anthropic_refusal_and_max_tokens_map() {
     let refused = claude_reason(claude_says(content.clone(), "refusal")).await;
     assert_eq!(
         refused,
-        (manual("no_ai"), vec!["model_refused".to_string()], 1)
+        (
+            manual("model_refused"),
+            vec!["model_refused".to_string()],
+            1
+        )
     );
 
     let cut = claude_reason(claude_says(content, "max_tokens")).await;
@@ -220,6 +241,25 @@ async fn anthropic_refusal_and_max_tokens_map() {
         cut,
         (manual("no_ai"), vec!["output_truncated".to_string()], 1)
     );
+}
+
+/// Every reply holds text that would pass validation.
+#[tokio::test]
+async fn an_anthropic_reply_that_did_not_end_cleanly_is_not_an_answer() {
+    let text = json!([claude_text(JOB)]);
+    for (stop, reason) in [
+        ("tool_use", "permission_denied"),
+        ("pause_turn", "bad_reply"),
+        ("something_new", "bad_reply"),
+    ] {
+        let (outcome, rows, _) = claude_reason(claude_says(text.clone(), stop)).await;
+        assert!(!matches!(outcome, Outcome::Ok { .. }), "{stop}");
+        assert_eq!(rows, [reason], "{stop}");
+    }
+    for stop in ["end_turn", "stop_sequence"] {
+        let fake = Fake::start(vec![(MESSAGES, claude_says(text.clone(), stop))]);
+        assert_eq!(complete(&anthropic(&fake)).await.unwrap(), JOB, "{stop}");
+    }
 }
 
 #[tokio::test]
@@ -295,7 +335,12 @@ async fn google_request_is_the_documented_shape() {
 
     let hits = fake.hits(GENERATE);
     let body = &hits[0];
+    assert_eq!(
+        keys(body),
+        ["contents", "generationConfig", "systemInstruction"]
+    );
     let config = &body["generationConfig"];
+    assert_eq!(keys(config), ["responseJsonSchema", "responseMimeType"]);
     assert_eq!(config["responseMimeType"], "application/json");
     assert_eq!(config["responseJsonSchema"]["type"], "object");
     assert!(
@@ -363,7 +408,12 @@ async fn google_finish_reasons_and_blocks_map() {
         ("SPII", "model_refused"),
     ] {
         let (outcome, rows, hits) = gemini_reason(gemini_says(text.clone(), finish)).await;
-        assert_eq!(outcome, manual("no_ai"), "{finish}");
+        let end = if reason == "model_refused" {
+            reason
+        } else {
+            "no_ai"
+        };
+        assert_eq!(outcome, manual(end), "{finish}");
         assert_eq!(rows, [reason], "{finish}");
         assert_eq!(hits, 1);
     }
@@ -377,6 +427,42 @@ async fn google_finish_reasons_and_blocks_map() {
     let both = json!({"candidates": [candidate], "promptFeedback": {"blockReason": "OTHER"}});
     let (_, rows, _) = gemini_reason(Canned::json(200, &both)).await;
     assert_eq!(rows, ["model_refused"]);
+}
+
+/// Every reply holds text that would pass validation in its first candidate.
+#[tokio::test]
+async fn a_google_reply_that_did_not_end_cleanly_is_not_an_answer() {
+    let text = json!([{"text": JOB}]);
+    for (finish, reason) in [
+        ("MALFORMED_FUNCTION_CALL", "permission_denied"),
+        ("UNEXPECTED_TOOL_CALL", "permission_denied"),
+        ("OTHER", "bad_reply"),
+        ("SOMETHING_NEW", "bad_reply"),
+    ] {
+        let (outcome, rows, _) = gemini_reason(gemini_says(text.clone(), finish)).await;
+        assert!(!matches!(outcome, Outcome::Ok { .. }), "{finish}");
+        assert_eq!(rows, [reason], "{finish}");
+    }
+    let good = json!({"content": {"parts": text}, "finishReason": "STOP"});
+    let call = json!({"functionCall": {"name": "search", "args": {}}});
+    for (second, reason) in [
+        (
+            json!({"content": {"parts": [call]}, "finishReason": "STOP"}),
+            "permission_denied",
+        ),
+        (json!({"finishReason": "SAFETY"}), "model_refused"),
+        (json!({"finishReason": "MAX_TOKENS"}), "output_truncated"),
+    ] {
+        let reply = json!({"candidates": [good, second]});
+        let (_, rows, _) = gemini_reason(Canned::json(200, &reply)).await;
+        assert_eq!(rows, [reason], "{reply}");
+    }
+    // A candidate may leave its finish out.
+    let fake = Fake::start(vec![(
+        GENERATE,
+        Canned::json(200, &json!({"candidates": [{"content": {"parts": text}}]})),
+    )]);
+    assert_eq!(complete(&google(&fake)).await.unwrap(), JOB);
 }
 
 #[tokio::test]
