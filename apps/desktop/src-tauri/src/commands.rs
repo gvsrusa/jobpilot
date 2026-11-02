@@ -1107,7 +1107,7 @@ pub async fn ai_set_cli_path<R: Runtime>(
     if !(path.is_absolute() && child::accepts_name(&path, spec, cfg!(windows))) {
         return Err(Error::Validation(format!(
             "choose a program named {}",
-            spec.program
+            child::bin_names(spec.program, cfg!(windows)).join(" or ")
         )));
     }
     let path = path
@@ -2524,6 +2524,33 @@ mod tests {
         assert_eq!(h.app.state::<PtyState>().pid(), Some(pid));
     }
 
+    /// macOS CI lost the interrupt in one run of eight and no run here repeats it. The mock's
+    /// trap is set before it says it is ready, so a failure prints who was running and in which
+    /// state. Dropped before the panel, which ends them.
+    #[cfg(unix)]
+    struct GroupTableOnPanic(u32);
+
+    #[cfg(unix)]
+    impl Drop for GroupTableOnPanic {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                return;
+            }
+            let table = std::process::Command::new("ps")
+                .args(["-axo", "pid=,pgid=,tpgid=,stat=,command="])
+                .output();
+            let text = table.map_or(String::new(), |table| {
+                String::from_utf8_lossy(&table.stdout).into_owned()
+            });
+            let group = self.0.to_string();
+            for row in text.lines() {
+                if row.split_whitespace().nth(1) == Some(group.as_str()) {
+                    eprintln!("{row}");
+                }
+            }
+        }
+    }
+
     /// Ctrl-C is a byte until the terminal driver makes it a signal, so this needs the PTY.
     #[cfg(unix)]
     #[test]
@@ -2535,6 +2562,7 @@ mod tests {
         );
         let panel = Panel::open(&h);
         let pid = h.app.state::<PtyState>().pid().unwrap();
+        let _table = GroupTableOnPanic(pid);
         panel.line("claude");
         panel.wait_for("claude-ready");
         panel.send(b"\x03").unwrap();
@@ -2983,12 +3011,16 @@ mod tests {
         assert!(h.asked()[0].contains(SECRET_LAST4), "{:?}", h.asked());
     }
 
-    /// The whole path, so the keychain. `.cargo/config.toml` names the throwaway service.
+    /// The whole path, so the keychain. `.cargo/config.toml` and CI name throwaway services,
+    /// and nothing else runs here, the real one least of all.
     #[test]
     #[ignore = "touches the OS keychain"]
     fn a_pasted_key_is_stored_and_the_clipboard_cleared() {
         let service = std::env::var("JOBPILOT_SECRET_SERVICE").unwrap();
-        assert_eq!(service, "jobpilot-test");
+        assert!(
+            matches!(service.as_str(), "jobpilot-test" | "jobpilot-ci"),
+            "{service}"
+        );
         let h = ready();
         let args = json!({ "provider": "openai" });
 
@@ -3537,20 +3569,36 @@ mod tests {
         assert!(h.asked().is_empty());
     }
 
-    /// What the macOS panel returns for npm's `gemini` link.
+    /// What the macOS panel returns for npm's `gemini` link. Windows resolves no link: its npm
+    /// folder holds `gemini.cmd`, a `.ps1`, and an sh script, and only the `.cmd` can start.
     #[test]
     fn cli_picker_accepts_a_resolved_npm_entry() {
         let h = ready();
+        let args = json!({ "provider": "gemini_cli" });
+        let key = json!({ "key": "ai.gemini_path" });
         let entry = h
             ._tmp
             .path()
             .join("lib/node_modules/@google/gemini-cli/bundle/gemini.js");
-        h.pick(&entry);
-        h.ok("ai_set_cli_path", json!({ "provider": "gemini_cli" }));
-        let key = json!({ "key": "ai.gemini_path" });
-        assert_eq!(h.ok("settings_get", key.clone()), json!(entry));
+        let plain = if cfg!(windows) {
+            for name in ["gemini", "gemini.ps1"] {
+                h.pick(&h._tmp.path().join(name));
+                let error = h.call("ai_set_cli_path", args.clone()).unwrap_err();
+                assert_eq!(error["code"], "validation", "{name}");
+                let message = error["message"].as_str().unwrap();
+                assert!(message.contains("gemini.cmd"), "{message}");
+            }
+            h.pick(&entry);
+            assert_eq!(h.code("ai_set_cli_path", args.clone()), "validation");
+            assert_eq!(h.ok("settings_get", key.clone()), Value::Null);
+            h._tmp.path().join("gemini.cmd")
+        } else {
+            h.pick(&entry);
+            h.ok("ai_set_cli_path", args.clone());
+            assert_eq!(h.ok("settings_get", key.clone()), json!(entry));
+            h._tmp.path().join("gemini")
+        };
 
-        let plain = h._tmp.path().join("gemini");
         h.pick(&plain);
         h.ok("ai_set_cli_path", json!({ "provider": "gemini_cli" }));
         assert_eq!(h.ok("settings_get", key.clone()), json!(plain));

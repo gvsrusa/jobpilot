@@ -38,6 +38,8 @@ type "%MOCK_GEMINI_REPLY%"
 if not defined MOCK_GEMINI_EXIT set MOCK_GEMINI_EXIT=0
 exit /b %MOCK_GEMINI_EXIT%
 :version
-if defined MOCK_GEMINI_VERSION (echo %MOCK_GEMINI_VERSION%) else (echo 0.40.0)
+rem Not in a parenthesised block: the value expands before the block parses, so its ) ends it.
+if not defined MOCK_GEMINI_VERSION set "MOCK_GEMINI_VERSION=0.40.0"
+echo(%MOCK_GEMINI_VERSION%
 if defined MOCK_GEMINI_VERSION_EXIT exit /b %MOCK_GEMINI_VERSION_EXIT%
 exit /b 0

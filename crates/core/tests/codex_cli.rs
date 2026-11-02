@@ -304,7 +304,14 @@ async fn a_spec_with_no_untrusted_text_runs_on_it() {
 async fn prompt_goes_to_stdin_never_argv() {
     let cli = MockCli::new(&[]);
     complete(&cli.codex()).await.unwrap();
-    let sent = cli.read("stdin");
+    let copy = cli.read("stdin");
+    // Windows has only `findstr` to copy stdin, and it ends an unterminated last line with
+    // CRLF. The rest stays exact there, and the sh mock copies every byte.
+    let sent = if cfg!(windows) {
+        copy.strip_suffix("\r\n").unwrap_or(&copy)
+    } else {
+        &copy
+    };
     assert_eq!(
         sent,
         format!("system rules\n\n{}", prompt().user),

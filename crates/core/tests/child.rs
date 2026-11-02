@@ -103,6 +103,7 @@ fn only_the_named_program_is_accepted() {
         "/n/gemini.bat",
         "/n/gemini",
         "/n/gemini.js",
+        "/n/gemini.ps1",
         "/n/node_modules/@google/gemini-cli/bundle/gemini.js",
     ] {
         assert!(!accepts_name(Path::new(bad), &GEMINI, true), "{bad}");
