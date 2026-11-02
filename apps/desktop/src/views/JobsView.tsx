@@ -34,7 +34,7 @@ import {
 const LIMIT = 200;
 const EMPTY_FILTER: JobFilter = { country: null, work_mode: null, min_pay: null, query: null, include_duplicates: false };
 const PERIODS: PayPeriod[] = ["hour", "day", "week", "month", "year"];
-const NO_SCORE = "no score: nothing in your profile to compare";
+const NO_SCORE = "Not scored yet";
 
 const selectClass =
   "h-8 rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50";
@@ -411,17 +411,24 @@ function List({
   const [importing, setImporting] = useState(false);
   const jobs = useQuery({ queryKey: ["jobs", filter], queryFn: () => ipc.jobsList(filter, LIMIT) });
   const statuses = useQuery({ queryKey: ["job-sources-status"], queryFn: ipc.jobSourcesStatus });
-  // The rules score needs no model: it runs on load and after a fetch or an import, for every
-  // job that has none or whose inputs changed.
+  // The rules score needs no model. It runs once on load, and only when a listed job has no
+  // score, so browsing writes no run. A fetch or an import runs it again.
   const client = useQueryClient();
   const score = useMutation({
     mutationFn: () => ipc.jobsAnalyze([], false),
     onSettled: () => client.invalidateQueries({ queryKey: ["jobs"] }),
   });
   const rescore = score.mutate;
+  const unscored = jobs.isSuccess && jobs.data.some((job) => job.score === null);
+  const asked = useRef(false);
   useEffect(() => {
-    rescore();
-  }, [rescore]);
+    if (unscored && !asked.current) {
+      asked.current = true;
+      rescore();
+    }
+  }, [unscored, rescore]);
+  // A busy task slot or the pause only means this pass waits for the next load.
+  const scoreError = score.error && !waits(score.error) ? score.error : null;
   return (
     <div className="grid gap-4">
       <div className="flex items-center justify-between">
@@ -431,7 +438,7 @@ function List({
         </Button>
       </div>
       <Filters form={form} onForm={onForm} onApply={onFilter} />
-      <ErrorAlert error={jobs.error ?? statuses.error ?? score.error} />
+      <ErrorAlert error={jobs.error ?? statuses.error ?? scoreError} />
       {jobs.isSuccess && jobs.data.length === 0 && (
         <p className="text-sm text-muted-foreground">
           No jobs yet. Import a posting, or fetch from a source marked allowed.
@@ -459,6 +466,11 @@ function List({
     </div>
   );
 }
+
+const waits = (error: unknown) => {
+  const { code, message } = toAppError(error);
+  return code === "paused" || message.includes("another_task_is_running");
+};
 
 export function JobsView() {
   const [openId, setOpenId] = useState<string | null>(null);

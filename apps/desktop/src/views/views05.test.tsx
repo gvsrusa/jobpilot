@@ -176,12 +176,13 @@ describe("Jobs screen", () => {
     expect(screen.queryByText(/jobs are shown/)).toBeNull();
   });
 
-  it("shows -- and the reason when a job has no score", async () => {
+  it("shows -- and Not scored yet when a job has no score", async () => {
     jobsBackend([job({ id: "n1", score: null, title: "Data Eng", company: "Gamma" })]);
     await openJobs();
     const row = await screen.findByRole("row", { name: /Data Eng/ });
     expect(within(row).getByText("--")).toBeInTheDocument();
-    expect(within(row).getByText("no score: nothing in your profile to compare")).toBeInTheDocument();
+    expect(within(row).getByText("Not scored yet")).toBeInTheDocument();
+    expect(screen.queryByText(/nothing in your profile to compare/)).toBeNull();
   });
 
   it("renders an HTML posting title as text", async () => {
@@ -284,7 +285,7 @@ describe("Jobs screen scoring and copy", () => {
 
   it("scores again after a fetch", async () => {
     const row: SourceRow = { id: "s1", connector: "lever", target: "acme", query: "", cursor: 0, created_at: "t" };
-    const b = jobsBackend([], {
+    const b = jobsBackend([job()], {
       jobs_fetch: () => ({
         sources: [{ source_id: "s1", connector: "lever", target: "acme", added: 1, updated: 0, skipped: 0, reason: null, next_at: null }],
         grouped: 0,
@@ -292,9 +293,69 @@ describe("Jobs screen scoring and copy", () => {
     }, [row]);
     const { user } = await openJobs();
     const lever = await screen.findByRole("listitem", { name: "Lever" });
-    await waitFor(() => expect(count(b, "jobs_analyze")).toBe(1));
+    expect(count(b, "jobs_analyze")).toBe(0);
     await user.click(within(lever).getByRole("button", { name: "Fetch Lever" }));
-    await waitFor(() => expect(count(b, "jobs_analyze")).toBe(2));
+    await waitFor(() => expect(count(b, "jobs_analyze")).toBe(1));
+  });
+
+  it("scores again after an import", async () => {
+    const b = jobsBackend([job()], { job_import: () => job({ id: "j9" }) });
+    const { user } = await openJobs();
+    await screen.findByRole("row", { name: /Backend Engineer/ });
+    expect(count(b, "jobs_analyze")).toBe(0);
+    await user.click(screen.getByRole("button", { name: "Import a posting" }));
+    await user.type(await screen.findByLabelText("Title"), "Role");
+    await user.type(screen.getByLabelText("Posting text"), "Text.");
+    await user.click(screen.getByRole("button", { name: "Save posting" }));
+    await waitFor(() => expect(count(b, "jobs_analyze")).toBe(1));
+  });
+
+  it("starts no run when every listed job has a score", async () => {
+    const b = jobsBackend([job({ score: 80 })]);
+    await openJobs();
+    await screen.findByRole("row", { name: /Backend Engineer/ });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(count(b, "jobs_analyze")).toBe(0);
+  });
+
+  it("starts one run for the load, however often the list is read again", async () => {
+    const b = jobsBackend([job({ score: null })]);
+    const { user } = await openJobs();
+    await screen.findByRole("row", { name: /Backend Engineer/ });
+    await waitFor(() => expect(count(b, "jobs_analyze")).toBe(1));
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(count(b, "jobs_analyze")).toBe(1);
+  });
+
+  it("shows no alert when the rules pass meets a busy task slot or the pause", async () => {
+    for (const failure of [
+      { code: "refused", message: "refused: another_task_is_running" },
+      { code: "paused", message: "Emergency pause is on" },
+    ]) {
+      const b = jobsBackend([job({ score: null })], {
+        jobs_analyze: () => {
+          throw failure;
+        },
+      });
+      const { unmount } = await openJobs();
+      const row = await screen.findByRole("row", { name: /Backend Engineer/ });
+      await waitFor(() => expect(count(b, "jobs_analyze")).toBe(1));
+      expect(within(row).getByText("Not scored yet")).toBeInTheDocument();
+      expect(screen.queryByRole("alert")).toBeNull();
+      unmount();
+    }
+  });
+
+  it("still shows any other failure of the rules pass", async () => {
+    jobsBackend([job({ score: null })], {
+      jobs_analyze: () => {
+        throw { code: "db", message: "the database is unreadable" };
+      },
+    });
+    await openJobs();
+    expect(await screen.findByRole("alert")).toHaveTextContent("the database is unreadable");
   });
 
   it("shows the true next fetch time from the stored hold", async () => {
