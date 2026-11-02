@@ -358,8 +358,8 @@ pub struct SourceStatus { pub name: String, pub label: String, pub read: PolicyS
     pub can_fetch: bool, pub operations: Vec<Operation>, pub attribution: Option<String>,
     pub date_read: Option<String>, pub target: TargetKind, pub min_interval_secs: Option<u64>,
     pub per_day: Option<u32>, pub note: Option<&'static str> }
-pub const D3_NOTE: &str = "Vendor is silent on third-party readers. Read under ruling R1.";
-pub fn statuses() -> Vec<SourceStatus>;   // `note` is D3_NOTE on an `SilentRead` row
+pub const R1_NOTE: &str = "Vendor is silent on third-party readers. Read under ruling R1.";
+pub fn statuses() -> Vec<SourceStatus>;   // `note` is R1_NOTE on a `SilentRead` row
 ```
 
 `gate` checks that the operation is declared first, then the status, so a decl with no read gets `operation_not_declared`. It passes `Allowed` and `SilentRead`. It refuses with `Refused("policy_unknown")`, `Refused("policy_blocked")`, `Refused("policy_user_assisted")`, or `Refused("operation_not_declared")`. `ImportPasted` passes on any declared connector. In this task `all()` is empty; Tasks 4 and 5 fill it, and their tests hold the assertions on real rows. Tests here use `read_status_on` and `gate_on` on a small inline register, because no row reads `silent-read` until Task 5.
@@ -390,7 +390,7 @@ fn decl(policy: PolicyStatus) -> ConnectorDecl { /* name "t", ListFeed, ReadPubl
     assert_eq!(read_status_on(TABLE, &decl(PolicyStatus::Unknown)), PolicyStatus::Unknown);
     assert_eq!(read_status_on(TABLE, &decl(PolicyStatus::Allowed)), PolicyStatus::Unknown);
 }
-#[test] fn owner_decision_passes_the_gate_and_never_reads_as_allowed() {
+#[test] fn silent_read_passes_the_gate_and_never_reads_as_allowed() {
     let d = decl(PolicyStatus::SilentRead);
     assert_eq!(read_status_on(TABLE, &d), PolicyStatus::SilentRead);
     assert!(gate_on(TABLE, &d, Operation::ListFeed).is_ok());
@@ -678,7 +678,7 @@ Parsing, pinned: Greenhouse `content` is entity-decoded at most twice, and `pay_
     }
 }
 #[test] fn no_row_ever_grants_more_than_a_status_says() {
-    // can_fetch is true only for these five, in `all()` order; `note` is set only on the D3 two.
+    // can_fetch is true only for these five, in `all()` order; `note` is set only on the R1 two.
     let fetchable: Vec<_> = statuses().into_iter().filter(|s| s.can_fetch).map(|s| s.name).collect();
     assert_eq!(fetchable, ["lever", "remoteok", "wwr", "greenhouse", "ashby"]);
 }
@@ -1313,7 +1313,7 @@ job prefs set [--min-pay 90000:EUR:year] [--seniority senior]
 #[test] fn job_source_add_linkedin_is_refused_with_the_import_route() {
     // stderr: error[refused]: ... Import the posting.
 }
-#[test] fn job_source_add_greenhouse_says_the_vendor_is_silent() { /* stored, prints the D3 line */ }
+#[test] fn job_source_add_greenhouse_says_the_vendor_is_silent() { /* stored, prints the R1 line */ }
 #[test] fn job_sources_lists_all_nine_with_status_limit_and_attribution() { /* */ }
 #[test] fn job_fetch_with_no_sources_says_add_one_and_sends_nothing() { /* no test here reaches a vendor */ }
 #[test] fn job_list_filters_are_exact_and_json_matches_text() { /* */ }
@@ -1396,7 +1396,7 @@ const index = e.key === "0" ? 9 : Number(e.key) - 1;
 ```tsx
 it("Ctrl+0 opens Jobs, and Ctrl+1 still opens Status", ...);
 it("shows a source's verdict and no Fetch button when it cannot fetch", ...);
-it("shows the D3 note and a Fetch button on Greenhouse and Ashby", ...);
+it("shows the R1 note and a Fetch button on Greenhouse and Ashby", ...);
 it("shows Remote OK on a card from that source, with no image", ...);
 it("shows -- and the reason when a job has no score", ...);
 it("renders an HTML posting title as text", ...);
@@ -1528,12 +1528,12 @@ git commit -m "feat: job detail with explained score, and the injection and bypa
 | `docs/policy-register.md` | **Site rows only. Edit no AI provider row and no owner decision line: decision 12 of 0.4 suspends consent on any change. Keep line 3 as it is, since `the_register_date_comes_from_the_third_line` pins it.** Set Date read to 2026-11-02 on the Lever, RemoteOK, We Work Remotely, Greenhouse, and Ashby read rows, and change line 73's "All dates read are 2026-11-01" to say so. Verdicts do not change beyond Task 5's two rows. Greenhouse's source URL moves to `https://docs.greenhouse.io/job-board.html`. Consequence cells: Greenhouse and Ashby read, "Read under R1, on a board the person names: 2 s, 300 a day. Vendor silent. Setting this row and the declaration to `unknown` refuses it."; Lever, "JobPilot's limit: 2 s, 300 a day."; RemoteOK, its 15 minutes and 24 a day, the link-back through Open posting, and no logo; WWR, 60 minutes (`<ttl>60</ttl>`), 24 a day. Company career pages, Workday, Indeed, and LinkedIn rows: no change of verdict; Task 15 re-reads them. Policy impact: FR-5.2 and FR-5.4 read "Read connector under R1, vendor silent. User-assisted import also works."; the milestone row says 0.5 ships three read connectors on `allowed` rows, two under R1, and four assisted. Open written questions: add RemoteOK, the `use=reference` signal and a user's own model. Add a Connector declarations table: name, operations, automation, limit, status. |
 | `docs/connector-sdk.md` | Replace the stub: the four declarations, `ConnectorDecl` field by field, the two pure functions, the gate, how `check` refuses, the rate-limit rules, a worked connector, the fixture rule, the `silent-read` status, and the two-line change that turns a D3 read off. FR-13.5. |
 | `docs/milestones.md` | Release 0.5 scope, "0.1 to 0.5 built". Reword the exit test: a read connector runs for a source whose verdict is `allowed` or `silent-read`; at `unknown` or `blocked` none runs, and a test proves the refusal. Add the 0.5 gate record with `PLACEHOLDER_TASK_15_*` rows, as 0.4 did. |
-| `docs/agents.md` | Status line. The Discovery row and note: `allowed` rows plus the two D3 rows. Sections 2 to 4: Discovery, Matching, Research as built, with their timeouts and steps. Permission table: `read:matches` not yet used. Matching without `read:sensitive` (decision 18). Research with no `net:connector` (decision 19). Analytics note (decision 22). The task type sentence at the top names the two new tasks. |
+| `docs/agents.md` | Status line. The Discovery row and note: `allowed` rows plus the two R1 rows. Sections 2 to 4: Discovery, Matching, Research as built, with their timeouts and steps. Permission table: `read:matches` not yet used. Matching without `read:sensitive` (decision 18). Research with no `net:connector` (decision 19). Analytics note (decision 22). The task type sentence at the top names the two new tasks. |
 | `docs/architecture.md` | New modules `connectors`, `jobs`, `agents::{discovery, matching, research}`. CLI `job` surface. The Jobs view. Remove `connector SDK` from planned later modules. |
 | `docs/database-schema.md` | Section for `0013` with rule 7. `schema_version` 13. Replace the proposed connector and job rows. |
 | `docs/ai-providers.md` | `semantic_match` and `summarize_company` in the task table: categories, schema, attempts. |
 | `docs/security/threat-model.md` | Status block for 0.5, **Built 0.5**. M-33 built, with `silent-read` beside `allowed`, test names, and "Declared rate limits are enforced" pointing at `connector_fetch.rs`. M-18 matching with test names. M-23 corpus files 20 to 22. M-34 extended to connector text. B4: Spoofing and Elevation at 0.5 done; Denial of service gains `MAX_FEED_BYTES` and page caps. Section 11 adds: skills and pay rules are English-first; a fake posting from a feed can still score well; RemoteOK's signal; Greenhouse and Ashby reads rest on D3 and vendor silence. |
-| `docs/wireframes.md` | Screens 8 and 9 as built: the fixed copy above, points as pinned, the compared weight, Locked and no-country lines, and Greenhouse and Ashby with a Fetch button and the D3 note. |
+| `docs/wireframes.md` | Screens 8 and 9 as built: the fixed copy above, points as pinned, the compared weight, Locked and no-country lines, and Greenhouse and Ashby with a Fetch button and the R1 note. |
 | `docs/development.md` | `tests/fixtures/connectors`, the synthetic rule, and that no test or CI step reaches a job source. |
 | `docs/prd.md` | Open items line: FR-5.2 and FR-5.4 met under R1; FR-5.7 to FR-5.9 as they stand. |
 | `README.md`, `CHANGELOG.md`, `docs/releases/0.5.0.md` | Built, tests, not exercised, risks, upgrading. |
@@ -1576,7 +1576,7 @@ JP="$PWD/target/debug/jobpilot"
 $JP status; $JP job sources
 ```
 
-Expected: schema 13, version 0.5.0, nine sources, and exactly Lever, RemoteOK, We Work Remotely, Greenhouse, and Ashby fetchable, the last two with the D3 note.
+Expected: schema 13, version 0.5.0, nine sources, and exactly Lever, RemoteOK, We Work Remotely, Greenhouse, and Ashby fetchable, the last two with the R1 note.
 
 - [ ] **Step 3: Offline and no-provider path, no network**
 
@@ -1607,7 +1607,7 @@ With Claude Code signed in: `ai enable claude_code`, give consent for `job_text,
 
 - [ ] **Step 8: The GUI, once**
 
-Launch the debug app with the same `JOBPILOT_HOME` and `JOBPILOT_SECRET_SERVICE`. By keyboard: Ctrl+0 opens Jobs; the Sources list shows the verdicts, Greenhouse shows the D3 note and a Fetch button, and LinkedIn has none; open a RemoteOK job, which shows `Remote OK` and no image; Open posting opens the default browser on `remoteok.com`; Add to tracker makes an application. Press Emergency pause during a fetch.
+Launch the debug app with the same `JOBPILOT_HOME` and `JOBPILOT_SECRET_SERVICE`. By keyboard: Ctrl+0 opens Jobs; the Sources list shows the verdicts, Greenhouse shows the R1 note and a Fetch button, and LinkedIn has none; open a RemoteOK job, which shows `Remote OK` and no image; Open posting opens the default browser on `remoteok.com`; Add to tracker makes an application. Press Emergency pause during a fetch.
 
 - [ ] **Step 9: Backup and restore**
 
