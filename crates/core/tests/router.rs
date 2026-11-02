@@ -14,7 +14,7 @@ use jobpilot_core::ai::{
     Provider, ProviderId, TaskSpec, TaskType, consent, spec,
 };
 use jobpilot_core::render::ResumeDoc;
-use jobpilot_core::{AppPaths, Db, Error, Result, audit, settings, transfer};
+use jobpilot_core::{AppPaths, Db, Error, Result, audit, pause, settings, transfer};
 use serde_json::json;
 use sqlx::SqlitePool;
 use tempfile::TempDir;
@@ -2047,4 +2047,72 @@ async fn classify_stays_one_attempt_on_a_429() {
 
     assert_eq!(counters.calls.load(Ordering::SeqCst), 1);
     assert_eq!(outcome, manual("rate_limited"));
+}
+
+#[tokio::test]
+async fn a_pause_that_fires_the_token_mid_wait_ends_the_run_at_once() {
+    let (_tmp, db) = setup().await;
+    with_claude_consent(&db).await;
+    let wait = Some(Duration::from_secs(20));
+    let claude = Mock::claude(vec![Reply::RateLimited(wait), text(JOB)]);
+    let counters = claude.counters();
+    let router = Router::with_providers(vec![claude.boxed()]);
+    let cancel = CancellationToken::new();
+    let pool = db.pool.clone();
+    let setter = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        sqlx::query("INSERT INTO emergency_pause (id, set_at, set_by) VALUES ('me', 'now', 'gui')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pause::watch(&db, &cancel).await;
+    };
+    let run = router.run(&db, "gui", TaskType::ParseJob, prompt(), cancel.clone());
+
+    let clock = Instant::now();
+    let (outcome, ()) = tokio::join!(run, setter);
+
+    assert_eq!(outcome.unwrap(), Outcome::Cancelled);
+    assert!(
+        clock.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        clock.elapsed()
+    );
+    assert_eq!(counters.calls.load(Ordering::SeqCst), 1);
+}
+
+/// 30 s is the longest wait obeyed, so it waits (and a cancel ends it); 31 s moves on.
+#[tokio::test]
+async fn a_retry_after_of_exactly_the_limit_waits_and_one_past_it_does_not() {
+    for (secs, waits) in [(30, true), (31, false)] {
+        let (_tmp, db) = setup().await;
+        with_claude_consent(&db).await;
+        let claude = Mock::claude(vec![
+            Reply::RateLimited(Some(Duration::from_secs(secs))),
+            text(JOB),
+        ]);
+        let counters = claude.counters();
+        let router = Router::with_providers(vec![claude.boxed()]);
+        let cancel = CancellationToken::new();
+        let stopper = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            stopper.cancel();
+        });
+
+        let clock = Instant::now();
+        let outcome = router
+            .run(&db, "gui", TaskType::ParseJob, prompt(), cancel)
+            .await
+            .unwrap();
+
+        if waits {
+            assert_eq!(outcome, Outcome::Cancelled, "{secs}");
+            assert!(clock.elapsed() >= Duration::from_millis(600), "{secs}");
+        } else {
+            assert_eq!(outcome, manual("rate_limited"), "{secs}");
+            assert!(clock.elapsed() < Duration::from_millis(600), "{secs}");
+        }
+        assert_eq!(counters.calls.load(Ordering::SeqCst), 1, "{secs}");
+    }
 }

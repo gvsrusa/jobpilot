@@ -20,6 +20,7 @@ fn retry_after_only_trusts_small_whole_seconds() {
         "",
         "Wed, 21 Oct 2026 07:28:00 GMT",
         "99999999999999999999",
+        "+5",
     ] {
         assert_eq!(retry_after(Some(bad)), None, "{bad}");
     }
@@ -95,21 +96,20 @@ async fn hosted_client_refuses_plain_http() {
     assert!(fake.paths().is_empty());
 }
 
-#[tokio::test]
-async fn hosted_client_does_not_follow_a_redirect() {
-    // https_only refuses http before any redirect could matter; the policy is still pinned
-    // by the builder, and this keeps the 302 from ever being followed to the second fake.
-    let second = Fake::start(vec![("/x", Canned::json(200, &json!({})))]);
-    let first = Fake::start(vec![(
-        "/y",
-        Canned::json(302, &json!({})).with_header("Location", &format!("{}/x", second.url)),
-    )]);
-    let _ = hosted_client()
-        .unwrap()
-        .get(format!("{}/y", first.url))
-        .send()
-        .await;
-    assert!(second.paths().is_empty());
+/// A local check of the redirect policy needs an https server, and a test has no certificate
+/// the OS trusts, so the client's own description is read instead. `https_only` is pinned by
+/// the test above. `tls_version_min` has no local check: its description is not exposed and a
+/// handshake needs a trusted certificate, so only Task 11's real handshake covers it.
+#[test]
+fn both_clients_are_built_to_follow_no_redirect() {
+    let hosted = format!("{:?}", hosted_client().unwrap());
+    let (_, loopback) = loopback_client("http://127.0.0.1:1").unwrap();
+    for described in [hosted, format!("{loopback:?}")] {
+        assert!(
+            described.contains("redirect_policy: \"Policy(None)\""),
+            "{described}"
+        );
+    }
 }
 
 #[test]

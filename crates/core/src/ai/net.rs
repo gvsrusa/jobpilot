@@ -70,8 +70,13 @@ pub fn retry_after(header: Option<&str>) -> Option<Duration> {
 }
 
 #[allow(dead_code)]
-/// Reads at most `limit` bytes of the body. A longer body is `TooLarge`, so a hostile or
-/// broken server cannot fill memory.
+/// Reads at most `limit` bytes of the body, counting chunks as they arrive, so a body with no
+/// `Content-Length` is capped too. A longer body is `TooLarge`: a hostile or broken server
+/// cannot fill memory.
+///
+/// This sets no deadline of its own, and `hosted_client` sets no overall timeout. A server that
+/// drips bytes is stopped by the router's `bounded` around the whole attempt, so a caller must
+/// read inside `bounded` and never outside it.
 pub(crate) async fn read_capped(mut response: Response, limit: u64) -> Result<Vec<u8>> {
     if response.content_length().is_some_and(|len| len > limit) {
         return Err(Error::TooLarge { limit });
@@ -111,6 +116,36 @@ mod tests {
         });
         let (_, client) = loopback_client(&url).unwrap();
         client.get(url).send().await.unwrap()
+    }
+
+    /// Three 3-byte chunks, no `Content-Length`.
+    async fn get_chunked() -> Response {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+            let _ = stream.write_all(head.as_bytes());
+            for _ in 0..3 {
+                let _ = stream.write_all(b"3\r\nabc\r\n");
+                let _ = stream.flush();
+            }
+            let _ = stream.write_all(b"0\r\n\r\n");
+        });
+        let (_, client) = loopback_client(&url).unwrap();
+        client.get(url).send().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn read_capped_counts_chunks_when_there_is_no_content_length() {
+        let response = get_chunked().await;
+        assert_eq!(response.content_length(), None);
+        let past = read_capped(response, 8).await;
+        assert!(matches!(past, Err(Error::TooLarge { limit: 8 })));
+        let at = read_capped(get_chunked().await, 9).await.unwrap();
+        assert_eq!(at, b"abcabcabc");
     }
 
     #[tokio::test]
