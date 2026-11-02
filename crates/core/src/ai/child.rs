@@ -416,15 +416,14 @@ pub fn accepts_name(path: &Path, spec: &CliSpec, windows: bool) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    let named = if windows {
-        bin_names(spec.program, true)
-            .into_iter()
-            .chain([spec.program.to_string()])
-            .any(|allowed| name.eq_ignore_ascii_case(&allowed))
-    } else {
-        name == spec.program
-    };
-    named || is_npm_entry(path, spec)
+    // CreateProcess runs neither an extensionless file nor a `.js`, so Windows takes the two
+    // names `bin_names` lists and no npm entry.
+    if windows {
+        return bin_names(spec.program, true)
+            .iter()
+            .any(|allowed| name.eq_ignore_ascii_case(allowed));
+    }
+    name == spec.program || is_npm_entry(path, spec)
 }
 
 /// `.../node_modules/<package>/.../<entry>`, with the package's own folders in that order.
@@ -474,6 +473,17 @@ pub fn child_path(bin: &Path, spec: &CliSpec, inherited: &OsStr) -> OsString {
         .unwrap_or_else(|_| inherited.to_os_string())
 }
 
+/// The environment of a probe or a run: the shared list, with `PATH` led by the program's own
+/// folder so a script that starts `node` finds the one beside it from a GUI launch.
+pub fn program_env(bin: &Path, spec: &CliSpec) -> Vec<(String, String)> {
+    let mut env = child_env(spec.extra_env);
+    env.retain(|(name, _)| name != "PATH");
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let path = child_path(bin, spec, &inherited);
+    env.push(("PATH".into(), path.to_string_lossy().into_owned()));
+    env
+}
+
 pub fn not_found(spec: &CliSpec) -> String {
     format!(
         "{program} was not found. Install it, or choose its full path in the AI screen, or \
@@ -501,6 +511,23 @@ fn checked(bin: PathBuf, spec: &CliSpec, source: &str) -> std::result::Result<Pa
 /// error, never a silent fall through. One that is well formed and whose file is gone is
 /// skipped: an update removes what it named, and discovery is what an unset path gets.
 pub async fn find_cli(spec: &CliSpec, db: Option<&Db>) -> std::result::Result<PathBuf, String> {
+    find_cli_by(spec, db, true).await
+}
+
+/// `find_cli` without the login shell, which takes up to its 5 s timeout: for a CLI that is
+/// off, where `status` only wants to know whether it is there.
+pub async fn find_cli_quick(
+    spec: &CliSpec,
+    db: Option<&Db>,
+) -> std::result::Result<PathBuf, String> {
+    find_cli_by(spec, db, false).await
+}
+
+async fn find_cli_by(
+    spec: &CliSpec,
+    db: Option<&Db>,
+    login_shell: bool,
+) -> std::result::Result<PathBuf, String> {
     if let Some(bin) = std::env::var_os(spec.env_bin).filter(|bin| !bin.is_empty()) {
         return checked(PathBuf::from(bin), spec, spec.env_bin);
     }
@@ -518,15 +545,19 @@ pub async fn find_cli(spec: &CliSpec, db: Option<&Db>) -> std::result::Result<Pa
         return Ok(found);
     }
     #[cfg(unix)]
-    if let Some(found) = login_shell_lookup(
-        &std::env::var_os("SHELL").unwrap_or_default(),
-        spec.program,
-        &|path| accepts_name(path, spec, false),
-    )
-    .await
+    if login_shell
+        && let Some(found) = login_shell_lookup(
+            &std::env::var_os("SHELL").unwrap_or_default(),
+            spec.program,
+            &|path| accepts_name(path, spec, false),
+        )
+        .await
     {
         return Ok(found);
     }
+    // Windows has no login shell to ask.
+    #[cfg(windows)]
+    let _ = login_shell;
     Err(not_found(spec))
 }
 

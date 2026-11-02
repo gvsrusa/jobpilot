@@ -1301,9 +1301,28 @@ async fn availability_comes_from_settings_and_the_index_alone() {
     assert_eq!(row("openrouter").reason.as_deref(), Some("no_api_model"));
     assert_eq!(row("endpoint").reason.as_deref(), Some("no_endpoint"));
     assert_eq!(row("anthropic").reason.as_deref(), Some("no_api_model"));
-    // A CLI row is found or not by its folders and never started while it is off (decision 28),
-    // so what it says depends on the machine: only "not built" is gone.
-    assert_ne!(row("gemini_cli").reason.as_deref(), Some("not_built"));
+    // A CLI row is judged by its program and never started while it is off (decision 28). A
+    // directory named `gemini` is what the setting names, so the answer does not depend on
+    // what this machine has installed: it is not a program, and discovery is not reached.
+    let fake = _tmp.path().join("gemini");
+    std::fs::create_dir_all(&fake).unwrap();
+    jobpilot_core::settings::set(&db, "ai.gemini_path", &json!(fake.to_str().unwrap()))
+        .await
+        .unwrap();
+    let status = ai::status(&db).await.unwrap();
+    let gemini = status
+        .external
+        .iter()
+        .find(|r| r.name == "gemini_cli")
+        .unwrap();
+    assert_eq!(
+        (
+            gemini.available,
+            gemini.reason.as_deref(),
+            gemini.path.as_deref()
+        ),
+        (false, Some("not_installed"), None)
+    );
 }
 
 #[tokio::test]

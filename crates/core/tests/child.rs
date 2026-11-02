@@ -95,10 +95,18 @@ fn only_the_named_program_is_accepted() {
     assert!(accepts_name(Path::new("/x/gemini"), &GEMINI, false));
     assert!(!accepts_name(Path::new("/x/codex"), &GEMINI, false));
     // Windows names ignore case and take the shim.
-    for good in ["/n/Gemini.CMD", "/n/gemini.exe", "/n/gemini"] {
+    for good in ["/n/Gemini.CMD", "/n/gemini.exe"] {
         assert!(accepts_name(Path::new(good), &GEMINI, true), "{good}");
     }
-    assert!(!accepts_name(Path::new("/n/gemini.bat"), &GEMINI, true));
+    // CreateProcess cannot run an extensionless file or a script.
+    for bad in [
+        "/n/gemini.bat",
+        "/n/gemini",
+        "/n/gemini.js",
+        "/n/node_modules/@google/gemini-cli/bundle/gemini.js",
+    ] {
+        assert!(!accepts_name(Path::new(bad), &GEMINI, true), "{bad}");
+    }
 }
 
 #[test]
@@ -285,4 +293,19 @@ async fn cmd_shim_takes_spaces_stdin_and_exit_code() {
             "{err:?}"
         ),
     }
+}
+
+/// Rust's refusal of an argument it cannot pass is `InvalidInput`; a NUL byte is one on every
+/// Unix, where a `.cmd` argument is not available to try. It is `cli_error`, not an I/O fault.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_argument_the_os_refuses_is_cli_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut run = helper_run(dir.path(), "echo", b"", 1 << 20);
+    run.args.push("a\0b".into());
+    let err = run_piped(run).await.unwrap_err();
+    assert!(
+        matches!(&err, jobpilot_core::Error::Failed(why) if why == "cli_error"),
+        "{err:?}"
+    );
 }

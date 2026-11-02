@@ -478,36 +478,62 @@ pub(crate) async fn provider_settings(db: &Db) -> Result<(Vec<String>, serde_jso
     Ok((order, enabled))
 }
 
-/// Where a CLI provider's program is, by the shared discovery.
+/// Where a CLI provider's program is, by the shared discovery (the consent dialog's line).
 async fn cli_path(db: &Db, name: &str) -> Option<String> {
     let spec = child::spec_for(name)?;
     let found = child::find_cli(spec, Some(db)).await.ok()?;
     Some(found.display().to_string())
 }
 
-/// Decision 28: a CLI that is off is found but never started, because `status` runs on every
-/// refresh of the AI screen and a Node CLI takes seconds to start. Only an enabled one gets
-/// the `--version` probe, which for Gemini includes its version floor.
-async fn cli_availability(db: &Db, name: &str, enabled: bool) -> (bool, Option<String>) {
+/// Past this, a CLI row reads `no_answer`: its own probe is 10 s, and a login shell lookup
+/// before it is 5 s, so no row holds the screen longer than one of each.
+const CLI_ROW_BOUND: Duration = Duration::from_secs(16);
+
+/// What a CLI row shows: available, the reason it is not, and where its program is.
+type CliRow = (bool, Option<String>, Option<String>);
+
+/// Decision 28: a CLI that is off is found, by the folders alone, and never started, because
+/// `status` runs on every refresh of the AI screen and a Node CLI takes seconds to start. Only
+/// an enabled one gets the login shell and the `--version` probe, which for Gemini includes its
+/// version floor. One discovery per row.
+async fn cli_row(db: &Db, name: &str, enabled: bool) -> CliRow {
     let Some(spec) = child::spec_for(name) else {
-        return (false, Some("not_built".into()));
+        return (false, Some("not_built".into()), None);
     };
-    let Ok(bin) = child::find_cli(spec, Some(db)).await else {
-        return (false, Some("not_installed".into()));
+    let found = if enabled {
+        child::find_cli(spec, Some(db)).await
+    } else {
+        child::find_cli_quick(spec, Some(db)).await
     };
+    let Ok(bin) = found else {
+        return (false, Some("not_installed".into()), None);
+    };
+    let path = Some(bin.display().to_string());
     if !enabled {
-        return (true, None);
+        return (true, None, path);
     }
-    if name == "gemini_cli" {
-        return match GeminiCli::with_binary(bin).available().await {
-            Availability::Available => (true, None),
-            Availability::Unavailable(why) => (false, Some(why)),
-        };
+    let probe = if name == "gemini_cli" {
+        match GeminiCli::with_binary(bin).available().await {
+            Availability::Available => Ok(()),
+            Availability::Unavailable(why) => Err(why),
+        }
+    } else {
+        let env = child::program_env(&bin, spec);
+        child::version_of(&bin, env)
+            .await
+            .map(|_| ())
+            .map_err(str::to_string)
+    };
+    match probe {
+        Ok(()) => (true, None, path),
+        Err(why) => (false, Some(why), path),
     }
-    match child::version_of(&bin, child::child_env(spec.extra_env)).await {
-        Ok(_) => (true, None),
-        Err(why) => (false, Some(why.into())),
-    }
+}
+
+async fn bounded_cli_row(db: &Db, name: &str, enabled: bool) -> CliRow {
+    tokio::time::timeout(CLI_ROW_BOUND, cli_row(db, name, enabled))
+        .await
+        .unwrap_or((false, Some("no_answer".into()), None))
 }
 
 /// A provider row's availability, by the same checks routing uses. Opens no socket.
@@ -533,8 +559,8 @@ async fn external_status(db: &Db) -> Result<Vec<ExternalStatus>> {
     let (_, enabled) = provider_settings(db).await?;
     // Together, so `status` waits for one probe timeout at most.
     let (gemini, codex) = tokio::join!(
-        cli_availability(db, "gemini_cli", enabled["gemini_cli"] == true),
-        cli_availability(db, "codex_cli", enabled["codex_cli"] == true),
+        bounded_cli_row(db, "gemini_cli", enabled["gemini_cli"] == true),
+        bounded_cli_row(db, "codex_cli", enabled["codex_cli"] == true),
     );
     let mut rows = Vec::new();
     for info in register::PROVIDERS {
@@ -543,15 +569,18 @@ async fn external_status(db: &Db) -> Result<Vec<ExternalStatus>> {
         }
         let state = consent::state(db, &info.id.to_string()).await?;
         let suspended = matches!(state, ConsentState::Suspended(_));
-        let (available, reason) = match info.name {
+        let (available, reason, cli_path) = match info.name {
             "gemini_cli" => gemini.clone(),
             "codex_cli" => codex.clone(),
-            _ => api_availability(db, info).await?,
+            _ => {
+                let (available, reason) = api_availability(db, info).await?;
+                (available, reason, None)
+            }
         };
         let model = text_setting(db, &format!("ai.model.{}", info.name)).await?;
         let path = match info.kind {
             ProviderKind::Endpoint => api::endpoint_address(db).await?,
-            ProviderKind::Cli => cli_path(db, info.name).await,
+            ProviderKind::Cli => cli_path,
             _ => None,
         };
         rows.push(ExternalStatus {

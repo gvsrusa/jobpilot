@@ -1125,6 +1125,10 @@ pub async fn ai_clear_cli_path<R: Runtime>(
         .ok_or_else(|| Error::Validation("choose a program for gemini_cli or codex_cli".into()))?;
     let stored = settings::get(&*state.work().await?, spec.setting).await?;
     let stored = stored.as_ref().and_then(Value::as_str).unwrap_or_default();
+    if stored.trim().is_empty() {
+        // Already automatic: nothing changes, so there is nothing to confirm.
+        return Ok(());
+    }
     let message = format!(
         "Stop using this program as {}, and find {} automatically?\n\n{stored}",
         spec.program, spec.program
@@ -3431,6 +3435,15 @@ mod tests {
         assert_eq!(row["available"], true);
         assert_eq!(row["reason"], Value::Null);
         assert_eq!(row["runs_job_text"], true);
+    }
+
+    #[test]
+    fn clearing_a_cli_path_that_is_not_set_asks_nothing() {
+        let h = ready();
+        // A refusing dialog would fail the call; there is nothing to confirm.
+        h.answer(false);
+        h.ok("ai_clear_cli_path", json!({ "provider": "codex_cli" }));
+        assert!(h.asked().is_empty());
     }
 
     /// What the macOS panel returns for npm's `gemini` link.
