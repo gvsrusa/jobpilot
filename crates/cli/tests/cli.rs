@@ -11,6 +11,7 @@ fn run(home: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_jobpilot"))
         .args(args)
         .env("JOBPILOT_HOME", home)
+        .env("JOBPILOT_SECRET_SERVICE", "jobpilot-test")
         .output()
         .unwrap()
 }
@@ -172,6 +173,7 @@ fn run_env(home: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_jobpilot"))
         .args(args)
         .env("JOBPILOT_HOME", home)
+        .env("JOBPILOT_SECRET_SERVICE", "jobpilot-test")
         .envs(env.iter().copied())
         .output()
         .unwrap()
@@ -315,8 +317,8 @@ fn cli_output_strips_terminal_escapes() {
     }
     // JSON mode: the parsed values are clean, not merely escaped on the wire.
     let job = stdout_json(&run(&home, &["job", "show", &id, "--json"]));
-    assert_eq!(job["title"], "title");
-    assert!(job["normalized"].as_str().unwrap().contains("Build things"));
+    assert_eq!(job["job"]["title"], "title");
+    assert!(job["text"].as_str().unwrap().contains("Build things"));
     assert_eq!(
         stdout_json(&run(&home, &["job", "list", "--json"]))[0]["title"],
         "title"
@@ -3018,4 +3020,388 @@ fn cli_path_refuses_another_program() {
     let cleared = run(&home, &["ai", "cli-path", "gemini_cli", "", "--json"]);
     assert_eq!(stdout_json(&cleared)["gemini_cli_path"], "");
     drop(dir);
+}
+
+// Job commands. Each runs on a temporary home and the test keychain service; none reaches a
+// vendor, and no provider is set up.
+
+fn run_stdin(home: &Path, args: &[&str], input: &str) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jobpilot"))
+        .args(args)
+        .env("JOBPILOT_HOME", home)
+        .env("JOBPILOT_SECRET_SERVICE", "jobpilot-test")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn stdout_of(output: &Output) -> String {
+    assert!(output.status.success(), "stderr: {}", stderr_text(output));
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Pastes a posting through standard input and returns its job.
+fn paste(home: &Path, title: &str, extra: &[&str], text: &str) -> serde_json::Value {
+    let mut args = vec!["job", "paste", title];
+    args.extend_from_slice(extra);
+    args.push("--json");
+    stdout_json(&run_stdin(home, &args, text))
+}
+
+#[test]
+fn job_paste_then_list_show_and_resume_generate_reach_the_same_job() {
+    let (_dir, home) = fresh_home();
+    let job = paste(
+        &home,
+        "Rust role",
+        &["--company", "Acme"],
+        "Build Rust services.",
+    );
+    let id = job["id"].as_str().unwrap();
+    let listed = stdout_json(&run(&home, &["job", "list", "--json"]));
+    assert_eq!(listed[0]["id"], id);
+    let shown = stdout_json(&run(&home, &["job", "show", id, "--json"]));
+    assert_eq!(shown["job"]["id"], id);
+    assert_eq!(shown["job"]["company"], "Acme");
+    // The draft commands take the same id, and reach the same posting: no AI, so manual.
+    let drafted = run(&home, &["resume", "generate", id]);
+    let text = stderr_text(&drafted);
+    assert!(!text.contains("not_found"), "{text}");
+    assert!(!text.contains("error[validation]"), "{text}");
+    let text = stderr_text(&run(&home, &["letter", "generate", id]));
+    assert!(!text.contains("not_found"), "{text}");
+    assert_eq!(
+        stderr_text(&run(&home, &["resume", "generate", "nosuch"]))
+            .split(':')
+            .next(),
+        Some("error[not_found]")
+    );
+}
+
+#[test]
+fn job_import_a_linkedin_url_with_text_stores_it_and_makes_no_request() {
+    let (_dir, home) = fresh_home();
+    let url = "https://www.linkedin.com/jobs/view/123";
+    let args = ["job", "import", "--url", url, "--title", "Dev", "--json"];
+    let job = stdout_json(&run_stdin(&home, &args, "A posting body."));
+    assert_eq!(job["connector"], "linkedin");
+    assert_eq!(job["url"], url);
+    assert!(
+        stdout_json(&run(&home, &["agents", "list", "--json"]))
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "an import starts no run"
+    );
+}
+
+#[test]
+fn job_import_a_url_with_no_text_says_paste_the_text() {
+    let (_dir, home) = fresh_home();
+    let args = [
+        "job",
+        "import",
+        "--url",
+        "https://jobs.lever.co/acme/1",
+        "--title",
+        "Dev",
+    ];
+    let refused = run_stdin(&home, &args, "");
+    assert_eq!(refused.status.code(), Some(1));
+    let text = stderr_text(&refused);
+    assert!(text.starts_with("error[refused]"), "{text}");
+    assert!(text.contains("needs_text"), "{text}");
+    assert!(text.contains("paste the posting's text"), "{text}");
+}
+
+#[test]
+fn job_src_add_linkedin_is_refused_with_the_import_route() {
+    let (_dir, home) = fresh_home();
+    let refused = run(&home, &["job", "src", "add", "linkedin", "x"]);
+    assert_eq!(refused.status.code(), Some(1));
+    let text = stderr_text(&refused);
+    assert!(text.starts_with("error[refused]"), "{text}");
+    assert!(text.contains("Import the posting."), "{text}");
+    assert!(text.contains("jobpilot job import"), "{text}");
+    let none = stdout_json(&run(&home, &["job", "source", "list", "--json"]));
+    assert!(none.as_array().unwrap().is_empty());
+}
+
+#[test]
+fn job_src_add_greenhouse_says_the_vendor_is_silent() {
+    let (_dir, home) = fresh_home();
+    let text = stdout_of(&run(&home, &["job", "src", "add", "greenhouse", "acme"]));
+    assert!(
+        text.contains("Vendor is silent on third-party readers"),
+        "{text}"
+    );
+    let list = stdout_json(&run(&home, &["job", "source", "list", "--json"]));
+    assert_eq!(list[0]["connector"], "greenhouse");
+    assert_eq!(list[0]["target"], "acme");
+    let added = stdout_json(&run(
+        &home,
+        &["job", "source", "add", "lever", "acme", "--json"],
+    ));
+    assert!(added["note"].is_null());
+    let id = added["id"].as_str().unwrap();
+    ok(&home, &["job", "source", "remove", id]);
+    assert_eq!(
+        stdout_json(&run(&home, &["job", "source", "list", "--json"]))
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn job_sources_lists_all_nine_with_status_limit_and_attribution() {
+    let (_dir, home) = fresh_home();
+    let json = stdout_json(&run(&home, &["job", "sources", "--json"]));
+    let all = json.as_array().unwrap();
+    assert_eq!(all.len(), 9);
+    let text = stdout_of(&run(&home, &["job", "sources"]));
+    for source in all {
+        assert!(text.contains(source["name"].as_str().unwrap()), "{text}");
+    }
+    let remoteok = text.lines().find(|l| l.starts_with("remoteok")).unwrap();
+    assert!(remoteok.contains("read: allowed"), "{remoteok}");
+    assert!(remoteok.contains("Remote OK"), "{remoteok}");
+    assert!(remoteok.contains("limit:"), "{remoteok}");
+    assert!(
+        text.contains("Vendor is silent on third-party readers"),
+        "{text}"
+    );
+    assert!(text.contains("read on: 20"), "{text}");
+}
+
+#[test]
+fn job_fetch_with_no_sources_says_add_one_and_sends_nothing() {
+    let (_dir, home) = fresh_home();
+    let text = stdout_of(&run(&home, &["job", "fetch"]));
+    assert!(text.contains("job source add"), "{text}");
+    assert!(
+        stdout_json(&run(&home, &["agents", "list", "--json"]))
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn job_list_filters_are_exact_and_json_matches_text() {
+    let (_dir, home) = fresh_home();
+    paste(
+        &home,
+        "Remote dev",
+        &[],
+        "Fully remote role. Work from anywhere.",
+    );
+    paste(&home, "Plain dev", &[], "Write code for us.");
+    let all = stdout_json(&run(&home, &["job", "list", "--json"]));
+    assert_eq!(all.as_array().unwrap().len(), 2);
+    let text = stdout_of(&run(&home, &["job", "list"]));
+    assert_eq!(text.lines().count(), 2);
+    for job in all.as_array().unwrap() {
+        assert!(text.contains(job["id"].as_str().unwrap()), "{text}");
+    }
+    // A job that states another mode is dropped; one that states none stays, marked.
+    let hybrid = stdout_json(&run(&home, &["job", "list", "--mode", "hybrid", "--json"]));
+    for job in hybrid.as_array().unwrap() {
+        assert!(job["work_mode"].is_null() || job["work_mode"] == "hybrid");
+    }
+    let remote = stdout_json(&run(&home, &["job", "list", "--mode", "remote", "--json"]));
+    assert!(remote.as_array().unwrap().len() <= all.as_array().unwrap().len());
+    let marked = stdout_of(&run(&home, &["job", "list", "--country", "PT"]));
+    assert!(marked.contains("not stated: country"), "{marked}");
+    let bad = run(&home, &["job", "list", "--min-pay", "lots"]);
+    assert!(stderr_text(&bad).starts_with("error[validation]"));
+    let pay = stdout_of(&run(&home, &["job", "list", "--min-pay", "90000:eur:year"]));
+    assert_eq!(pay.lines().count(), 2, "unstated pay is kept: {pay}");
+}
+
+#[test]
+fn job_analyze_with_no_ai_scores_and_prints_reasons() {
+    let (_dir, home) = fresh_home();
+    ok(&home, &["profile", "set", "--name", "Ada"]);
+    let job = paste(&home, "Rust dev", &[], "Remote role using Rust and SQL.");
+    let id = job["id"].as_str().unwrap();
+    let text = stdout_of(&run(&home, &["job", "analyze", id]));
+    assert!(text.contains("scored"), "{text}");
+    assert!(text.contains(id), "{text}");
+    assert!(text.contains("skills"), "reasons are printed: {text}");
+    let json = stdout_json(&run(&home, &["job", "analyze", id, "--json"]));
+    assert_eq!(json["jobs"][0]["id"], id);
+    assert!(json["jobs"][0]["explanation"]["rows"].is_array());
+    let shown = stdout_of(&run(&home, &["job", "show", id]));
+    assert!(shown.contains("Score:"), "{shown}");
+}
+
+#[test]
+fn job_analyze_ai_without_yes_states_calls_and_stops() {
+    let (_dir, home) = fresh_home();
+    let bin = fresh_claude(&home);
+    let job = paste(&home, "Rust dev", &[], "Remote role using Rust.");
+    let id = job["id"].as_str().unwrap();
+    let env = [("JOBPILOT_CLAUDE_BIN", bin.as_str())];
+    let stopped = run_env(&home, &["job", "analyze", id, "--ai"], &env);
+    let text = stdout_of(&stopped);
+    assert!(text.contains("at most"), "{text}");
+    assert!(text.contains("--ai --yes"), "{text}");
+    assert!(
+        stdout_json(&run(&home, &["agents", "list", "--json"]))
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "no run started"
+    );
+}
+
+/// A mock claude that is on and consented. The plan only counts: nothing here runs it.
+fn fresh_claude(home: &Path) -> String {
+    let bin = claude_saying(home, &serde_json::json!({}));
+    claude_only(home, &bin, "job_text,profile_basic,resume_text");
+    bin
+}
+
+#[test]
+fn job_show_reads_not_stated_for_a_missing_country() {
+    let (_dir, home) = fresh_home();
+    ok(&home, &["profile", "auth", "set", "PT"]);
+    let job = paste(&home, "Dev", &[], "Write code.");
+    let text = stdout_of(&run(&home, &["job", "show", job["id"].as_str().unwrap()]));
+    assert!(text.contains("Country: not stated"), "{text}");
+    assert!(text.contains("Work authorization: not stated"), "{text}");
+    assert!(text.contains("Source: import"), "{text}");
+    assert!(text.contains("Untrusted text:"), "{text}");
+    assert!(!text.contains("eligible"), "{text}");
+}
+
+#[test]
+fn job_show_strips_terminal_escapes_from_a_posting() {
+    let (_dir, home) = fresh_home();
+    let url = "https://example.com/jobs/1\x1b]0;evil\x07";
+    let args = [
+        "job",
+        "import",
+        "--url",
+        url,
+        "--title",
+        "Dev\x1b[2J",
+        "--company",
+        "Ac\x1b[31mme",
+        "--json",
+    ];
+    let job = stdout_json(&run_stdin(
+        &home,
+        &args,
+        "Build \x1b[31mthings\x1b[0m\x07 now",
+    ));
+    let id = job["id"].as_str().unwrap();
+    let text = stdout_of(&run(&home, &["job", "show", id]));
+    assert!(
+        !text
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t'),
+        "{text:?}"
+    );
+    assert!(text.contains("Build things now"), "{text}");
+}
+
+#[test]
+fn job_research_with_no_backend_shows_stored_text() {
+    let (_dir, home) = fresh_home();
+    paste(&home, "Dev", &["--company", "Acme"], "Acme builds anvils.");
+    let companies = stdout_json(&run(&home, &["job", "company", "list", "--json"]));
+    let company = companies[0]["id"].as_str().unwrap();
+    let noted = run_stdin(
+        &home,
+        &["job", "company", "note", company],
+        "Founded long ago.",
+    );
+    stdout_of(&noted);
+    let text = stdout_of(&run(&home, &["job", "research", company]));
+    assert!(text.contains("Stored text:"), "{text}");
+    assert!(text.contains("Founded long ago."), "{text}");
+    let missing = run(&home, &["job", "research", "nosuch"]);
+    assert!(stderr_text(&missing).starts_with("error[not_found]"));
+}
+
+#[test]
+fn job_commands_refuse_while_paused_where_they_write() {
+    let (_dir, home) = fresh_home();
+    let job = paste(&home, "Dev", &[], "Write code.");
+    let id = job["id"].as_str().unwrap();
+    ok(&home, &["job", "src", "add", "lever", "acme"]);
+    ok(&home, &["pause", "set"]);
+    let attempts: Vec<(Vec<&str>, &str)> = vec![
+        (vec!["job", "fetch"], ""),
+        (
+            vec![
+                "job",
+                "import",
+                "--url",
+                "https://example.com/a",
+                "--title",
+                "T",
+            ],
+            "Body.",
+        ),
+        (vec!["job", "analyze", id], ""),
+        (vec!["job", "analyze"], ""),
+    ];
+    for (args, input) in attempts {
+        let output = run_stdin(&home, &args, input);
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(
+            stderr_text(&output).starts_with("error[paused]"),
+            "{args:?}"
+        );
+    }
+    let nothing = stdout_json(&run(&home, &["job", "list", "--json"]));
+    assert_eq!(nothing.as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn job_list_and_show_work_while_paused() {
+    let (_dir, home) = fresh_home();
+    let job = paste(&home, "Dev", &[], "Write code.");
+    let id = job["id"].as_str().unwrap();
+    ok(&home, &["pause", "set"]);
+    assert!(stdout_of(&run(&home, &["job", "list"])).contains(id));
+    assert!(stdout_of(&run(&home, &["job", "show", id])).contains("Write code."));
+    ok(&home, &["job", "sources"]);
+    ok(&home, &["job", "prefs", "show"]);
+    ok(&home, &["job", "search", "code"]);
+}
+
+#[test]
+fn job_prefs_set_then_show_keeps_the_other_value() {
+    let (_dir, home) = fresh_home();
+    ok(
+        &home,
+        &["job", "prefs", "set", "--min-pay", "90000:eur:year"],
+    );
+    let both = stdout_json(&run(
+        &home,
+        &["job", "prefs", "set", "--seniority", "Senior", "--json"],
+    ));
+    assert_eq!(both["min_pay"]["amount"], 90000);
+    assert_eq!(both["min_pay"]["currency"], "EUR");
+    assert_eq!(both["seniority"], "senior");
+    let text = stdout_of(&run(&home, &["job", "prefs", "show"]));
+    assert!(text.contains("90000 EUR per year"), "{text}");
+    let bad = run(&home, &["job", "prefs", "set", "--seniority", "boss"]);
+    assert!(stderr_text(&bad).starts_with("error[validation]"));
 }

@@ -5,6 +5,7 @@ mod ai;
 mod analytics;
 mod apps;
 mod data;
+mod jobs;
 mod memory;
 mod pause;
 mod profile;
@@ -55,7 +56,7 @@ pub enum Command {
     Kb(profile::KbCommand),
     /// Pasted job postings.
     #[command(subcommand)]
-    Job(profile::JobCommand),
+    Job(jobs::JobCommand),
     /// Resume drafts.
     #[command(subcommand)]
     Resume(resume::ResumeCommand),
@@ -93,9 +94,10 @@ impl Command {
     pub fn refused_in_panel(&self) -> bool {
         use ai::{AiCommand, ConsentCommand};
         use data::{BackupCommand, DataCommand};
+        use jobs::JobCommand;
         use memory::MemoryCommand;
         use pause::PauseCommand;
-        use profile::{JobCommand, KbCommand};
+        use profile::KbCommand;
         use resume::{ExportArgs, LetterCommand, ResumeCommand};
         matches!(
             self,
@@ -130,7 +132,10 @@ impl Command {
                         | MemoryCommand::Authorization { .. }
                         | MemoryCommand::Refresh { yes: true }
                 )
-                | Command::Job(JobCommand::Paste { file: Some(_), .. })
+                | Command::Job(
+                    JobCommand::Paste { file: Some(_), .. }
+                        | JobCommand::Import { file: Some(_), .. }
+                )
                 | Command::Resume(
                     ResumeCommand::Import { .. }
                         | ResumeCommand::Export(ExportArgs { out: Some(_), .. })
@@ -247,10 +252,14 @@ fn source_reason(reason: &str) -> Option<&'static str> {
             "The policy register blocks reading this source, so nothing was requested."
         }
         "policy_user_assisted" => {
-            "This source is user-assisted only. Import a posting by hand instead."
+            "This source is user-assisted only, so nothing is read from it. Import the posting. \
+             Use `jobpilot job import --url <link> --title <title>` with its text on standard \
+             input."
         }
         "operation_not_declared" => {
-            "This source does not declare that operation, so nothing was requested."
+            "This source does not declare that operation, so nothing was requested. Import the \
+             posting. Use `jobpilot job import --url <link> --title <title>` with its text on \
+             standard input."
         }
         "source_blocked" => {
             "The source refused or showed a challenge page. JobPilot stops there, tries nothing else, and leaves it alone for a day."
@@ -440,7 +449,7 @@ async fn with_db(db: &Db, command: Command) -> Result<Output> {
         Command::Profile(command) => profile::profile(db, command).await,
         Command::Prefs(command) => profile::prefs(db, command).await,
         Command::Kb(command) => profile::kb(db, command).await,
-        Command::Job(command) => profile::job(db, command).await,
+        Command::Job(command) => jobs::job(db, command).await,
         Command::Resume(command) => resume::resume(db, command).await,
         Command::Letter(command) => resume::letter(db, command).await,
         Command::App(command) => apps::app(db, command).await,
@@ -498,8 +507,30 @@ mod tests {
         ("kb search q", false),
         ("job paste t", false),
         ("job paste t --file /f", true),
+        ("job import --url u --title t", false),
+        ("job import --url u --title t --file /f", true),
         ("job list", false),
+        (
+            "job list --country PT --mode remote --min-pay 90000:EUR:year --all",
+            false,
+        ),
+        ("job search q", false),
         ("job show i", false),
+        ("job remove i", false),
+        ("job split i", false),
+        ("job sources", false),
+        ("job source list", false),
+        ("job source add lever acme", false),
+        ("job source remove i", false),
+        ("job fetch", false),
+        ("job fetch --source i", false),
+        ("job analyze", false),
+        ("job analyze i --ai --yes", false),
+        ("job research c --yes", false),
+        ("job company list", false),
+        ("job company note c", false),
+        ("job prefs show", false),
+        ("job prefs set --seniority senior", false),
         ("resume import /r", true),
         ("resume list", false),
         ("resume versions l", false),
