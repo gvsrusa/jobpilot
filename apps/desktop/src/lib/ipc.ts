@@ -318,6 +318,9 @@ export type BackupInfo = {
   schema_version: number | null;
 };
 
+/** `withheld` counts sealed answers left out, because no key could open them. */
+export type Exported = { path: string; withheld: number };
+
 export type AuditEntry = {
   id: number;
   at: string;
@@ -342,7 +345,7 @@ export const ipc = {
   backupCreate: () => invoke<BackupInfo>("backup_create"),
   backupList: () => invoke<BackupInfo[]>("backup_list"),
   backupRestore: (source: string) => invoke<Status>("backup_restore", { source }),
-  dataExport: () => invoke<string>("data_export"),
+  dataExport: () => invoke<Exported>("data_export"),
   dataDelete: (confirm: string, includeBackups: boolean) =>
     invoke<Status>("data_delete", { confirm, includeBackups }),
   secretSet: (name: string, value: string) => invoke<void>("secret_set", { name, value }),

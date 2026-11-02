@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import { explainReason } from "@/lib/reasons";
 import { CLASSES, ipc, type Answer, type KnowledgeItem, type MemoryClass, type QuestionRow } from "@/lib/ipc";
 
 const LABELS: Record<MemoryClass, string> = {
@@ -33,10 +34,12 @@ function useRefresh() {
 /** Stored text is inert here: never an anchor, and a sealed body comes only from Show. */
 function AnswerRow({
   answer,
+  items,
   noValue,
   onRemove,
 }: {
   answer: Answer;
+  items: KnowledgeItem[];
   noValue: boolean;
   onRemove: () => void;
 }) {
@@ -57,6 +60,7 @@ function AnswerRow({
   });
   const cleared = !answer.sealed && answer.body === "";
   const busy = approve.isPending || reviewed.isPending;
+  const item = items.find((i) => i.id === answer.source_ref);
 
   return (
     <li className="grid gap-1 rounded border p-2 text-sm">
@@ -93,7 +97,10 @@ function AnswerRow({
       <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
         <span>{answer.approved ? "Approved" : "Waiting"}</span>
         {answer.stale && <span>Stale</span>}
-        <span>Source: {answer.source}</span>
+        <span>
+          Source: {answer.source}
+          {answer.source_ref && `, ${item ? itemLabel(item) : answer.source_ref}`}
+        </span>
         {!noValue && (
           <>
             <Button size="sm" variant="outline" disabled={busy || cleared} onClick={() => approve.mutate()}>
@@ -142,6 +149,7 @@ function QuestionCard({
     },
   });
   const noValue = question.class === "work_authorization";
+  const hint = setClass.error ? explainReason(setClass.error) : null;
 
   return (
     <li className="grid gap-3 rounded-lg border p-4">
@@ -183,12 +191,14 @@ function QuestionCard({
         </Button>
       </div>
       <ErrorAlert error={setClass.error} />
+      {hint && <p className="text-sm text-muted-foreground">{hint}.</p>}
       {answers.length > 0 && (
         <ul aria-label="Answers" className="grid gap-2">
           {answers.map((answer) => (
             <AnswerRow
               key={answer.id}
               answer={answer}
+              items={items}
               noValue={noValue}
               onRemove={() => onRemove({ kind: "answer", id: answer.id })}
             />

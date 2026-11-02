@@ -215,6 +215,11 @@ fn message(error: &Error) -> String {
         Error::ManualRequired(reason) if reason == "model_not_installed" => {
             "The chosen model is not installed in Ollama. Check `jobpilot ai models`.".into()
         }
+        Error::Refused(reason) if reason == "use_profile_by_country" => {
+            "Work authorization is answered from your profile, for one country at a time. If \
+             this question asks something else, remove it and add it in other words."
+                .into()
+        }
         other => other.to_string(),
     }
 }

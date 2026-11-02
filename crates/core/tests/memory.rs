@@ -129,6 +129,21 @@ fn rules_class_each_question() {
             "Will you now or in future need visa sponsorship?",
             Class::WorkAuthorization,
         ),
+        ("Are you disabled?", Class::Sensitive),
+        ("Have you been convicted of a crime?", Class::Sensitive),
+        ("What are your religious beliefs?", Class::Sensitive),
+        ("Are you married?", Class::Sensitive),
+        ("How old are you?", Class::Sensitive),
+        ("Are you male or female?", Class::Sensitive),
+        ("What is your expected pay?", Class::Sensitive),
+        ("I acknowledge that false statements...", Class::Legal),
+        ("Did you use artificial intelligence...", Class::Legal),
+        ("What is your immigration status?", Class::WorkAuthorization),
+        ("Are you able to work in Germany?", Class::WorkAuthorization),
+        ("Have you ever been a felon?", Class::Sensitive),
+        ("What is your sex?", Class::Sensitive),
+        ("Your DOB, please", Class::Sensitive),
+        ("What is your nationality?", Class::Sensitive),
     ] {
         assert_eq!(rules::classify(text), class, "{text}");
     }
@@ -396,11 +411,51 @@ async fn a_body_left_under_work_authorization_is_never_approved_or_edited() {
     );
     let edited = memory::edit_answer(&db, &answer.id, "Yes").await;
     assert!(matches!(edited, Err(Error::Validation(_))), "{edited:?}");
+    set_reviewed_days_ago(&db, &answer.id, 181).await;
+    refused(
+        memory::mark_reviewed(&db, "cli", &answer.id).await,
+        "use_profile_by_country",
+    );
 
     let row = only_answer(&db, &question.id).await;
     assert!(!row.approved);
     assert_eq!(row.body, "");
     assert!(row.sealed);
+    assert!(row.stale, "reviewing it changed nothing");
+    db.close().await;
+}
+
+// A person can lower what a model got wrong, but not their way into storing a value.
+#[tokio::test]
+async fn a_question_that_states_authorization_is_never_lowered() {
+    let (_tmp, _paths, db) = open().await;
+    let question = memory::add_question(&db, "Are you authorized to work in Canada?", None)
+        .await
+        .unwrap();
+
+    for class in [Class::Normal, Class::Sensitive, Class::Legal] {
+        let lowered = memory::set_class(&db, "cli", &question.id, class).await;
+        refused(lowered.map(|_| ()), "use_profile_by_country");
+    }
+
+    let row = memory::get(&db, &question.id).await.unwrap();
+    assert_eq!(row.question.class, Class::WorkAuthorization);
+    let added = memory::add_answer(&db, &question.id, "Yes", None).await;
+    assert!(matches!(added, Err(Error::Validation(_))), "{added:?}");
+    db.close().await;
+}
+
+#[tokio::test]
+async fn a_question_a_model_got_wrong_can_be_lowered_from_work_authorization() {
+    let (_tmp, _paths, db) = open().await;
+    let id = question_of(&db, "Why this job?", Class::WorkAuthorization).await;
+
+    let lowered = memory::set_class(&db, "cli", &id, Class::Normal)
+        .await
+        .unwrap();
+
+    assert_eq!(lowered.class, Class::Normal);
+    memory::add_answer(&db, &id, "Because", None).await.unwrap();
     db.close().await;
 }
 
@@ -521,6 +576,32 @@ async fn editing_unapproves_and_bumps_the_version() {
     assert_eq!(edited.version, 2);
     assert!(!edited.approved);
     assert!(!edited.stale, "text just written is text just reviewed");
+    db.close().await;
+}
+
+// New words are the person's, whatever they were first drawn from.
+#[tokio::test]
+async fn editing_a_knowledge_sourced_answer_makes_it_the_users() {
+    let (_tmp, _paths, db) = open().await;
+    let question = memory::add_question(&db, "Why this job?", None)
+        .await
+        .unwrap();
+    let item = knowledge::add(&db, "note", "A note", "user", None)
+        .await
+        .unwrap();
+    let answer = memory::add_answer(&db, &question.id, "From the note", Some(&item.id))
+        .await
+        .unwrap();
+    assert_eq!(answer.source, "knowledge");
+
+    let edited = memory::edit_answer(&db, &answer.id, "My own words")
+        .await
+        .unwrap();
+
+    assert_eq!(edited.source, "user");
+    assert_eq!(edited.source_ref, None);
+    let row = only_answer(&db, &question.id).await;
+    assert_eq!((row.source.as_str(), row.source_ref), ("user", None));
     db.close().await;
 }
 
@@ -722,7 +803,7 @@ async fn export_without_sealed_answers_writes_an_empty_list() {
 
     assert_eq!(
         memory::export_sealed(&db).await.unwrap(),
-        ("[]".to_owned(), false)
+        ("[]".to_owned(), false, 0)
     );
     let dir = transfer::export_all(&db, "cli").await.unwrap();
     let file = std::fs::read_to_string(dir.join("memory_sealed_answers.json")).unwrap();
@@ -991,8 +1072,9 @@ async fn export_writes_sealed_answers_to_the_private_file() {
         .unwrap();
     raise_by_sql(&db, &raised.id, Class::Legal).await;
 
-    let (text, plain) = memory::export_sealed(&db).await.unwrap();
+    let (text, plain, withheld) = memory::export_sealed(&db).await.unwrap();
     assert!(plain);
+    assert_eq!(withheld, 0);
     assert!(
         text.contains(CANARY) && text.contains("ZXQ-WAITING"),
         "{text}"

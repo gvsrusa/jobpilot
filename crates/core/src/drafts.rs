@@ -99,8 +99,9 @@ impl ExportFormat {
 /// Matched at the start of a word of the folded text, so `citizenship` counts and
 /// `noncitizen` needs its own entry; [`WHOLE_WORD_PATTERNS`] must match a word exactly.
 // ponytail: this matches words, not meaning. A paraphrase passes ("my papers are in order"),
-// a look-alike letter from another script passes, and an honest "Visa Inc." or "opt in" is
-// flagged until it is reworded or entered by the user. The compare screen is the next gate.
+// a look-alike letter from another script passes, and an honest "Visa Inc.", "opt in", or
+// "able to work in a team" is flagged until it is reworded or entered by the user. The
+// compare screen is the next gate.
 pub const AUTHORIZATION_PATTERNS: &[&str] = &[
     "authorized to work",
     "authorised to work",
@@ -130,6 +131,8 @@ pub const AUTHORIZATION_PATTERNS: &[&str] = &[
     "allowed to work",
     "permitted to work",
     "entitled to work",
+    "able to work",
+    "immigration",
     "legally authorized",
     "legally authorised",
     "legally allowed",

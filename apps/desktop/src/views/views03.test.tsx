@@ -389,7 +389,7 @@ describe("career memory", () => {
 
     const added = await within(row).findByText("Because");
     expect(row).toHaveTextContent("Waiting");
-    expect(row).toHaveTextContent("Source: knowledge");
+    expect(row).toHaveTextContent("Source: knowledge, note: Led the migration");
     expect(added.closest("li")).toBeTruthy();
     await user.click(within(row).getByRole("button", { name: "Approve" }));
     await waitFor(() => expect(count(api, "memory_approve")).toBe(1));
@@ -604,6 +604,45 @@ describe("career memory", () => {
     expect(within(row).queryByRole("button", { name: "Show" })).toBeNull();
     expect(within(row).getByRole("button", { name: "Approve" })).toBeDisabled();
     expect(within(row).getByText(/cleared/)).toBeInTheDocument();
+  });
+
+  it("provenance_names_an_item_that_has_gone", async () => {
+    bank([
+      {
+        question: questionOf("q1", "Why this job?"),
+        answers: [answerOf("a1", "q1", { body: "Because", source: "knowledge", source_ref: "gone1" })],
+      },
+    ]);
+    const { user } = renderApp();
+    await openMemory(user);
+    expect(await rowOf("Why this job?")).toHaveTextContent("Source: knowledge, gone1");
+  });
+
+  it("a_refused_lowering_says_to_reword_the_question", async () => {
+    bank(
+      [{ question: questionOf("q1", "Are you authorized to work?", { class: "work_authorization" }), answers: [] }],
+      {
+        memory_set_class: () => {
+          throw { code: "refused", message: "refused: use_profile_by_country" };
+        },
+      },
+    );
+    const { user } = renderApp();
+    await openMemory(user);
+    const row = await rowOf("Are you authorized to work?");
+    await user.selectOptions(within(row).getByLabelText("Class"), "normal");
+    expect(await within(row).findByRole("alert")).toHaveTextContent("code: refused");
+    expect(within(row).getByText(/in other words/)).toBeInTheDocument();
+  });
+
+  it("an_export_says_what_it_left_out", async () => {
+    backend({ data_export: () => ({ path: "/home/me/jobpilot/exports/e1", withheld: 2 }) });
+    const { user } = renderApp();
+    await user.click(await screen.findByRole("button", { name: "Data" }));
+    await user.click(await screen.findByRole("button", { name: "Export all data..." }));
+    await user.click(await screen.findByRole("button", { name: "Write plain text export" }));
+    expect(await screen.findByText(/\/home\/me\/jobpilot\/exports\/e1/)).toBeInTheDocument();
+    expect(await screen.findByText(/2 sealed career answers were left out/)).toBeInTheDocument();
   });
 
   it("a_refusal_shows_its_code", async () => {

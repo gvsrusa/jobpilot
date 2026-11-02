@@ -27,7 +27,7 @@ use sqlx::sqlite::SqliteExecutor;
 
 use crate::crypto::{self, DataKey, KeyState};
 use crate::db::Db;
-use crate::drafts::fold;
+use crate::drafts::{fold, states_authorization};
 use crate::error::{Error, Result};
 use crate::knowledge::{self, Finding};
 use crate::{audit, profile};
@@ -481,8 +481,27 @@ fn no_stored_authorization(class: Class) -> Result<()> {
     Ok(())
 }
 
+/// A body left under work authorization is never made usable: that value comes from the
+/// profile. For adapters too, so that a refusal comes before any dialog.
+pub fn refuse_authorization(class: Class) -> Result<()> {
+    if class == Class::WorkAuthorization {
+        return Err(Error::Refused("use_profile_by_country".into()));
+    }
+    Ok(())
+}
+
+/// Lowering a question whose words state authorization would let memory store that value, so
+/// it is refused while they do. One that only a model or a person raised can come down.
+pub fn check_lowering(question: &Question, class: Class) -> Result<()> {
+    if class < question.class && states_authorization(&question.text) {
+        refuse_authorization(question.class)?;
+    }
+    Ok(())
+}
+
 /// New text is not approved text: this unapproves and takes a new version, which voids any
-/// confirmation of the old one. A person just wrote it, so it counts as reviewed.
+/// confirmation of the old one. A person just wrote it, so it counts as reviewed, and it is
+/// theirs: it no longer says it came from a knowledge item.
 pub async fn edit_answer(db: &Db, answer_id: &str, text: &str) -> Result<Answer> {
     let text = clean_answer(text)?;
     let row = stored_answer(db, answer_id).await?;
@@ -492,7 +511,7 @@ pub async fn edit_answer(db: &Db, answer_id: &str, text: &str) -> Result<Answer>
     let mut write = db.pool.begin().await?;
     let edited = sqlx::query(concat!(
         "UPDATE memory_answers SET body = ?, body_enc = ?, key_id = ?, approved = 0, \
-         version = version + 1, reviewed_at = ",
+         source = 'user', source_ref = NULL, version = version + 1, reviewed_at = ",
         now!(),
         ", updated_at = ",
         now!(),
@@ -525,9 +544,7 @@ pub async fn approve(db: &Db, actor: &str, answer_id: &str, approved: bool) -> R
     person(actor)?;
     let row = stored_answer(db, answer_id).await?;
     let class = row.class()?;
-    if class == Class::WorkAuthorization {
-        return Err(Error::Refused("use_profile_by_country".into()));
-    }
+    refuse_authorization(class)?;
     if row.body.is_empty() && row.body_enc.is_none() {
         return Err(bad("this text was cleared when its key was given up"));
     }
@@ -592,6 +609,7 @@ async fn set_unapproved(db: &Db, actor: &str, answer_id: &str) -> Result<()> {
 /// A person says the text still holds, which restarts [`FRESH_DAYS`].
 pub async fn mark_reviewed(db: &Db, actor: &str, answer_id: &str) -> Result<()> {
     person(actor)?;
+    refuse_authorization(stored_answer(db, answer_id).await?.class()?)?;
     let mut write = db.pool.begin().await?;
     let done = sqlx::query(concat!(
         "UPDATE memory_answers SET reviewed_at = ",
@@ -629,6 +647,7 @@ pub async fn set_class(db: &Db, actor: &str, question_id: &str, class: Class) ->
     if from == class {
         return Ok(question);
     }
+    check_lowering(&question, class)?;
     let (open, seal): (Vec<_>, Vec<_>) = answers_of(db, question_id)
         .await?
         .into_iter()
@@ -904,10 +923,11 @@ struct ExportedAnswer<'a> {
     body: String,
 }
 
-/// Rows for `transfer::export_all`, and whether plaintext was written. With no sealed row,
-/// nothing is asked of the keychain. A raised body can be the only one on a root with no
-/// key: an export must not make a key, so there it asks nothing either.
-pub async fn export_sealed(db: &Db) -> Result<(String, bool)> {
+/// Rows for `transfer::export_all`, whether plaintext was written, and how many answers were
+/// left out because no key could open them, which the marker and both adapters say. With no
+/// sealed row, nothing is asked of the keychain. A raised body can be the only one on a root
+/// with no key: an export must not make a key, so there it asks nothing either.
+pub async fn export_sealed(db: &Db) -> Result<(String, bool, usize)> {
     let rows: Vec<StoredAnswer> = sqlx::query_as(concat!(
         select_answers!(),
         "WHERE a.body_enc IS NOT NULL OR (q.class <> 'normal' AND a.body <> '') ORDER BY a.seq"
@@ -916,21 +936,22 @@ pub async fn export_sealed(db: &Db) -> Result<(String, bool)> {
     .fetch_all(&db.pool)
     .await?;
     if rows.is_empty() {
-        return Ok(("[]".into(), false));
+        return Ok(("[]".into(), false, 0));
     }
+    let withheld = |state: KeyState| {
+        let marker = json!({ "locked": state, "withheld": rows.len() });
+        (marker.to_string(), false, rows.len())
+    };
     let key_state = match crypto::known_state(db).await? {
         KeyState::NotLoaded => crypto::peek(db).await?,
         no_key_yet => no_key_yet,
     };
     if !matches!(key_state, KeyState::Unlocked { .. }) {
-        return Ok((json!({ "locked": key_state }).to_string(), false));
+        return Ok(withheld(key_state));
     }
     let texts = match plain_texts(db, &rows).await {
         Ok(texts) => texts,
-        Err(error) => {
-            let locked = json!({ "locked": profile::degraded(error)? });
-            return Ok((locked.to_string(), false));
-        }
+        Err(error) => return Ok(withheld(profile::degraded(error)?)),
     };
     let exported: Vec<ExportedAnswer> = rows
         .iter()
@@ -945,7 +966,7 @@ pub async fn export_sealed(db: &Db) -> Result<(String, bool)> {
         })
         .collect();
     let text = serde_json::to_string(&exported).map_err(|e| Error::Validation(e.to_string()))?;
-    Ok((text, true))
+    Ok((text, true, 0))
 }
 
 #[cfg(test)]
@@ -1080,17 +1101,26 @@ mod tests {
             .await
             .unwrap();
 
-        let (text, plain) = export_sealed(&db).await.unwrap();
+        let (text, plain, withheld) = export_sealed(&db).await.unwrap();
         assert!(!plain, "no key is unlocked, so no plain text goes out");
         assert!(!text.contains(CANARY), "{text}");
+        assert_eq!(withheld, 1);
 
-        let dir = transfer::export_all(&db, "cli").await.unwrap();
+        let report = transfer::export_report(&db, "cli").await.unwrap();
+        let dir = report.path;
+        assert!(!report.sensitive_plain);
+        assert_eq!(report.withheld, 1, "what was left out is said out loud");
 
         let data = std::fs::read_to_string(dir.join("data.json")).unwrap();
         assert!(!data.contains(CANARY));
         assert!(data.contains(&answer), "the row stays, with no body");
         let sealed = std::fs::read_to_string(dir.join("memory_sealed_answers.json")).unwrap();
         assert!(!sealed.contains(CANARY));
+        let marker: serde_json::Value = serde_json::from_str(&sealed).unwrap();
+        assert_eq!(marker["withheld"], 1);
+        let log = audit::recent(&db, 10).await.unwrap();
+        let row = log.iter().find(|entry| entry.action == "export").unwrap();
+        assert_eq!(row.detail["withheld"], 1);
         assert_eq!(db.key_state(), KeyState::NotLoaded, "and no key was made");
         let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM data_keys")
             .fetch_one(&db.pool)

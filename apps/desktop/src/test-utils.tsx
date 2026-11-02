@@ -80,7 +80,7 @@ export function backend(overrides: Record<string, Handler> = {}): Backend {
       return info;
     },
     backup_restore: () => READY,
-    data_export: () => "/home/me/jobpilot/exports/export-1",
+    data_export: () => ({ path: "/home/me/jobpilot/exports/export-1", withheld: 0 }),
     data_delete: () => READY,
     secret_names: () => secrets,
     secret_set: ({ name }) => {

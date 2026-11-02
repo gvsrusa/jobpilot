@@ -40,6 +40,14 @@ use crate::native::{self, FileDialog};
 use crate::state::{AppState, StartupError, Status};
 
 const ACTOR: &str = "gui";
+
+/// `withheld` counts sealed answers left out, because no key could open them.
+#[derive(serde::Serialize)]
+pub struct Exported {
+    path: String,
+    withheld: usize,
+}
+
 /// Settings core keeps for itself: what the router runs, and the recovery reminder's mark.
 /// The first has a command for each key, and the second is only ever core's to write.
 const OWNED_SETTINGS: &[&str] = &["ai.", "recovery_key_exported_"];
@@ -332,9 +340,12 @@ pub async fn backup_restore<R: Runtime>(
 }
 
 #[tauri::command]
-pub async fn data_export(state: State<'_, AppState>) -> Result<String> {
-    let path = transfer::export_all(&*state.work().await?, ACTOR).await?;
-    Ok(path.to_string_lossy().into_owned())
+pub async fn data_export(state: State<'_, AppState>) -> Result<Exported> {
+    let report = transfer::export_report(&*state.work().await?, ACTOR).await?;
+    Ok(Exported {
+        path: report.path.to_string_lossy().into_owned(),
+        withheld: report.withheld,
+    })
 }
 
 #[tauri::command]
@@ -630,6 +641,7 @@ pub async fn memory_approve<R: Runtime>(
 ) -> Result<()> {
     if approved {
         let (class, _) = memory::find_answer(&*state.work().await?, &answer_id).await?;
+        memory::refuse_authorization(class)?;
         if class.sealed() {
             let message = format!(
                 "Approve the {} answer {answer_id}?\n\nIt can then be offered for applications, \
@@ -650,6 +662,7 @@ pub async fn memory_mark_reviewed<R: Runtime>(
     answer_id: String,
 ) -> Result<()> {
     let (class, _) = memory::find_answer(&*state.work().await?, &answer_id).await?;
+    memory::refuse_authorization(class)?;
     if class.sealed() {
         let message = format!(
             "Mark the {} answer {answer_id} as reviewed?\n\nThis says it is still true.",
@@ -668,14 +681,19 @@ pub async fn memory_set_class<R: Runtime>(
     question_id: String,
     class: Class,
 ) -> Result<Question> {
-    let from = memory::get(&*state.work().await?, &question_id)
+    let question = memory::get(&*state.work().await?, &question_id)
         .await?
-        .question
-        .class;
+        .question;
+    memory::check_lowering(&question, class)?;
+    let from = question.class;
     if class < from {
+        let takes_answers = match from {
+            Class::WorkAuthorization => "It can then take an answer here. ",
+            _ => "",
+        };
         let message = format!(
-            "Lower question {question_id} from {} to {}?\n\nA body in the normal class is \
-             stored as plain text.",
+            "Lower question {question_id} from {} to {}?\n\n{takes_answers}A body in the \
+             normal class is stored as plain text.",
             from.as_str(),
             class.as_str()
         );
@@ -1503,10 +1521,11 @@ mod tests {
         assert_eq!(h.ok("backup_list", json!({}))[0]["path"], info["path"]);
         let export = h.ok("data_export", json!({}));
         assert!(
-            Path::new(export.as_str().unwrap())
+            Path::new(export["path"].as_str().unwrap())
                 .join("data.json")
                 .is_file()
         );
+        assert_eq!(export["withheld"], 0);
         assert_eq!(h.code("secret_delete", json!({ "name": "n" })), "not_found");
 
         let audit = h.ok("audit_recent", json!({ "limit": 2 }));
@@ -3750,6 +3769,77 @@ mod tests {
         let unknown = h.call("memory_reveal", json!({ "answerId": "nope" }));
         assert_eq!(code_of(unknown), "not_found");
         assert!(h.asked().is_empty());
+    }
+
+    // A dialog that can only end in a refusal asks the user for nothing.
+    #[test]
+    fn a_work_authorization_refusal_opens_no_dialog() {
+        let h = ready();
+        seal_answer_without_a_key(&h, "work_authorization", "s1");
+        let added = h.ok(
+            "memory_add_question",
+            json!({ "text": "Are you authorized to work in Canada?", "country": null }),
+        );
+
+        for result in [
+            h.call(
+                "memory_approve",
+                json!({ "answerId": "s1", "approved": true }),
+            ),
+            h.call("memory_mark_reviewed", json!({ "answerId": "s1" })),
+            h.call(
+                "memory_set_class",
+                json!({ "questionId": added["id"], "class": "normal" }),
+            ),
+        ] {
+            let error = result.unwrap_err();
+            assert_eq!(error["code"], "refused");
+            assert!(
+                error["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("use_profile_by_country")
+            );
+        }
+        assert!(h.asked().is_empty(), "{:?}", h.asked());
+    }
+
+    #[test]
+    fn lowering_from_work_authorization_says_what_it_allows() {
+        let h = ready();
+        let question = seal_answer_without_a_key(&h, "work_authorization", "s1");
+        h.answer(false);
+        let refused = h.call(
+            "memory_set_class",
+            json!({ "questionId": question, "class": "sensitive" }),
+        );
+        assert_eq!(code_of(refused), "confirmation_required");
+        assert!(
+            h.asked()[0].contains("can then take an answer"),
+            "{:?}",
+            h.asked()
+        );
+    }
+
+    #[test]
+    fn data_export_says_how_many_answers_it_left_out() {
+        let h = ready();
+        let added = h.ok(
+            "memory_add_question",
+            json!({ "text": "Why this job?", "country": null }),
+        );
+        h.ok(
+            "memory_add_answer",
+            json!({ "questionId": added["id"], "text": "Because", "sourceRef": null }),
+        );
+        with_db(&h, |db| async move {
+            sqlx::query("UPDATE memory_questions SET class = 'sensitive'")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        });
+
+        assert_eq!(h.ok("data_export", json!({}))["withheld"], 1);
     }
 
     #[test]

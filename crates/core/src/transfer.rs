@@ -25,6 +25,20 @@ use crate::{audit, crypto, memory};
 /// marker; callers warn first) and a copy of `documents/`. A folder under that name is
 /// always complete: it is built under a temporary name and renamed last.
 pub async fn export_all(db: &Db, actor: &str) -> Result<PathBuf> {
+    Ok(export_report(db, actor).await?.path)
+}
+
+/// What an export did, for an adapter to tell the user.
+#[derive(Debug)]
+pub struct ExportReport {
+    pub path: PathBuf,
+    pub sensitive_plain: bool,
+    /// Sealed answers left out, because no key could open them.
+    pub withheld: usize,
+}
+
+/// [`export_all`], with what it wrote and what it left out.
+pub async fn export_report(db: &Db, actor: &str) -> Result<ExportReport> {
     let (stamp, exported_at) = utc_stamps(&db.pool).await?;
     let data = json!({
         "format": 1,
@@ -34,7 +48,7 @@ pub async fn export_all(db: &Db, actor: &str) -> Result<PathBuf> {
     });
     let text = serde_json::to_string_pretty(&data).map_err(io::Error::other)?;
     let (authorization, authorization_plain) = profile::export_authorization(db).await?;
-    let (answers, answers_plain) = memory::export_sealed(db).await?;
+    let (answers, answers_plain, withheld) = memory::export_sealed(db).await?;
     let sensitive_plain = authorization_plain || answers_plain;
 
     let (exports, documents) = (db.paths().exports(), db.paths().documents());
@@ -52,9 +66,13 @@ pub async fn export_all(db: &Db, actor: &str) -> Result<PathBuf> {
     .map_err(io::Error::other)??;
 
     let target = dir.to_string_lossy();
-    let detail = json!({ "sensitive_plain": sensitive_plain });
+    let detail = json!({ "sensitive_plain": sensitive_plain, "withheld": withheld });
     audit::record(db, actor, "export", Some(&target), detail).await?;
-    Ok(dir)
+    Ok(ExportReport {
+        path: dir,
+        sensitive_plain,
+        withheld,
+    })
 }
 
 /// Every row of every user table, in one read transaction so the tables agree.

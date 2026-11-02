@@ -216,7 +216,7 @@ pub async fn data(db: &Db, command: DataCommand) -> Result<Output> {
         DataCommand::Export => {
             // Before writing: the export holds these in plain text when unlocked.
             let (_, authorization) = profile::export_authorization(db).await?;
-            let (_, answers) = memory::export_sealed(db).await?;
+            let (_, answers, _) = memory::export_sealed(db).await?;
             let sensitive_plain = authorization || answers;
             if sensitive_plain {
                 eprintln!(
@@ -224,9 +224,21 @@ pub async fn data(db: &Db, command: DataCommand) -> Result<Output> {
                      career answers as plain text. Keep the folder private."
                 );
             }
-            let path = transfer::export_all(db, ACTOR).await?;
+            let report = transfer::export_report(db, ACTOR).await?;
+            let (path, withheld) = (report.path, report.withheld);
+            if withheld > 0 {
+                let plural = if withheld == 1 { "" } else { "s" };
+                eprintln!(
+                    "warning: {withheld} sealed career answer{plural} left out of this export, \
+                     as no key could open them. They are still in JobPilot."
+                );
+            }
             out(
-                json!({ "path": path, "sensitive_plain": sensitive_plain }),
+                json!({
+                    "path": path,
+                    "sensitive_plain": sensitive_plain,
+                    "withheld": withheld,
+                }),
                 format!("exported to {}", path.display()),
             )
         }

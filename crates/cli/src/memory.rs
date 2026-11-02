@@ -114,9 +114,13 @@ fn answer_line(answer: &Answer) -> String {
     } else {
         answer.body.as_str()
     };
+    let source = match &answer.source_ref {
+        Some(item) => format!("{} {item}", answer.source),
+        None => answer.source.clone(),
+    };
     format!(
-        "  {}  v{}  {state}{stale}  {}  {body}",
-        answer.id, answer.version, answer.source
+        "  {}  v{}  {state}{stale}  {source}  {body}",
+        answer.id, answer.version
     )
 }
 

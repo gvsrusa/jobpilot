@@ -8,6 +8,7 @@ const LEGAL: &[&str] = &[
     "attest",
     "declare",
     "declaration",
+    "acknowledge",
     "under penalty",
     "perjury",
     "signature",
@@ -18,6 +19,7 @@ const LEGAL: &[&str] = &[
     "written by",
     "your own work",
     "generative",
+    "artificial intelligence",
     "chatgpt",
 ];
 /// Whole words: short enough to begin others.
@@ -26,25 +28,31 @@ const SENSITIVE: &[&str] = &[
     "salary",
     "compensation",
     "pay expectation",
+    "expected pay",
     "wage",
-    "disability",
+    "disab",
     "gender",
+    "sex",
+    "male or female",
     "ethnicity",
     "race",
     "racial",
-    "religion",
-    "sexual orientation",
+    "religio",
+    "nationality",
     "veteran",
     "criminal",
-    "conviction",
+    "convict",
+    "felon",
     "date of birth",
     "pregnan",
     "national insurance",
     "social security",
     "marital",
+    "marri",
+    "how old",
 ];
 /// Whole words: short enough to begin others.
-const SENSITIVE_WHOLE: &[&str] = &["age", "ssn"];
+const SENSITIVE_WHOLE: &[&str] = &["age", "ssn", "dob"];
 
 /// Highest rank first, on the folded text, at the start of a word.
 // ponytail: these match words, so a paraphrase passes until the model or the user raises the

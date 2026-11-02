@@ -29,6 +29,10 @@ const REASONS: [word: string, text: string][] = [
     "model_not_installed",
     "The chosen model is not installed in Ollama. Download it on the AI screen, or choose another",
   ],
+  [
+    "use_profile_by_country",
+    "Work authorization is answered from your profile, for one country at a time. If this question asks something else, remove it and add it in other words",
+  ],
   ["no_ai", "No AI provider could take this task, so nothing was generated"],
   ["no_embedding_model", "No embedding model is set on the AI screen"],
 ];

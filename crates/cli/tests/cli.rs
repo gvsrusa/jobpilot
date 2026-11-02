@@ -1172,3 +1172,90 @@ fn memory_search_by_text_with_no_model() {
             .contains("No embedding model is set; search uses text.")
     );
 }
+
+#[test]
+fn memory_text_names_the_item_an_answer_came_from() {
+    let (_dir, home) = fresh_home();
+    let added = stdout_json(&run(
+        &home,
+        &["memory", "add-question", "Why this job?", "--json"],
+    ));
+    let question = added["id"].as_str().unwrap().to_string();
+    let item = stdout_json(&run(&home, &["kb", "add", "note", "A note", "--json"]));
+    let item = item["id"].as_str().unwrap().to_string();
+    let answer = stdout_json(&run(
+        &home,
+        &[
+            "memory",
+            "add-answer",
+            &question,
+            "Because",
+            "--from-item",
+            &item,
+            "--json",
+        ],
+    ));
+    let id = answer["id"].as_str().unwrap().to_string();
+
+    let text =
+        String::from_utf8_lossy(&ok(&home, &["memory", "show", &question]).stdout).into_owned();
+    assert!(text.contains(&format!("knowledge {item}")), "{text}");
+
+    ok(&home, &["memory", "edit-answer", &id, "My own words"]);
+    let text =
+        String::from_utf8_lossy(&ok(&home, &["memory", "show", &question]).stdout).into_owned();
+    assert!(!text.contains(&item), "{text}");
+}
+
+#[test]
+fn memory_refuses_lowering_authorization_and_says_to_reword() {
+    let (_dir, home) = fresh_home();
+    let added = stdout_json(&run(
+        &home,
+        &[
+            "memory",
+            "add-question",
+            "Are you authorized to work here?",
+            "--json",
+        ],
+    ));
+    let question = added["id"].as_str().unwrap();
+
+    let refused = run(&home, &["memory", "set-class", question, "normal"]);
+
+    assert_eq!(refused.status.code(), Some(1));
+    let said = stderr_text(&refused);
+    assert!(said.starts_with("error[refused]"), "{said}");
+    assert!(
+        said.contains("your profile") && said.contains("other words"),
+        "{said}"
+    );
+}
+
+#[tokio::test]
+async fn data_export_says_how_many_answers_it_left_out() {
+    let (_dir, home) = fresh_home();
+    let added = stdout_json(&run(
+        &home,
+        &["memory", "add-question", "Why this job?", "--json"],
+    ));
+    let question = added["id"].as_str().unwrap().to_string();
+    ok(&home, &["memory", "add-answer", &question, "Because"]);
+    let db = Db::open(&AppPaths::new(&home)).await.unwrap();
+    sqlx::query("UPDATE memory_questions SET class = 'sensitive'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    db.close().await;
+
+    let output = run(&home, &["data", "export", "--json"]);
+
+    assert!(
+        stderr_text(&output).contains("1 sealed career answer"),
+        "{}",
+        stderr_text(&output)
+    );
+    let report = stdout_json(&output);
+    assert_eq!(report["withheld"], 1);
+    assert_eq!(report["sensitive_plain"], false);
+}
