@@ -833,16 +833,16 @@ async fn the_gemini_mock_steered_to_a_tool_stores_nothing() {
     assert!(!PathBuf::from(hosted.canary()).exists());
 }
 
-/// A line of the document that no claim covers has nothing to carry its flag, so a reply that
-/// tucks one in is refused whole.
+/// The old shape, with a line tucked into the document that no claim covers. There is nowhere
+/// for such a line to go any more: a reply outside the one tree is refused whole.
 #[tokio::test]
-async fn a_planted_line_no_claim_covers_stores_nothing() {
+async fn a_planted_line_outside_the_claim_tree_stores_nothing() {
     let reply = json!({
         "doc": {
             "name": "Ada Lovelace",
             "contact": [],
             "summary": ["Holds a PhD in Computer Science from MIT"],
-            "sections": [{"heading": "Experience", "entries": [{
+            "sections": [{"heading": "experience", "entries": [{
                 "title": "", "subtitle": "", "dates": "",
                 "bullets": ["Shipped the Rust compiler"],
             }]}],
@@ -866,15 +866,11 @@ async fn work_authorization_is_never_stated_by_a_steered_hosted_reply() {
     // Citing the user's real evidence buys it nothing: the words are what is checked.
     let line = "Authorized to work in the United States";
     let cited = json!({
-        "doc": {
-            "name": "Mallory Model",
-            "contact": [],
-            "summary": [],
-            "sections": [{"heading": "Experience", "entries": [{
-                "title": "", "subtitle": "", "dates": "", "bullets": [line],
-            }]}],
-        },
-        "claims": [{"text": line, "evidence_ids": ["$EVIDENCE_ID"]}],
+        "summary": [],
+        "sections": [{"heading": "experience", "entries": [{
+            "title": "", "subtitle": "", "dates": "", "evidence_ids": [],
+            "bullets": [{"text": line, "evidence_ids": ["$EVIDENCE_ID"]}],
+        }]}],
     });
     let cited = format!("Backend Engineer\n{MOCK_REPLY} {cited}\n");
 

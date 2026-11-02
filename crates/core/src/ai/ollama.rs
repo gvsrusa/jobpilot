@@ -319,9 +319,16 @@ impl Provider for Ollama {
                 // the rules and the block's markers can go first. A refusal is the safe end.
                 "truncate": false,
                 "shift": false,
+                // On by default for a model that can. Thinking counts against `num_ctx`, and a
+                // small model spent the whole window on it and returned no content.
+                "think": false,
                 "options": {"temperature": 0, "num_ctx": CONTEXT_LIMIT},
             });
             let reply = self.post("/api/chat", body).await?;
+            // At temperature 0 a retry would repeat the same cut, token for token.
+            if reply["done_reason"] == "length" {
+                return Err(Error::Failed("output_truncated".into()));
+            }
             reply["message"]["content"]
                 .as_str()
                 .map(str::to_string)

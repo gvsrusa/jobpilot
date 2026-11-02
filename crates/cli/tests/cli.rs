@@ -475,14 +475,11 @@ fn draftable(home: &Path) -> (String, serde_json::Value) {
         ],
     ));
     let reply = serde_json::json!({
-        "doc": {
-            "name": "x", "contact": [], "summary": [],
-            "sections": [{"heading": "Experience", "entries": [{
-                "title": "", "subtitle": "", "dates": "",
-                "bullets": ["Shipped the Rust compiler"],
-            }]}],
-        },
-        "claims": [{"text": "Shipped the Rust compiler", "evidence_ids": [item["id"]]}],
+        "summary": [],
+        "sections": [{"heading": "experience", "entries": [{
+            "title": "", "subtitle": "", "dates": "", "evidence_ids": [],
+            "bullets": [{"text": "Shipped the Rust compiler", "evidence_ids": [item["id"]]}],
+        }]}],
     });
     (job["id"].as_str().unwrap().to_owned(), reply)
 }

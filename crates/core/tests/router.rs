@@ -13,7 +13,6 @@ use jobpilot_core::ai::{
     Availability, CancellationToken, Capability, DataCategory, Declaration, Outcome, Prompt,
     Provider, ProviderId, TaskSpec, TaskType, consent, spec,
 };
-use jobpilot_core::render::ResumeDoc;
 use jobpilot_core::{AppPaths, Db, Error, Result, audit, pause, settings, transfer};
 use serde_json::json;
 use sqlx::SqlitePool;
@@ -202,8 +201,8 @@ fn prompt() -> Prompt {
 
 fn draft() -> String {
     json!({
-        "doc": {"name": "", "contact": [], "summary": [], "sections": []},
-        "claims": [{"text": "Built parsers", "evidence_ids": ["a"]}],
+        "summary": [{"text": "Built parsers", "evidence_ids": ["a"]}],
+        "sections": [],
     })
     .to_string()
 }
@@ -849,7 +848,7 @@ async fn second_validation_failure_ends_the_provider_with_attempts_left() {
         .run_spec(&db, "gui", &generous, prompt(), CancellationToken::new())
         .await
         .unwrap();
-    assert_eq!(outcome, manual("no_ai"));
+    assert_eq!(outcome, manual("unusable_reply"));
     assert_eq!(calls(&counters), 2);
 }
 
@@ -874,7 +873,7 @@ async fn output_is_checked_against_the_task_schema_not_the_prompt() {
         )
         .await
         .unwrap();
-    assert_eq!(outcome, manual("no_ai"));
+    assert_eq!(outcome, manual("unusable_reply"));
     assert_eq!(
         *counters.schema.lock().unwrap(),
         spec(TaskType::ParseJob).schema
@@ -1236,30 +1235,25 @@ fn parse_job_schema_enforces_its_bounds() {
     assert!(validate(schema, &missing.to_string()).is_err());
 }
 
-/// Each level of `ResumeDoc` is `deny_unknown_fields`, so the schema must refuse the same
-/// extras, or a reply could pass the router and fail to deserialize later.
+/// A field the schema let through would be text no line carries, so no claim would judge it.
 #[test]
 fn draft_schemas_refuse_extras_at_every_level() {
     let resume = spec(TaskType::DraftResume).schema;
+    let line = json!({"text": "B", "evidence_ids": ["id"]});
     let valid = json!({
-        "doc": {"name": "A", "contact": ["c"], "summary": ["s"], "sections": [
-            {"heading": "H", "entries": [
-                {"title": "T", "subtitle": "S", "dates": "D", "bullets": ["B"]}
-            ]}
-        ]},
-        "claims": [{"text": "B", "evidence_ids": ["id"]}],
+        "summary": [line],
+        "sections": [{"heading": "skills", "entries": [{
+            "title": "T", "subtitle": "S", "dates": "D", "evidence_ids": ["id"], "bullets": [line],
+        }]}],
     });
     validate(resume, &valid.to_string()).unwrap();
-    let doc: ResumeDoc = serde_json::from_value(valid["doc"].clone()).unwrap();
-    let round_trip = json!({"doc": doc, "claims": []});
-    validate(resume, &round_trip.to_string()).unwrap();
 
     for pointer in [
         "",
-        "/doc",
-        "/doc/sections/0",
-        "/doc/sections/0/entries/0",
-        "/claims/0",
+        "/summary/0",
+        "/sections/0",
+        "/sections/0/entries/0",
+        "/sections/0/entries/0/bullets/0",
     ] {
         let mut extra = valid.clone();
         extra.pointer_mut(pointer).unwrap()["x"] = json!(1);
@@ -1272,9 +1266,31 @@ fn draft_schemas_refuse_extras_at_every_level() {
         );
     }
 
-    let mut long = valid.clone();
-    long["claims"][0]["text"] = json!("x".repeat(601));
-    assert!(validate(resume, &long.to_string()).is_err());
+    let entry = "/sections/0/entries/0";
+    for pointer in [
+        "/summary/0/text",
+        "/sections/0/entries/0/title",
+        "/sections/0/entries/0/subtitle",
+        "/sections/0/entries/0/dates",
+        "/sections/0/entries/0/bullets/0/text",
+    ] {
+        let mut long = valid.clone();
+        *long.pointer_mut(pointer).unwrap() = json!("x".repeat(601));
+        assert!(validate(resume, &long.to_string()).is_err(), "{pointer}");
+    }
+    // What a model cannot leave out: an entry's lines always have a citation to carry.
+    let mut uncited = valid.clone();
+    uncited
+        .pointer_mut(entry)
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("evidence_ids");
+    assert!(validate(resume, &uncited.to_string()).is_err());
+    // A hostile or wandering model cannot name a section.
+    let mut invented = valid.clone();
+    invented["sections"][0]["heading"] = json!("Work Authorization");
+    assert!(validate(resume, &invented.to_string()).is_err());
 
     let letter = spec(TaskType::DraftCoverLetter).schema;
     let valid = json!({"paragraphs": [{"text": "T", "evidence_ids": []}]});

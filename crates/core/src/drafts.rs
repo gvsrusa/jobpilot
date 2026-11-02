@@ -563,8 +563,6 @@ async fn owned_field_states(db: &Db, doc: &ResumeDoc, when_locked: WhenLocked) -
 /// The name, contact, and headings must be the user's: from the profile, a stock heading, or
 /// any stored version, so a draft stays editable after the profile changes. Being the user's
 /// says only who wrote the value; [`owned_field_states`] judges what it says.
-// ponytail: a heading outside these fails the whole draft with `Err(Validation)`, like a claim
-// mismatch; the Task 15 prompt has to name the stock headings.
 async fn check_user_owned(db: &Db, doc: &ResumeDoc) -> Result<()> {
     let basic = profile::basic(db).await?;
     let mut names = HashSet::from([plain(&basic.name)]);
@@ -752,6 +750,15 @@ pub(crate) struct Made<'a> {
     pub run_id: Option<&'a str>,
 }
 
+/// What refuses a generated or edited version whole. A failure is `Err(Validation)`.
+pub(crate) async fn check_generated(db: &Db, doc: &ResumeDoc, claims: &[ClaimInput]) -> Result<()> {
+    let units = lines(doc);
+    if !claims.iter().map(|c| &c.text).eq(units.iter()) {
+        return Err(bad("the claims must be the lines of the document"));
+    }
+    check_user_owned(db, doc).await
+}
+
 /// As [`create_version`], with the run's id written in the same transaction as the version.
 pub(crate) async fn create_version_for(
     db: &Db,
@@ -794,11 +801,7 @@ pub(crate) async fn create_version_for(
             if origin == "edited" && !generated {
                 return Err(bad("the user's own edit is saved with save_manual"));
             }
-            let units = lines(&doc);
-            if !claims.iter().map(|c| &c.text).eq(units.iter()) {
-                return Err(bad("the claims must be the lines of the document"));
-            }
-            check_user_owned(db, &doc).await?;
+            check_generated(db, &doc, &claims).await?;
             review(db, &claims).await?
         }
         _ => return Err(bad("an origin is uploaded, generated, or edited")),

@@ -812,11 +812,9 @@ async fn stored_order_stays_first_and_a_provider_turned_off_is_not_routed() {
 
 /// A resume reply a stored draft can be made from, citing `evidence`.
 fn resume_reply(evidence: &str) -> Value {
-    let line = "Built billing systems";
-    let doc = json!({"name": "", "contact": [], "summary": [line], "sections": []});
-    let claims = json!([{"text": line, "evidence_ids": [evidence]}]);
+    let line = json!({"text": "Built billing systems", "evidence_ids": [evidence]});
     json!({"type": "result", "subtype": "success", "is_error": false, "permission_denials": [],
-        "structured_output": {"doc": doc, "claims": claims}})
+        "structured_output": {"summary": [line], "sections": []}})
 }
 
 /// The whole first run, through what the desktop commands call: `Router::from_settings` and

@@ -519,17 +519,15 @@ async fn world() -> World {
 }
 
 fn resume_reply(bullet: &str, ids: &[&str]) -> String {
+    let line = json!({"text": bullet, "evidence_ids": ids});
     json!({
-        "doc": {
-            "name": "Mallory Model",
-            "contact": [],
-            "summary": [],
-            "sections": [{
-                "heading": "Experience",
-                "entries": [{"title": "", "subtitle": "", "dates": "", "bullets": [bullet]}],
+        "summary": [],
+        "sections": [{
+            "heading": "experience",
+            "entries": [{
+                "title": "", "subtitle": "", "dates": "", "evidence_ids": [], "bullets": [line],
             }],
-        },
-        "claims": [{"text": bullet, "evidence_ids": ids}],
+        }],
     })
     .to_string()
 }

@@ -286,6 +286,16 @@ fn message(error: &Error) -> String {
         Error::ManualRequired(reason) if reason == "model_not_installed" => {
             "The chosen model is not installed in Ollama. Check `jobpilot ai models`.".into()
         }
+        Error::ManualRequired(reason) if reason == "unusable_reply" => {
+            "The AI model answered, but not in a form JobPilot could use, so nothing was saved. \
+             Try again, choose a larger model, or write this one yourself."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "output_truncated" => {
+            "The AI model ran out of room before it finished, so nothing was saved. Remove some \
+             knowledge items, shorten the posting, or write this one yourself."
+                .into()
+        }
         Error::ManualRequired(reason) if reason == "rate_limited" => {
             "The AI provider is busy and asked to wait. Try again shortly, or write this one \
              yourself."

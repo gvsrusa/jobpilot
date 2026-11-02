@@ -269,6 +269,33 @@ async fn status_hides_remote_models() {
     assert_eq!(gemma.size, 3_338_801_718);
 }
 
+/// A reply cut by `num_ctx` looks like a normal 200. At temperature 0 a retry repeats it, token
+/// for token, so it is named here and not left to fail validation twice.
+#[tokio::test]
+async fn a_reply_cut_by_the_window_is_named() {
+    let fake = Fake::start(vec![
+        ("/api/tags", Reply::Json(200, tag_routes(&["gemma3:4b"]))),
+        (
+            "/api/chat",
+            Reply::Json(
+                200,
+                json!({"done_reason": "length", "message": {"content": "{\"summary\": ["}}),
+            ),
+        ),
+    ]);
+    let ollama = Ollama::new(&fake.url, Some("gemma3:4b".into()), None).unwrap();
+
+    let error = ollama
+        .complete(&prompt(), CancellationToken::new())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(&error, Error::Failed(reason) if reason == "output_truncated"),
+        "{error:?}"
+    );
+}
+
 #[tokio::test]
 async fn complete_sends_schema_as_format_and_returns_content() {
     let fake = Fake::start(vec![
@@ -297,6 +324,8 @@ async fn complete_sends_schema_as_format_and_returns_content() {
     assert_eq!(sent["options"]["num_ctx"], json!(CONTEXT_LIMIT));
     assert_eq!(sent["truncate"], json!(false));
     assert_eq!(sent["shift"], json!(false));
+    // Left on, a thinking model spent all of num_ctx before its first character of JSON.
+    assert_eq!(sent["think"], json!(false));
     assert_eq!(
         sent["messages"][0],
         json!({"role": "system", "content": "sys"})

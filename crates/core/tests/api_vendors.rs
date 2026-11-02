@@ -239,7 +239,11 @@ async fn anthropic_refusal_and_max_tokens_map() {
     let cut = claude_reason(claude_says(content, "max_tokens")).await;
     assert_eq!(
         cut,
-        (manual("no_ai"), vec!["output_truncated".to_string()], 1)
+        (
+            manual("output_truncated"),
+            vec!["output_truncated".to_string()],
+            1
+        )
     );
 }
 
@@ -474,12 +478,7 @@ async fn google_finish_reasons_and_blocks_map() {
         ("SPII", "model_refused"),
     ] {
         let (outcome, rows, hits) = gemini_reason(gemini_says(text.clone(), finish)).await;
-        let end = if reason == "model_refused" {
-            reason
-        } else {
-            "no_ai"
-        };
-        assert_eq!(outcome, manual(end), "{finish}");
+        assert_eq!(outcome, manual(reason), "{finish}");
         assert_eq!(rows, [reason], "{finish}");
         assert_eq!(hits, 1);
     }
@@ -629,11 +628,11 @@ async fn reply_text_goes_through_the_routers_validation() {
     let wrong = r#"{"title": "not the schema"}"#;
     let (outcome, rows, _) =
         claude_reason(claude_says(json!([claude_text(wrong)]), "end_turn")).await;
-    assert_eq!(outcome, manual("no_ai"));
+    assert_eq!(outcome, manual("unusable_reply"));
     assert_eq!(rows, ["validation", "validation"]);
 
     let (outcome, rows, _) = gemini_reason(gemini_says(json!([{"text": wrong}]), "STOP")).await;
-    assert_eq!(outcome, manual("no_ai"));
+    assert_eq!(outcome, manual("unusable_reply"));
     assert_eq!(rows, ["validation", "validation"]);
 }
 

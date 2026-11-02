@@ -421,7 +421,7 @@ async fn a_length_stop_is_truncated_not_retried() {
 
     let outcome = parse(&router(vec![provider("openai", &fake)]), &db).await;
 
-    assert_eq!(outcome, manual("no_ai"));
+    assert_eq!(outcome, manual("output_truncated"));
     assert_eq!(reasons(&db, "openai/api_key").await, ["output_truncated"]);
     assert_eq!(fake.hits(PATH).len(), 1);
 }
@@ -453,7 +453,7 @@ async fn reply_text_goes_through_the_routers_validation() {
 
     let outcome = parse(&router(vec![provider("openai", &fake)]), &db).await;
 
-    assert_eq!(outcome, manual("no_ai"));
+    assert_eq!(outcome, manual("unusable_reply"));
     assert_eq!(
         reasons(&db, "openai/api_key").await,
         ["validation", "validation"]

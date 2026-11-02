@@ -3,10 +3,11 @@
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::api::ApiProvider;
 use super::claude_code::ClaudeCode;
@@ -48,6 +49,8 @@ const PROVIDER_UNAVAILABLE: &str = "provider_unavailable";
 const NO_MODEL_SET: &str = "no_model_set";
 const MODEL_NOT_INSTALLED: &str = "model_not_installed";
 const CLI_TOO_OLD: &str = "cli_too_old";
+const UNUSABLE_REPLY: &str = "unusable_reply";
+const OUTPUT_TRUNCATED: &str = "output_truncated";
 const OLLAMA: &str = "ollama";
 const CLAUDE_CODE: &str = "claude_code";
 const OPENAI: &str = "openai";
@@ -187,6 +190,21 @@ impl Router {
         self.run_spec(db, actor, spec(task), prompt, cancel).await
     }
 
+    /// `run`, with `check` as part of each attempt after the schema: its `Err(Validation)` is
+    /// a validation failure like the schema's, so it retries and is logged the same way.
+    pub async fn run_checked<Check: Future<Output = Result<()>>>(
+        &self,
+        db: &Db,
+        actor: &str,
+        task: TaskType,
+        prompt: Prompt,
+        cancel: CancellationToken,
+        check: impl Fn(Value) -> Check,
+    ) -> Result<Outcome> {
+        self.run_inner(db, actor, spec(task), prompt, cancel, check)
+            .await
+    }
+
     /// `run` with a chosen spec, so tests can prove a rule holds for a spec that does not
     /// ship. `run` is the only production caller.
     #[doc(hidden)]
@@ -195,8 +213,21 @@ impl Router {
         db: &Db,
         actor: &str,
         spec: &TaskSpec,
+        prompt: Prompt,
+        cancel: CancellationToken,
+    ) -> Result<Outcome> {
+        self.run_inner(db, actor, spec, prompt, cancel, |_| async { Ok(()) })
+            .await
+    }
+
+    async fn run_inner<Check: Future<Output = Result<()>>>(
+        &self,
+        db: &Db,
+        actor: &str,
+        spec: &TaskSpec,
         mut prompt: Prompt,
         cancel: CancellationToken,
+        check: impl Fn(Value) -> Check,
     ) -> Result<Outcome> {
         prompt.schema = spec.schema;
         let task = Task {
@@ -218,11 +249,27 @@ impl Router {
 
         for provider in &self.providers {
             let provider = provider.as_ref();
+            // Set by a reply, so a provider's own `Validation` is not blamed on its output.
+            let unusable = AtomicBool::new(false);
             let call = || async {
                 let raw = provider.complete(&prompt, cancel.clone()).await?;
-                validate(spec.schema, &raw)
+                let checked = async {
+                    let output = validate(spec.schema, &raw)?;
+                    check(output.clone()).await?;
+                    Ok(output)
+                };
+                let checked = checked.await;
+                if matches!(checked, Err(Error::Validation(_))) {
+                    unusable.store(true, Ordering::Relaxed);
+                }
+                checked
             };
-            match self.try_provider(&task, provider, call).await? {
+            let step = self.try_provider(&task, provider, call).await?;
+            let step = match step {
+                Step::Next if unusable.load(Ordering::Relaxed) => Step::Manual(UNUSABLE_REPLY),
+                step => step,
+            };
+            match step {
                 Step::Done {
                     value: output,
                     attempts,
@@ -449,6 +496,7 @@ impl Router {
                     MODEL_NOT_FOUND,
                     MODEL_REFUSED,
                     CLI_ACCOUNT_REFUSED,
+                    OUTPUT_TRUNCATED,
                 ]
                 .contains(&reason) =>
                 {

@@ -51,6 +51,14 @@ const REASONS: [word: string, text: string][] = [
     "The AI program failed or answered in a way JobPilot could not use. Check it on the AI screen, or write this one yourself.",
   ],
   [
+    "unusable_reply",
+    "The AI model answered, but not in a form JobPilot could use, so nothing was saved. Try again, choose a larger model, or write this one yourself.",
+  ],
+  [
+    "output_truncated",
+    "The AI model ran out of room before it finished, so nothing was saved. Remove some knowledge items, shorten the posting, or write this one yourself.",
+  ],
+  [
     "rate_limited",
     "The AI provider is busy and asked to wait. Try again shortly, or write this one yourself.",
   ],

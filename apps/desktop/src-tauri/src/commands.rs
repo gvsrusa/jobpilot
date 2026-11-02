@@ -4076,10 +4076,9 @@ mod tests {
     #[test]
     fn enable_and_consent_alone_reach_claude() {
         let h = ready();
-        let doc = json!({ "name": "", "contact": [], "summary": ["Builds"], "sections": [] });
-        let claims = json!([{ "text": "Builds", "evidence_ids": [] }]);
+        let summary = json!([{ "text": "Builds", "evidence_ids": [] }]);
         let reply = json!({ "type": "result", "subtype": "success", "is_error": false,
-            "permission_denials": [], "structured_output": { "doc": doc, "claims": claims } });
+            "permission_denials": [], "structured_output": { "summary": summary, "sections": [] } });
         let job = claude_is_set_up(&h, &format!("cat > /dev/null\nprintf '%s' '{reply}'"));
 
         assert_eq!(
@@ -4971,10 +4970,9 @@ mod tests {
     #[cfg(unix)]
     fn drafting_with_claude(h: &Harness) -> Value {
         let item = h.ok("kb_add", json!({ "kind": "skill", "body": "Rust" }));
-        let doc = json!({ "name": "", "contact": [], "summary": ["Rust"], "sections": [] });
-        let claims = json!([{ "text": "Rust", "evidence_ids": [item["id"]] }]);
+        let summary = json!([{ "text": "Rust", "evidence_ids": [item["id"]] }]);
         let reply = json!({ "type": "result", "subtype": "success", "is_error": false,
-            "permission_denials": [], "structured_output": { "doc": doc, "claims": claims } });
+            "permission_denials": [], "structured_output": { "summary": summary, "sections": [] } });
         fake_claude(
             h,
             &format!("[ \"$1\" = --version ] && exit 0\ncat > /dev/null\nprintf '%s' '{reply}'"),

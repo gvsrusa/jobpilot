@@ -63,6 +63,7 @@ pub const RUN_REASONS: &[&str] = &[
     "model_has_tools",
     "endpoint_changed",
     "cli_account_refused",
+    "unusable_reply",
 ];
 
 /// Absent capabilities are false: a declaration lists only what the provider proves.

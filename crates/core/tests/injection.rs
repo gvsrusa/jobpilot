@@ -86,9 +86,15 @@ impl Provider for SteeredProvider {
             if !letter {
                 return Ok(line);
             }
-            // The same hostile claims, in the cover letter's shape.
+            // The same hostile lines, in the cover letter's shape.
             let reply: Value = serde_json::from_str(&line).unwrap();
-            Ok(serde_json::json!({ "paragraphs": reply["claims"] }).to_string())
+            let mut lines = reply["summary"].as_array().cloned().unwrap_or_default();
+            for section in reply["sections"].as_array().into_iter().flatten() {
+                for entry in section["entries"].as_array().into_iter().flatten() {
+                    lines.extend(entry["bullets"].as_array().cloned().unwrap_or_default());
+                }
+            }
+            Ok(serde_json::json!({ "paragraphs": lines }).to_string())
         })
     }
 
@@ -424,7 +430,7 @@ async fn a_reply_asking_for_a_tool_stores_nothing() {
     let (router, _) = w.router(&job.id);
 
     // The reply carries a `tool_use` key the schema does not know, so it never validates.
-    // (The harness rebuilds the letter reply from `claims` alone, so only the resume sees it.)
+    // (The harness rebuilds the letter reply from the lines alone, so only the resume sees it.)
     let made = generate::resume(&w.db, &router, "gui", &job.id, CancellationToken::new()).await;
     assert!(made.is_err(), "{made:?}");
 

@@ -173,24 +173,20 @@ fn posting(text: &str) -> JobText {
     }
 }
 
-/// A reply with these bullets, each citing `ids`, under a name and contact the model made up.
+/// A reply with these bullets, each citing `ids`.
 fn reply_citing(bullets: &[(&str, &[&str])]) -> Value {
-    let texts: Vec<&str> = bullets.iter().map(|(text, _)| *text).collect();
-    let claims: Vec<Value> = bullets
+    let bullets: Vec<Value> = bullets
         .iter()
         .map(|(text, ids)| json!({"text": text, "evidence_ids": ids}))
         .collect();
     json!({
-        "doc": {
-            "name": "Mallory Model",
-            "contact": ["mallory@evil.example", "+1 555 0100"],
-            "summary": [],
-            "sections": [{
-                "heading": "Experience",
-                "entries": [{"title": "", "subtitle": "", "dates": "", "bullets": texts}],
+        "summary": [],
+        "sections": [{
+            "heading": "experience",
+            "entries": [{
+                "title": "", "subtitle": "", "dates": "", "evidence_ids": [], "bullets": bullets,
             }],
-        },
-        "claims": claims,
+        }],
     })
 }
 
@@ -318,9 +314,10 @@ fn system_states_the_rules_for_both_tasks() {
 #[test]
 fn resume_system_explains_claims_and_lists_every_stock_heading() {
     let prompt = build_prompt(TaskType::DraftResume, &basic(), &[], &posting("Job"));
-    assert!(prompt.system.contains("one entry per line of the document"));
-    assert!(prompt.system.contains("identical text"));
-    for heading in [
+    assert!(prompt.system.contains("cites its own `evidence_ids`"));
+    // gemma4 wrote out all twelve jobs of a large knowledge base and ran out of window.
+    assert!(prompt.system.contains("at most 5 entries"));
+    let stock = [
         "experience",
         "work experience",
         "professional experience",
@@ -339,16 +336,20 @@ fn resume_system_explains_claims_and_lists_every_stock_heading() {
         "volunteering",
         "references",
         "work history",
-        "summary",
-        "profile",
-        "objective",
-        "professional summary",
-    ] {
+    ];
+    for heading in stock {
         assert!(
             prompt.system.contains(&format!("'{heading}'")),
             "{heading} is missing"
         );
     }
+    // `summary` is its own field, so a section by that name would be the same lines twice.
+    assert!(!prompt.system.contains("'professional summary'"));
+
+    // The schema offers the same list, so a grammar-bound model cannot write another.
+    let schema: Value = serde_json::from_str(spec(TaskType::DraftResume).schema).unwrap();
+    let offered = &schema["properties"]["sections"]["items"]["properties"]["heading"]["enum"];
+    assert_eq!(offered, &json!(stock));
 }
 
 #[test]
@@ -799,25 +800,155 @@ async fn an_authorization_statement_is_stored_flagged() {
     assert_eq!(claims[0].status, "authorization_statement");
 }
 
+/// What a real local model answered, every evidence id replaced by `id`. The people and
+/// employers in these files were invented for the capture.
+fn real_reply(file: &str, id: &str) -> Value {
+    let path = format!(
+        "{}/tests/fixtures/real_replies/{file}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let text = std::fs::read_to_string(path).unwrap();
+    serde_json::from_str(&text.replace("$EVIDENCE_ID", id)).unwrap()
+}
+
 #[tokio::test]
-async fn claims_that_differ_from_the_lines_store_nothing() {
+async fn real_local_model_replies_become_drafts_with_one_claim_per_line() {
+    // gemma4 cited skill names, not an id, on one line: a real claim with no usable evidence.
+    for (file, unsupported) in [("gemma4.json", 1), ("qwen3_4b.json", 0)] {
+        let w = world().await;
+        let (router, _) = router(vec![real_reply(file, &w.item.id)]);
+
+        let made = generate::resume(&w.db, &router, "gui", &w.job.id, CancellationToken::new())
+            .await
+            .unwrap();
+
+        let claims = drafts::claims(&w.db, &made.draft.id).await.unwrap();
+        let texts: Vec<String> = claims.iter().map(|claim| claim.text.clone()).collect();
+        assert_eq!(texts, lines(&made.draft.doc), "{file}");
+        assert!(texts.len() > 5, "{file}");
+        assert_eq!(made.blocked, unsupported, "{file}");
+        let flagged = claims.iter().filter(|c| c.status == "no_evidence").count();
+        assert_eq!(flagged, unsupported, "{file}");
+        assert_eq!(made.draft.doc.name, "Ada Lovelace", "{file}");
+        assert_eq!(made.draft.doc.contact, ["ada@example.com"], "{file}");
+    }
+}
+
+/// The anti-fabrication promise, on the one tree: every field is a claim with the citation
+/// next to it, so a line with no citation is stored flagged and stops the export.
+#[tokio::test]
+async fn an_uncited_line_anywhere_in_the_tree_is_flagged_and_blocks_export() {
     let w = world().await;
-    let mut reply = reply_citing(&[(BULLET, &[&w.item.id])]);
-    reply["claims"] = json!([{"text": "Something else", "evidence_ids": [w.item.id]}]);
+    let id = w.item.id.as_str();
+    let reply = json!({
+        "summary": [
+            {"text": "Holds a PhD in Computer Science from MIT", "evidence_ids": []},
+            {"text": "Authorized to work in the United States", "evidence_ids": [id]},
+        ],
+        "sections": [{"heading": "experience", "entries": [
+            {
+                "title": "Staff Engineer", "subtitle": "Google", "dates": "2010",
+                "evidence_ids": [],
+                "bullets": [{"text": BULLET, "evidence_ids": [id]}],
+            },
+            {
+                "title": "Engineer", "subtitle": "", "dates": "",
+                "evidence_ids": [id, "not-an-item"],
+                "bullets": [{"text": "", "evidence_ids": []}],
+            },
+        ]}],
+    });
     let (router, _) = router(vec![reply]);
+
+    let made = generate::resume(&w.db, &router, "gui", &w.job.id, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let claims = drafts::claims(&w.db, &made.draft.id).await.unwrap();
+    let got: Vec<(&str, &str)> = claims
+        .iter()
+        .map(|c| (c.text.as_str(), c.status.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("Holds a PhD in Computer Science from MIT", "no_evidence"),
+            (
+                "Authorized to work in the United States",
+                "authorization_statement"
+            ),
+            ("Staff Engineer", "no_evidence"),
+            ("Google", "no_evidence"),
+            ("2010", "no_evidence"),
+            (BULLET, "ok"),
+            ("Engineer", "no_evidence"),
+        ]
+    );
+    assert_eq!(made.blocked, 6);
+    let texts: Vec<String> = claims.iter().map(|c| c.text.clone()).collect();
+    assert_eq!(texts, lines(&made.draft.doc));
+    let exported = drafts::export(
+        &w.db,
+        &made.draft.id,
+        Template::Classic,
+        ExportFormat::Docx,
+        &w._tmp.path().join("out"),
+        "gui",
+    )
+    .await;
+    assert!(
+        matches!(&exported, Err(Error::Refused(reason)) if reason == "claims_blocked"),
+        "{exported:?}"
+    );
+}
+
+/// The reply that showed the bug: `doc` and `claims` written apart, so they disagreed. Asking
+/// again cannot help, so the run ends with a reason, and the disagreement is never stored.
+#[tokio::test]
+async fn a_reply_with_a_separate_claim_list_stores_nothing_and_names_why() {
+    let w = world().await;
+    let reply = real_reply("gemma4_doc_and_claims_disagree.json", &w.item.id);
+    let (router, seen) = router(vec![reply.clone(), reply]);
 
     let made = generate::resume(&w.db, &router, "gui", &w.job.id, CancellationToken::new()).await;
 
-    assert!(matches!(made, Err(Error::Validation(_))), "{made:?}");
+    assert!(
+        matches!(&made, Err(Error::ManualRequired(reason)) if reason == "unusable_reply"),
+        "{made:?}"
+    );
+    assert_eq!(seen.prompts.lock().unwrap().len(), 2);
     assert_eq!(draft_count(&w.db).await, 0);
     assert_eq!(claim_count(&w.db).await, 0);
+}
+
+/// Passes the schema, so only the drafting half can refuse it, and the router still retries.
+#[tokio::test]
+async fn a_reply_refused_after_the_schema_check_is_retried_once() {
+    let w = world().await;
+    let empty = json!({"summary": [], "sections": []});
+    let good = real_reply("qwen3_4b.json", &w.item.id);
+    let (router, seen) = router(vec![empty, good]);
+
+    let made = generate::resume(&w.db, &router, "gui", &w.job.id, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(seen.prompts.lock().unwrap().len(), 2);
+    assert_eq!(made.blocked, 0);
+    let outcomes: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT outcome, reason FROM task_runs ORDER BY attempt")
+            .fetch_all(&w.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(outcomes[0], ("failed".into(), Some("validation".into())));
+    assert_eq!(outcomes[1].0, "ok");
 }
 
 #[tokio::test]
 async fn stock_headings_come_out_title_cased() {
     let w = world().await;
     let mut reply = reply_citing(&[(BULLET, &[&w.item.id])]);
-    reply["doc"]["sections"][0]["heading"] = json!("work experience");
+    reply["sections"][0]["heading"] = json!("work experience");
     let (router, _) = router(vec![reply]);
 
     let made = generate::resume(&w.db, &router, "gui", &w.job.id, CancellationToken::new())
@@ -832,26 +963,34 @@ async fn stock_headings_come_out_title_cased() {
 async fn an_invented_heading_stores_nothing() {
     let w = world().await;
     let mut reply = reply_citing(&[(BULLET, &[&w.item.id])]);
-    reply["doc"]["sections"][0]["heading"] = json!("Work Authorization");
-    let (router, _) = router(vec![reply]);
+    reply["sections"][0]["heading"] = json!("Work Authorization");
+    let (router, _) = router(vec![reply.clone(), reply]);
 
     let made = generate::resume(&w.db, &router, "gui", &w.job.id, CancellationToken::new()).await;
 
-    assert!(matches!(made, Err(Error::Validation(_))), "{made:?}");
+    assert!(
+        matches!(&made, Err(Error::ManualRequired(reason)) if reason == "unusable_reply"),
+        "{made:?}"
+    );
     assert_eq!(draft_count(&w.db).await, 0);
 }
 
 #[tokio::test]
 async fn an_empty_reply_stores_nothing() {
     let w = world().await;
-    let (router, _) = router(vec![reply_citing(&[]), json!({"paragraphs": []})]);
+    let (empty, none) = (reply_citing(&[]), json!({"paragraphs": []}));
+    let (router, _) = router(vec![empty.clone(), empty, none.clone(), none]);
 
     let resume = generate::resume(&w.db, &router, "gui", &w.job.id, CancellationToken::new()).await;
     let letter =
         generate::cover_letter(&w.db, &router, "gui", &w.job.id, CancellationToken::new()).await;
 
-    assert!(matches!(resume, Err(Error::Validation(_))), "{resume:?}");
-    assert!(matches!(letter, Err(Error::Validation(_))), "{letter:?}");
+    for made in [resume, letter] {
+        assert!(
+            matches!(&made, Err(Error::ManualRequired(reason)) if reason == "unusable_reply"),
+            "{made:?}"
+        );
+    }
     assert_eq!(draft_count(&w.db).await, 0);
 }
 

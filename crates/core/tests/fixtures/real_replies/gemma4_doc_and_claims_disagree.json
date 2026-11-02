@@ -1,0 +1,157 @@
+{
+ "claims": [
+  {
+   "evidence_ids": [
+    "$EVIDENCE_ID",
+    "$EVIDENCE_ID",
+    "$EVIDENCE_ID"
+   ],
+   "text": "Highly accomplished Backend Engineer with over 6 years of experience designing and implementing scalable, low-latency services using Rust, Python, and PostgreSQL. Proven expertise in cloud environments (AWS, Kubernetes) and leading complex migrations and development teams to ensure high availability and performance improvements."
+  },
+  {
+   "evidence_ids": [
+    "$EVIDENCE_ID"
+   ],
+   "text": "experience"
+  },
+  {
+   "evidence_ids": [
+    "$EVIDENCE_ID"
+   ],
+   "text": "Senior Backend Engineer at Northwind Logistics, Austin TX, March 2021 to June 2024"
+  },
+  {
+   "evidence_ids": [
+    "$EVIDENCE_ID"
+   ],
+   "text": "• Built a Rust order-routing service handling 40,000 requests per minute and cut p99 latency by 35 percent."
+  },
+  {
+   "evidence_ids": [
+    "$EVIDENCE_ID"
+   ],
+   "text": "• Led a team of four engineers and migrated PostgreSQL 12 to 15 with no downtime."
+  },
+  {
+   "evidence_ids": [
+    "$EVIDENCE_ID"
+   ],
+   "text": "work experience"
+  },
+  {
+   "evidence_ids": [
+    "$EVIDENCE_ID"
+   ],
+   "text": "Software Engineer at Fabrikam Health, Remote, January 2018 to February 2021"
+  },
+  {
+   "evidence_ids": [
+    "$EVIDENCE_ID"
+   ],
+   "text": "• Wrote Python data pipelines on AWS Lambda that processed 2 million claims per day, and added integration tests that reduced production incidents by 20 percent."
+  },
+  {
+   "evidence_ids": [
+    "$EVIDENCE_ID"
+   ],
+   "text": "skills"
+  },
+  {
+   "evidence_ids": [
+    "$EVIDENCE_ID"
+   ],
+   "text": "Rust, Python, PostgreSQL, Kubernetes, AWS, gRPC"
+  },
+  {
+   "evidence_ids": [
+    "$EVIDENCE_ID"
+   ],
+   "text": "education"
+  },
+  {
+   "evidence_ids": [
+    "$EVIDENCE_ID"
+   ],
+   "text": "B.S. Computer Science, University of Texas at Austin, 2017"
+  }
+ ],
+ "doc": {
+  "contact": [
+   "Jordan Rivera",
+   "jordan.rivera@example.com"
+  ],
+  "name": "Jordan Rivera",
+  "sections": [
+   {
+    "entries": [
+     {
+      "bullets": [
+       "Highly accomplished Backend Engineer with over 6 years of experience designing and implementing scalable, low-latency services using Rust, Python, and PostgreSQL. Proven expertise in cloud environments (AWS, Kubernetes) and leading complex migrations and development teams to ensure high availability and performance improvements."
+      ],
+      "dates": "",
+      "subtitle": "Professional Summary",
+      "title": "Professional Summary"
+     }
+    ],
+    "heading": "professional summary"
+   },
+   {
+    "entries": [
+     {
+      "bullets": [
+       "Built a Rust order-routing service handling 40,000 requests per minute and cut p99 latency by 35 percent."
+      ],
+      "dates": "March 2021 to June 2024",
+      "subtitle": "Senior Backend Engineer at Northwind Logistics, Austin TX",
+      "title": "experience"
+     },
+     {
+      "bullets": [
+       "Led a team of four engineers and migrated PostgreSQL 12 to 15 with no downtime."
+      ],
+      "dates": "",
+      "subtitle": "experience",
+      "title": "experience"
+     },
+     {
+      "bullets": [
+       "Wrote Python data pipelines on AWS Lambda that processed 2 million claims per day, and added integration tests that reduced production incidents by 20 percent."
+      ],
+      "dates": "January 2018 to February 2021",
+      "subtitle": "Software Engineer at Fabrikam Health, Remote",
+      "title": "work experience"
+     }
+    ],
+    "heading": "work experience"
+   },
+   {
+    "entries": [
+     {
+      "bullets": [
+       "Rust, Python, PostgreSQL, Kubernetes, AWS, gRPC"
+      ],
+      "dates": "",
+      "subtitle": "Technical Skills",
+      "title": "skills"
+     }
+    ],
+    "heading": "skills"
+   },
+   {
+    "entries": [
+     {
+      "bullets": [],
+      "dates": "2017",
+      "subtitle": "B.S. Computer Science",
+      "title": "education"
+     }
+    ],
+    "heading": "education"
+   }
+  ],
+  "summary": [
+   "Jordan Rivera",
+   "jordan.rivera@example.com"
+  ]
+ }
+}
