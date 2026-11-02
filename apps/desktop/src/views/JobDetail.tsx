@@ -209,7 +209,7 @@ export function JobDetailView({ id, onBack }: { id: string; onBack(): void }) {
               <div className="grid gap-1">
                 <p className="font-medium">Work authorization</p>
                 <p>{authText(d.authorization)}</p>
-                {d.mentions_authorization && <p>This posting mentions work authz. Read it yourself.</p>}
+                {d.mentions_authorization && <p>This posting mentions work authorization. Read it yourself.</p>}
               </div>
               <p>{`Scored by: ${d.explanation?.by ?? "rules"}.`}</p>
               {backendEnabled(ai.data) && (

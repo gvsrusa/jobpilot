@@ -120,7 +120,7 @@ fn no_connector_starts_a_process_or_a_browser() {
 }
 
 #[test]
-fn no_src_holds_a_bypass() {
+fn no_source_holds_a_bypass() {
     let banned = [
         "captcha",
         "2captcha",

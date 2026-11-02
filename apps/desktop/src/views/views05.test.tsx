@@ -119,7 +119,7 @@ describe("Jobs screen", () => {
     await screen.findByRole("heading", { name: "Status" });
   });
 
-  it("shows a src's verdict and no Fetch button when it cannot fetch", async () => {
+  it("shows a source's verdict and no Fetch button when it cannot fetch", async () => {
     jobsBackend([]);
     await openJobs();
     const sources = await screen.findByRole("region", { name: "Sources" });
@@ -154,7 +154,7 @@ describe("Jobs screen", () => {
     }
   });
 
-  it("shows Remote OK on a card from that src, with no image", async () => {
+  it("shows Remote OK on a card from that source, with no image", async () => {
     jobsBackend([job({ id: "r1", connector: "remoteok", attribution: "Remote OK", title: "Platform Dev" })]);
     const { container } = await openJobs();
     const row = await screen.findByRole("row", { name: /Platform Dev/ });
@@ -202,7 +202,7 @@ describe("Jobs screen", () => {
     expect(screen.getByRole("button", { name: "Import a posting" })).toBeInTheDocument();
   });
 
-  it("shows a refused fetch on its src row in role=alert", async () => {
+  it("shows a refused fetch on its source row in role=alert", async () => {
     const row: SourceRow = { id: "s1", connector: "greenhouse", target: "acme", query: "", cursor: 0, created_at: "t" };
     const b = jobsBackend([], {
       jobs_fetch: () => ({
@@ -379,7 +379,7 @@ describe("Job detail", () => {
     expect(screen.getByText("Compared weight: 80 of 100")).toBeInTheDocument();
   });
 
-  it("never shows eligible or ineligible, for each authz state", async () => {
+  it("never shows eligible or ineligible, for each authorization state", async () => {
     const states: [AuthNote, boolean, string][] = [
       [{ kind: "not_stated", country: "PT" }, false, "PT: not stated by you. Not checked."],
       [
@@ -389,7 +389,7 @@ describe("Job detail", () => {
       ],
       [{ kind: "locked" }, false, "Locked, see Recovery."],
       [{ kind: "no_country" }, false, "No country on this posting. Not checked."],
-      [{ kind: "not_stated", country: "PT" }, true, "This posting mentions work authz. Read it yourself."],
+      [{ kind: "not_stated", country: "PT" }, true, "This posting mentions work authorization. Read it yourself."],
     ];
     for (const [authorization, mentions_authorization, line] of states) {
       const { container, unmount } = await openDetail(job(), { authorization, mentions_authorization });
