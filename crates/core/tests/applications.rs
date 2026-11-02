@@ -261,6 +261,8 @@ async fn list_filters_by_status_newest_first() {
     let c = applications::add(&db, "cli", input("C", "r"))
         .await
         .unwrap();
+    // `updated_at` has millisecond resolution, and a tie falls to `seq`.
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     applications::set_status(&db, "cli", &b.id, "applied", None, "")
         .await
         .unwrap();
