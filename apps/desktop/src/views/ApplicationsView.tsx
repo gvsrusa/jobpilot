@@ -17,6 +17,7 @@ import {
   type ApplicationEvent,
   type ApplicationInput,
   type ApplicationStatus,
+  type Report,
   type Answer,
   type Question,
 } from "@/lib/ipc";
@@ -66,6 +67,74 @@ function describe(event: ApplicationEvent): string {
     case "edited":
       return "Details edited";
   }
+}
+
+const NO_DATA = "Not enough data yet";
+const percent = (rate: number | null) => (rate === null ? NO_DATA : `${Math.round(rate * 100)}%`);
+
+/**
+ * Counts and rates from the application store, built on request. The figures hold no text, so
+ * nothing here needs to be inert. A rate with nothing behind it says so instead of showing 0.
+ */
+function Summary() {
+  const client = useQueryClient();
+  const key = ["analytics", "latest"];
+  const latest = useQuery({ queryKey: key, queryFn: ipc.analyticsLatest });
+  const run = useMutation({
+    mutationFn: ipc.analyticsRun,
+    onSuccess: (report: Report) => client.setQueryData(key, report),
+  });
+  const report = latest.data;
+  const rows: [string, string][] = report
+    ? [
+        ["Total applications", String(report.volume.total)],
+        ["Applied in the last 30 days", String(report.volume.applied_last_30_days)],
+        ["Response rate", percent(report.funnel.response_rate)],
+        ["Offer rate", percent(report.funnel.offer_rate)],
+        [
+          "Median days to a response",
+          report.timing.median_days_to_response === null
+            ? NO_DATA
+            : `${Math.round(report.timing.median_days_to_response * 10) / 10} days`,
+        ],
+      ]
+    : [];
+  return (
+    <section className="grid gap-2" aria-labelledby="summary-heading">
+      <div className="flex items-center gap-3">
+        <h2 id="summary-heading" className="text-sm font-semibold">
+          Summary
+        </h2>
+        <Button type="button" variant="outline" disabled={run.isPending} onClick={() => run.mutate()}>
+          {run.isPending ? "Working..." : "Refresh"}
+        </Button>
+        {report && <span className="text-sm text-muted-foreground">As of {formatDate(report.created_at)}</span>}
+      </div>
+      <ErrorAlert error={latest.error ?? run.error} />
+      {latest.isSuccess && !report && (
+        <p className="text-sm text-muted-foreground">No summary yet. Press Refresh to build one.</p>
+      )}
+      {report && (
+        <>
+          <dl className="grid grid-cols-5 gap-3 text-sm">
+            {rows.map(([name, value]) => (
+              <div key={name} className="grid gap-0.5">
+                <dt className="text-muted-foreground">{name}</dt>
+                <dd className="font-medium">{value}</dd>
+              </div>
+            ))}
+          </dl>
+          <ul aria-label="Applications by status" className="flex flex-wrap gap-x-4 text-sm">
+            {Object.entries(report.volume.by_status).map(([status, count]) => (
+              <li key={status}>
+                {label(status)}: {count}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </section>
+  );
 }
 
 type Choice = { value: string; text: string; question: Question; answer: Answer | null };
@@ -368,6 +437,7 @@ export function ApplicationsView() {
   return (
     <div className="grid gap-4">
       <PageHeading>Applications</PageHeading>
+      <Summary />
       <ErrorAlert error={apps.error} />
       <div className="flex items-center gap-3">
         <Label htmlFor="app-filter">Filter by status</Label>

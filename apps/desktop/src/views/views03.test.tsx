@@ -15,6 +15,7 @@ import type {
   MemoryHit,
   Question,
   QuestionRow,
+  Report,
   RunDetail,
   RunState,
   RunSummary,
@@ -91,6 +92,76 @@ async function open(user: ReturnType<typeof renderApp>["user"]) {
 }
 
 const env = (globalThis as unknown as { process: { env: Record<string, string | undefined> } }).process.env;
+
+const report = (over: Partial<Report> = {}): Report => ({
+  id: "r1",
+  created_at: "2026-11-01T10:00:00Z",
+  volume: { total: 0, by_status: {}, applied_last_30_days: 0 },
+  funnel: { applied: 0, responded: 0, interviews: 0, offers: 0, response_rate: null, offer_rate: null },
+  timing: { median_days_to_response: null, responses_counted: 0 },
+  ...over,
+});
+
+describe("applications summary", () => {
+  it("summary_shows_not_enough_data_with_no_applications", async () => {
+    backend({ analytics_latest: () => report() });
+    const { user } = renderApp();
+    await open(user);
+    const summary = await screen.findByRole("region", { name: "Summary" });
+    expect(await within(summary).findByText("Total applications")).toBeInTheDocument();
+    expect(within(summary).getAllByText("Not enough data yet")).toHaveLength(3);
+    expect(within(summary).getByText("Applied in the last 30 days").nextSibling).toHaveTextContent("0");
+  });
+
+  it("no_report_yet_asks_for_a_refresh", async () => {
+    backend({ analytics_latest: () => null });
+    const { user } = renderApp();
+    await open(user);
+    const summary = await screen.findByRole("region", { name: "Summary" });
+    expect(await within(summary).findByText("No summary yet. Press Refresh to build one.")).toBeInTheDocument();
+  });
+
+  it("refresh_runs_a_report", async () => {
+    let built = false;
+    const api = backend({
+      analytics_latest: () => (built ? report({ id: "r2" }) : null),
+      analytics_run: () => {
+        built = true;
+        return report({
+          id: "r2",
+          volume: { total: 4, by_status: { applied: 3, rejected: 1 }, applied_last_30_days: 4 },
+          funnel: { applied: 4, responded: 1, interviews: 0, offers: 0, response_rate: 0.25, offer_rate: 0 },
+          timing: { median_days_to_response: 3.5, responses_counted: 1 },
+        });
+      },
+    });
+    const { user } = renderApp();
+    await open(user);
+    const summary = await screen.findByRole("region", { name: "Summary" });
+    await user.click(await within(summary).findByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(count(api, "analytics_run")).toBe(1));
+    expect(await within(summary).findByText("25%")).toBeInTheDocument();
+    expect(within(summary).getByText("0%")).toBeInTheDocument();
+    expect(within(summary).getByText("3.5 days")).toBeInTheDocument();
+    expect(within(summary).getByText("Total applications").nextSibling).toHaveTextContent("4");
+    expect(within(summary).getByText("Applied: 3")).toBeInTheDocument();
+    expect(within(summary).getByText("Rejected: 1")).toBeInTheDocument();
+  });
+
+  it("a_refused_refresh_shows_its_code", async () => {
+    backend({
+      analytics_latest: () => null,
+      analytics_run: () => {
+        throw { code: "paused", message: "emergency pause is on" };
+      },
+    });
+    const { user } = renderApp();
+    await open(user);
+    const summary = await screen.findByRole("region", { name: "Summary" });
+    await user.click(await within(summary).findByRole("button", { name: "Refresh" }));
+    expect(await within(summary).findByRole("alert")).toHaveTextContent("paused");
+  });
+});
 
 describe("applications", () => {
   it("ctrl_7_opens_applications", async () => {

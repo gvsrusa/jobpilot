@@ -264,6 +264,22 @@ export type LogRow = {
 
 export type RunDetail = { run: RunSummary; log: LogRow[] };
 
+/** Counts and rates only. A rate with no applications behind it is null. */
+export type Report = {
+  id: string;
+  created_at: string;
+  volume: { total: number; by_status: Record<string, number>; applied_last_30_days: number };
+  funnel: {
+    applied: number;
+    responded: number;
+    interviews: number;
+    offers: number;
+    response_rate: number | null;
+    offer_rate: number | null;
+  };
+  timing: { median_days_to_response: number | null; responses_counted: number };
+};
+
 export type DraftKind = "resume" | "cover_letter";
 export type Template = "classic" | "compact";
 export type ExportFormat = "docx" | "pdf";
@@ -432,6 +448,9 @@ export const ipc = {
   /** An active run stops at its next poll; a halted run ends now. */
   agentCancel: (id: string) => invoke<void>("agent_cancel", { id }),
   agentResume: (id: string) => invoke<RunDetail>("agent_resume", { id }),
+  /** Builds a new report from the application store. No model is involved. */
+  analyticsRun: () => invoke<Report>("analytics_run"),
+  analyticsLatest: () => invoke<Report | null>("analytics_latest"),
   appRemove: (id: string) => invoke<void>("app_remove", { id }),
 
   memoryList: (cls: MemoryClass | null) => invoke<QuestionRow[]>("memory_list", { class: cls }),

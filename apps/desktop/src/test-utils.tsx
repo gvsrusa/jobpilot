@@ -92,6 +92,7 @@ export function backend(overrides: Record<string, Handler> = {}): Backend {
     audit_recent: () => [],
     app_list: () => [],
     app_history: () => [],
+    analytics_latest: () => null,
     job_list: () => [],
     kb_list: () => [],
     memory_list: () => [],

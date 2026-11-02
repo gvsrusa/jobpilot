@@ -2,6 +2,7 @@
 
 mod agents;
 mod ai;
+mod analytics;
 mod apps;
 mod data;
 mod memory;
@@ -69,6 +70,9 @@ pub enum Command {
     /// Agent runs and their logs.
     #[command(subcommand)]
     Agents(agents::AgentsCommand),
+    /// Counts and rates over your applications.
+    #[command(subcommand)]
+    Analytics(analytics::AnalyticsCommand),
     /// AI providers, models, and consent.
     #[command(subcommand)]
     Ai(ai::AiCommand),
@@ -266,6 +270,7 @@ async fn with_db(db: &Db, command: Command) -> Result<Output> {
         Command::App(command) => apps::app(db, command).await,
         Command::Memory(command) => memory::memory(db, command).await,
         Command::Agents(command) => agents::agents(db, command).await,
+        Command::Analytics(command) => analytics::analytics(db, command).await,
         Command::Ai(command) => ai::ai(db, command).await,
         // `main` and the shell handle this before any command runs.
         Command::Shell => Err(Error::PanelRefused),
@@ -362,6 +367,8 @@ mod tests {
         ("agents log r", false),
         ("agents cancel r", false),
         ("agents resume r", false),
+        ("analytics report", false),
+        ("analytics show", false),
         ("ai status", false),
         ("ai models", false),
         ("ai pull m", true),

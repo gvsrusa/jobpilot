@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use jobpilot_core::agents::{self, tracking};
+use jobpilot_core::agents::{self, analytics, tracking};
 use jobpilot_core::ai::{BoxFuture, CancellationToken, DataCategory, ProviderId, TaskType};
 use jobpilot_core::runner::{
     self, Agent, Ctx, Limits, Permission, RunInput, RunState, StepDef, StepOutput, Workflow,
@@ -257,7 +257,10 @@ async fn a_check_inside_a_step_refuses_too() {
 
 #[test]
 fn every_agent_step_stays_in_its_set() {
-    let table: &[(Agent, &[StepDef])] = &[(Agent::Tracking, tracking::STEPS)];
+    let table: &[(Agent, &[StepDef])] = &[
+        (Agent::Tracking, tracking::STEPS),
+        (Agent::Analytics, analytics::STEPS),
+    ];
     for (agent, steps) in table {
         let spec = spec_of(*agent);
         for step in *steps {

@@ -2,6 +2,7 @@
 
 pub mod agents;
 pub mod ai;
+pub mod analytics;
 pub mod applications;
 pub mod audit;
 pub mod backup;

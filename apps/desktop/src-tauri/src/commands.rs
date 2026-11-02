@@ -14,6 +14,7 @@ use jobpilot_core::ai::claude_code::{self, TERMS_DATE};
 use jobpilot_core::ai::ollama::Ollama;
 use jobpilot_core::ai::router::{Router, ollama_from_settings};
 use jobpilot_core::ai::{self, AiStatus, CancellationToken, DataCategory, ProviderId, consent};
+use jobpilot_core::analytics::{self, Report};
 use jobpilot_core::applications::{self, Application, ApplicationEvent, ApplicationInput};
 use jobpilot_core::audit::{self, AuditEntry};
 use jobpilot_core::backup::{self, BackupInfo};
@@ -101,6 +102,8 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         agent_get,
         agent_cancel,
         agent_resume,
+        analytics_run,
+        analytics_latest,
         app_remove,
         memory_list,
         memory_get,
@@ -1127,6 +1130,17 @@ pub async fn agent_resume(state: State<'_, AppState>, id: String) -> Result<RunD
         .await?
         .into_result()?;
     runner::get(&db, &id).await
+}
+
+/// Builds a report from the application store. No model, so no AI slot is taken.
+#[tauri::command]
+pub async fn analytics_run(state: State<'_, AppState>) -> Result<Report> {
+    agents::analytics_report(&*state.work().await?, ACTOR, CancellationToken::new()).await
+}
+
+#[tauri::command]
+pub async fn analytics_latest(state: State<'_, AppState>) -> Result<Option<Report>> {
+    analytics::latest(&*state.work().await?).await
 }
 
 /// `peek`: asks the store and never makes a key.
@@ -2353,6 +2367,8 @@ mod tests {
         "agent_get",
         "agent_cancel",
         "agent_resume",
+        "analytics_run",
+        "analytics_latest",
         "app_remove",
         "memory_list",
         "memory_get",
@@ -3435,6 +3451,30 @@ mod tests {
         h.ok("agent_cancel", json!({ "id": run }));
         let detail = h.ok("agent_get", json!({ "id": run }));
         assert_eq!(detail["run"]["state"], "cancelled");
+    }
+
+    #[test]
+    fn analytics_commands_reach_core() {
+        let h = ready();
+        assert_eq!(h.ok("analytics_latest", json!({})), Value::Null);
+        let added = h.ok(
+            "app_add",
+            json!({ "input": { "company": "Acme", "role": "Engineer" } }),
+        );
+        let id = added["id"].as_str().unwrap().to_owned();
+        h.ok(
+            "app_set_status",
+            json!({ "id": id, "status": "applied", "on": null, "note": "" }),
+        );
+        let report = h.ok("analytics_run", json!({}));
+        assert_eq!(report["volume"]["total"], 1);
+        assert_eq!(report["funnel"]["applied"], 1);
+        assert_eq!(report["funnel"]["response_rate"], 0.0);
+        let latest = h.ok("analytics_latest", json!({}));
+        assert_eq!(latest["id"], report["id"]);
+        let runs = h.ok("agents_list", json!({ "limit": 10 }));
+        assert_eq!(runs[0]["agent"], "analytics");
+        assert_eq!(runs[0]["actor"], "gui");
     }
 
     /// A sealed row naming a key this keychain never held, under a question of `class`.

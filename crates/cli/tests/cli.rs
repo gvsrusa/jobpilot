@@ -1369,3 +1369,40 @@ async fn agents_cancel_and_resume_act_on_a_halted_run() {
     let app = stdout_json(&run(&home, &["app", "show", &app, "--json"]));
     assert_eq!(app["status"], "applied");
 }
+
+#[test]
+fn analytics_show_says_so_with_no_report() {
+    let (_dir, home) = fresh_home();
+    let shown = run(&home, &["analytics", "show"]);
+    assert!(shown.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&shown.stdout).trim(),
+        "No report yet."
+    );
+    let json = stdout_json(&run(&home, &["analytics", "show", "--json"]));
+    assert!(json.is_null(), "{json}");
+}
+
+#[test]
+fn analytics_report_after_applying_prints_a_rate() {
+    let (_dir, home) = fresh_home();
+    tracked_run(&home);
+    let report = stdout_json(&run(&home, &["analytics", "report", "--json"]));
+    assert_eq!(report["volume"]["total"], 1);
+    assert_eq!(report["funnel"]["applied"], 1);
+    assert_eq!(report["funnel"]["response_rate"], 0.0);
+
+    let text = run(&home, &["analytics", "report"]);
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(text.contains("Response rate: 0%"), "{text}");
+    assert!(
+        text.contains("Median days to a response: not enough data yet"),
+        "{text}"
+    );
+    assert!(!text.contains("Acme"), "{text}");
+
+    let shown = String::from_utf8_lossy(&run(&home, &["analytics", "show"]).stdout).into_owned();
+    assert!(shown.contains("Response rate: 0%"), "{shown}");
+    let runs = stdout_json(&run(&home, &["agents", "list", "--json"]));
+    assert_eq!(runs[0]["agent"], "analytics");
+}
