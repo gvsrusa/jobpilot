@@ -15,7 +15,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
-import { JobDetailView } from "@/views/JobDetail";
+import { JobDetailView, noScoreText } from "@/views/JobDetail";
 import {
   ipc,
   toAppError,
@@ -34,7 +34,6 @@ import {
 const LIMIT = 200;
 const EMPTY_FILTER: JobFilter = { country: null, work_mode: null, min_pay: null, query: null, include_duplicates: false };
 const PERIODS: PayPeriod[] = ["hour", "day", "week", "month", "year"];
-const NO_SCORE = "Not scored yet";
 
 const selectClass =
   "h-8 rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50";
@@ -268,13 +267,16 @@ function JobTable({
             onDoubleClick={() => onOpen(job.id)}
             className="focus-visible:ring-3 focus-visible:ring-ring/50 outline-none"
           >
-            <TableCell className="align-top">{job.score ?? "--"}</TableCell>
+            <TableCell className="align-top">
+              <div>{job.score ?? "--"}</div>
+              {job.stale && <div className="text-xs text-muted-foreground">Out of date</div>}
+            </TableCell>
             <TableCell className="whitespace-normal">
               <div>
                 {job.title}
                 {job.company ? `, ${job.company}` : ""}
               </div>
-              {job.score === null && <div className="text-xs text-muted-foreground">{NO_SCORE}</div>}
+              {job.score === null && <div className="text-xs text-muted-foreground">{noScoreText(job)}</div>}
               {job.not_stated.length > 0 && (
                 <div className="text-xs text-muted-foreground">not stated: {job.not_stated.join(", ")}</div>
               )}
@@ -412,21 +414,21 @@ function List({
   const jobs = useQuery({ queryKey: ["jobs", filter], queryFn: () => ipc.jobsList(filter, LIMIT) });
   const statuses = useQuery({ queryKey: ["job-sources-status"], queryFn: ipc.jobSourcesStatus });
   // The rules score needs no model. It runs once on load, and only when a listed job has no
-  // score, so browsing writes no run. A fetch or an import runs it again.
+  // stored result or a stale one, so browsing writes no run. A fetch or an import runs it again.
   const client = useQueryClient();
   const score = useMutation({
     mutationFn: () => ipc.jobsAnalyze([], false),
     onSettled: () => client.invalidateQueries({ queryKey: ["jobs"] }),
   });
   const rescore = score.mutate;
-  const unscored = jobs.isSuccess && jobs.data.some((job) => job.score === null);
+  const toScore = jobs.isSuccess && jobs.data.some((job) => !job.scored || job.stale);
   const asked = useRef(false);
   useEffect(() => {
-    if (unscored && !asked.current) {
+    if (toScore && !asked.current) {
       asked.current = true;
       rescore();
     }
-  }, [unscored, rescore]);
+  }, [toScore, rescore]);
   // A busy task slot or the pause only means this pass waits for the next load.
   const scoreError = score.error && !waits(score.error) ? score.error : null;
   return (

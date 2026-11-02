@@ -67,6 +67,7 @@ const job = (over: Partial<Job> = {}): Job => ({
   first_seen_at: "2026-11-01T10:00:00Z",
   last_seen_at: "2026-11-01T10:00:00Z",
   score: 82,
+  scored: over.score !== null,
   stale: false,
   not_stated: [],
   ...over,
@@ -183,6 +184,25 @@ describe("Jobs screen", () => {
     expect(within(row).getByText("--")).toBeInTheDocument();
     expect(within(row).getByText("Not scored yet")).toBeInTheDocument();
     expect(screen.queryByText(/nothing in your profile to compare/)).toBeNull();
+  });
+
+  it("says a stored empty result has nothing to compare, and starts no pass for it", async () => {
+    const b = jobsBackend([job({ score: null, scored: true })]);
+    await openJobs();
+    const row = await screen.findByRole("row", { name: /Backend Engineer/ });
+    expect(within(row).getByText("--")).toBeInTheDocument();
+    expect(within(row).getByText("No score: nothing in your profile to compare")).toBeInTheDocument();
+    expect(screen.queryByText("Not scored yet")).toBeNull();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(count(b, "jobs_analyze")).toBe(0);
+  });
+
+  it("marks a stale score and rescores it once on load", async () => {
+    const b = jobsBackend([job({ stale: true })]);
+    await openJobs();
+    const row = await screen.findByRole("row", { name: /Backend Engineer/ });
+    expect(within(row).getByText("Out of date")).toBeInTheDocument();
+    await waitFor(() => expect(count(b, "jobs_analyze")).toBe(1));
   });
 
   it("renders an HTML posting title as text", async () => {
@@ -411,6 +431,22 @@ async function openDetail(j: Job, over: Partial<JobDetail> = {}, overrides: Reco
 const lastList = (b: ReturnType<typeof jobsBackend>) => b.calls.filter((c) => c.cmd === "jobs_list").slice(-1)[0];
 
 describe("Job detail", () => {
+  it("marks a stale score beside the number", async () => {
+    await openDetail(job({ stale: true }));
+    expect(await screen.findByText("Score 82 / 100")).toBeInTheDocument();
+    expect(screen.getByText("Out of date")).toBeInTheDocument();
+  });
+
+  it("says why a job has no score", async () => {
+    await openDetail(job({ score: null, scored: true }));
+    expect(await screen.findByText("No score: nothing in your profile to compare")).toBeInTheDocument();
+  });
+
+  it("says a job has not been scored yet", async () => {
+    await openDetail(job({ score: null }));
+    expect(await screen.findByText("Not scored yet")).toBeInTheDocument();
+  });
+
   it("lists every criterion with weight and points", async () => {
     await openDetail(job({ url: "https://remoteok.com/x" }), {
       explanation: {

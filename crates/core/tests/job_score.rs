@@ -55,6 +55,7 @@ fn blank_job() -> Job {
         last_seen_at: String::new(),
         score: None,
         stale: false,
+        scored: false,
         not_stated: Vec::new(),
     }
 }

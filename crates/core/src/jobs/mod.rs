@@ -123,6 +123,8 @@ pub struct Job {
     pub first_seen_at: String,
     pub last_seen_at: String,
     pub score: Option<i64>,
+    /// A result is stored. With no `score`, the result had nothing to compare.
+    pub scored: bool,
     pub stale: bool,
     /// Fields a filter was asked about that this job does not state: `country`, `work_mode`.
     pub not_stated: Vec<&'static str>,
@@ -238,6 +240,7 @@ impl JobRow {
             first_seen_at: self.first_seen_at,
             last_seen_at: self.last_seen_at,
             score: self.score,
+            scored: inputs.is_some(),
             stale: false,
             not_stated: Vec::new(),
         };

@@ -230,7 +230,7 @@ The 0.5 CLI adds the `job` surface (alias `job src` for `job source`):
     "seniority", "skills": [..], "fields_by",
     "duplicate_of", "duplicates", "findings",
     "first_seen_at", "last_seen_at",
-    "score", "stale", "not_stated": [..]
+    "score", "scored", "stale", "not_stated": [..]
   },
   "text": "...",                       // the cleaned posting; untrusted
   "findings": [ { "kind", "excerpt" } ],

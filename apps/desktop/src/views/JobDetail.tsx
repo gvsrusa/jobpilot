@@ -18,6 +18,8 @@ import { useUiStore } from "@/lib/store";
 const sourceLabel = (statuses: SourceStatus[], connector: string) =>
   connector === "import" ? "Imported" : (statuses.find((s) => s.name === connector)?.label ?? connector);
 
+export const noScoreText = (job: Job) => (job.scored ? "No score: nothing in your profile to compare" : "Not scored yet");
+
 function payText(pay: PayRange | null): string {
   if (!pay || (pay.min === null && pay.max === null)) return "not stated";
   const range = pay.min !== null && pay.max !== null ? `${pay.min}-${pay.max}` : String(pay.min ?? pay.max);
@@ -192,6 +194,8 @@ export function JobDetailView({ id, onBack }: { id: string; onBack(): void }) {
             </div>
             <div className="flex items-baseline gap-3">
               <span>{`Score ${job.score === null ? "--" : `${job.score} / 100`}`}</span>
+              {job.score === null && <span className="text-sm text-muted-foreground">{noScoreText(job)}</span>}
+              {job.stale && <span className="text-sm text-muted-foreground">Out of date</span>}
               {stopped && (
                 <span role="alert" className="text-sm text-destructive">
                   AI evaluation stopped. The rules score stands.{" "}

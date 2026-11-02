@@ -502,6 +502,8 @@ export type Job = {
   first_seen_at: string;
   last_seen_at: string;
   score: number | null;
+  /** A result is stored: with a null `score`, it had nothing to compare. */
+  scored: boolean;
   stale: boolean;
   not_stated: string[];
 };

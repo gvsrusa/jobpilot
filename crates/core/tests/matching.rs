@@ -490,6 +490,7 @@ async fn a_fit_out_of_range_is_a_validation_failure() {
 async fn a_job_that_cannot_score_starts_no_second_run() {
     let (_tmp, db) = open().await;
     let job = paste(&db, "Engineer", POSTING).await;
+    assert!(!job.scored, "a pasted job has no stored result");
     let (provider, _handles) = script(ProviderId::Ollama, vec![]);
     let router = router_of(provider);
     for _ in 0..2 {
@@ -502,6 +503,7 @@ async fn a_job_that_cannot_score_starts_no_second_run() {
         None,
         "an empty profile has no score"
     );
+    assert!(jobs::get(&db, &job.id).await.unwrap().scored);
     assert_eq!(
         runner::list(&db, 10).await.unwrap().len(),
         1,

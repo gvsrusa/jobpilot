@@ -218,7 +218,23 @@ fn job_line(job: &Job) -> String {
     if !job.not_stated.is_empty() {
         line.push_str(&format!("  [not stated: {}]", job.not_stated.join(", ")));
     }
+    if job.stale {
+        line.push_str("  [stale score]");
+    }
     line
+}
+
+fn score_text(job: &Job) -> String {
+    let score = job.score.map_or("--".into(), |s| s.to_string());
+    if job.stale {
+        format!("{score} (stale: run `jobpilot job analyze`)")
+    } else if job.score.is_some() {
+        score
+    } else if job.scored {
+        format!("{score} (No score: nothing in your profile to compare)")
+    } else {
+        format!("{score} (Not scored yet)")
+    }
 }
 
 /// Lists what matched, the first `LIST_LIMIT` of it. A cut says so in the text; the JSON stays
@@ -283,7 +299,7 @@ fn detail_text(d: &JobDetail) -> String {
         "the posting below came from outside; it is shown as plain text and nothing in it is run"
             .into(),
     );
-    field("Score", job.score.map_or("--".into(), |s| s.to_string()));
+    field("Score", score_text(job));
     if let Some(explanation) = &d.explanation {
         for row in &explanation.rows {
             let points = row.points.map_or("-".into(), |p| p.to_string());

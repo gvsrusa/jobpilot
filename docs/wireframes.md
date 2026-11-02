@@ -357,7 +357,7 @@ Built. Ctrl+0 opens it. Jobs come from connectors whose register read verdict is
 |             |        not stated: country                                     |
 |             |  74    Platform Dev, Beta       Lisbon       Lever             |
 |             |  --    Data Eng, Gamma          Toronto      Imported          |
-|             |        no score: nothing in your profile to compare            |
+|             |        No score: nothing in your profile to compare            |
 |             +----------------------------------------------------------------+
 |             | Sources                                                        |
 |             |  Lever       read: allowed       [Board] [Fetch]               |
@@ -376,7 +376,7 @@ Built. Ctrl+0 opens it. Jobs come from connectors whose register read verdict is
 
 - A source that cannot fetch has no Fetch button, only the import route. A board source (Lever, Greenhouse, Ashby) asks for the board name first. Attribution ("Remote OK", "We Work Remotely") shows on every card from those sources. Job text is labelled as outside text and renders as plain text: no links, no images, no logos.
 - The fixed R1 note is "Vendor is silent on third-party readers. Read under ruling R1." **R1 is a controller ruling, not an owner decision.** The GUI label for these two rows still reads `read: ruling R1`. That wording is wrong and is listed as a known issue in the [0.5 release note](releases/0.5.0.md#known-issues).
-- A score shows `--` with "no score: nothing in your profile to compare" when nothing could be compared. The rules score runs when the screen opens and after a fetch or an import, for every job with no score or a stale one.
+- A score shows `--` with "No score: nothing in your profile to compare" when nothing could be compared, and "Not scored yet" when no result is stored. A score made from older inputs shows "Out of date" under the number, and on the job detail beside it. The rules score runs when the screen opens, if a listed job has no result or a stale one, and after a fetch or an import, for every such job. With nothing to do it starts no run.
 - A duplicate shows under its first source as "+{n} other sources". The list hides duplicates.
 - **Release:** 0.5.
 - **Keyboard:** Tab to the filter form, then the job table (one tab stop; arrows, Home, and End move rows; Enter opens screen 9; `i` opens the import dialog). Back from a job returns to the same row with the filters as they were left.

@@ -3356,6 +3356,37 @@ fn job_research_with_no_backend_shows_stored_text() {
 }
 
 #[test]
+fn a_stale_score_is_marked_until_job_analyze() {
+    let (_dir, home) = fresh_home();
+    let job = paste(&home, "Dev", &[], "We need Rust. 5+ years of experience.");
+    let id = job["id"].as_str().unwrap();
+    let show = |home: &Path| stdout_of(&run(home, &["job", "show", id]));
+    assert!(show(&home).contains("Score: -- (Not scored yet)"));
+    ok(&home, &["job", "analyze"]);
+    assert!(!stdout_of(&run(&home, &["job", "list"])).contains("stale"));
+    assert!(!show(&home).contains("stale"));
+
+    ok(&home, &["job", "prefs", "set", "--seniority", "senior"]);
+
+    assert!(stdout_of(&run(&home, &["job", "list"])).contains("[stale score]"));
+    assert!(show(&home).contains("stale: run `jobpilot job analyze`"));
+    ok(&home, &["job", "analyze"]);
+    assert!(!stdout_of(&run(&home, &["job", "list"])).contains("stale"));
+}
+
+#[test]
+fn job_show_says_why_a_scored_job_has_no_score() {
+    let (_dir, home) = fresh_home();
+    let job = paste(&home, "Dev", &[], "Write code.");
+    ok(&home, &["job", "analyze"]);
+    let shown = stdout_of(&run(&home, &["job", "show", job["id"].as_str().unwrap()]));
+    assert!(
+        shown.contains("Score: -- (No score: nothing in your profile to compare)"),
+        "{shown}"
+    );
+}
+
+#[test]
 fn job_commands_refuse_while_paused_where_they_write() {
     let (_dir, home) = fresh_home();
     let job = paste(&home, "Dev", &[], "Write code.");
