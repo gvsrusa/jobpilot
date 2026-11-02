@@ -558,6 +558,7 @@ async fn analyze(db: &Db, ids: Vec<String>, ai: bool, yes: bool) -> Result<Outpu
 }
 
 async fn research(db: &Db, company_id: String, yes: bool) -> Result<Output> {
+    pause::ensure_off(db).await?;
     let router = Router::from_settings(db).await?;
     let plan = agents::research_plan(db, &router, &company_id).await?;
     if plan.external_calls > 0 && !yes {

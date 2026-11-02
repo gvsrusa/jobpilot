@@ -3269,6 +3269,20 @@ fn job_analyze_ai_without_yes_states_calls_and_stops() {
 }
 
 #[test]
+fn job_research_while_paused_refuses_before_the_count() {
+    let (_dir, home) = fresh_home();
+    let bin = claude_saying(&home, &serde_json::json!({}));
+    claude_only(&home, &bin, "job_text,company_text");
+    let job = paste(&home, "Rust dev", &["--company", "Acme"], "Remote role.");
+    let company = job["company_id"].as_str().unwrap();
+    let env = [("JOBPILOT_CLAUDE_BIN", bin.as_str())];
+    ok(&home, &["pause", "set"]);
+    let stopped = run_env(&home, &["job", "research", company], &env);
+    assert_eq!(stopped.status.code(), Some(1));
+    assert!(stderr_text(&stopped).starts_with("error[paused]"));
+}
+
+#[test]
 fn job_analyze_ai_with_no_approved_evidence_says_what_to_do() {
     let (_dir, home) = fresh_home();
     let bin = fresh_claude(&home);
