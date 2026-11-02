@@ -10,7 +10,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use jobpilot_core::agents::MemoryRefreshed;
+use jobpilot_core::agents::{
+    AiPlan, CompanyResearch, DiscoveryReport, MatchReport, MatchRequest, MemoryRefreshed,
+};
 use jobpilot_core::ai::ollama::Ollama;
 use jobpilot_core::ai::register::{self, ProviderInfo};
 use jobpilot_core::ai::router::{Router, ollama_from_settings};
@@ -22,11 +24,15 @@ use jobpilot_core::analytics::{self, Report};
 use jobpilot_core::applications::{self, Application, ApplicationEvent, ApplicationInput};
 use jobpilot_core::audit::{self, AuditEntry};
 use jobpilot_core::backup::{self, BackupInfo};
+use jobpilot_core::connectors::{self, SourceStatus};
 use jobpilot_core::crypto::{self, KeyState};
 use jobpilot_core::documents::{self, Document, SearchHit};
 use jobpilot_core::drafts::{self, ClaimInput, Compare, Draft, ExportFormat};
 use jobpilot_core::embed::{self, Hit};
 use jobpilot_core::generate::{self, Generated, PromptPreview};
+use jobpilot_core::jobs::company::{self, Company, CompanyNote};
+use jobpilot_core::jobs::prefs::{self as match_prefs, MatchPrefs};
+use jobpilot_core::jobs::{self as jobs_core, Job, JobDetail, JobFilter, PastedJob, SourceRow};
 use jobpilot_core::knowledge::{self, JobText, KnowledgeItem};
 use jobpilot_core::memory::{
     self, Answer, AppliedAnswer, AuthorizationAnswer, Class, MemoryHit, Question, QuestionRow,
@@ -95,6 +101,26 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         job_paste,
         job_list,
         job_get,
+        jobs_list,
+        job_detail,
+        job_import,
+        job_remove,
+        job_split,
+        job_open,
+        job_to_app,
+        job_sources_status,
+        job_sources_list,
+        job_src_add,
+        job_src_remove,
+        jobs_fetch,
+        jobs_analyze,
+        jobs_analyze_plan,
+        job_research,
+        job_research_plan,
+        companies_list,
+        company_note_add,
+        match_prefs_get,
+        match_prefs_set,
         app_list,
         app_get,
         app_add,
@@ -535,7 +561,225 @@ pub async fn kb_search(
 
 #[tauri::command]
 pub async fn job_paste(state: State<'_, AppState>, title: String, raw: String) -> Result<JobText> {
-    knowledge::import_job_text(&*state.work().await?, &title, &raw).await
+    let db = state.work().await?;
+    let input = PastedJob {
+        title,
+        company: String::new(),
+        url: None,
+        text: raw,
+    };
+    let job = jobs_core::import_pasted(&db, input).await?;
+    knowledge::get_job_text(&db, &job.job_text_id).await
+}
+
+#[tauri::command]
+pub async fn jobs_list(
+    state: State<'_, AppState>,
+    filter: JobFilter,
+    limit: i64,
+) -> Result<Vec<Job>> {
+    jobs_core::list(&*state.work().await?, &filter, limit).await
+}
+
+#[tauri::command]
+pub async fn job_detail(state: State<'_, AppState>, id: String) -> Result<JobDetail> {
+    jobs_core::detail(&*state.work().await?, &id).await
+}
+
+/// Stores the text and keeps the link. Nothing here requests it.
+#[tauri::command]
+pub async fn job_import(state: State<'_, AppState>, input: PastedJob) -> Result<Job> {
+    jobs_core::import_pasted(&*state.work().await?, input).await
+}
+
+#[tauri::command]
+pub async fn job_remove(state: State<'_, AppState>, id: String) -> Result<()> {
+    jobs_core::remove(&*state.work().await?, ACTOR, &id).await
+}
+
+#[tauri::command]
+pub async fn job_split(state: State<'_, AppState>, id: String) -> Result<()> {
+    jobs_core::split(&*state.work().await?, ACTOR, &id).await
+}
+
+/// The webview names a job, never a link: Rust reads the stored one and opens it only when
+/// it is `https`.
+#[tauri::command]
+pub async fn job_open<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<()> {
+    let job = jobs_core::get(&*state.work().await?, &id).await?;
+    let url = job.url.as_deref().map(str::trim).unwrap_or_default();
+    if !url
+        .get(..8)
+        .is_some_and(|head| head.eq_ignore_ascii_case("https://"))
+    {
+        return Err(Error::Refused("this job has no https link to open".into()));
+    }
+    native::open_url(&app, url).await
+}
+
+/// The tracker entry links the stored text and carries no note.
+#[tauri::command]
+pub async fn job_to_app(state: State<'_, AppState>, id: String) -> Result<Application> {
+    let db = state.work().await?;
+    let job = jobs_core::get(&db, &id).await?;
+    let input = ApplicationInput {
+        company: job.company.unwrap_or_default(),
+        role: job.title,
+        job_text_id: Some(job.job_text_id),
+        link: job.url.unwrap_or_default(),
+        country: job.country.unwrap_or_default(),
+        ..ApplicationInput::default()
+    };
+    applications::add(&db, ACTOR, input).await
+}
+
+#[tauri::command]
+pub async fn job_sources_status() -> Vec<SourceStatus> {
+    connectors::statuses()
+}
+
+#[tauri::command]
+pub async fn job_sources_list(state: State<'_, AppState>) -> Result<Vec<SourceRow>> {
+    jobs_core::list_sources(&*state.work().await?).await
+}
+
+#[tauri::command]
+pub async fn job_src_add(
+    state: State<'_, AppState>,
+    connector: String,
+    target: String,
+    query: String,
+) -> Result<SourceRow> {
+    jobs_core::add_source(&*state.work().await?, &connector, &target, &query).await
+}
+
+#[tauri::command]
+pub async fn job_src_remove(state: State<'_, AppState>, id: String) -> Result<()> {
+    jobs_core::remove_source(&*state.work().await?, &id).await
+}
+
+/// Reads the sources named, or all of them. The run's token is the pause watcher's.
+#[tauri::command]
+pub async fn jobs_fetch(
+    state: State<'_, AppState>,
+    src_ids: Vec<String>,
+) -> Result<DiscoveryReport> {
+    let running = state.ai.begin()?;
+    let db = state.work().await?;
+    agents::discover(&db, ACTOR, src_ids, running.token.clone()).await
+}
+
+#[tauri::command]
+pub async fn jobs_analyze_plan(state: State<'_, AppState>, ids: Vec<String>) -> Result<AiPlan> {
+    let db = state.work().await?;
+    let router = Router::from_settings(&db).await?;
+    agents::match_plan(&db, &router, &ids).await
+}
+
+/// Like `memory_refresh`: with outside calls ahead, the count is named in a native dialog
+/// first, and a count that moved after the yes is refused.
+#[tauri::command]
+pub async fn jobs_analyze<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    ids: Vec<String>,
+    ai: bool,
+) -> Result<MatchReport> {
+    let mut asked = 0;
+    if ai {
+        let plan = {
+            let db = state.work().await?;
+            let router = Router::from_settings(&db).await?;
+            agents::match_plan(&db, &router, &ids).await?
+        };
+        asked = plan.external_calls;
+        if asked > 0 {
+            let message = format!(
+                "This will make at most {asked} paid or subscription calls for {} jobs.",
+                plan.jobs
+            );
+            native::confirmed(&app, "Analyze jobs with a model", message, "Analyze").await?;
+        }
+    }
+    let running = state.ai.begin()?;
+    let db = state.work().await?;
+    let router = Router::from_settings(&db).await?;
+    if ai && agents::match_plan(&db, &router, &ids).await?.external_calls != asked {
+        return Err(Error::Validation(
+            "the number of outside calls changed since you were asked; press Analyze again".into(),
+        ));
+    }
+    let req = MatchRequest { job_ids: ids, ai };
+    agents::match_jobs(&db, &router, ACTOR, req, running.token.clone()).await
+}
+
+#[tauri::command]
+pub async fn job_research_plan(state: State<'_, AppState>, company_id: String) -> Result<AiPlan> {
+    let db = state.work().await?;
+    let router = Router::from_settings(&db).await?;
+    agents::research_plan(&db, &router, &company_id).await
+}
+
+#[tauri::command]
+pub async fn job_research<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    company_id: String,
+) -> Result<CompanyResearch> {
+    let plan = {
+        let db = state.work().await?;
+        let router = Router::from_settings(&db).await?;
+        agents::research_plan(&db, &router, &company_id).await?
+    };
+    let asked = plan.external_calls;
+    if asked > 0 {
+        let message = format!(
+            "This will make at most {asked} paid or subscription calls for {} stored texts.",
+            plan.jobs
+        );
+        native::confirmed(&app, "Research a company", message, "Research").await?;
+    }
+    let running = state.ai.begin()?;
+    let db = state.work().await?;
+    let router = Router::from_settings(&db).await?;
+    if agents::research_plan(&db, &router, &company_id)
+        .await?
+        .external_calls
+        != asked
+    {
+        return Err(Error::Validation(
+            "the number of outside calls changed since you were asked; press Research again".into(),
+        ));
+    }
+    agents::research_company(&db, &router, ACTOR, &company_id, running.token.clone()).await
+}
+
+#[tauri::command]
+pub async fn companies_list(state: State<'_, AppState>) -> Result<Vec<Company>> {
+    company::list(&*state.work().await?).await
+}
+
+#[tauri::command]
+pub async fn company_note_add(
+    state: State<'_, AppState>,
+    company_id: String,
+    text: String,
+) -> Result<CompanyNote> {
+    company::add_note(&*state.work().await?, ACTOR, &company_id, &text).await
+}
+
+#[tauri::command]
+pub async fn match_prefs_get(state: State<'_, AppState>) -> Result<MatchPrefs> {
+    match_prefs::get(&*state.work().await?).await
+}
+
+#[tauri::command]
+pub async fn match_prefs_set(state: State<'_, AppState>, prefs: MatchPrefs) -> Result<()> {
+    match_prefs::set(&*state.work().await?, &prefs).await
 }
 
 #[tauri::command]
@@ -2690,6 +2934,26 @@ mod tests {
         "job_paste",
         "job_list",
         "job_get",
+        "jobs_list",
+        "job_detail",
+        "job_import",
+        "job_remove",
+        "job_split",
+        "job_open",
+        "job_to_app",
+        "job_sources_status",
+        "job_sources_list",
+        "job_src_add",
+        "job_src_remove",
+        "jobs_fetch",
+        "jobs_analyze",
+        "jobs_analyze_plan",
+        "job_research",
+        "job_research_plan",
+        "companies_list",
+        "company_note_add",
+        "match_prefs_get",
+        "match_prefs_set",
         "app_list",
         "app_get",
         "app_add",
@@ -5315,6 +5579,199 @@ mod tests {
 
         assert!(block_on(super::stop_if_paused(&state)));
         assert!(ai.token.is_cancelled() && pull.token.is_cancelled());
+    }
+
+    fn import_job(h: &Harness, url: Option<&str>) -> Value {
+        let input = json!({
+            "title": "Backend Engineer", "company": "Acme", "url": url,
+            "text": "Build services in Rust. Remote.",
+        });
+        h.ok("job_import", json!({ "input": input }))
+    }
+
+    fn all_jobs(h: &Harness) -> Value {
+        let filter = json!({ "include_duplicates": true });
+        h.ok("jobs_list", json!({ "filter": filter, "limit": 50 }))
+    }
+
+    #[test]
+    fn every_job_cmd_is_listed_and_reaches_core() {
+        let h = ready();
+        let job = import_job(&h, Some("https://example.com/jobs/1"));
+        let id = job["id"].as_str().unwrap().to_owned();
+
+        assert_eq!(all_jobs(&h)[0]["id"], id);
+        let detail = h.ok("job_detail", json!({ "id": id }));
+        assert_eq!(detail["job"]["title"], "Backend Engineer");
+        assert!(detail["text"].as_str().unwrap().contains("Rust"));
+
+        let status = h.ok("job_sources_status", json!({}));
+        let names: Vec<&str> = status
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"greenhouse") && names.contains(&"lever"),
+            "{names:?}"
+        );
+
+        let src = h.ok(
+            "job_src_add",
+            json!({ "connector": "lever", "target": "acme", "query": "" }),
+        );
+        assert_eq!(h.ok("job_sources_list", json!({}))[0]["id"], src["id"]);
+        h.ok("job_src_remove", json!({ "id": src["id"] }));
+        assert_eq!(h.ok("job_sources_list", json!({})), json!([]));
+
+        let companies = h.ok("companies_list", json!({}));
+        assert_eq!(companies[0]["name"], "Acme");
+        let note = h.ok(
+            "company_note_add",
+            json!({ "companyId": companies[0]["id"], "text": "Small team" }),
+        );
+        assert_eq!(note["origin"], "pasted");
+
+        h.ok("job_split", json!({ "id": id }));
+        let old = h.ok(
+            "job_paste",
+            json!({ "title": "Role", "raw": "<b>Build</b>" }),
+        );
+        assert_eq!(old["normalized"], "Build", "job_paste keeps its shape");
+
+        h.ok("job_remove", json!({ "id": id }));
+        assert_eq!(h.code("job_detail", json!({ "id": id })), "not_found");
+    }
+
+    #[test]
+    fn job_open_takes_only_an_id_and_refuses_a_non_https_url() {
+        let source = include_str!("commands.rs");
+        let (_, rest) = source
+            .split_once("pub async fn job_open<R: Runtime>(")
+            .unwrap();
+        let (arguments, _) = rest.split_once(") -> ").unwrap();
+        let names: Vec<&str> = arguments
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, _)| name.trim())
+            .collect();
+        assert_eq!(names, ["app", "state", "id"]);
+
+        let h = ready();
+        let id = import_job(&h, Some("https://example.com/jobs/1"))["id"].clone();
+        with_db(&h, |db| async move {
+            sqlx::query("UPDATE jobs SET url = 'http://example.com/jobs/1'")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        });
+        assert_eq!(h.code("job_open", json!({ "id": id })), "refused");
+        let hook = h.app.state::<NativeHook>();
+        assert!(hook.opened.lock().unwrap().is_empty());
+
+        with_db(&h, |db| async move {
+            sqlx::query("UPDATE jobs SET url = 'https://example.com/jobs/1'")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        });
+        h.ok("job_open", json!({ "id": id }));
+        assert_eq!(*hook.opened.lock().unwrap(), ["https://example.com/jobs/1"]);
+
+        let bare = import_job(&h, None)["id"].clone();
+        assert_eq!(h.code("job_open", json!({ "id": bare })), "refused");
+    }
+
+    #[test]
+    fn jobs_analyze_names_the_count_natively() {
+        let h = ready();
+        h.ok(
+            "ai_enable",
+            json!({ "provider": "claude_code", "enabled": true }),
+        );
+        h.ok(
+            "ai_consent_give",
+            json!({ "provider": "claude_code", "categories": ["job_text"] }),
+        );
+        let id = import_job(&h, None)["id"].clone();
+        let plan = h.ok("jobs_analyze_plan", json!({ "ids": [id] }));
+        let calls = plan["external_calls"].as_u64().unwrap();
+        assert!(calls > 0, "{plan}");
+
+        h.answer(false);
+        let args = json!({ "ids": [id], "ai": true });
+        assert_eq!(h.code("jobs_analyze", args), "confirmation_required");
+        let asked = h.asked();
+        let dialog = asked.last().unwrap();
+        assert!(
+            dialog.contains(&format!(
+                "This will make at most {calls} paid or subscription calls"
+            )),
+            "{asked:?}"
+        );
+        assert_eq!(h.ok("agents_list", json!({ "limit": 10 })), json!([]));
+        let hook = h.app.state::<NativeHook>();
+        assert_eq!(hook.work_at_dialog.lock().unwrap().last(), Some(&false));
+
+        // A count that moves while the dialog is open is refused after the yes.
+        let db = with_db(&h, |db| async move { db });
+        *hook.on_ask.lock().unwrap() = Some(Box::new(move || {
+            let db = db.clone();
+            Box::pin(async move {
+                let input = jobpilot_core::jobs::PastedJob {
+                    title: "Second".into(),
+                    company: String::new(),
+                    url: None,
+                    text: "Another posting".into(),
+                };
+                jobpilot_core::jobs::import_pasted(&db, input)
+                    .await
+                    .unwrap();
+            })
+        }));
+        h.answer(true);
+        let all = json!({ "ids": [], "ai": true });
+        assert_eq!(h.code("jobs_analyze", all), "validation");
+
+        // No model means no dialog.
+        let before = h.asked().len();
+        let done = h.ok("jobs_analyze", json!({ "ids": [id], "ai": false }));
+        assert_eq!(done["scored"], 1);
+        assert_eq!(h.asked().len(), before);
+    }
+
+    #[test]
+    fn job_to_app_links_the_text_and_stores_no_note() {
+        let h = ready();
+        let job = import_job(&h, Some("https://example.com/jobs/1"));
+        let app = h.ok("job_to_app", json!({ "id": job["id"] }));
+        assert_eq!(app["company"], "Acme");
+        assert_eq!(app["role"], "Backend Engineer");
+        assert_eq!(app["job_text_id"], job["job_text_id"]);
+        assert_eq!(app["link"], "https://example.com/jobs/1");
+        assert_eq!(app["notes"], "");
+        assert_eq!(app["status"], "saved");
+        assert_eq!(h.ok("app_list", json!({})).as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn jobs_prefs_are_not_reachable_through_the_generic_setting() {
+        let h = ready();
+        let set = json!({ "key": "jobs.prefs", "value": {} });
+        assert_eq!(h.code("settings_set", set), "refused");
+
+        let prefs = json!({
+            "min_pay": { "amount": 90000, "currency": "eur", "period": "year" },
+            "seniority": null,
+        });
+        h.ok("match_prefs_set", json!({ "prefs": prefs }));
+        let stored = h.ok("match_prefs_get", json!({}));
+        assert_eq!(stored["min_pay"]["currency"], "EUR");
+        assert_eq!(
+            h.code("match_prefs_set", json!({ "prefs": { "min_pay": { "amount": 0, "currency": "EUR", "period": "year" } } })),
+            "validation"
+        );
     }
 
     fn code_of(result: Result<Value, Value>) -> String {

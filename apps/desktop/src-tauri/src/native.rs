@@ -32,6 +32,16 @@ pub async fn confirmed<R: Runtime>(
     }
 }
 
+/// Hands a link to the system browser. The caller has already checked it is `https`.
+#[cfg(not(test))]
+pub async fn open_url<R: Runtime>(app: &AppHandle<R>, url: &str) -> Result<()> {
+    use tauri_plugin_opener::OpenerExt;
+
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|_| Error::Failed("the link could not be opened".into()))
+}
+
 /// `Err(Cancelled)` when the user closes the picker.
 pub async fn open_file<R: Runtime>(app: &AppHandle<R>, dialog: FileDialog<'_>) -> Result<PathBuf> {
     pick(app, dialog, false).await?.ok_or(Error::Cancelled)
@@ -158,6 +168,8 @@ pub struct NativeHook {
     pub clipboard: std::sync::Mutex<Option<String>>,
     /// The next clipboard reads fail, as a busy clipboard does.
     pub clipboard_fails: std::sync::atomic::AtomicBool,
+    /// Every link handed to the system browser.
+    pub opened: std::sync::Mutex<Vec<String>>,
     /// Every dialog opened, as title and message.
     pub asked: std::sync::Mutex<Vec<String>>,
     /// For each confirmation, whether a `Work` was open while it waited.
@@ -177,11 +189,24 @@ impl Default for NativeHook {
             picked: Default::default(),
             clipboard: Default::default(),
             clipboard_fails: false.into(),
+            opened: Default::default(),
             asked: Default::default(),
             work_at_dialog: Default::default(),
             on_ask: Default::default(),
         }
     }
+}
+
+#[cfg(test)]
+pub async fn open_url<R: Runtime>(app: &AppHandle<R>, url: &str) -> Result<()> {
+    use tauri::Manager;
+
+    app.state::<NativeHook>()
+        .opened
+        .lock()
+        .unwrap()
+        .push(url.to_owned());
+    Ok(())
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@ import { AgentsView } from "@/views/AgentsView";
 import { AiView } from "@/views/AiView";
 import { ApplicationsView } from "@/views/ApplicationsView";
 import { DocumentsView } from "@/views/DocumentsView";
+import { JobsView } from "@/views/JobsView";
 import { MemoryView } from "@/views/MemoryView";
 import { ProfileView } from "@/views/ProfileView";
 import { ResumesView } from "@/views/ResumesView";
@@ -28,6 +29,7 @@ const NAV: { view: View; label: string }[] = [
   { view: "applications", label: "Applications" },
   { view: "memory", label: "Memory" },
   { view: "agents", label: "Agents" },
+  { view: "jobs", label: "Jobs" },
 ];
 
 function Shell({ root }: { root: string }) {
@@ -47,7 +49,7 @@ function Shell({ root }: { root: string }) {
 
   useEffect(() => {
     const onKey = (e: globalThis.KeyboardEvent) => {
-      const index = Number(e.key) - 1;
+      const index = e.key === "0" ? 9 : Number(e.key) - 1;
       if ((e.ctrlKey || e.metaKey) && NAV[index]) {
         e.preventDefault();
         setView(NAV[index].view);
@@ -124,6 +126,7 @@ function Shell({ root }: { root: string }) {
           {view === "applications" && <ApplicationsView />}
           {view === "memory" && <MemoryView />}
           {view === "agents" && <AgentsView />}
+          {view === "jobs" && <JobsView />}
         </main>
       </div>
       <TerminalPanel open={terminal} onClose={() => setTerminal(false)} />
