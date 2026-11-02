@@ -27,6 +27,7 @@ function tracking() {
   const find = (id: unknown) => apps.find((a) => a.id === id)!;
   return backend({
     app_list: ({ status }: Args) => apps.filter((a) => !status || a.status === status),
+    app_get: ({ id }: Args) => find(id),
     app_add: ({ input }: Args) => {
       const app: Application = {
         ...(input as ApplicationInput),
@@ -47,6 +48,10 @@ function tracking() {
     },
     app_set_status: ({ id, status, on, note }: Args) => {
       const app = find(id);
+      if (app.status === status) {
+        log(app.id, "note", { note: String(note) });
+        return app;
+      }
       log(app.id, "status", { from_status: app.status, to_status: status as ApplicationStatus, note: String(note) });
       app.status = status as ApplicationStatus;
       if (status === "applied" && !app.applied_on) app.applied_on = (on as string) ?? "2026-11-01";
@@ -66,6 +71,8 @@ async function open(user: ReturnType<typeof renderApp>["user"]) {
   await user.click(await screen.findByRole("button", { name: "Applications" }));
   await screen.findByRole("heading", { level: 1, name: "Applications" });
 }
+
+const env = (globalThis as unknown as { process: { env: Record<string, string | undefined> } }).process.env;
 
 describe("applications", () => {
   it("ctrl_7_opens_applications", async () => {
@@ -169,5 +176,66 @@ describe("applications", () => {
     expect(screen.getByLabelText(/^Link/)).toHaveValue("https://example.com/job?x=1");
     expect(screen.getByText(/untrusted/i)).toBeInTheDocument();
     expect(container.querySelectorAll("a, [role='link']")).toHaveLength(0);
+  });
+
+  it("keeps_the_controls_when_a_status_change_leaves_the_filter", async () => {
+    tracking();
+    const { user } = renderApp();
+    await open(user);
+    await user.click(screen.getByRole("button", { name: "Add application" }));
+    await user.type(screen.getByLabelText("Company"), "Acme");
+    await user.type(screen.getByLabelText("Role"), "Engineer");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await user.selectOptions(screen.getByLabelText("Filter by status"), "saved");
+    await user.click(await screen.findByRole("button", { name: "Acme" }));
+    await user.selectOptions(await screen.findByLabelText("New status"), "applied");
+    await user.click(screen.getByRole("button", { name: "Set status" }));
+    await screen.findByText("No applications with this status.");
+    expect(screen.getByRole("button", { name: "Set status" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Remove..." })).toBeInTheDocument();
+  });
+
+  it("a_same_status_needs_a_note_to_be_set", async () => {
+    const api = tracking();
+    const { user } = renderApp();
+    await open(user);
+    await user.click(screen.getByRole("button", { name: "Add application" }));
+    await user.type(screen.getByLabelText("Company"), "Acme");
+    await user.type(screen.getByLabelText("Role"), "Engineer");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await user.click(await screen.findByRole("button", { name: "Acme" }));
+    const set = await screen.findByRole("button", { name: "Set status" });
+    expect(screen.getByLabelText("New status")).toHaveValue("saved");
+    expect(set).toBeDisabled();
+    await user.type(screen.getByLabelText("Status note (optional)"), "still waiting");
+    expect(set).toBeEnabled();
+    await user.click(set);
+    await waitFor(() => expect(count(api, "app_set_status")).toBe(1));
+    expect(await screen.findByRole("list", { name: "History" })).toHaveTextContent("still waiting");
+  });
+
+  it("an_applied_date_is_not_a_day_early_west_of_utc", async () => {
+    const zone = env.TZ;
+    env.TZ = "America/Los_Angeles";
+    try {
+      const api = tracking();
+      const { user } = renderApp();
+      await open(user);
+      await user.click(screen.getByRole("button", { name: "Add application" }));
+      await user.type(screen.getByLabelText("Company"), "Acme");
+      await user.type(screen.getByLabelText("Role"), "Engineer");
+      await user.click(screen.getByRole("button", { name: "Save" }));
+      await user.click(await screen.findByRole("button", { name: "Acme" }));
+      await user.selectOptions(await screen.findByLabelText("New status"), "applied");
+      await user.type(screen.getByLabelText("Applied on (optional)"), "2026-10-02");
+      await user.click(screen.getByRole("button", { name: "Set status" }));
+      await waitFor(() => expect(count(api, "app_set_status")).toBe(1));
+      const cell = (await screen.findByRole("button", { name: "Acme" })).closest("tr")!;
+      await waitFor(() => expect(cell).toHaveTextContent("Oct 2, 2026"));
+      expect(cell).not.toHaveTextContent("Oct 1, 2026");
+    } finally {
+      if (zone === undefined) delete env.TZ;
+      else env.TZ = zone;
+    }
   });
 });

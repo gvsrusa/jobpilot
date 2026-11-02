@@ -316,7 +316,22 @@ pub async fn set_status(
     .await?
     .ok_or(Error::NotFound)?;
     if current.status == status {
-        return Ok(current);
+        // No status event, but a note the person typed is not dropped.
+        if note.is_empty() {
+            return Ok(current);
+        }
+        let app: Application = sqlx::query_as(concat!(
+            "UPDATE applications SET updated_at = ",
+            now!(),
+            " WHERE id = ? RETURNING ",
+            columns!()
+        ))
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        event(&mut tx, id, actor, "note", None, None, note).await?;
+        tx.commit().await?;
+        return Ok(app);
     }
     let app: Application = sqlx::query_as(concat!(
         "UPDATE applications SET status = ?1, updated_at = ",

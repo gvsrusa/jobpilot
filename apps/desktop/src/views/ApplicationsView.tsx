@@ -16,7 +16,7 @@ import {
   type ApplicationInput,
   type ApplicationStatus,
 } from "@/lib/ipc";
-import { formatDate } from "@/lib/utils";
+import { formatDate, formatDay } from "@/lib/utils";
 
 const NEW = "new";
 const EMPTY: ApplicationInput = {
@@ -76,6 +76,12 @@ export function ApplicationsView() {
   });
   const jobs = useQuery({ queryKey: ["jobs"], queryFn: ipc.jobList });
   const drafts = useQuery({ queryKey: ["drafts", "all"], queryFn: () => ipc.resumeList(null) });
+  // Not from the filtered list: a status change can take the row out of the filter.
+  const detail = useQuery({
+    queryKey: ["applications", "get", selected],
+    queryFn: () => ipc.appGet(selected!),
+    enabled: selected !== null && selected !== NEW,
+  });
   const history = useQuery({
     queryKey: ["applications", "history", selected],
     queryFn: () => ipc.appHistory(selected!),
@@ -127,7 +133,7 @@ export function ApplicationsView() {
   });
 
   const rows = apps.data ?? [];
-  const current = rows.find((a) => a.id === selected);
+  const current = selected === NEW ? undefined : detail.data;
   const canSave = form.company.trim() !== "" && form.role.trim() !== "" && !save.isPending;
   const set = <K extends keyof ApplicationInput>(key: K, value: ApplicationInput[K]) =>
     setForm({ ...form, [key]: value });
@@ -142,7 +148,7 @@ export function ApplicationsView() {
       target.focus();
     }
   };
-  const tabStop = current?.id ?? rows[0]?.id;
+  const tabStop = rows.find((a) => a.id === selected)?.id ?? rows[0]?.id;
 
   const resumes = (drafts.data ?? []).filter((d) => d.kind === "resume");
   const letters = (drafts.data ?? []).filter((d) => d.kind === "cover_letter");
@@ -226,7 +232,7 @@ export function ApplicationsView() {
                     </TableCell>
                     <TableCell className="whitespace-normal">{a.role}</TableCell>
                     <TableCell>{label(a.status)}</TableCell>
-                    <TableCell>{a.applied_on ? formatDate(a.applied_on) : ""}</TableCell>
+                    <TableCell>{a.applied_on ? formatDay(a.applied_on) : ""}</TableCell>
                     <TableCell className="text-muted-foreground">{formatDate(a.updated_at)}</TableCell>
                   </TableRow>
                 ))}
@@ -314,7 +320,10 @@ export function ApplicationsView() {
                   </div>
                   <ErrorAlert error={move.error} />
                   <div>
-                    <Button type="submit" disabled={move.isPending}>
+                    <Button
+                      type="submit"
+                      disabled={move.isPending || (next === current.status && !statusNote.trim())}
+                    >
                       {move.isPending ? "Saving..." : "Set status"}
                     </Button>
                   </div>

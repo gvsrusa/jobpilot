@@ -1093,6 +1093,32 @@ mod tests {
         let listed = crate::knowledge::list(&db).await.unwrap();
         assert!(listed[0].sealed && listed[0].body.is_empty());
         assert_eq!(calls(), before);
+
+        // Tracking reads and writes ask no one, with a sealed row in the database.
+        let app = crate::applications::add(
+            &db,
+            "cli",
+            crate::applications::ApplicationInput {
+                company: "Acme".into(),
+                role: "Engineer".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        crate::applications::get(&db, &app.id).await.unwrap();
+        crate::applications::list(&db, None).await.unwrap();
+        crate::applications::set_status(&db, "cli", &app.id, "applied", None, "n")
+            .await
+            .unwrap();
+        crate::applications::add_note(&db, "cli", &app.id, "n")
+            .await
+            .unwrap();
+        crate::applications::history(&db, &app.id).await.unwrap();
+        crate::applications::remove(&db, "cli", &app.id)
+            .await
+            .unwrap();
+        assert_eq!(calls(), before);
         db.close().await;
 
         // The seam itself: an empty name stops before the OS, but it passed through.

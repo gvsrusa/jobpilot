@@ -107,10 +107,20 @@ async fn the_same_status_twice_writes_no_event() {
     applications::set_status(&db, "cli", &app.id, "applied", None, "")
         .await
         .unwrap();
-    applications::set_status(&db, "cli", &app.id, "applied", None, "again")
+    applications::set_status(&db, "cli", &app.id, "applied", None, "  ")
         .await
         .unwrap();
     assert_eq!(applications::history(&db, &app.id).await.unwrap().len(), 2);
+    // A typed note is kept, as a note and not a status change.
+    let same = applications::set_status(&db, "cli", &app.id, "applied", None, "again")
+        .await
+        .unwrap();
+    assert_eq!(same.status, "applied");
+    let events = applications::history(&db, &app.id).await.unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[2].kind, "note");
+    assert_eq!(events[2].note, "again");
+    assert_eq!(events[2].from_status, None);
 }
 
 #[tokio::test]
