@@ -3,6 +3,7 @@
 mod ai;
 mod apps;
 mod data;
+mod memory;
 mod profile;
 mod resume;
 mod shell;
@@ -61,6 +62,9 @@ pub enum Command {
     /// Applications you are tracking.
     #[command(subcommand)]
     App(apps::AppCommand),
+    /// Questions and answers you reuse.
+    #[command(subcommand)]
+    Memory(memory::MemoryCommand),
     /// AI providers, models, and consent.
     #[command(subcommand)]
     Ai(ai::AiCommand),
@@ -77,6 +81,7 @@ impl Command {
     pub fn refused_in_panel(&self) -> bool {
         use ai::{AiCommand, ConsentCommand};
         use data::{BackupCommand, DataCommand};
+        use memory::MemoryCommand;
         use profile::{JobCommand, KbCommand};
         use resume::{ExportArgs, LetterCommand, ResumeCommand};
         matches!(
@@ -97,6 +102,12 @@ impl Command {
                         | DataCommand::DiscardLocked { .. }
                 )
                 | Command::Kb(KbCommand::Reveal { .. })
+                | Command::Memory(
+                    MemoryCommand::Approve { .. }
+                        | MemoryCommand::Reviewed { .. }
+                        | MemoryCommand::SetClass { .. }
+                        | MemoryCommand::Reveal { .. }
+                )
                 | Command::Job(JobCommand::Paste { file: Some(_), .. })
                 | Command::Resume(
                     ResumeCommand::Import { .. }
@@ -241,6 +252,7 @@ async fn with_db(db: &Db, command: Command) -> Result<Output> {
         Command::Resume(command) => resume::resume(db, command).await,
         Command::Letter(command) => resume::letter(db, command).await,
         Command::App(command) => apps::app(db, command).await,
+        Command::Memory(command) => memory::memory(db, command).await,
         Command::Ai(command) => ai::ai(db, command).await,
         // `main` and the shell handle this before any command runs.
         Command::Shell => Err(Error::PanelRefused),
@@ -313,6 +325,18 @@ mod tests {
         ("app status i applied", false),
         ("app note i n", false),
         ("app remove i", false),
+        ("memory add-question q", false),
+        ("memory add-answer q a", false),
+        ("memory list", false),
+        ("memory show q", false),
+        ("memory edit-answer a t", false),
+        ("memory unapprove a", false),
+        ("memory remove-question q", false),
+        ("memory remove-answer a", false),
+        ("memory approve a", true),
+        ("memory reviewed a", true),
+        ("memory set-class q normal", true),
+        ("memory reveal a", true),
         ("ai status", false),
         ("ai models", false),
         ("ai pull m", true),

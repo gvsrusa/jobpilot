@@ -23,6 +23,7 @@ use jobpilot_core::drafts::{self, ClaimInput, Compare, Draft, ExportFormat};
 use jobpilot_core::embed::{self, Hit};
 use jobpilot_core::generate::{self, Generated};
 use jobpilot_core::knowledge::{self, JobText, KnowledgeItem};
+use jobpilot_core::memory::{self, Answer, Class, Question, QuestionRow};
 use jobpilot_core::parse::{self, Imported};
 use jobpilot_core::profile::{self, Profile, ProfileBasic, WorkAuthorization};
 use jobpilot_core::recovery::{self, RecoveryReceipt};
@@ -85,6 +86,17 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         app_note,
         app_history,
         app_remove,
+        memory_list,
+        memory_get,
+        memory_add_question,
+        memory_add_answer,
+        memory_edit_answer,
+        memory_approve,
+        memory_mark_reviewed,
+        memory_set_class,
+        memory_reveal,
+        memory_remove_question,
+        memory_remove_answer,
         resume_import,
         resume_list,
         resume_versions,
@@ -551,6 +563,147 @@ pub async fn app_history(state: State<'_, AppState>, id: String) -> Result<Vec<A
 #[tauri::command]
 pub async fn app_remove(state: State<'_, AppState>, id: String) -> Result<()> {
     applications::remove(&*state.work().await?, ACTOR, &id).await
+}
+
+#[tauri::command]
+pub async fn memory_list(
+    state: State<'_, AppState>,
+    class: Option<Class>,
+) -> Result<Vec<QuestionRow>> {
+    memory::list(&*state.work().await?, class).await
+}
+
+#[tauri::command]
+pub async fn memory_get(state: State<'_, AppState>, question_id: String) -> Result<QuestionRow> {
+    memory::get(&*state.work().await?, &question_id).await
+}
+
+#[tauri::command]
+pub async fn memory_add_question(
+    state: State<'_, AppState>,
+    text: String,
+    country: Option<String>,
+) -> Result<Question> {
+    memory::add_question(&*state.work().await?, &text, country.as_deref()).await
+}
+
+#[tauri::command]
+pub async fn memory_add_answer(
+    state: State<'_, AppState>,
+    question_id: String,
+    text: String,
+    source_ref: Option<String>,
+) -> Result<Answer> {
+    let db = state.work().await?;
+    memory::add_answer(&db, &question_id, &text, source_ref.as_deref()).await
+}
+
+#[tauri::command]
+pub async fn memory_edit_answer(
+    state: State<'_, AppState>,
+    answer_id: String,
+    text: String,
+) -> Result<Answer> {
+    memory::edit_answer(&*state.work().await?, &answer_id, &text).await
+}
+
+// ponytail: the class is read before the dialog and not again after it, so a raise that lands
+// while the dialog is open is approved on the answer given. Core still refuses what the
+// class forbids then, and the audit row names who approved.
+/// Approving under a sealed class asks a native yes, so script in the webview cannot make a
+/// sensitive answer usable. Each `state.work()` here ends before any dialog.
+#[tauri::command]
+pub async fn memory_approve<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    answer_id: String,
+    approved: bool,
+) -> Result<()> {
+    if approved {
+        let (class, _) = memory::find_answer(&*state.work().await?, &answer_id).await?;
+        if class.sealed() {
+            let message = format!(
+                "Approve the {} answer {answer_id}?\n\nIt can then be offered for applications, \
+                 each use confirmed by you.",
+                class.as_str()
+            );
+            native::confirmed(&app, "Approve sealed answer", message, "Approve").await?;
+        }
+    }
+    memory::approve(&*state.work().await?, ACTOR, &answer_id, approved).await
+}
+
+/// See [`memory_approve`]: marking a sealed-class answer as still true is a person's word.
+#[tauri::command]
+pub async fn memory_mark_reviewed<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    answer_id: String,
+) -> Result<()> {
+    let (class, _) = memory::find_answer(&*state.work().await?, &answer_id).await?;
+    if class.sealed() {
+        let message = format!(
+            "Mark the {} answer {answer_id} as reviewed?\n\nThis says it is still true.",
+            class.as_str()
+        );
+        native::confirmed(&app, "Review sealed answer", message, "Mark reviewed").await?;
+    }
+    memory::mark_reviewed(&*state.work().await?, ACTOR, &answer_id).await
+}
+
+/// Lowering a class can open sealed bodies, so it asks a native yes. Raising only protects.
+#[tauri::command]
+pub async fn memory_set_class<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    question_id: String,
+    class: Class,
+) -> Result<Question> {
+    let from = memory::get(&*state.work().await?, &question_id)
+        .await?
+        .question
+        .class;
+    if class < from {
+        let message = format!(
+            "Lower question {question_id} from {} to {}?\n\nA body in the normal class is \
+             stored as plain text.",
+            from.as_str(),
+            class.as_str()
+        );
+        native::confirmed(&app, "Lower class", message, "Lower").await?;
+    }
+    memory::set_class(&*state.work().await?, ACTOR, &question_id, class).await
+}
+
+/// The text of one answer. A sealed body is shown only after a native confirmation, every
+/// time, as in [`kb_reveal`]: the dialog is Rust's and does not name the text. An unknown id
+/// answers `not_found` and an unsealed answer answers at once, with no dialog.
+#[tauri::command]
+pub async fn memory_reveal<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    answer_id: String,
+) -> Result<String> {
+    let (class, answer) = memory::find_answer(&*state.work().await?, &answer_id).await?;
+    if answer.sealed {
+        let message = format!(
+            "Show the sealed {} answer {answer_id}?\n\nIts text will appear on screen until \
+             you hide it or leave this screen.",
+            class.as_str()
+        );
+        native::confirmed(&app, "Show sealed text", message, "Show").await?;
+    }
+    memory::reveal(&*state.work().await?, ACTOR, &answer_id).await
+}
+
+#[tauri::command]
+pub async fn memory_remove_question(state: State<'_, AppState>, id: String) -> Result<()> {
+    memory::remove_question(&*state.work().await?, &id).await
+}
+
+#[tauri::command]
+pub async fn memory_remove_answer(state: State<'_, AppState>, id: String) -> Result<()> {
+    memory::remove_answer(&*state.work().await?, &id).await
 }
 
 /// The path comes from the picker: the webview never names a file to read. Closing the
@@ -2042,6 +2195,17 @@ mod tests {
         "app_note",
         "app_history",
         "app_remove",
+        "memory_list",
+        "memory_get",
+        "memory_add_question",
+        "memory_add_answer",
+        "memory_edit_answer",
+        "memory_approve",
+        "memory_mark_reviewed",
+        "memory_set_class",
+        "memory_reveal",
+        "memory_remove_question",
+        "memory_remove_answer",
         "resume_import",
         "resume_list",
         "resume_versions",
@@ -3042,6 +3206,299 @@ mod tests {
         assert_eq!(code_of(refused), "validation");
         h.ok("app_remove", json!({ "id": id }));
         assert_eq!(code_of(h.call("app_get", json!({ "id": id }))), "not_found");
+    }
+
+    /// A sealed row naming a key this keychain never held, under a question of `class`.
+    fn seal_answer_without_a_key(h: &Harness, class: &str, id: &str) -> String {
+        let text = format!("Question for {id}");
+        let question = h.ok(
+            "memory_add_question",
+            json!({ "text": text, "country": null }),
+        );
+        let question = question["id"].as_str().unwrap().to_owned();
+        with_db(h, |db| async move {
+            let mut connection = db.pool.acquire().await.unwrap();
+            sqlx::query("PRAGMA foreign_keys = OFF")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE memory_questions SET class = ? WHERE id = ?")
+                .bind(class)
+                .bind(&question)
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO memory_answers (id, question_id, body, body_enc, key_id, source, \
+                 reviewed_at, created_at, updated_at) \
+                 VALUES (?, ?, '', x'00', 'gone', 'user', 't', 't', 't')",
+            )
+            .bind(id)
+            .bind(&question)
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+            sqlx::query("PRAGMA foreign_keys = ON")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            question
+        })
+    }
+
+    fn with_db<T, F: Future<Output = T>>(h: &Harness, work: impl FnOnce(Arc<Db>) -> F) -> T {
+        block_on(async {
+            let slot = h.app.state::<AppState>();
+            let db = slot.db.read().await.as_ref().unwrap().clone();
+            work(db).await
+        })
+    }
+
+    fn approved(h: &Harness, question: &str) -> Value {
+        h.ok("memory_get", json!({ "questionId": question }))["answers"][0]["approved"].clone()
+    }
+
+    #[test]
+    fn memory_commands_reach_core() {
+        let h = ready();
+        let added = h.ok(
+            "memory_add_question",
+            json!({ "text": "Why this job?", "country": "pt" }),
+        );
+        let question = added["id"].as_str().unwrap().to_owned();
+        assert_eq!(added["class"], "normal");
+        assert_eq!(added["country"], "PT");
+        let item = h.ok("kb_add", json!({ "kind": "note", "body": "A note" }));
+
+        let answer = h.ok(
+            "memory_add_answer",
+            json!({ "questionId": question, "text": "Because", "sourceRef": item["id"] }),
+        );
+        let id = answer["id"].as_str().unwrap().to_owned();
+        assert_eq!(answer["source"], "knowledge");
+        assert_eq!(answer["approved"], false);
+
+        let edited = h.ok(
+            "memory_edit_answer",
+            json!({ "answerId": id, "text": "Since then" }),
+        );
+        assert_eq!(edited["version"], 2);
+        h.ok(
+            "memory_approve",
+            json!({ "answerId": id, "approved": true }),
+        );
+        h.ok("memory_mark_reviewed", json!({ "answerId": id }));
+        assert!(h.asked().is_empty(), "a normal answer asks nothing");
+
+        let row = h.ok("memory_get", json!({ "questionId": question }));
+        assert_eq!(row["answers"][0]["approved"], true);
+        assert_eq!(row["answers"][0]["body"], "Since then");
+        assert_eq!(
+            h.ok("memory_reveal", json!({ "answerId": id })),
+            "Since then"
+        );
+        h.ok(
+            "memory_approve",
+            json!({ "answerId": id, "approved": false }),
+        );
+
+        let raised = h.ok(
+            "memory_add_question",
+            json!({ "text": "A question with no answers", "country": null }),
+        );
+        let raised = raised["id"].as_str().unwrap().to_owned();
+        let saved = h.ok(
+            "memory_set_class",
+            json!({ "questionId": raised, "class": "legal" }),
+        );
+        assert_eq!(saved["class"], "legal");
+        assert_eq!(saved["class_source"], "user");
+        let legal = h.ok("memory_list", json!({ "class": "legal" }));
+        assert_eq!(legal.as_array().unwrap().len(), 1);
+        let all = h.ok("memory_list", json!({ "class": null }));
+        assert_eq!(all.as_array().unwrap().len(), 2);
+
+        h.ok("memory_remove_answer", json!({ "id": id }));
+        h.ok("memory_remove_question", json!({ "id": question }));
+        let gone = h.call("memory_get", json!({ "questionId": question }));
+        assert_eq!(code_of(gone), "not_found");
+    }
+
+    #[test]
+    fn approving_a_sealed_class_answer_asks_natively() {
+        let h = ready();
+        let question = seal_answer_without_a_key(&h, "sensitive", "s1");
+
+        h.answer(false);
+        let refused = h.call(
+            "memory_approve",
+            json!({ "answerId": "s1", "approved": true }),
+        );
+        assert_eq!(code_of(refused), "confirmation_required");
+        assert_eq!(approved(&h, &question), false);
+        assert_eq!(h.asked().len(), 1);
+        assert!(h.asked()[0].contains("s1"), "{:?}", h.asked());
+
+        h.answer(true);
+        h.ok(
+            "memory_approve",
+            json!({ "answerId": "s1", "approved": true }),
+        );
+        assert_eq!(approved(&h, &question), true);
+        assert_eq!(h.asked().len(), 2);
+
+        // Taking it back asks no one.
+        h.answer(false);
+        h.ok(
+            "memory_approve",
+            json!({ "answerId": "s1", "approved": false }),
+        );
+        assert_eq!(approved(&h, &question), false);
+        assert_eq!(h.asked().len(), 2);
+    }
+
+    #[test]
+    fn reviewing_a_sealed_class_answer_asks_natively() {
+        let h = ready();
+        let question = seal_answer_without_a_key(&h, "legal", "s1");
+
+        h.answer(false);
+        let refused = h.call("memory_mark_reviewed", json!({ "answerId": "s1" }));
+        assert_eq!(code_of(refused), "confirmation_required");
+        let row = h.ok("memory_get", json!({ "questionId": question }));
+        assert_eq!(row["answers"][0]["reviewed_at"], "t");
+
+        h.answer(true);
+        h.ok("memory_mark_reviewed", json!({ "answerId": "s1" }));
+        let row = h.ok("memory_get", json!({ "questionId": question }));
+        assert_ne!(row["answers"][0]["reviewed_at"], "t");
+    }
+
+    #[test]
+    fn lowering_a_class_asks_natively_and_raising_does_not() {
+        let h = ready();
+        let added = h.ok(
+            "memory_add_question",
+            json!({ "text": "What is your salary?", "country": null }),
+        );
+        let question = added["id"].as_str().unwrap().to_owned();
+        assert_eq!(added["class"], "sensitive");
+
+        h.answer(false);
+        let saved = h.ok(
+            "memory_set_class",
+            json!({ "questionId": question, "class": "legal" }),
+        );
+        assert_eq!(saved["class"], "legal");
+        assert!(h.asked().is_empty());
+
+        let refused = h.call(
+            "memory_set_class",
+            json!({ "questionId": question, "class": "normal" }),
+        );
+        assert_eq!(code_of(refused), "confirmation_required");
+        let row = h.ok("memory_get", json!({ "questionId": question }));
+        assert_eq!(row["question"]["class"], "legal");
+        assert_eq!(h.asked().len(), 1);
+
+        h.answer(true);
+        let saved = h.ok(
+            "memory_set_class",
+            json!({ "questionId": question, "class": "normal" }),
+        );
+        assert_eq!(saved["class"], "normal");
+    }
+
+    #[test]
+    fn memory_reveal_of_a_sealed_answer_needs_a_native_yes_every_time() {
+        let h = ready();
+        // A body raised and not yet sealed needs no key, so a yes reaches the text here.
+        let added = h.ok(
+            "memory_add_question",
+            json!({ "text": "Why this job?", "country": null }),
+        );
+        let question = added["id"].as_str().unwrap().to_owned();
+        let answer = h.ok(
+            "memory_add_answer",
+            json!({ "questionId": question, "text": "ZXQ-SEALED", "sourceRef": null }),
+        );
+        let id = answer["id"].as_str().unwrap().to_owned();
+        with_db(&h, |db| async move {
+            sqlx::query("UPDATE memory_questions SET class = 'sensitive'")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        });
+        let row = h.ok("memory_get", json!({ "questionId": question }));
+        assert_eq!(row["answers"][0]["sealed"], true);
+        assert_eq!(row["answers"][0]["body"], "");
+
+        h.answer(false);
+        let refused = h.call("memory_reveal", json!({ "answerId": id }));
+        assert_eq!(code_of(refused), "confirmation_required");
+        assert_eq!(h.asked().len(), 1);
+        assert!(h.asked()[0].contains(&id), "{:?}", h.asked());
+        let log = h.ok("audit_recent", json!({ "limit": 10 }));
+        assert!(!log.to_string().contains("answer_revealed"), "{log}");
+
+        h.answer(true);
+        assert_eq!(
+            h.ok("memory_reveal", json!({ "answerId": id })),
+            "ZXQ-SEALED"
+        );
+        assert_eq!(
+            h.ok("memory_reveal", json!({ "answerId": id })),
+            "ZXQ-SEALED"
+        );
+        assert_eq!(h.asked().len(), 3, "one dialog per reveal");
+        assert!(!h.asked().iter().any(|m| m.contains("ZXQ-SEALED")));
+        let log = h.ok("audit_recent", json!({ "limit": 10 }));
+        assert!(log.to_string().contains("answer_revealed"), "{log}");
+        assert!(!log.to_string().contains("ZXQ-SEALED"), "{log}");
+    }
+
+    #[test]
+    fn memory_reveal_of_a_plain_answer_or_an_unknown_id_asks_nothing() {
+        let h = ready();
+        let added = h.ok(
+            "memory_add_question",
+            json!({ "text": "Why this job?", "country": null }),
+        );
+        let answer = h.ok(
+            "memory_add_answer",
+            json!({ "questionId": added["id"], "text": "Because", "sourceRef": null }),
+        );
+
+        assert_eq!(
+            h.ok("memory_reveal", json!({ "answerId": answer["id"] })),
+            "Because"
+        );
+        let unknown = h.call("memory_reveal", json!({ "answerId": "nope" }));
+        assert_eq!(code_of(unknown), "not_found");
+        assert!(h.asked().is_empty());
+    }
+
+    #[test]
+    fn no_memory_dialog_holds_the_handle() {
+        let h = ready();
+        let question = seal_answer_without_a_key(&h, "sensitive", "s1");
+        h.answer(false);
+        for result in [
+            h.call(
+                "memory_approve",
+                json!({ "answerId": "s1", "approved": true }),
+            ),
+            h.call("memory_mark_reviewed", json!({ "answerId": "s1" })),
+            h.call("memory_reveal", json!({ "answerId": "s1" })),
+            h.call(
+                "memory_set_class",
+                json!({ "questionId": question, "class": "normal" }),
+            ),
+        ] {
+            assert_eq!(code_of(result), "confirmation_required");
+        }
+        let hook = h.app.state::<NativeHook>();
+        assert_eq!(*hook.work_at_dialog.lock().unwrap(), [false; 4]);
     }
 
     fn code_of(result: Result<Value, Value>) -> String {

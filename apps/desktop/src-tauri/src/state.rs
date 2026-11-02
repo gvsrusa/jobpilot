@@ -189,6 +189,11 @@ impl AppState {
         Ok(Work { db, _gate: gate })
     }
 
+    #[cfg(test)]
+    pub fn work_is_open(&self) -> bool {
+        self.gate.try_write().is_err()
+    }
+
     /// For what replaces the handle: ends running tasks, as they would write to the data
     /// being replaced and a download can last hours, then waits for them to let go.
     pub async fn exclusive(

@@ -122,6 +122,44 @@ export type ApplicationInput = {
   notes: string;
 };
 
+/** Core's `memory::Class`, lowest first. */
+export const CLASSES = ["normal", "sensitive", "legal", "work_authorization"] as const;
+export type MemoryClass = (typeof CLASSES)[number];
+
+/** Render `text` as text only. It may come from outside the app. */
+export type Question = {
+  id: string;
+  text: string;
+  class: MemoryClass;
+  class_source: string;
+  country: string | null;
+  source: string;
+  source_ref: string | null;
+  findings: Finding[];
+  classified_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type Answer = {
+  id: string;
+  question_id: string;
+  /** Empty under a sealed class: `memoryReveal` fetches it. Render it as text only. */
+  body: string;
+  /** There is text to show on request. False on a body cleared with its key. */
+  sealed: boolean;
+  approved: boolean;
+  version: number;
+  source: string;
+  source_ref: string | null;
+  reviewed_at: string;
+  stale: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type QuestionRow = { question: Question; answers: Answer[] };
+
 export type Application = ApplicationInput & {
   id: string;
   status: ApplicationStatus;
@@ -300,6 +338,27 @@ export const ipc = {
   appNote: (id: string, note: string) => invoke<void>("app_note", { id, note }),
   appHistory: (id: string) => invoke<ApplicationEvent[]>("app_history", { id }),
   appRemove: (id: string) => invoke<void>("app_remove", { id }),
+
+  memoryList: (cls: MemoryClass | null) => invoke<QuestionRow[]>("memory_list", { class: cls }),
+  memoryGet: (questionId: string) => invoke<QuestionRow>("memory_get", { questionId }),
+  memoryAddQuestion: (text: string, country: string | null) =>
+    invoke<Question>("memory_add_question", { text, country }),
+  memoryAddAnswer: (questionId: string, text: string, sourceRef: string | null) =>
+    invoke<Answer>("memory_add_answer", { questionId, text, sourceRef }),
+  memoryEditAnswer: (answerId: string, text: string) =>
+    invoke<Answer>("memory_edit_answer", { answerId, text }),
+  /** Under a sealed class, Rust confirms an approval in a native dialog. */
+  memoryApprove: (answerId: string, approved: boolean) =>
+    invoke<void>("memory_approve", { answerId, approved }),
+  /** Under a sealed class, Rust confirms in a native dialog. */
+  memoryMarkReviewed: (answerId: string) => invoke<void>("memory_mark_reviewed", { answerId }),
+  /** Rust confirms lowering in a native dialog. */
+  memorySetClass: (questionId: string, cls: MemoryClass) =>
+    invoke<Question>("memory_set_class", { questionId, class: cls }),
+  /** Rust asks the user in a native dialog each time; script cannot answer it. */
+  memoryReveal: (answerId: string) => invoke<string>("memory_reveal", { answerId }),
+  memoryRemoveQuestion: (id: string) => invoke<void>("memory_remove_question", { id }),
+  memoryRemoveAnswer: (id: string) => invoke<void>("memory_remove_answer", { id }),
 
   /** Rust opens the picker. Rejects with `cancelled` when the user closes it. */
   resumeImport: () => invoke<Imported>("resume_import"),

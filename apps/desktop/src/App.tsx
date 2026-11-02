@@ -9,6 +9,7 @@ import { DataView } from "@/views/DataView";
 import { AiView } from "@/views/AiView";
 import { ApplicationsView } from "@/views/ApplicationsView";
 import { DocumentsView } from "@/views/DocumentsView";
+import { MemoryView } from "@/views/MemoryView";
 import { ProfileView } from "@/views/ProfileView";
 import { ResumesView } from "@/views/ResumesView";
 import { RecoveryView } from "@/views/RecoveryView";
@@ -22,6 +23,7 @@ const NAV: { view: View; label: string }[] = [
   { view: "resumes", label: "Resumes" },
   { view: "ai", label: "AI" },
   { view: "applications", label: "Applications" },
+  { view: "memory", label: "Memory" },
 ];
 
 function Shell({ version, root }: { version: string; root: string }) {
@@ -114,6 +116,7 @@ function Shell({ version, root }: { version: string; root: string }) {
           {view === "resumes" && <ResumesView />}
           {view === "ai" && <AiView />}
           {view === "applications" && <ApplicationsView />}
+          {view === "memory" && <MemoryView />}
         </main>
       </div>
       <TerminalPanel open={terminal} onClose={() => setTerminal(false)} />

@@ -18,12 +18,12 @@ use crate::error::{Error, Result};
 use crate::paths::AppPaths;
 use crate::profile;
 use crate::secrets;
-use crate::{audit, crypto};
+use crate::{audit, crypto, memory};
 
 /// Writes `exports/jobpilot-export-<stamp>/`, holding `data.json`, `work_authorization.json`
-/// (plain when the key is unlocked, else a locked marker; callers warn first) and a copy of
-/// `documents/`. A folder under that name is always complete: it is built under a
-/// temporary name and renamed last.
+/// and `memory_sealed_answers.json` (each plain when the key is unlocked, else a locked
+/// marker; callers warn first) and a copy of `documents/`. A folder under that name is
+/// always complete: it is built under a temporary name and renamed last.
 pub async fn export_all(db: &Db, actor: &str) -> Result<PathBuf> {
     let (stamp, exported_at) = utc_stamps(&db.pool).await?;
     let data = json!({
@@ -33,11 +33,20 @@ pub async fn export_all(db: &Db, actor: &str) -> Result<PathBuf> {
         "tables": read_tables(&db.pool).await?,
     });
     let text = serde_json::to_string_pretty(&data).map_err(io::Error::other)?;
-    let (authorization, sensitive_plain) = profile::export_authorization(db).await?;
+    let (authorization, authorization_plain) = profile::export_authorization(db).await?;
+    let (answers, answers_plain) = memory::export_sealed(db).await?;
+    let sensitive_plain = authorization_plain || answers_plain;
 
     let (exports, documents) = (db.paths().exports(), db.paths().documents());
     let dir = tokio::task::spawn_blocking(move || {
-        write_export(&exports, &documents, &stamp, &text, &authorization)
+        write_export(
+            &exports,
+            &documents,
+            &stamp,
+            &text,
+            &authorization,
+            &answers,
+        )
     })
     .await
     .map_err(io::Error::other)??;
@@ -54,7 +63,8 @@ pub async fn export_all(db: &Db, actor: &str) -> Result<PathBuf> {
 /// leaves out FTS virtual and shadow tables, whatever a later migration names them.
 /// Their content is derived from the tables that are exported.
 /// BLOB columns are left out: `json_object` refuses them, and a declared BLOB is
-/// ciphertext, a key-check, or a vector, none of which means anything in an export.
+/// ciphertext, a key-check, or a vector, none of which means anything in an export. An
+/// answer body under a sealed class is blanked too, as it may wait in plain to be sealed.
 // ponytail: all rows sit in memory at once, and `json_object` refuses tables wider than
 // SQLite's function argument limit, so such a table fails the export loudly. No table is
 // that wide today; stream rows when one is.
@@ -95,9 +105,9 @@ fn rows_sql(table: &str, columns: &[String]) -> String {
         .iter()
         .map(|column| {
             format!(
-                "'{}', \"{}\"",
+                "'{}', {}",
                 column.replace('\'', "''"),
-                column.replace('"', "\"\"")
+                value_sql(table, column)
             )
         })
         .collect();
@@ -108,23 +118,43 @@ fn rows_sql(table: &str, columns: &[String]) -> String {
     )
 }
 
+/// `memory_sealed_answers.json` carries a body blanked here. A row whose question cannot be
+/// found counts as sealed.
+fn value_sql(table: &str, column: &str) -> String {
+    if (table, column) == ("memory_answers", "body") {
+        return "CASE WHEN EXISTS (SELECT 1 FROM memory_questions q \
+                WHERE q.id = question_id AND q.class = 'normal') THEN body ELSE '' END"
+            .to_owned();
+    }
+    format!("\"{}\"", column.replace('"', "\"\""))
+}
+
 fn write_export(
     exports: &Path,
     documents: &Path,
     stamp: &str,
     text: &str,
     authorization: &str,
+    answers: &str,
 ) -> Result<PathBuf> {
     let name = format!("jobpilot-export-{stamp}");
     let temp = new_snapshot_dir(exports, &format!("tmp-{name}"))?;
-    let finished = fill_and_publish(&temp, exports, documents, &name, text, authorization);
+    let finished = fill_and_publish(
+        &temp,
+        exports,
+        documents,
+        &name,
+        text,
+        authorization,
+        answers,
+    );
     if finished.is_err() {
         let _ = fs::remove_dir_all(&temp);
     }
     Ok(finished?)
 }
 
-/// Owner-only on Unix: this file may hold plaintext work authorization.
+/// Owner-only on Unix: this file may hold plaintext work authorization or sealed answers.
 fn write_private(path: &Path, text: &str) -> io::Result<()> {
     use io::Write;
     let mut options = fs::OpenOptions::new();
@@ -144,9 +174,11 @@ fn fill_and_publish(
     name: &str,
     text: &str,
     authorization: &str,
+    answers: &str,
 ) -> io::Result<PathBuf> {
     fs::write(temp.join("data.json"), text)?;
     write_private(&temp.join("work_authorization.json"), authorization)?;
+    write_private(&temp.join("memory_sealed_answers.json"), answers)?;
     copy_dir(documents, &temp.join("documents"))?;
 
     let mut dir = exports.join(name);

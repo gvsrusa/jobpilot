@@ -789,3 +789,193 @@ fn panel_runs_tracking_commands() {
         );
     }
 }
+
+#[test]
+fn memory_add_approve_and_list_round_trip() {
+    let (_dir, home) = fresh_home();
+    let added = stdout_json(&run(
+        &home,
+        &["memory", "add-question", "Why this job?", "--json"],
+    ));
+    let question = added["id"].as_str().unwrap().to_string();
+    assert_eq!(added["class"], "normal");
+    let item = stdout_json(&run(&home, &["kb", "add", "note", "A note", "--json"]));
+    let item = item["id"].as_str().unwrap();
+    let answer = stdout_json(&run(
+        &home,
+        &[
+            "memory",
+            "add-answer",
+            &question,
+            "Because",
+            "--from-item",
+            item,
+            "--json",
+        ],
+    ));
+    let id = answer["id"].as_str().unwrap().to_string();
+    assert_eq!(answer["approved"], false);
+    assert_eq!(answer["source"], "knowledge");
+
+    ok(&home, &["memory", "approve", &id]);
+    ok(&home, &["memory", "reviewed", &id]);
+    ok(&home, &["memory", "edit-answer", &id, "Since then"]);
+    ok(&home, &["memory", "approve", &id]);
+
+    let listed = stdout_json(&run(
+        &home,
+        &["memory", "list", "--class", "normal", "--json"],
+    ));
+    let row = &listed[0];
+    assert_eq!(row["question"]["text"], "Why this job?");
+    assert_eq!(row["answers"][0]["body"], "Since then");
+    assert_eq!(row["answers"][0]["approved"], true);
+    assert_eq!(row["answers"][0]["version"], 2);
+    let text =
+        String::from_utf8_lossy(&ok(&home, &["memory", "show", &question]).stdout).into_owned();
+    assert!(
+        text.contains("Since then") && text.contains("approved"),
+        "{text}"
+    );
+    let shown = stdout_json(&run(&home, &["memory", "reveal", &id, "--json"]));
+    assert_eq!(shown["body"], "Since then");
+
+    ok(&home, &["memory", "unapprove", &id]);
+    ok(&home, &["memory", "set-class", &question, "normal"]);
+    let empty = stdout_json(&run(
+        &home,
+        &["memory", "list", "--class", "legal", "--json"],
+    ));
+    assert_eq!(empty, serde_json::json!([]));
+    ok(&home, &["memory", "remove-answer", &id]);
+    ok(&home, &["memory", "remove-question", &question]);
+    let gone = run(&home, &["memory", "show", &question]);
+    assert!(stderr_text(&gone).starts_with("error[not_found]"));
+}
+
+#[test]
+fn memory_refuses_an_answer_on_a_work_authorization_question() {
+    let (_dir, home) = fresh_home();
+    let added = stdout_json(&run(
+        &home,
+        &[
+            "memory",
+            "add-question",
+            "Are you authorized to work here?",
+            "--country",
+            "ca",
+            "--json",
+        ],
+    ));
+    assert_eq!(added["class"], "work_authorization");
+    assert_eq!(added["country"], "CA");
+    let question = added["id"].as_str().unwrap();
+
+    let refused = run(&home, &["memory", "add-answer", question, "Yes"]);
+
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(stderr_text(&refused).starts_with("error[validation]"));
+    let row = stdout_json(&run(&home, &["memory", "show", question, "--json"]));
+    assert_eq!(row["answers"], serde_json::json!([]));
+}
+
+#[test]
+fn panel_refuses_what_memory_confirms_and_runs_the_rest() {
+    let (_dir, home) = fresh_home();
+    let panel = [("JOBPILOT_PANEL", "1")];
+    let added = run_env(
+        &home,
+        &["memory", "add-question", "Why this job?", "--json"],
+        &panel,
+    );
+    let question = stdout_json(&added)["id"].as_str().unwrap().to_string();
+    let answer = run_env(
+        &home,
+        &["memory", "add-answer", &question, "Because", "--json"],
+        &panel,
+    );
+    let answer = stdout_json(&answer)["id"].as_str().unwrap().to_string();
+
+    for args in [
+        vec!["memory", "approve", &answer],
+        vec!["memory", "reviewed", &answer],
+        vec!["memory", "set-class", &question, "normal"],
+        vec!["memory", "reveal", &answer],
+    ] {
+        let refused = run_env(&home, &args, &panel);
+        assert_eq!(refused.status.code(), Some(1), "{args:?}");
+        assert!(
+            stderr_text(&refused).contains("panel_refused"),
+            "{args:?}: {}",
+            stderr_text(&refused)
+        );
+    }
+    let row = stdout_json(&run(&home, &["memory", "show", &question, "--json"]));
+    assert_eq!(row["answers"][0]["approved"], false);
+
+    for args in [
+        vec!["memory", "list"],
+        vec!["memory", "show", &question],
+        vec!["memory", "edit-answer", &answer, "Since then"],
+        vec!["memory", "unapprove", &answer],
+        vec!["memory", "remove-answer", &answer],
+        vec!["memory", "remove-question", &question],
+    ] {
+        let output = run_env(&home, &args, &panel);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            stderr_text(&output)
+        );
+    }
+}
+
+#[tokio::test]
+async fn memory_lists_a_sealed_answer_empty_and_reveal_needs_its_key() {
+    let (_dir, home) = fresh_home();
+    let added = stdout_json(&run(
+        &home,
+        &["memory", "add-question", "Your salary?", "--json"],
+    ));
+    let question = added["id"].as_str().unwrap().to_string();
+
+    // A sealed row naming a key this root never had, so no keychain entry can exist.
+    let db = Db::open(&AppPaths::new(&home)).await.unwrap();
+    let mut connection = db.pool.acquire().await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO memory_answers (id, question_id, body, body_enc, key_id, source, \
+         reviewed_at, created_at, updated_at) \
+         VALUES ('sealed1', ?, '', x'00', 'gone', 'user', 't', 't', 't')",
+    )
+    .bind(&question)
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+    drop(connection);
+    db.close().await;
+
+    let service = format!("jobpilot-test-unused-{}", std::process::id());
+    let env = [("JOBPILOT_SECRET_SERVICE", service.as_str())];
+    let row = stdout_json(&run_env(
+        &home,
+        &["memory", "show", &question, "--json"],
+        &env,
+    ));
+    assert_eq!(row["answers"][0]["sealed"], true);
+    assert_eq!(row["answers"][0]["body"], "");
+    let text =
+        String::from_utf8_lossy(&run_env(&home, &["memory", "list"], &env).stdout).into_owned();
+    assert!(text.contains("[sealed]"), "{text}");
+
+    let revealed = run_env(&home, &["memory", "reveal", "sealed1"], &env);
+    assert_eq!(revealed.status.code(), Some(1));
+    assert!(
+        stderr_text(&revealed).contains("key_missing"),
+        "{}",
+        stderr_text(&revealed)
+    );
+}

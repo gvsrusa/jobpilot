@@ -13,6 +13,7 @@ pub mod error;
 pub mod generate;
 pub mod hardware;
 pub mod knowledge;
+pub mod memory;
 pub mod parse;
 pub mod paths;
 pub mod profile;

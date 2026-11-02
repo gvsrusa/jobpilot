@@ -117,7 +117,7 @@ pub async fn show(db: &Db) -> Result<Profile> {
 
 /// A key error while reading rows (a row sealed under a key this machine lost) leaves the
 /// profile locked instead of failing it. Any other error is real.
-fn degraded(error: Error) -> Result<KeyState> {
+pub(crate) fn degraded(error: Error) -> Result<KeyState> {
     match error {
         Error::KeyMissing { key_id } => Ok(KeyState::KeyMissing { key_id }),
         Error::KeyMismatch { key_id } => Ok(KeyState::KeyMismatch { key_id }),

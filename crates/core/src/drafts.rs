@@ -214,7 +214,7 @@ fn hides(c: char) -> bool {
 
 /// Lower-case words split at anything that is not a letter or digit, after compatibility
 /// decomposition with marks dropped: what a reader sees, not how it was typed.
-fn fold(text: &str) -> String {
+pub(crate) fn fold(text: &str) -> String {
     let words: String = text
         .nfkd()
         .filter(|c| !is_combining_mark(*c) && !hides(*c))
@@ -224,7 +224,7 @@ fn fold(text: &str) -> String {
     words.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn states_authorization(text: &str) -> bool {
+pub(crate) fn states_authorization(text: &str) -> bool {
     let folded = format!(" {} ", fold(text));
     AUTHORIZATION_PATTERNS.iter().any(|pattern| {
         if WHOLE_WORD_PATTERNS.contains(pattern) {

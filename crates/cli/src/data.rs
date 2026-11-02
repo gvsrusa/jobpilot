@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use clap::Subcommand;
 use jobpilot_core::crypto::{self, KeyState};
 use jobpilot_core::{
-    AppPaths, Db, Error, Result, app_schema_version, backup, documents, profile, recovery, transfer,
+    AppPaths, Db, Error, Result, app_schema_version, backup, documents, memory, profile, recovery,
+    transfer,
 };
 use serde_json::json;
 
@@ -213,12 +214,14 @@ pub async fn restore(paths: &AppPaths, source: &Path) -> Result<Output> {
 pub async fn data(db: &Db, command: DataCommand) -> Result<Output> {
     match command {
         DataCommand::Export => {
-            // Before writing: the export holds work authorization in plain text when unlocked.
-            let (_, sensitive_plain) = profile::export_authorization(db).await?;
+            // Before writing: the export holds these in plain text when unlocked.
+            let (_, authorization) = profile::export_authorization(db).await?;
+            let (_, answers) = memory::export_sealed(db).await?;
+            let sensitive_plain = authorization || answers;
             if sensitive_plain {
                 eprintln!(
-                    "warning: this export holds your work authorization answers as plain text. \
-                     Keep the folder private."
+                    "warning: this export holds your work authorization answers and sealed \
+                     career answers as plain text. Keep the folder private."
                 );
             }
             let path = transfer::export_all(db, ACTOR).await?;

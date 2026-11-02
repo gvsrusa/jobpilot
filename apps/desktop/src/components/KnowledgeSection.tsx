@@ -51,12 +51,12 @@ const waiting = (item: KnowledgeItem) => !item.approved && !item.marked_sensitiv
 const KEY_CODES = ["key_missing", "key_mismatch", "key_unavailable", "locked"];
 
 /**
- * A sealed item lists with no text. Show asks Rust, which asks the user in a native dialog
+ * A sealed body lists with no text. Show asks Rust, which asks the user in a native dialog
  * and then the keychain; the text lives only here and goes when hidden or unmounted.
  */
-function SealedText({ item }: { item: KnowledgeItem }) {
+export function SealedText({ reveal: open }: { reveal: () => Promise<string> }) {
   const [text, setText] = useState<string | null>(null);
-  const reveal = useMutation({ mutationFn: () => ipc.kbReveal(item.id), onSuccess: setText });
+  const reveal = useMutation({ mutationFn: open, onSuccess: setText });
   const code = reveal.error ? toAppError(reveal.error).code : null;
   return (
     <div className="grid gap-1">
@@ -164,7 +164,7 @@ export function KnowledgeSection() {
             {group.items.map((item) => (
               <li key={item.id} className="grid gap-1 rounded border p-2">
                 {item.sealed ? (
-                  <SealedText item={item} />
+                  <SealedText reveal={() => ipc.kbReveal(item.id)} />
                 ) : (
                   <span className="whitespace-pre-wrap">{item.body}</span>
                 )}

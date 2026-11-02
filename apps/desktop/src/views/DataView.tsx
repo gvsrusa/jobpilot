@@ -117,8 +117,8 @@ function ExportSection({ root }: { root: string }) {
           onConfirm={() => exported.mutate()}
         >
           <p>
-            JobPilot keeps some fields encrypted: work authorization, notes, and knowledge you
-            marked sensitive. The export writes them as plain text. Anyone who can read the
+            JobPilot keeps some fields encrypted: work authorization, notes, knowledge you marked
+            sensitive, and sealed career answers. The export writes them as plain text. Anyone who can read the
             exports folder can read them, and a cloud-synced or shared folder would copy them.
           </p>
           <p>Delete the file when you no longer need it.</p>

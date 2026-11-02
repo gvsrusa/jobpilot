@@ -106,6 +106,8 @@ pub struct NativeHook {
     pub picked: std::sync::Mutex<Option<PathBuf>>,
     /// Every dialog opened, as title and message.
     pub asked: std::sync::Mutex<Vec<String>>,
+    /// For each confirmation, whether a `Work` was open while it waited.
+    pub work_at_dialog: std::sync::Mutex<Vec<bool>>,
 }
 
 #[cfg(test)]
@@ -115,6 +117,7 @@ impl Default for NativeHook {
             confirm: true.into(),
             picked: Default::default(),
             asked: Default::default(),
+            work_at_dialog: Default::default(),
         }
     }
 }
@@ -134,6 +137,8 @@ async fn ask<R: Runtime>(
         .lock()
         .unwrap()
         .push(format!("{title}: {message}"));
+    let work = app.state::<crate::state::AppState>().work_is_open();
+    hook.work_at_dialog.lock().unwrap().push(work);
     Ok(hook.confirm.load(Ordering::SeqCst))
 }
 
