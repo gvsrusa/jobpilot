@@ -763,7 +763,7 @@ async fn from_settings_honours_order_and_enabled() {
     // Names outside the allow-list and repeats do not add a provider or a second turn, and an
     // enabled provider the stored order leaves out still gets its turn, after that order.
     settings::set(&db, "ai.enabled", &both).await.unwrap();
-    let odd = json!(["openai", "claude_code", "claude_code", "no_ai"]);
+    let odd = json!(["vertex_ai", "claude_code", "claude_code", "no_ai"]);
     settings::set(&db, "ai.order", &odd).await.unwrap();
     assert_eq!(
         ids(&db).await,

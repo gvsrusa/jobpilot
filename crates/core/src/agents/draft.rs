@@ -111,7 +111,7 @@ impl<'r> DraftWorkflow<'r> {
         };
         ctx.save("draft", &made.draft.id)?;
         let output = StepOutput {
-            provider: Some(made.provider.clone()),
+            provider: Some(made.provider),
             categories: spec(self.task).categories,
         };
         *self.held() = Some(made);
@@ -169,7 +169,7 @@ async fn rebuild(db: &Db, id: Option<&str>) -> Result<Generated> {
     let claims = drafts::claims(db, id).await?;
     let blocked = claims.iter().filter(|claim| claim.status != "ok").count();
     let stored = draft.provider.as_deref();
-    let provider = [ProviderId::Ollama, ProviderId::ClaudeCode, ProviderId::NoAi]
+    let provider = ProviderId::ALL
         .into_iter()
         .find(|known| Some(known.to_string().as_str()) == stored)
         .ok_or_else(|| Error::Failed("provider_unknown".into()))?;

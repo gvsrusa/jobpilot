@@ -1,5 +1,9 @@
 import { toAppError } from "./ipc";
 
+/** Said wherever a suspended consent shows, Claude Code included. */
+export const SUSPENDED =
+  "Suspended: this consent was given before the terms on file now. Review it once to turn it back on.";
+
 // Task 20 reports the reason inside the message ("failed: not_logged_in"), so the message is
 // searched for the stable word. ponytail: add a `reason` field to the error if a word ever
 // has to be told from a provider's own text.
@@ -15,7 +19,11 @@ const REASONS: [word: string, text: string][] = [
   ],
   [
     "consent_needed",
-    "Claude Code is on, but your consent does not cover this task. On the AI screen, choose Review consent, then Allow what drafting needs",
+    "An AI provider is on, but your consent does not cover this task. See `jobpilot ai status`, then give consent in an ordinary terminal, for example `jobpilot ai consent give claude_code --categories job_text,profile_basic,resume_text`, or on the AI screen.",
+  ],
+  [
+    "consent_suspended",
+    "Your consent for this provider was given before the terms on file now, so it is paused and nothing is sent. Review it once on the AI screen, or with `jobpilot ai consent show`.",
   ],
   [
     "provider_unavailable",

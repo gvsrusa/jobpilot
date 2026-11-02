@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use jobpilot_core::ai::DataCategory;
+use jobpilot_core::ai::consent::{self, ConsentState};
 use jobpilot_core::crypto::KeyState;
 use jobpilot_core::{AppPaths, Db, Error, MIGRATOR, app_schema_version};
 use sqlx::SqlSafeStr;
@@ -273,7 +275,7 @@ async fn a_0_2_database_upgrades_to_0_3() {
 
     let db = Db::open(&paths).await.unwrap();
 
-    assert_eq!(db.schema_version().await.unwrap(), 11);
+    assert_eq!(db.schema_version().await.unwrap(), app_schema_version());
     assert_eq!(snapshots(&paths, "pre-migrate-5").len(), 1);
     for (sql, want) in [
         (
@@ -324,10 +326,51 @@ async fn a_0_2_database_upgrades_to_0_3() {
 }
 
 #[tokio::test]
-async fn a_fresh_database_is_schema_11() {
+async fn a_fresh_database_is_schema_12() {
     let (_tmp, paths) = temp_root();
     let db = Db::open(&paths).await.unwrap();
-    assert_eq!(db.schema_version().await.unwrap(), 11);
-    assert_eq!(app_schema_version(), 11);
+    assert_eq!(db.schema_version().await.unwrap(), 12);
+    assert_eq!(app_schema_version(), 12);
+    db.close().await;
+}
+
+// A 0.3 database (schema 11) holds a Claude consent record. Opening it with 0.4 keeps the
+// record, snapshots first, and reads it as suspended until the user confirms again.
+#[tokio::test]
+async fn a_0_3_database_upgrades_to_0_4() {
+    const CLAUDE: &str = "claude_code/cli_login";
+    let (_tmp, paths) = temp_root();
+    let release_0_3: Vec<Migration> = MIGRATOR
+        .iter()
+        .filter(|m| m.version <= 11)
+        .cloned()
+        .collect();
+    let db = Db::open_with(&paths, &Migrator::with_migrations(release_0_3))
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO consent (provider, categories, given_at, terms_date) \
+         VALUES (?, '[\"job_text\",\"resume_text\"]', '2026-10-01T00:00:00.000Z', '2026-11-01')",
+    )
+    .bind(CLAUDE)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    db.close().await;
+
+    let db = Db::open(&paths).await.unwrap();
+
+    assert_eq!(db.schema_version().await.unwrap(), 12);
+    assert_eq!(snapshots(&paths, "pre-migrate-11-").len(), 1);
+    let kept: (String, String) = sqlx::query_as("SELECT provider, register_row FROM consent")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(kept, (CLAUDE.to_string(), String::new()));
+    assert_eq!(
+        consent::state(&db, CLAUDE).await.unwrap(),
+        ConsentState::Suspended(vec![DataCategory::JobText, DataCategory::ResumeText])
+    );
+    assert_eq!(consent::active(&db, CLAUDE).await.unwrap(), None);
     db.close().await;
 }

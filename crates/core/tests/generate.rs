@@ -58,7 +58,7 @@ impl Mock {
 impl Provider for Mock {
     fn declaration(&self) -> Declaration {
         Declaration {
-            id: self.id.clone(),
+            id: self.id,
             capabilities: vec![Capability::StructuredOutput, Capability::NoTools],
             local: self.local,
             context_limit: self.limit,
@@ -421,6 +421,46 @@ fn only_usable_evidence_enters_the_prompt() {
     ] {
         assert!(!text.contains(leak), "{leak} leaked");
     }
+}
+
+#[tokio::test]
+async fn preview_is_the_prompt_and_withholds_a_marked_item() {
+    let w = world().await;
+    let marked = knowledge::add(&w.db, "note", "ZXQ-MARKED", "user", None)
+        .await
+        .unwrap();
+    knowledge::approve(&w.db, &marked.id, true).await.unwrap();
+    sqlx::query("UPDATE knowledge_items SET marked_sensitive = 1 WHERE id = ?")
+        .bind(&marked.id)
+        .execute(&w.db.pool)
+        .await
+        .unwrap();
+    let task = TaskType::DraftResume;
+
+    let preview = generate::preview(&w.db, task, &w.job.id).await.unwrap();
+
+    let basic = profile::basic(&w.db).await.unwrap();
+    let evidence = knowledge::evidence(&w.db).await.unwrap();
+    let posting = knowledge::get_job_text(&w.db, &w.job.id).await.unwrap();
+    let built = build_prompt(task, &basic, &evidence, &posting);
+    assert_eq!(preview.user, built.user);
+    assert_eq!(preview.system, built.system);
+    assert!(preview.user.contains(BULLET));
+    assert!(!preview.user.contains("ZXQ-MARKED"));
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM task_runs")
+        .fetch_one(&w.db.pool)
+        .await
+        .unwrap();
+    assert_eq!(runs, 0, "nothing was sent");
+}
+
+#[tokio::test]
+async fn preview_refuses_a_task_that_is_not_a_draft() {
+    let w = world().await;
+    let error = generate::preview(&w.db, TaskType::ParseJob, &w.job.id)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "validation");
 }
 
 #[tokio::test]

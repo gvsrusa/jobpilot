@@ -5,7 +5,7 @@ import userEvent from "@testing-library/user-event";
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import App from "./App";
 import { useUiStore } from "./lib/store";
-import type { BackupInfo, Document, PauseState, Status } from "./lib/ipc";
+import type { BackupInfo, Document, PauseState, Provider, Sharing, Status } from "./lib/ipc";
 
 export const READY: Status = {
   state: "ready",
@@ -28,6 +28,27 @@ export function recovery(code: string, message = `message for ${code}`): Status 
     key_state: null,
   };
 }
+
+/** Core's `ai::sharing` for a provider that can run every task. */
+export const sharing = (over: Partial<Sharing> = {}): Sharing => ({
+  name: "claude_code",
+  label: "Claude Code",
+  key: "claude_code/cli_login",
+  destination: "Anthropic, through the claude program on this computer",
+  path: null,
+  tasks: [
+    { task: "parse_job", categories: ["job_text"], runs: true, skipped_because: null },
+    { task: "draft_resume", categories: ["job_text", "profile_basic", "resume_text"], runs: true, skipped_because: null },
+    { task: "draft_cover_letter", categories: ["job_text", "profile_basic", "resume_text"], runs: true, skipped_because: null },
+    { task: "classify_answer", categories: ["job_text"], runs: true, skipped_because: null },
+  ],
+  data_use: "Consumer Terms allow training unless the user opts out.",
+  terms_date: "2026-11-01",
+  attestation: null,
+  suspended: false,
+  given: null,
+  ...over,
+});
 
 type Handler = (args: Record<string, unknown>) => unknown;
 
@@ -100,6 +121,7 @@ export function backend(overrides: Record<string, Handler> = {}): Backend {
       return pause;
     },
     audit_recent: () => [],
+    ai_sharing: ({ provider }) => sharing({ name: provider as Provider }),
     app_list: () => [],
     app_history: () => [],
     analytics_latest: () => null,

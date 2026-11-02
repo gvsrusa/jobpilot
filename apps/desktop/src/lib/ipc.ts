@@ -333,7 +333,7 @@ export type Compare = {
 export type Generated = {
   draft: Draft;
   blocked: number;
-  provider: "ollama" | "claude_code" | "no_ai";
+  provider: ProviderId;
   /** Where the file went, when an export was asked for and no claim was blocked. */
   exported: string | null;
   /** Set when an export was asked for and refused: a line, the name, a contact, or a heading. */
@@ -367,14 +367,67 @@ export type DataCategory =
   | "career_memory"
   | "sensitive";
 
-export type Provider = "ollama" | "claude_code";
+export type Provider =
+  | "ollama"
+  | "claude_code"
+  | "openai"
+  | "anthropic"
+  | "google"
+  | "openrouter"
+  | "endpoint"
+  | "gemini_cli"
+  | "codex_cli";
+
+/** Core's `ProviderId` as JSON. */
+export type ProviderId = Provider | "no_ai";
+
+export type ExternalStatus = {
+  name: Provider;
+  label: string;
+  kind: "api" | "cli" | "endpoint";
+  available: boolean;
+  /** A reason code. Plain words are the screen's. */
+  reason: string | null;
+  model: string | null;
+  key_stored: boolean;
+  path: string | null;
+  consent: DataCategory[] | null;
+  suspended: boolean;
+  runs_job_text: boolean;
+};
+
+export type TaskSharing = {
+  task: "parse_job" | "draft_resume" | "draft_cover_letter" | "classify_answer";
+  categories: DataCategory[];
+  runs: boolean;
+  skipped_because: string | null;
+};
+
+export type Sharing = {
+  name: Provider;
+  label: string;
+  key: string;
+  destination: string;
+  path: string | null;
+  tasks: TaskSharing[];
+  data_use: string;
+  terms_date: string;
+  attestation: string | null;
+  suspended: boolean;
+  given: DataCategory[] | null;
+};
+
+/** Holds the posting and evidence. Render it as text only. */
+export type PromptPreview = { task: "draft_resume" | "draft_cover_letter"; system: string; user: string };
 
 export type AiStatus = {
   ollama: OllamaStatus;
-  claude_code: { available: boolean; path: string | null; consent: DataCategory[] | null };
+  claude_code: { available: boolean; path: string | null; consent: DataCategory[] | null; suspended: boolean };
+  external: ExternalStatus[];
+  register_date: string;
   hardware: { total_memory: number; cpus: number; gpu: string; free_disk: number };
   order: string[];
-  enabled: { ollama: boolean; claude_code: boolean };
+  enabled: { ollama: boolean; claude_code: boolean } & Partial<Record<Provider, boolean>>;
   drafting_model: string | null;
   embedding_model: string | null;
 };
@@ -551,9 +604,12 @@ export const ipc = {
   /** Rust confirms in a native dialog. */
   aiSetOllamaUrl: (url: string) => invoke<void>("ai_set_ollama_url", { url }),
   /** Rust confirms in a native dialog. */
-  aiConsentGive: (provider: "claude_code", categories: DataCategory[]) =>
+  aiConsentGive: (provider: Provider, categories: DataCategory[]) =>
     invoke<void>("ai_consent_give", { provider, categories }),
-  aiConsentRevoke: (provider: "claude_code") => invoke<void>("ai_consent_revoke", { provider }),
+  aiConsentRevoke: (provider: Provider) => invoke<void>("ai_consent_revoke", { provider }),
+  aiSharing: (provider: Provider) => invoke<Sharing>("ai_sharing", { provider }),
+  /** Builds the prompt and sends nothing. */
+  aiPreview: (jobTextId: string) => invoke<PromptPreview>("ai_preview", { jobTextId }),
   aiIndex: () => invoke<number>("ai_index"),
   aiCancel: () => invoke<void>("ai_cancel"),
 

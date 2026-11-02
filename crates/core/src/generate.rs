@@ -54,6 +54,14 @@ struct LetterReply {
     paragraphs: Vec<ClaimInput>,
 }
 
+/// What a drafting task would send, exactly. Nothing here has left the machine.
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptPreview {
+    pub task: TaskType,
+    pub system: String,
+    pub user: String,
+}
+
 /// What a finished router run hands to the kind-specific half.
 struct Reply {
     provider: ProviderId,
@@ -257,6 +265,28 @@ fn contact(basic: &ProfileBasic) -> Vec<String> {
     email.into_iter().collect()
 }
 
+/// What a prompt is built from, in one place so [`ask`] and [`preview`] cannot differ.
+async fn gather(db: &Db, job_text_id: &str) -> Result<(JobText, ProfileBasic, Vec<KnowledgeItem>)> {
+    let posting = knowledge::get_job_text(db, job_text_id).await?;
+    let basic = profile::basic(db).await?;
+    let evidence = knowledge::evidence(db).await?;
+    if evidence.is_empty() {
+        return Err(Error::ManualRequired("no_evidence".into()));
+    }
+    Ok((posting, basic, evidence))
+}
+
+/// The prompt a drafting task would send for this posting. Builds it and sends nothing, so
+/// it runs with no provider, no consent, and while paused.
+pub async fn preview(db: &Db, task: TaskType, job_text_id: &str) -> Result<PromptPreview> {
+    if !matches!(task, TaskType::DraftResume | TaskType::DraftCoverLetter) {
+        return Err(Error::Validation("only a draft has a preview".into()));
+    }
+    let (posting, basic, evidence) = gather(db, job_text_id).await?;
+    let Prompt { system, user, .. } = build_prompt(task, &basic, &evidence, &posting);
+    Ok(PromptPreview { task, system, user })
+}
+
 async fn ask(
     db: &Db,
     router: &Router,
@@ -265,12 +295,7 @@ async fn ask(
     job_text_id: &str,
     cancel: CancellationToken,
 ) -> Result<Reply> {
-    let posting = knowledge::get_job_text(db, job_text_id).await?;
-    let basic = profile::basic(db).await?;
-    let evidence = knowledge::evidence(db).await?;
-    if evidence.is_empty() {
-        return Err(Error::ManualRequired("no_evidence".into()));
-    }
+    let (posting, basic, evidence) = gather(db, job_text_id).await?;
     let prompt = build_prompt(task, &basic, &evidence, &posting);
     match router.run(db, actor, task, prompt, cancel.clone()).await? {
         Outcome::Ok {

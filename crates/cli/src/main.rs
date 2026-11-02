@@ -215,9 +215,16 @@ fn message(error: &Error) -> String {
             "Claude Code is not signed in. Run `claude` once to log in, then try again.".into()
         }
         Error::ManualRequired(reason) if reason == "consent_needed" => {
-            "Claude Code is on, but your consent does not cover this task. Give consent with \
-             `jobpilot ai consent give claude_code --categories \
-             job_text,profile_basic,resume_text` in an ordinary terminal, or on the AI screen."
+            "An AI provider is on, but your consent does not cover this task. See `jobpilot ai \
+             status`, then give consent in an ordinary terminal, for example `jobpilot ai \
+             consent give claude_code --categories job_text,profile_basic,resume_text`, or on \
+             the AI screen."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "consent_suspended" => {
+            "Your consent for this provider was given before the terms on file now, so it is \
+             paused and nothing is sent. Review it once on the AI screen, or with `jobpilot ai \
+             consent show`."
                 .into()
         }
         Error::ManualRequired(reason) if reason == "provider_unavailable" => {
@@ -244,6 +251,11 @@ fn message(error: &Error) -> String {
         Error::ManualRequired(reason) if reason == "quota_exhausted" => {
             "The AI provider says your usage or credit has run out. Add credit with the vendor, \
              then try again."
+                .into()
+        }
+        Error::Refused(reason) if reason == "attestation_needed" => {
+            "This provider needs you to state the line above. If it is true, run this again \
+             with --attest."
                 .into()
         }
         Error::Refused(reason) if reason == "use_profile_by_country" => {
@@ -407,8 +419,15 @@ mod tests {
         ("ai enable claude_code", true),
         ("ai disable claude_code", true),
         ("ai claude-path /c", true),
+        ("ai enable openai", true),
+        ("ai disable openai", true),
+        ("ai order openai", true),
         ("ai consent give claude_code --categories job_text", true),
+        ("ai consent give openai --categories job_text", true),
         ("ai consent revoke claude_code", false),
+        ("ai consent revoke openai", false),
+        ("ai consent show openai", false),
+        ("ai consent show openai --job j", false),
         ("ai index", false),
     ];
 
@@ -449,6 +468,17 @@ mod tests {
                 "jobpilot ai consent give claude_code --categories job_text,profile_basic,resume_text"
             ),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn consent_reasons_name_no_one_provider() {
+        let needed = message(&Error::ManualRequired("consent_needed".into()));
+        assert!(needed.starts_with("An AI provider is on"), "{needed}");
+        let suspended = message(&Error::ManualRequired("consent_suspended".into()));
+        assert!(
+            suspended.contains("jobpilot ai consent show"),
+            "{suspended}"
         );
     }
 

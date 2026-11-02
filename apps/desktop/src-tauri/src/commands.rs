@@ -11,10 +11,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use jobpilot_core::agents::MemoryRefreshed;
-use jobpilot_core::ai::claude_code::{self, TERMS_DATE};
+use jobpilot_core::ai::claude_code;
 use jobpilot_core::ai::ollama::Ollama;
+use jobpilot_core::ai::register::{self, ProviderInfo};
 use jobpilot_core::ai::router::{Router, ollama_from_settings};
-use jobpilot_core::ai::{self, AiStatus, CancellationToken, DataCategory, ProviderId, consent};
+use jobpilot_core::ai::{
+    self, AiStatus, CancellationToken, DataCategory, Sharing, TaskType, consent,
+};
 use jobpilot_core::analytics::{self, Report};
 use jobpilot_core::applications::{self, Application, ApplicationEvent, ApplicationInput};
 use jobpilot_core::audit::{self, AuditEntry};
@@ -23,7 +26,7 @@ use jobpilot_core::crypto::{self, KeyState};
 use jobpilot_core::documents::{self, Document, SearchHit};
 use jobpilot_core::drafts::{self, ClaimInput, Compare, Draft, ExportFormat};
 use jobpilot_core::embed::{self, Hit};
-use jobpilot_core::generate::Generated;
+use jobpilot_core::generate::{self, Generated, PromptPreview};
 use jobpilot_core::knowledge::{self, JobText, KnowledgeItem};
 use jobpilot_core::memory::{
     self, Answer, AppliedAnswer, AuthorizationAnswer, Class, MemoryHit, Question, QuestionRow,
@@ -55,8 +58,6 @@ pub struct Exported {
 /// Settings core keeps for itself: what the router runs, and the recovery reminder's mark.
 /// The first has a command for each key, and the second is only ever core's to write.
 const OWNED_SETTINGS: &[&str] = &["ai.", "recovery_key_exported_"];
-/// Consent is recorded for the one external provider, under `ProviderId`'s text.
-const CONSENT_PROVIDER: &str = "claude_code";
 
 pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
@@ -149,6 +150,8 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         ai_set_ollama_url,
         ai_consent_give,
         ai_consent_revoke,
+        ai_sharing,
+        ai_preview,
         ai_index,
         ai_cancel,
         key_state,
@@ -1089,13 +1092,28 @@ pub async fn ai_set_ollama_url<R: Runtime>(
     settings::set(&db, "ai.ollama_url", &json!(url)).await
 }
 
-fn consent_provider(provider: &str) -> Result<String> {
-    if provider != CONSENT_PROVIDER {
-        return Err(Error::Validation(
-            "consent applies to claude_code only".into(),
-        ));
-    }
-    Ok(ProviderId::ClaudeCode.to_string())
+/// A provider in the table. Ollama is not one: it runs here and needs no record, and a name
+/// the owner decisions leave out has no row.
+fn consent_provider(provider: &str) -> Result<&'static ProviderInfo> {
+    register::info(provider)
+        .ok_or_else(|| Error::Validation("consent does not apply to this provider".into()))
+}
+
+/// What the native dialog says. It states the data use and the attestation itself, as a yes
+/// to this text is the consent: script in the webview cannot change what it reads.
+fn consent_message(sharing: &Sharing, categories: &[DataCategory]) -> String {
+    let (label, destination) = (&sharing.label, &sharing.destination);
+    let names = json!(categories);
+    let program = sharing.path.as_ref();
+    let program = program.map_or_else(String::new, |path| format!("\n\nProgram: {path}"));
+    let attestation = sharing.attestation.as_ref();
+    let attestation = attestation.map_or_else(String::new, |line| format!("\n\n{line}"));
+    format!(
+        "Allow JobPilot to send this data to {label}?\n\n{names}{program}\n\n\
+         Where it goes: {destination}\n\n\
+         How {label} uses it: {}{attestation}",
+        sharing.data_use
+    )
 }
 
 /// The record that lets data leave this machine (FR-3.30), so it is confirmed outside the
@@ -1108,29 +1126,41 @@ pub async fn ai_consent_give<R: Runtime>(
     provider: String,
     categories: Vec<DataCategory>,
 ) -> Result<()> {
-    let id = consent_provider(&provider)?;
-    drop(state.work().await?);
-    let names = json!(categories);
-    let message = format!(
-        "Allow JobPilot to send this data to Claude Code on your own login?\n\n{names}\n\n\
-         It leaves this computer. Consumer Terms allow training unless you opt out."
-    );
-    native::confirmed(&app, "Claude Code consent", message, "Allow").await?;
+    consent_provider(&provider)?;
+    let sharing = ai::sharing(&*state.work().await?, &provider).await?;
+    let title = format!("{} consent", sharing.label);
+    let message = consent_message(&sharing, &categories);
+    native::confirmed(&app, &title, message, "Allow").await?;
     let db = state.work().await?;
-    consent::give(&db, &id, &categories, TERMS_DATE, ACTOR).await
+    // Pressing Allow on that text attests, when the provider asks for it.
+    consent::give_for(&db, &provider, &categories, true, ACTOR).await
 }
 
 /// Revoked first, so a run that has not yet reached the consent check cannot pass it, and the
 /// token fires whatever the write did: a run the user wants stopped stops.
 #[tauri::command]
 pub async fn ai_consent_revoke(state: State<'_, AppState>, provider: String) -> Result<()> {
-    let id = consent_provider(&provider)?;
+    let id = consent_provider(&provider)?.id.to_string();
     let revoked = match state.work().await {
         Ok(db) => consent::revoke(&db, &id, ACTOR).await,
         Err(error) => Err(error),
     };
     state.ai.cancel();
     revoked
+}
+
+/// What the consent dialog shows.
+#[tauri::command]
+pub async fn ai_sharing(state: State<'_, AppState>, provider: String) -> Result<Sharing> {
+    consent_provider(&provider)?;
+    ai::sharing(&*state.work().await?, &provider).await
+}
+
+/// The exact resume prompt for a pasted posting. Builds it and sends nothing.
+#[tauri::command]
+pub async fn ai_preview(state: State<'_, AppState>, job_text_id: String) -> Result<PromptPreview> {
+    let db = state.work().await?;
+    generate::preview(&db, TaskType::DraftResume, &job_text_id).await
 }
 
 #[tauri::command]
@@ -2510,6 +2540,8 @@ mod tests {
         "ai_set_ollama_url",
         "ai_consent_give",
         "ai_consent_revoke",
+        "ai_sharing",
+        "ai_preview",
         "ai_index",
         "ai_cancel",
         "key_state",
@@ -3004,6 +3036,81 @@ mod tests {
         assert_eq!(h.code("ai_consent_give", other), "validation");
         let other = json!({ "provider": "ollama" });
         assert_eq!(h.code("ai_consent_revoke", other), "validation");
+    }
+
+    #[test]
+    fn consent_dialog_names_data_use_and_attestation() {
+        let h = ready();
+        let args = json!({ "provider": "google", "categories": ["job_text"] });
+
+        h.answer(false);
+        assert_eq!(
+            h.code("ai_consent_give", args.clone()),
+            "confirmation_required"
+        );
+        let asked = h.asked().remove(0);
+        assert!(asked.contains("Google Gemini"), "{asked}");
+        assert!(asked.contains("job_text"), "{asked}");
+        assert!(
+            asked.contains("generativelanguage.googleapis.com"),
+            "{asked}"
+        );
+        assert!(asked.contains("logged for a limited period"), "{asked}");
+        assert!(asked.contains("billing on"), "{asked}");
+
+        h.answer(true);
+        h.ok("ai_consent_give", args);
+        let sharing = h.ok("ai_sharing", json!({ "provider": "google" }));
+        assert_eq!(sharing["given"], json!(["job_text"]));
+        assert_eq!(sharing["suspended"], false);
+        assert_eq!(sharing["terms_date"], "2026-11-01");
+        h.ok("ai_consent_revoke", json!({ "provider": "google" }));
+        let sharing = h.ok("ai_sharing", json!({ "provider": "google" }));
+        assert_eq!(sharing["given"], Value::Null);
+    }
+
+    #[test]
+    fn a_left_out_provider_is_refused_at_ipc() {
+        let h = ready();
+        h.answer(true);
+        for name in ["vertex_ai", "antigravity", "ollama", "gemini_free"] {
+            let give = json!({ "provider": name, "categories": ["job_text"] });
+            assert_eq!(h.code("ai_consent_give", give), "validation", "{name}");
+            let one = json!({ "provider": name });
+            assert_eq!(
+                h.code("ai_consent_revoke", one.clone()),
+                "validation",
+                "{name}"
+            );
+            assert_eq!(h.code("ai_sharing", one), "validation", "{name}");
+        }
+        for name in ["vertex_ai", "antigravity"] {
+            let args = json!({ "provider": name, "enabled": true });
+            assert_eq!(h.code("ai_enable", args), "validation", "{name}");
+        }
+        assert!(h.asked().is_empty(), "nothing to ask about");
+    }
+
+    #[test]
+    fn ai_preview_shows_the_prompt_and_sends_nothing() {
+        let h = ready();
+        let job = h.ok(
+            "job_paste",
+            json!({ "title": "Role", "raw": "ZXQ-POSTING <script>x</script>" }),
+        );
+        h.ok(
+            "kb_add",
+            json!({ "kind": "note", "body": "Shipped a compiler" }),
+        );
+        let preview = h.ok("ai_preview", json!({ "jobTextId": job["id"] }));
+        assert_eq!(preview["task"], "draft_resume");
+        assert!(preview["user"].as_str().unwrap().contains("ZXQ-POSTING"));
+        assert!(
+            preview["system"]
+                .as_str()
+                .unwrap()
+                .contains("Never fabricate")
+        );
     }
 
     #[test]

@@ -31,6 +31,7 @@ use serde_json::json;
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 
+use crate::ai::register;
 use crate::crypto::{self, KeyState};
 use crate::db::{
     Db, MIGRATOR, Manifest, claim_root, copy_dir, current_version, latest_version, lock_exclusive,
@@ -647,7 +648,7 @@ fn merge_pause(before: Option<bool>, under_lock: Option<bool>) -> Option<bool> {
 /// Consent is a decision made now, and a backup is an old one, or someone else's copy, so a
 /// restore never brings one back (FR-3.30). Fails closed as the router does: anything but
 /// Ollama is external. The row stays as the record, closed by the restore. When one was
-/// closed, Claude Code is also switched off, as the AI screen's own Revoke does, so the
+/// closed, its provider is also switched off, as the AI screen's own Revoke does, so the
 /// screen shows it off with no consent rather than on and failing every task. With no
 /// consent to close, the switch is left as it was.
 async fn revoke_external_consent(pool: &SqlitePool, actor: &str) -> Result<()> {
@@ -660,15 +661,18 @@ async fn revoke_external_consent(pool: &SqlitePool, actor: &str) -> Result<()> {
     if revoked.is_empty() {
         return Ok(());
     }
-    // A missing or non-object setting has nothing to switch off: the default is off.
-    sqlx::query(
-        "UPDATE settings SET value = json_set(value, '$.claude_code', json('false')), \
-         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-         WHERE key = 'ai.enabled' AND json_type(value) = 'object'",
-    )
-    .execute(pool)
-    .await?;
     for provider in revoked {
+        // A missing or non-object setting has nothing to switch off: the default is off.
+        if let Some(info) = register::info_for(&provider) {
+            sqlx::query(
+                "UPDATE settings SET value = json_set(value, '$.' || ?, json('false')), \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                 WHERE key = 'ai.enabled' AND json_type(value) = 'object'",
+            )
+            .bind(info.name)
+            .execute(pool)
+            .await?;
+        }
         let action = "consent_revoked_by_restore";
         audit::record_to(pool, actor, action, Some(&provider), json!({})).await?;
     }

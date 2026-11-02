@@ -406,7 +406,7 @@ impl Provider for Script {
             capabilities.extend([Capability::Embeddings, Capability::LocalExecution]);
         }
         Declaration {
-            id: self.id.clone(),
+            id: self.id,
             capabilities,
             local,
             context_limit: 100_000,
@@ -697,6 +697,38 @@ impl Workflow for HaltAtRender<'_> {
         }
         self.inner.step(ctx, index)
     }
+}
+
+/// A checkpoint holds the draft's id only, so `rebuild` reads the provider back from its text.
+#[tokio::test]
+async fn a_resumed_run_knows_a_hosted_provider() {
+    let w = world().await;
+    let data = [
+        DataCategory::JobText,
+        DataCategory::ProfileBasic,
+        DataCategory::ResumeText,
+    ];
+    consent::give(&w.db, "openai/api_key", &data, "2026-11-01", "cli")
+        .await
+        .unwrap();
+    let reply = resume_reply(BULLET, &[&w.item.id]);
+    let (provider, handles) = script(ProviderId::OpenAi, vec![reply]);
+    let router = router_of(provider);
+    let workflow = HaltAtRender {
+        inner: DraftWorkflow::new(TaskType::DraftResume, &w.job.id, pdf(), &router),
+        tripped: AtomicBool::new(false),
+    };
+    let halted = runner::start(&w.db, "cli", &workflow, token())
+        .await
+        .unwrap();
+    assert_eq!(halted.state, RunState::Halted);
+
+    let done = agents::resume_run(&w.db, &router, "cli", &halted.run_id, token()).await;
+
+    assert!(done.is_ok(), "{:?}", done.err());
+    assert_eq!(handles.calls(), 1);
+    let run = runner::list(&w.db, 1).await.unwrap().remove(0);
+    assert_eq!(run.state, RunState::Completed);
 }
 
 #[tokio::test]

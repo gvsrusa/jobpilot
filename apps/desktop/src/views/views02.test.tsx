@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type {
   AiStatus,
   Compare,
+  ExternalStatus,
   Draft,
   JobText,
   KeyState,
@@ -11,7 +12,7 @@ import type {
   ProfileBasic,
   Status,
 } from "../lib/ipc";
-import { backend, count, READY, renderApp } from "../test-utils";
+import { backend, count, READY, renderApp, sharing } from "../test-utils";
 
 const NOTHING: ProfileBasic = {
   name: "",
@@ -37,7 +38,9 @@ const profile = (over: Partial<Profile> = {}, basic: Partial<ProfileBasic> = {})
 
 const AI_OFF: AiStatus = {
   ollama: { state: "not_running", url: "http://127.0.0.1:11434" },
-  claude_code: { available: false, path: null, consent: null },
+  claude_code: { available: false, path: null, consent: null, suspended: false },
+  external: [],
+  register_date: "2026-11-01",
   hardware: { total_memory: 16 * 2 ** 30, cpus: 8, gpu: "no GPU found", free_disk: 100 * 2 ** 30 },
   order: ["ollama"],
   enabled: { ollama: true, claude_code: false },
@@ -311,6 +314,7 @@ describe("resumes", () => {
 
   it.each([
     ["consent_needed", /does not cover this task/],
+    ["consent_suspended", /so it is paused and nothing is sent/],
     ["provider_unavailable", /cannot be reached/],
     ["no_model_set", /No local model is chosen/],
     ["model_not_installed", /not installed in Ollama/],
@@ -380,7 +384,7 @@ describe("knowledge", () => {
     ...over,
   });
   const CLAUDE_READY = aiWith({
-    claude_code: { available: true, path: "/opt/claude", consent: ["job_text", "profile_basic", "resume_text"] },
+    claude_code: { available: true, path: "/opt/claude", consent: ["job_text", "profile_basic", "resume_text"], suspended: false },
     enabled: { ollama: true, claude_code: true },
     order: ["ollama", "claude_code"],
   });
@@ -679,7 +683,7 @@ describe("ai", () => {
   it("ai_claude_row_shows_path_and_consent_terms", async () => {
     const b = backend({
       ai_status: () =>
-        aiWith({ claude_code: { available: true, path: "/usr/local/bin/claude", consent: null } }),
+        aiWith({ claude_code: { available: true, path: "/usr/local/bin/claude", consent: null, suspended: false } }),
       ai_consent_give: () => undefined,
       ai_enable: () => undefined,
     });
@@ -703,9 +707,14 @@ describe("ai", () => {
   });
 
   const claudeUp = (consent: AiStatus["claude_code"]["consent"]) =>
-    aiWith({ claude_code: { available: true, path: "/opt/claude", consent } });
+    aiWith({ claude_code: { available: true, path: "/opt/claude", consent, suspended: false } });
   const consentBackend = (consent: AiStatus["claude_code"]["consent"]) =>
-    backend({ ai_status: () => claudeUp(consent), ai_consent_give: () => undefined, ai_enable: () => undefined });
+    backend({
+      ai_status: () => claudeUp(consent),
+      ai_sharing: () => sharing({ given: consent }),
+      ai_consent_give: () => undefined,
+      ai_enable: () => undefined,
+    });
 
   it("consent_names_what_drafting_needs_and_ticks_nothing_until_pressed", async () => {
     const b = consentBackend(null);
@@ -761,6 +770,227 @@ describe("ai", () => {
     });
   });
 
+  const external = (over: Partial<ExternalStatus>): ExternalStatus => ({
+    name: "openai",
+    label: "OpenAI",
+    kind: "api",
+    available: false,
+    reason: "not_built",
+    model: null,
+    key_stored: false,
+    path: null,
+    consent: null,
+    suspended: false,
+    runs_job_text: true,
+    ...over,
+  });
+  const SUSPENDED_LINE =
+    "Suspended: this consent was given before the terms on file now. Review it once to turn it back on.";
+  const CODEX = sharing({
+    name: "codex_cli",
+    label: "Codex CLI",
+    key: "codex_cli/cli_login",
+    destination: "OpenAI, through the codex program on this computer",
+    data_use: "The terms of whatever sign-in the installed CLI uses.",
+    tasks: sharing().tasks.map((t) => ({ ...t, runs: false, skipped_because: "no_tools" })),
+  });
+  const GOOGLE = sharing({
+    name: "google",
+    label: "Google Gemini",
+    key: "google/paid_key",
+    destination: "Google's Gemini API, at generativelanguage.googleapis.com",
+    data_use: "Not used to improve products; logged for a limited period for abuse detection.",
+    attestation: "This key belongs to a Google project with billing on. A free Gemini key is refused for personal data.",
+  });
+  const reviewOf = async (user: ReturnType<typeof renderApp>["user"], label: string) => {
+    await go(user, "AI", /AI/);
+    await user.click(await screen.findByRole("button", { name: `Review ${label}...` }));
+    return within(await screen.findByRole("dialog"));
+  };
+
+  it("consent_dialog_shows_tasks_destination_and_terms", async () => {
+    backend({
+      ai_status: () => aiWith({ external: [external({ name: "google", label: "Google Gemini" })] }),
+      ai_sharing: () => GOOGLE,
+    });
+    const { user } = renderApp();
+    const dialog = await reviewOf(user, "Google Gemini");
+    expect(dialog.getByRole("heading", { name: "Share data with Google Gemini (your own paid key)" })).toBeInTheDocument();
+    expect(dialog.getByRole("heading", { name: "What will be sent" })).toBeInTheDocument();
+    expect(dialog.getByText("Resume: Job text, Basic profile, Resume text")).toBeInTheDocument();
+    expect(dialog.getByText(GOOGLE.destination)).toBeInTheDocument();
+    expect(dialog.getByRole("heading", { name: "How Google Gemini uses it (terms read 2026-11-01)" })).toBeInTheDocument();
+    expect(dialog.getByText(GOOGLE.data_use)).toBeInTheDocument();
+    expect(dialog.getByText(GOOGLE.attestation!)).toBeInTheDocument();
+    expect(dialog.getByText("Paste a posting to see this.")).toBeInTheDocument();
+    expect(dialog.queryByRole("button", { name: "Show exactly what will be sent" })).toBeNull();
+    for (const box of dialog.getAllByRole("checkbox")) expect(box).not.toBeChecked();
+  });
+
+  it("consent_dialog_says_why_a_task_is_skipped", async () => {
+    backend({
+      ai_status: () => aiWith({ external: [external({ name: "codex_cli", label: "Codex CLI", runs_job_text: false })] }),
+      ai_sharing: () => CODEX,
+    });
+    const { user } = renderApp();
+    const dialog = await reviewOf(user, "Codex CLI");
+    expect(dialog.getByText("Resume: Skipped: this provider cannot prove it has no tools")).toBeInTheDocument();
+    expect(dialog.queryByRole("button", { name: "Allow what drafting needs" })).toBeNull();
+    expect(dialog.queryByText(/Job text goes to/)).toBeNull();
+  });
+
+  it("consent_focus_starts_on_cancel", async () => {
+    consentBackend(null);
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    await user.click(await screen.findByRole("button", { name: "Review consent..." }));
+    const dialog = within(await screen.findByRole("dialog"));
+    expect(dialog.getByRole("button", { name: "Cancel" })).toHaveFocus();
+  });
+
+  it("show_exactly_what_will_be_sent_is_inert_text", async () => {
+    const b = backend({
+      ai_status: () => aiWith({ external: [external({})] }),
+      ai_sharing: () => sharing({ name: "openai", label: "OpenAI" }),
+      job_list: () => [JOB],
+      ai_preview: () => ({
+        task: "draft_resume",
+        system: "ZXQ-SYSTEM",
+        user: '<script>window.pwned = true</script><a href="https://x">link</a>',
+      }),
+    });
+    const { user } = renderApp();
+    const dialog = await reviewOf(user, "OpenAI");
+    await user.click(await dialog.findByRole("button", { name: "Show exactly what will be sent" }));
+    const shown = await dialog.findByText(/ZXQ-SYSTEM/);
+    expect(shown.tagName).toBe("PRE");
+    expect(shown.textContent).toContain("<script>window.pwned = true</script>");
+    expect(shown.querySelector("script, a")).toBeNull();
+    expect(b.calls.find((c) => c.cmd === "ai_preview")?.args).toEqual({ jobTextId: "j1" });
+    expect(count(b, "ai_consent_give")).toBe(0);
+  });
+
+  it("a_suspended_row_says_so_and_offers_review", async () => {
+    const b = backend({
+      ai_status: () => aiWith({ external: [external({ suspended: true })] }),
+      ai_sharing: () => sharing({ name: "openai", label: "OpenAI", suspended: true, given: ["job_text"] }),
+      ai_consent_revoke: () => undefined,
+      ai_enable: () => undefined,
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const row = within(await screen.findByRole("listitem", { name: "OpenAI" }));
+    expect(row.getByRole("alert")).toHaveTextContent(SUSPENDED_LINE);
+    expect(row.getByText("Unavailable: not built yet")).toBeInTheDocument();
+    await user.click(row.getByRole("button", { name: "Revoke consent for OpenAI" }));
+    await waitFor(() => expect(count(b, "ai_consent_revoke")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_consent_revoke")?.args).toEqual({ provider: "openai" });
+    await user.click(row.getByRole("button", { name: "Review OpenAI..." }));
+    expect(within(await screen.findByRole("dialog")).getByLabelText("Job text")).toBeChecked();
+  });
+
+  it("a_provider_row_shows_what_was_allowed_and_can_be_used", async () => {
+    const b = backend({
+      ai_status: () => aiWith({ external: [external({ available: true, reason: null, consent: ["job_text"] })] }),
+      ai_enable: () => undefined,
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    expect(await screen.findByText("Consent given for: Job text.")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Register date 2026-11-01" })).toBeInTheDocument();
+    await user.click(screen.getByLabelText("Use OpenAI"));
+    await waitFor(() => expect(count(b, "ai_enable")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_enable")?.args).toEqual({ provider: "openai", enabled: true });
+  });
+
+  it("claude_suspended_on_upgrade_says_why_and_review_starts_ticked", async () => {
+    const b = backend({
+      ai_status: () =>
+        aiWith({
+          claude_code: { available: true, path: "/opt/claude", consent: null, suspended: true },
+          enabled: { ollama: true, claude_code: true },
+        }),
+      ai_sharing: () => sharing({ suspended: true, given: ["job_text", "profile_basic", "resume_text"] }),
+      ai_consent_give: () => undefined,
+      ai_enable: () => undefined,
+    });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    expect(await screen.findByRole("alert")).toHaveTextContent(SUSPENDED_LINE);
+    expect(screen.queryByText("Off. Claude Code is used only after you consent below.")).toBeNull();
+    expect(screen.getAllByRole("button", { name: "Review consent..." })).toHaveLength(1);
+    await user.click(screen.getByRole("button", { name: "Review consent..." }));
+    const dialog = within(await screen.findByRole("dialog"));
+    for (const name of ["Job text", "Basic profile", "Resume text"]) expect(dialog.getByLabelText(name)).toBeChecked();
+    await user.click(dialog.getByRole("button", { name: "Allow selected" }));
+    await waitFor(() => expect(count(b, "ai_consent_give")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "ai_consent_give")?.args).toEqual({
+      provider: "claude_code",
+      categories: ["job_text", "profile_basic", "resume_text"],
+    });
+  });
+
+  it("resumes_view_says_why_generate_is_gone_while_suspended", async () => {
+    for (const ai of [
+      aiWith({
+        claude_code: { available: true, path: "/opt/claude", consent: null, suspended: true },
+        enabled: { ollama: false, claude_code: true },
+      }),
+      aiWith({ external: [external({ suspended: true })], enabled: { ollama: false, claude_code: false, openai: true } }),
+    ]) {
+      resumeBackend({ resume_list: () => [], ai_status: () => ai });
+      const { user, unmount } = renderApp();
+      await go(user, "Resumes", "Resumes");
+      expect(await screen.findByRole("alert")).toHaveTextContent(`${SUSPENDED_LINE} Open the AI screen to review it.`);
+      expect(screen.queryByRole("button", { name: "Generate" })).toBeNull();
+      unmount();
+    }
+  });
+
+  it("a_suspended_provider_that_is_off_says_nothing_on_resumes", async () => {
+    resumeBackend({
+      resume_list: () => [],
+      ai_status: () => aiWith({ external: [external({ suspended: true })] }),
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    await screen.findByText("No generated resume for this job yet.");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("the_not_available_list_has_no_controls", async () => {
+    backend({ ai_status: () => AI_OFF });
+    const { user } = renderApp();
+    await go(user, "AI", /AI/);
+    const section = within(await screen.findByRole("region", { name: "Not available" }));
+    expect(section.getByText("Vertex AI: not supported.")).toBeInTheDocument();
+    expect(section.getByText("Ollama cloud models: not supported.")).toBeInTheDocument();
+    expect(section.getByText(/Antigravity CLI/)).toBeInTheDocument();
+    expect(section.getByText(/free key: no personal data allowed/)).toBeInTheDocument();
+    expect(section.getByText(/Only localhost works/)).toBeInTheDocument();
+    expect(section.queryByText(/Sign in with ChatGPT/)).toBeNull();
+    for (const role of ["button", "checkbox", "textbox", "link"]) expect(section.queryByRole(role)).toBeNull();
+  });
+
+  it("resumes_view_counts_a_hosted_provider_as_a_backend", async () => {
+    const ready = external({ available: true, reason: null, consent: ["job_text", "profile_basic", "resume_text"] });
+    const on = { ollama: false, claude_code: false, openai: true };
+    resumeBackend({ resume_list: () => [], ai_status: () => aiWith({ external: [ready], enabled: on }) });
+    const first = renderApp();
+    await go(first.user, "Resumes", "Resumes");
+    expect(await screen.findByRole("button", { name: "Generate" })).toBeInTheDocument();
+    first.unmount();
+
+    for (const row of [{ ...ready, runs_job_text: false }, { ...ready, consent: null }, { ...ready, available: false }]) {
+      resumeBackend({ resume_list: () => [], ai_status: () => aiWith({ external: [row], enabled: on }) });
+      const { user, unmount } = renderApp();
+      await go(user, "Resumes", "Resumes");
+      await screen.findByText("No generated resume for this job yet.");
+      expect(screen.queryByRole("button", { name: "Generate" })).toBeNull();
+      unmount();
+    }
+  });
+
   it("full_consent_asks_for_nothing_more", async () => {
     consentBackend(["job_text", "profile_basic", "resume_text"]);
     const { user } = renderApp();
@@ -782,7 +1012,7 @@ describe("ai", () => {
   it("ai_use_automatic_clears_the_claude_path", async () => {
     const b = backend({
       ai_status: () =>
-        aiWith({ claude_code: { available: true, path: "/opt/claude", consent: null } }),
+        aiWith({ claude_code: { available: true, path: "/opt/claude", consent: null, suspended: false } }),
       ai_clear_claude_path: () => undefined,
     });
     const { user } = renderApp();
@@ -929,13 +1159,13 @@ describe("data", () => {
     const info = { path: "/home/me/jobpilot/backups/manual-1", created_at: "2026-11-01T10:00:00Z", schema_version: 5 };
     let restored = false;
     const on = aiWith({
-      claude_code: { available: true, path: "/opt/claude", consent: ["job_text", "profile_basic", "resume_text"] },
+      claude_code: { available: true, path: "/opt/claude", consent: ["job_text", "profile_basic", "resume_text"], suspended: false },
       enabled: { ollama: true, claude_code: true },
       order: ["ollama", "claude_code"],
     });
     // As core leaves it: consent revoked, and Claude Code switched off with it.
     const off = aiWith({
-      claude_code: { available: true, path: "/opt/claude", consent: null },
+      claude_code: { available: true, path: "/opt/claude", consent: null, suspended: false },
       enabled: { ollama: true, claude_code: false },
       order: ["ollama", "claude_code"],
     });

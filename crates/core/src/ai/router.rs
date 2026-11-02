@@ -9,6 +9,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use super::claude_code::ClaudeCode;
+use super::consent::ConsentState;
 use super::net::MAX_RETRY_WAIT;
 use super::noai::NoAi;
 use super::ollama::{DEFAULT_URL, Ollama};
@@ -31,6 +32,7 @@ const QUOTA_EXHAUSTED: &str = "quota_exhausted";
 const PROMPT_TOO_LARGE: &str = "prompt_too_large";
 const CONSENT: &str = "consent";
 const CONSENT_NEEDED: &str = "consent_needed";
+const CONSENT_SUSPENDED: &str = "consent_suspended";
 const PROVIDER_UNAVAILABLE: &str = "provider_unavailable";
 const NO_MODEL_SET: &str = "no_model_set";
 const MODEL_NOT_INSTALLED: &str = "model_not_installed";
@@ -427,6 +429,7 @@ fn after_skip<T>(task: &Task<'_>, declaration: &Declaration, reason: &str) -> St
     match reason {
         PROMPT_TOO_LARGE => Step::Manual(PROMPT_TOO_LARGE),
         CONSENT if unfit(task, declaration).is_none() => Step::Manual(CONSENT_NEEDED),
+        CONSENT_SUSPENDED if unfit(task, declaration).is_none() => Step::Manual(CONSENT_SUSPENDED),
         _ => Step::Next,
     }
 }
@@ -437,7 +440,7 @@ fn weight(reason: &str) -> u8 {
     match reason {
         PROVIDER_UNAVAILABLE | NO_MODEL_SET | MODEL_NOT_INSTALLED | "no_key" | "no_api_model"
         | "cli_too_old" => 0,
-        CONSENT_NEEDED => 1,
+        CONSENT_NEEDED | CONSENT_SUSPENDED => 1,
         _ => 2,
     }
 }
@@ -485,7 +488,8 @@ fn is_external(declaration: &Declaration) -> bool {
 ///
 /// 1. Owner decisions: `ProviderId` is the allow-list, so nothing ineligible constructs.
 /// 2. Ollama needs a confirmed local model, and consent cannot stand in for one. Everything
-///    else needs a consent record covering every category of the task.
+///    else needs a consent record, given under this build's register text, covering every
+///    category of the task.
 /// 3. Mode: every task in 0.2 is `reviewed`, so there is nothing to refuse. `TaskSpec` gains
 ///    a mode with the first `unreviewed` task.
 /// 4. Every required capability is declared. Absent means false, so this fails closed, and
@@ -495,11 +499,14 @@ fn is_external(declaration: &Declaration) -> bool {
 /// 5. Availability, in `try_provider`.
 async fn ineligible(task: &Task<'_>, declaration: &Declaration) -> Result<Option<String>> {
     if is_external(declaration) {
-        let granted = consent::active(task.db, &declaration.id.to_string()).await?;
-        let covered =
-            granted.is_some_and(|granted| task.spec.categories.iter().all(|c| granted.contains(c)));
-        if !covered {
-            return Ok(Some(CONSENT.into()));
+        match consent::state(task.db, &declaration.id.to_string()).await? {
+            ConsentState::None => return Ok(Some(CONSENT.into())),
+            ConsentState::Suspended(_) => return Ok(Some(CONSENT_SUSPENDED.into())),
+            ConsentState::Active(granted) => {
+                if !task.spec.categories.iter().all(|c| granted.contains(c)) {
+                    return Ok(Some(CONSENT.into()));
+                }
+            }
         }
     } else if !declaration.local {
         return Ok(Some("model_not_local".into()));
@@ -509,20 +516,21 @@ async fn ineligible(task: &Task<'_>, declaration: &Declaration) -> Result<Option
 
 /// Check 4: what the provider cannot do for this task, whatever the user allows.
 fn unfit(task: &Task<'_>, declaration: &Declaration) -> Option<String> {
-    let declares = |capability| declaration.capabilities.contains(&capability);
-    if carries_untrusted_text(task.spec) && !declares(Capability::NoTools) {
-        return Some(code(&Capability::NoTools));
-    }
-    let missing = task
-        .spec
-        .required
-        .iter()
-        .find(|capability| !declares(**capability))
-        .map(code);
+    let missing = lacking(task.spec, &declaration.capabilities);
     if missing.is_none() && task.tokens > declaration.context_limit {
         return Some(PROMPT_TOO_LARGE.into());
     }
     missing
+}
+
+/// The capability a spec needs that `capabilities` leaves out, as a reason code. The consent
+/// screen reads this too, so it and the router cannot differ on what a provider runs.
+pub(super) fn lacking(spec: &TaskSpec, capabilities: &[Capability]) -> Option<String> {
+    if carries_untrusted_text(spec) && !capabilities.contains(&Capability::NoTools) {
+        return Some(code(&Capability::NoTools));
+    }
+    let missing = spec.required.iter().find(|c| !capabilities.contains(c));
+    missing.map(code)
 }
 
 /// Ends `work` at the timeout or within one poll of the cancel, whichever is first.

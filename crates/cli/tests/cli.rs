@@ -700,6 +700,145 @@ async fn consent_give_then_revoke_writes_audit_rows() {
     );
 }
 
+#[test]
+fn consent_show_says_what_is_sent_for_each_provider() {
+    let (_dir, home) = fresh_home();
+    for (name, words) in [
+        ("openai", "Services Agreement 4.2"),
+        ("anthropic", "Customer Content"),
+        ("google", "billing on"),
+        ("openrouter", "Prompt logging"),
+        ("endpoint", "up to that server"),
+        ("gemini_cli", "free Gemini API key"),
+        ("codex_cli", "cannot prove it has no tools"),
+        ("claude_code", "Consumer Terms"),
+    ] {
+        let output = ok(&home, &["ai", "consent", "show", name]);
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains(words), "{name}: {text}");
+        assert!(text.contains("draft_resume"), "{name}: {text}");
+        assert!(text.contains("terms read 2026-11-01"), "{name}: {text}");
+    }
+
+    let shown = stdout_json(&run(
+        &home,
+        &["ai", "consent", "show", "codex_cli", "--json"],
+    ));
+    assert_eq!(shown["key"], "codex_cli/cli_login");
+    assert_eq!(shown["tasks"][0]["skipped_because"], "no_tools");
+
+    let local = run(&home, &["ai", "consent", "show", "ollama"]);
+    assert!(!local.status.success());
+    let text = stderr_text(&local);
+    assert!(text.starts_with("error[validation]"), "{text}");
+    assert!(!text.contains("claude_code only"), "{text}");
+}
+
+#[test]
+fn consent_show_with_a_job_prints_the_prompt() {
+    let (_dir, home) = fresh_home();
+    ok(&home, &["kb", "add", "note", "Shipped the Rust compiler"]);
+    let posting = home.parent().unwrap().join("posting.txt");
+    std::fs::write(&posting, "We need a Rust engineer.").unwrap();
+    let file = posting.to_str().unwrap();
+    ok(&home, &["job", "paste", "Rust role", "--file", file]);
+    let jobs = stdout_json(&run(&home, &["job", "list", "--json"]));
+    let id = jobs[0]["id"].as_str().unwrap();
+
+    let output = ok(&home, &["ai", "consent", "show", "openai", "--job", id]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("<<<UNTRUSTED_POSTING>>>"), "{text}");
+    assert!(text.contains("Shipped the Rust compiler"), "{text}");
+}
+
+#[tokio::test]
+async fn consent_give_needs_attest_for_google() {
+    let (_dir, home) = fresh_home();
+    let args = [
+        "ai",
+        "consent",
+        "give",
+        "google",
+        "--categories",
+        "job_text",
+    ];
+    let refused = run(&home, &args);
+    assert!(!refused.status.success());
+    let text = stderr_text(&refused);
+    assert!(text.contains("billing on"), "{text}");
+    assert!(text.contains("logged for a limited period"), "{text}");
+    assert!(text.contains("--attest"), "{text}");
+    assert!(text.contains("error[refused]"), "{text}");
+
+    let mut attested = args.to_vec();
+    attested.push("--attest");
+    ok(&home, &attested);
+
+    let db = Db::open(&AppPaths::new(&home)).await.unwrap();
+    let given = jobpilot_core::ai::consent::active(&db, "google/paid_key").await;
+    db.close().await;
+    assert_eq!(given.unwrap().unwrap().len(), 1);
+    ok(&home, &["ai", "consent", "revoke", "google"]);
+}
+
+#[test]
+fn panel_refuses_new_ai_commands() {
+    let (_dir, home) = fresh_home();
+    let panel = [("JOBPILOT_PANEL", "1")];
+    for args in [
+        vec!["ai", "enable", "openai"],
+        vec!["ai", "disable", "openai"],
+        vec!["ai", "order", "openai"],
+        vec![
+            "ai",
+            "consent",
+            "give",
+            "openai",
+            "--categories",
+            "job_text",
+        ],
+    ] {
+        let refused = run_env(&home, &args, &panel);
+        assert!(!refused.status.success(), "{args:?}");
+        assert!(stderr_text(&refused).contains("panel_refused"), "{args:?}");
+    }
+    for args in [
+        vec!["ai", "consent", "show", "openai"],
+        vec!["ai", "consent", "revoke", "openai"],
+    ] {
+        let allowed = run_env(&home, &args, &panel);
+        assert!(allowed.status.success(), "{args:?}");
+    }
+}
+
+#[test]
+fn every_provider_shows_in_status() {
+    let (_dir, home) = fresh_home();
+    let env = [("JOBPILOT_CLAUDE_BIN", "not-a-path")];
+    let shown = run_env(&home, &["ai", "status"], &env);
+    let text = String::from_utf8_lossy(&shown.stdout);
+    for label in [
+        "OpenAI",
+        "Anthropic",
+        "Google Gemini",
+        "OpenRouter",
+        "Codex CLI",
+    ] {
+        assert!(text.contains(label), "{label}: {text}");
+    }
+    assert!(
+        run_env(&home, &["ai", "enable", "openrouter"], &env)
+            .status
+            .success()
+    );
+    let shown = run_env(&home, &["status"], &env);
+    let text = String::from_utf8_lossy(&shown.stdout);
+    assert!(text.contains("OpenRouter"), "{text}");
+    assert!(!text.contains("Codex CLI"), "only what is on: {text}");
+    let json = stdout_json(&run_env(&home, &["status", "--json"], &env));
+    assert_eq!(json["ai"]["external"].as_array().unwrap().len(), 7);
+}
+
 #[tokio::test]
 async fn status_and_profile_show_never_make_a_key() {
     let (_dir, home) = fresh_home();

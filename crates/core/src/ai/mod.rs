@@ -13,15 +13,18 @@ use serde::{Deserialize, Serialize};
 use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::hardware::{self, Hardware};
-use crate::settings;
+use crate::{secrets, settings};
 use claude_code::ClaudeCode;
+use consent::ConsentState;
 use ollama::OllamaStatus;
+use register::ProviderKind;
 
 pub mod claude_code;
 pub mod consent;
 pub mod net;
 pub mod noai;
 pub mod ollama;
+pub mod register;
 pub mod router;
 pub mod validate;
 
@@ -154,12 +157,36 @@ pub fn spec(task: TaskType) -> &'static TaskSpec {
 }
 
 /// The owner-decision allow-list: a provider the decisions leave out has no variant.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderId {
     Ollama,
     ClaudeCode,
     NoAi,
+    #[serde(rename = "openai")]
+    OpenAi,
+    Anthropic,
+    Google,
+    #[serde(rename = "openrouter")]
+    OpenRouter,
+    Endpoint,
+    GeminiCli,
+    CodexCli,
+}
+
+impl ProviderId {
+    pub const ALL: [ProviderId; 10] = [
+        ProviderId::Ollama,
+        ProviderId::ClaudeCode,
+        ProviderId::NoAi,
+        ProviderId::OpenAi,
+        ProviderId::Anthropic,
+        ProviderId::Google,
+        ProviderId::OpenRouter,
+        ProviderId::Endpoint,
+        ProviderId::GeminiCli,
+        ProviderId::CodexCli,
+    ];
 }
 
 /// This text is the `consent.provider` value, so it names the sign-in method too.
@@ -169,6 +196,13 @@ impl fmt::Display for ProviderId {
             ProviderId::Ollama => "ollama",
             ProviderId::ClaudeCode => "claude_code/cli_login",
             ProviderId::NoAi => "no_ai",
+            ProviderId::OpenAi => "openai/api_key",
+            ProviderId::Anthropic => "anthropic/api_key",
+            ProviderId::Google => "google/paid_key",
+            ProviderId::OpenRouter => "openrouter/api_key",
+            ProviderId::Endpoint => "endpoint/loopback",
+            ProviderId::GeminiCli => "gemini_cli/cli_login",
+            ProviderId::CodexCli => "codex_cli/cli_login",
         })
     }
 }
@@ -271,12 +305,35 @@ pub struct ClaudeStatus {
     pub path: Option<String>,
     /// The categories the active consent record allows, if there is one.
     pub consent: Option<Vec<DataCategory>>,
+    /// A record exists, given under other register text, so `consent` is `None`.
+    pub suspended: bool,
+}
+
+/// One external provider on the AI screen. Built by a table walk that never touches the
+/// keychain or the network.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalStatus {
+    pub name: String,
+    pub label: String,
+    pub kind: ProviderKind,
+    pub available: bool,
+    pub reason: Option<String>,
+    pub model: Option<String>,
+    pub key_stored: bool,
+    pub path: Option<String>,
+    pub consent: Option<Vec<DataCategory>>,
+    pub suspended: bool,
+    /// It can carry a posting: it declares what the drafting tasks require.
+    pub runs_job_text: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AiStatus {
     pub ollama: OllamaStatus,
     pub claude_code: ClaudeStatus,
+    /// Every provider but Ollama and Claude Code, which have their own sections.
+    pub external: Vec<ExternalStatus>,
+    pub register_date: String,
     pub hardware: Hardware,
     pub order: Vec<String>,
     pub enabled: serde_json::Value,
@@ -285,7 +342,94 @@ pub struct AiStatus {
 }
 
 /// The provider names the settings accept.
-pub const PROVIDER_NAMES: &[&str] = &["ollama", "claude_code"];
+pub const PROVIDER_NAMES: &[&str] = &[
+    "ollama",
+    "claude_code",
+    "openai",
+    "anthropic",
+    "google",
+    "openrouter",
+    "endpoint",
+    "gemini_cli",
+    "codex_cli",
+];
+
+/// What one completion task sends to a provider, or why it never runs there.
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskSharing {
+    pub task: TaskType,
+    pub categories: Vec<DataCategory>,
+    pub runs: bool,
+    pub skipped_because: Option<String>,
+}
+
+/// What the consent screen shows for one provider. There is no verdict: the owner decisions
+/// govern what ships, and no screen re-raises a vendor's.
+#[derive(Debug, Clone, Serialize)]
+pub struct Sharing {
+    pub name: String,
+    pub label: String,
+    pub key: String,
+    pub destination: String,
+    pub path: Option<String>,
+    pub tasks: Vec<TaskSharing>,
+    pub data_use: String,
+    pub terms_date: String,
+    pub attestation: Option<String>,
+    pub suspended: bool,
+    /// The categories of an active or a suspended record, so a review starts ticked.
+    pub given: Option<Vec<DataCategory>>,
+}
+
+/// `Embed` is local only, so it never reaches a consent screen.
+const COMPLETION_TASKS: [TaskType; 4] = [
+    TaskType::ParseJob,
+    TaskType::DraftResume,
+    TaskType::DraftCoverLetter,
+    TaskType::ClassifyAnswer,
+];
+
+pub async fn sharing(db: &Db, name: &str) -> Result<Sharing> {
+    let info = register::info(name)
+        .ok_or_else(|| Error::Validation("consent does not apply to this provider".into()))?;
+    let key = info.id.to_string();
+    let state = consent::state(db, &key).await?;
+    let suspended = matches!(state, ConsentState::Suspended(_));
+    let given = match state {
+        ConsentState::None => None,
+        ConsentState::Active(categories) | ConsentState::Suspended(categories) => Some(categories),
+    };
+    let tasks = COMPLETION_TASKS.map(|task| {
+        let spec = spec(task);
+        let skipped_because = router::lacking(spec, info.capabilities);
+        TaskSharing {
+            task,
+            categories: spec.categories.to_vec(),
+            runs: skipped_because.is_none(),
+            skipped_because,
+        }
+    });
+    let path = match info.id {
+        ProviderId::ClaudeCode => ClaudeCode::locate_in(db, None)
+            .await
+            .ok()
+            .map(|claude| claude.path().display().to_string()),
+        _ => None,
+    };
+    Ok(Sharing {
+        name: info.name.into(),
+        label: info.label.into(),
+        destination: info.destination.into(),
+        path,
+        tasks: tasks.into(),
+        data_use: info.data_use.into(),
+        terms_date: register::date_read(&key).unwrap_or_else(register::register_date),
+        attestation: info.attestation.map(str::to_string),
+        suspended,
+        given,
+        key,
+    })
+}
 
 async fn text_setting(db: &Db, key: &str) -> Result<Option<String>> {
     let value = settings::get(db, key).await?;
@@ -297,14 +441,18 @@ async fn text_setting(db: &Db, key: &str) -> Result<Option<String>> {
 /// every enabled provider it leaves out, because `ai.order` is only written when the user
 /// reorders and enabling a provider must be enough to route it. The consent check still
 /// decides whether an external provider runs. A provider that is off stays listed if the
-/// order names it; the router passes over it. Ollama defaults on, Claude off, because data
-/// leaves the machine.
+/// order names it; the router passes over it. Ollama defaults on, every other provider off,
+/// because data leaves the machine.
 pub(crate) async fn provider_settings(db: &Db) -> Result<(Vec<String>, serde_json::Value)> {
     let stored = settings::get(db, "ai.enabled").await?.unwrap_or_default();
-    let enabled = serde_json::json!({
-        "ollama": stored["ollama"].as_bool().unwrap_or(true),
-        "claude_code": stored["claude_code"].as_bool().unwrap_or(false),
-    });
+    let enabled: serde_json::Map<String, serde_json::Value> = PROVIDER_NAMES
+        .iter()
+        .map(|name| {
+            let on = stored[*name].as_bool().unwrap_or(*name == "ollama");
+            ((*name).to_string(), serde_json::Value::Bool(on))
+        })
+        .collect();
+    let enabled = serde_json::Value::Object(enabled);
     let stored: Option<Vec<String>> = settings::get(db, "ai.order")
         .await?
         .and_then(|value| serde_json::from_value(value).ok());
@@ -319,7 +467,36 @@ pub(crate) async fn provider_settings(db: &Db) -> Result<(Vec<String>, serde_jso
     Ok((order, enabled))
 }
 
-/// What the screen and the CLI show: availability of both providers, hardware, and the
+/// Every external provider but Claude Code, from the table.
+// ponytail: `available` reads `not_built` until a provider's adapter lands, Tasks 3 to 8.
+async fn external_status(db: &Db) -> Result<Vec<ExternalStatus>> {
+    let stored = secrets::names(db).await?;
+    let mut rows = Vec::new();
+    for info in register::PROVIDERS {
+        if info.id == ProviderId::ClaudeCode {
+            continue;
+        }
+        let state = consent::state(db, &info.id.to_string()).await?;
+        let suspended = matches!(state, ConsentState::Suspended(_));
+        rows.push(ExternalStatus {
+            name: info.name.into(),
+            label: info.label.into(),
+            kind: info.kind,
+            available: false,
+            reason: Some("not_built".into()),
+            model: text_setting(db, &format!("ai.model.{}", info.name)).await?,
+            key_stored: stored.contains(&format!("ai-key-{}", info.name)),
+            path: None,
+            consent: state.allowed(),
+            suspended,
+            runs_job_text: router::lacking(spec(TaskType::DraftResume), info.capabilities)
+                .is_none(),
+        });
+    }
+    Ok(rows)
+}
+
+/// What the screen and the CLI show: availability of every provider, hardware, and the
 /// settings the router reads. Probes loopback Ollama and runs `claude --version`; sends no
 /// text and needs no consent.
 pub async fn status(db: &Db) -> Result<AiStatus> {
@@ -329,23 +506,29 @@ pub async fn status(db: &Db) -> Result<AiStatus> {
             reason: "not_loopback".into(),
         },
     };
-    let consent = consent::active(db, &ProviderId::ClaudeCode.to_string()).await?;
+    let state = consent::state(db, &ProviderId::ClaudeCode.to_string()).await?;
+    let suspended = matches!(state, ConsentState::Suspended(_));
+    let consent = state.allowed();
     let claude_code = match ClaudeCode::locate_in(db, None).await {
         Ok(claude) => ClaudeStatus {
             available: matches!(claude.available().await, Availability::Available),
             path: Some(claude.path().display().to_string()),
             consent,
+            suspended,
         },
         Err(_) => ClaudeStatus {
             available: false,
             path: None,
             consent,
+            suspended,
         },
     };
     let (order, enabled) = provider_settings(db).await?;
     Ok(AiStatus {
         ollama,
         claude_code,
+        external: external_status(db).await?,
+        register_date: register::register_date(),
         hardware: hardware::detect(),
         order,
         enabled,
@@ -358,9 +541,10 @@ fn known(name: &str) -> Result<()> {
     if PROVIDER_NAMES.contains(&name) {
         return Ok(());
     }
-    Err(Error::Validation(
-        "a provider is ollama or claude_code".into(),
-    ))
+    Err(Error::Validation(format!(
+        "a provider is one of {}",
+        PROVIDER_NAMES.join(", ")
+    )))
 }
 
 /// Providers in the order the router tries them. Each name once.

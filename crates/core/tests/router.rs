@@ -554,6 +554,44 @@ async fn external_provider_without_consent_is_skipped_and_consent_unlocks_it() {
 }
 
 #[tokio::test]
+async fn a_suspended_consent_skips_and_says_so() {
+    let (_tmp, db) = setup().await;
+    consent::give(&db, CLAUDE, &[DataCategory::JobText], "2026-11-01", "gui")
+        .await
+        .unwrap();
+    sqlx::query("UPDATE consent SET register_row = 'older words'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let claude = Mock::claude(vec![text(JOB)]);
+    let counters = claude.counters();
+    let router = Router::with_providers(vec![claude.boxed()]);
+
+    let outcome = parse_job(&router, &db).await;
+
+    assert_eq!(outcome, manual("consent_suspended"));
+    assert_eq!(counters.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(skip_reasons(&db, CLAUDE).await, ["consent_suspended"]);
+}
+
+/// A provider that could never run the task must not send the user to re-confirm for it.
+#[tokio::test]
+async fn a_suspended_consent_says_so_only_when_it_would_unlock_something() {
+    let (_tmp, db) = setup().await;
+    consent::give(&db, CLAUDE, &[DataCategory::JobText], "2026-11-01", "gui")
+        .await
+        .unwrap();
+    sqlx::query("UPDATE consent SET register_row = ''")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let mut mock = Mock::claude(vec![text(JOB)]);
+    mock.declaration.capabilities.clear();
+    let router = Router::with_providers(vec![mock.boxed()]);
+    assert_eq!(parse_job(&router, &db).await, manual("no_ai"));
+}
+
+#[tokio::test]
 async fn fallback_never_widens_consent() {
     let (_tmp, db) = setup().await;
     let job_text = [DataCategory::JobText];
@@ -1649,6 +1687,11 @@ async fn runs_and_consent_reach_the_export() {
     let data: serde_json::Value = serde_json::from_str(&text).unwrap();
 
     assert_eq!(data["tables"]["consent"][0]["provider"], CLAUDE);
+    let row = data["tables"]["consent"][0]["register_row"].as_str();
+    assert!(
+        row.is_some_and(|row| row.contains("Claude Code")),
+        "{row:?}"
+    );
     assert_eq!(data["tables"]["task_runs"][0]["outcome"], "manual_required");
 }
 
