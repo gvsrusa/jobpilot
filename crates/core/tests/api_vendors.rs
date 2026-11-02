@@ -341,6 +341,38 @@ async fn a_spend_cap_400_is_quota_exhausted() {
 }
 
 #[tokio::test]
+async fn each_vendors_words_count_only_on_its_own_wire() {
+    const CAP: &str = "You have reached your specified API usage limits. Access returns on x.";
+    let spend = [
+        json!({"error": {"code": "enforced_spend_limit_reached"}}),
+        json!({"error": {"message": CAP}}),
+    ];
+    let bad_key = json!({"error": {"details": [{"reason": "API_KEY_INVALID"}]}});
+    for body in &spend {
+        for status in [400, 429] {
+            let fake = Fake::start(vec![(MESSAGES, Canned::json(status, body))]);
+            let error = complete(&anthropic(&fake)).await.unwrap_err();
+            assert_eq!(error.to_string(), "refused: quota_exhausted", "{body}");
+
+            let fake = Fake::start(vec![(GENERATE, Canned::json(status, body))]);
+            let error = complete(&google(&fake)).await.unwrap_err();
+            let expected = if status == 400 {
+                "failed: http_400"
+            } else {
+                "rate limited"
+            };
+            assert_eq!(error.to_string(), expected, "{status} {body}");
+        }
+    }
+    let fake = Fake::start(vec![(MESSAGES, Canned::json(400, &bad_key))]);
+    let error = complete(&anthropic(&fake)).await.unwrap_err();
+    assert_eq!(error.to_string(), "failed: http_400");
+    let fake = Fake::start(vec![(GENERATE, Canned::json(400, &bad_key))]);
+    let error = complete(&google(&fake)).await.unwrap_err();
+    assert_eq!(error.to_string(), "refused: auth_failed");
+}
+
+#[tokio::test]
 async fn an_anthropic_reply_with_no_text_is_bad_reply() {
     let thinking_only = json!([{"type": "thinking", "thinking": "ZXQ"}]);
     let error = json!({"type": "error", "error": {"message": "ZXQ-VENDOR-TEXT"}});

@@ -296,9 +296,9 @@ function SearchSection() {
         </Button>
         {plan.data && (
           <span className="pb-1.5 text-xs text-muted-foreground">
-            {plan.data.claude_calls > 0
-              ? `Up to ${plan.data.claude_calls} Claude call${plan.data.claude_calls === 1 ? "" : "s"}, limit 20`
-              : "No Claude calls"}
+            {plan.data.external_calls > 0
+              ? `Up to ${plan.data.external_calls} paid or subscription call${plan.data.external_calls === 1 ? "" : "s"}, limit 20`
+              : "No outside calls"}
           </span>
         )}
       </form>

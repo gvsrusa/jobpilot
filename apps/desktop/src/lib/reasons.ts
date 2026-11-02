@@ -36,7 +36,7 @@ const REASONS: [word: string, text: string][] = [
   ],
   [
     "provider_unavailable",
-    "An AI provider is on but cannot be reached. Check the AI screen: start Ollama, or point JobPilot at claude",
+    "An AI provider is on but cannot be reached. Check it on the AI screen, or write this one yourself.",
   ],
   [
     "no_model_set",

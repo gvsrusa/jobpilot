@@ -91,10 +91,11 @@ pub enum MemoryCommand {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
-    /// Asks a model to double-check classes (up to 20 questions, shown first when Claude is
-    /// used), seals what a raise left plain, and embeds the questions with no vector yet.
+    /// Asks a model to double-check classes (up to 20 questions, shown first when a paid or
+    /// subscription provider is used), seals what a raise left plain, and embeds the questions
+    /// with no vector yet.
     Refresh {
-        /// Go ahead with the Claude calls the count above announces.
+        /// Go ahead with the calls the count above announces.
         #[arg(long)]
         yes: bool,
     },
@@ -282,21 +283,24 @@ pub async fn memory(db: &Db, command: MemoryCommand) -> Result<Output> {
         MemoryCommand::Refresh { yes } => {
             let router = Router::from_settings(db).await?;
             let plan = memory::refresh_plan(db, &router).await?;
-            if plan.claude_calls > 0 && !yes {
+            if plan.external_calls > 0 && !yes {
                 let text = format!(
-                    "This will make up to {} Claude calls, limit {}. Run `jobpilot memory \
-                     refresh --yes` to go ahead.",
-                    plan.claude_calls,
+                    "This will make up to {} paid or subscription calls, limit {}. Run \
+                     `jobpilot memory refresh --yes` to go ahead.",
+                    plan.external_calls,
                     memory::CLASSIFY_BATCH
                 );
-                let shown = json!({ "claude_calls": plan.claude_calls, "pending": plan.pending });
+                let shown = json!({
+                    "external_calls": plan.external_calls,
+                    "pending": plan.pending,
+                });
                 return out(shown, text);
             }
-            if plan.claude_calls > 0 {
+            if plan.external_calls > 0 {
                 // Before the run, on stderr so a JSON reader still gets clean stdout.
                 eprintln!(
-                    "Making up to {} Claude calls, limit {}.",
-                    plan.claude_calls,
+                    "Making up to {} paid or subscription calls, limit {}.",
+                    plan.external_calls,
                     memory::CLASSIFY_BATCH
                 );
             }
@@ -320,7 +324,7 @@ pub async fn memory(db: &Db, command: MemoryCommand) -> Result<Output> {
                 text.push_str("\nNo embedding model is set; search uses text.");
             }
             let mut shown = serde_json::to_value(&done).unwrap_or_default();
-            shown["claude_calls"] = json!(plan.claude_calls);
+            shown["external_calls"] = json!(plan.external_calls);
             out(shown, text)
         }
     }

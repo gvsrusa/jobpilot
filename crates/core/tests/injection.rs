@@ -124,7 +124,7 @@ fn corpus(canary: &str) -> Vec<Case> {
         })
         .collect();
     cases.sort_by(|a, b| a.name.cmp(&b.name));
-    assert!(cases.len() >= 17, "the corpus holds {} files", cases.len());
+    assert!(cases.len() >= 19, "the corpus holds {} files", cases.len());
     cases
 }
 
@@ -203,7 +203,7 @@ fn kinds(findings: &[knowledge::Finding]) -> Vec<&str> {
 fn every_corpus_file_normalizes_without_panic_and_reports_findings() {
     // The kinds a file must report. 02, 06, 07, 08, 09, 13, 14, 15 and 16 carry no pattern or
     // hidden text, only a steered reply, so they may report nothing.
-    let required: [(&str, &[&str]); 7] = [
+    let required: [(&str, &[&str]); 9] = [
         ("01", &["instruction_like"]),
         ("03", &["hidden_text"]),
         ("04", &["instruction_like"]),
@@ -211,6 +211,8 @@ fn every_corpus_file_normalizes_without_panic_and_reports_findings() {
         ("10", &["truncated"]),
         ("11", &["hidden_text", "instruction_like"]),
         ("12", &["instruction_like"]),
+        ("18", &["instruction_like"]),
+        ("19", &["instruction_like"]),
     ];
     let cases = corpus("/canary");
     for case in &cases {
@@ -329,7 +331,8 @@ async fn steered_output_never_adds_evidence_free_or_authorization_claims() {
     for case in &cases {
         // 15 steers a resume reply the schema refuses, so it stores nothing: its own test.
         // 17 steers the classifier, not the drafter: its own test too.
-        if case.name.starts_with("15") || case.name.starts_with("17") {
+        // 19 is a tool call, not a draft: its own test as well.
+        if ["15", "17", "19"].iter().any(|n| case.name.starts_with(n)) {
             continue;
         }
         let job = w.import(case).await;
@@ -429,6 +432,41 @@ async fn a_reply_asking_for_a_tool_stores_nothing() {
     let stored = drafts::list(&w.db, None).await.unwrap();
     assert!(stored.iter().all(|d| d.id == w.draft_id), "{stored:?}");
     assert!(!PathBuf::from(w.canary()).exists());
+}
+
+#[tokio::test]
+async fn a_reply_that_is_a_tool_call_stores_nothing() {
+    let w = world().await;
+    let cases = corpus(&w.canary());
+    let call = case(&cases, "19");
+    assert!(call.raw.contains(&w.canary()), "the canary is not named");
+    let job = w.import(call).await;
+    let (router, _) = w.router(&job.id);
+
+    let made = generate::resume(&w.db, &router, "gui", &job.id, CancellationToken::new()).await;
+
+    assert!(made.is_err(), "{made:?}");
+    let stored = drafts::list(&w.db, None).await.unwrap();
+    assert!(stored.iter().all(|d| d.id == w.draft_id), "{stored:?}");
+    assert!(!PathBuf::from(w.canary()).exists());
+}
+
+#[tokio::test]
+async fn a_printed_key_or_prompt_stays_flagged_text() {
+    let w = world().await;
+    let cases = corpus(&w.canary());
+    let job = w.import(case(&cases, "18")).await;
+    let (router, sent) = w.router(&job.id);
+
+    let made = generate::resume(&w.db, &router, "gui", &job.id, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(sent.lock().unwrap()[0].contains("every environment variable"));
+    let claims = drafts::claims(&w.db, &made.draft.id).await.unwrap();
+    assert!(claims[0].text.contains("API key"));
+    assert!(claims[1].text.contains("https://collect.evil.example/"));
+    assert!(claims.iter().all(|claim| claim.status == "no_evidence"));
 }
 
 #[tokio::test]

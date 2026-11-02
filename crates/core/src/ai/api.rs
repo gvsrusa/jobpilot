@@ -75,7 +75,8 @@ const QUOTA_WORDS: [&str; 3] = [
     "usage_limit",
 ];
 /// Anthropic's limit on a workspace's spend: the `error_code`, and the start of the message.
-/// Sent as a 400, so unlike `QUOTA_WORDS` these count there too.
+/// Sent as a 400, so unlike `QUOTA_WORDS` these count there too. Read on that wire alone, like
+/// `GOOGLE_BAD_KEY_WORD` on its own: a server on the chat wire can echo any text it was sent.
 const SPEND_CAP_WORDS: [&str; 2] = [
     "enforced_spend_limit_reached",
     "you have reached your specified api usage limits",
@@ -290,6 +291,7 @@ impl ApiProvider {
         // The status is the answer. A body too long to read just matches no word.
         let text = read_capped(response, MAX_ERROR_BODY).await;
         Err(classify_status(
+            self.wire,
             status.as_u16(),
             wait,
             &text.unwrap_or_default(),
@@ -628,15 +630,19 @@ pub(crate) async fn forget_key_of_replaced_endpoint(db: &Db, before: Option<&str
 
 /// A failed status as an error, matching the body only against fixed words so its text goes no
 /// further.
-pub(crate) fn classify_status(status: u16, retry_after: Option<Duration>, body: &[u8]) -> Error {
+fn classify_status(wire: Wire, status: u16, retry_after: Option<Duration>, body: &[u8]) -> Error {
     let text = String::from_utf8_lossy(body).to_ascii_lowercase();
     let holds = |words: &[&str]| words.iter().any(|word| text.contains(word));
     match status {
         401 | 403 => Error::Refused("auth_failed".into()),
         402 => Error::Refused("quota_exhausted".into()),
-        400 | 429 if holds(&SPEND_CAP_WORDS) => Error::Refused("quota_exhausted".into()),
+        400 | 429 if wire == Wire::Anthropic && holds(&SPEND_CAP_WORDS) => {
+            Error::Refused("quota_exhausted".into())
+        }
         429 if holds(&QUOTA_WORDS) => Error::Refused("quota_exhausted".into()),
-        400 if holds(&[GOOGLE_BAD_KEY_WORD]) => Error::Refused("auth_failed".into()),
+        400 if wire == Wire::Google && holds(&[GOOGLE_BAD_KEY_WORD]) => {
+            Error::Refused("auth_failed".into())
+        }
         404 => Error::Refused("model_not_found".into()),
         400 | 413 if holds(&OVERFLOW_WORDS) => Error::Refused("prompt_too_large".into()),
         429 | 503 | 529 => Error::RateLimited { retry_after },

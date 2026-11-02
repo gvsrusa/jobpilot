@@ -158,8 +158,8 @@ export type Answer = {
 
 export type QuestionRow = { question: Question; answers: Answer[] };
 
-/** At most 20 questions go to a model per press, and Claude is asked about each. */
-export type RefreshPlan = { pending: number; claude_calls: number };
+/** At most 20 questions go to a model per press, and an outside provider may be asked about each. */
+export type RefreshPlan = { pending: number; external_calls: number };
 
 /** `skipped`: no AI took the classifying, so classes are the rules'. */
 export type MemoryRefreshed = {
@@ -569,7 +569,7 @@ export const ipc = {
     invoke<MemoryHit[]>("memory_search", { query, limit }),
   /** What a press of Refresh would spend. Reads only. */
   memoryRefreshPlan: () => invoke<RefreshPlan>("memory_refresh_plan"),
-  /** Rust names the Claude count in its own dialog first, when any call is ahead. */
+  /** Rust names the count in its own dialog first, when any outside call is ahead. */
   memoryRefresh: () => invoke<MemoryRefreshed>("memory_refresh"),
 
   /** Rust opens the picker. Rejects with `cancelled` when the user closes it. */

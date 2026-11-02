@@ -1001,6 +1001,140 @@ fn resume_generate_export_writes_to_the_exports_folder() {
     assert_eq!(path.extension().unwrap(), "pdf");
 }
 
+/// The whole app with no provider: every switch off, no CLI to find, and a proxy that goes
+/// nowhere, so a stray request would fail a step here and not reach a host.
+#[tokio::test]
+async fn no_provider_works_end_to_end() {
+    let (dir, home) = fresh_home();
+    let empty = dir.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    let dead = "http://127.0.0.1:1";
+    let step = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_jobpilot"));
+        command
+            .args(args)
+            .env("JOBPILOT_HOME", &home)
+            .env("JOBPILOT_SECRET_SERVICE", "jobpilot-test")
+            .env("HOME", dir.path())
+            .env("USERPROFILE", dir.path())
+            .env("PATH", &empty)
+            .env("HTTP_PROXY", dead)
+            .env("HTTPS_PROXY", dead)
+            .env("http_proxy", dead)
+            .env("https_proxy", dead)
+            .env_remove("SHELL")
+            // A name that is not there: `ai status` must not find an installed `claude`.
+            .env("JOBPILOT_CLAUDE_BIN", "not-a-path")
+            .env_remove("JOBPILOT_GEMINI_BIN")
+            .env_remove("JOBPILOT_CODEX_BIN")
+            .current_dir(dir.path());
+        command.output().unwrap()
+    };
+    let json = |args: &[&str]| {
+        let mut all = args.to_vec();
+        all.push("--json");
+        let output = step(&all);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            stderr_text(&output)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+
+    assert_eq!(json(&["status"])["schema_version"], app_schema_version());
+    json(&["ai", "disable", "ollama"]);
+    let ai = json(&["ai", "status"]);
+    let enabled = ai["enabled"].as_object().unwrap();
+    assert!(!enabled.is_empty());
+    assert!(enabled.values().all(|on| on == false), "{ai}");
+
+    json(&["doc", "add", "Cover note", "--body", "zebra stripes"]);
+    assert_eq!(
+        json(&["doc", "search", "zebra"]).as_array().unwrap().len(),
+        1
+    );
+    json(&[
+        "profile",
+        "set",
+        "--name",
+        "Ada",
+        "--email",
+        "ada@example.com",
+    ]);
+    json(&["kb", "add", "experience", "Shipped the Rust compiler"]);
+    let posting = fixture("ollama_tags.json");
+    let job = json(&["job", "paste", "Rust role", "--file", &posting]);
+    let job = job["id"].as_str().unwrap();
+
+    let generated = step(&["resume", "generate", job]);
+    assert_eq!(generated.status.code(), Some(1));
+    let said = stderr_text(&generated);
+    assert!(said.starts_with("error[manual_required]"), "{said}");
+    assert!(said.contains("no_ai") || said.contains("No AI"), "{said}");
+
+    let app = json(&["app", "add", "--company", "Acme", "--role", "Dev"]);
+    let app = app["id"].as_str().unwrap();
+    json(&["app", "status", app, "applied", "--on", "2026-11-01"]);
+    json(&["memory", "add-question", "Why this job?"]);
+    assert_eq!(
+        json(&["memory", "search", "job"]).as_array().unwrap().len(),
+        1
+    );
+    json(&["analytics", "report"]);
+    assert!(json(&["backup", "create"])["path"].is_string());
+    assert!(json(&["data", "export"])["path"].is_string());
+
+    let db = Db::open(&AppPaths::new(&home)).await.unwrap();
+    let reasons: Vec<String> =
+        sqlx::query_scalar("SELECT coalesce(reason, outcome) FROM task_runs WHERE provider = ?")
+            .bind("no_ai")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert!(reasons.iter().any(|r| r == "no_ai"), "{reasons:?}");
+    let calls: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = 'ai_external_call'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(calls, 0, "nothing left the machine");
+    db.close().await;
+}
+
+#[test]
+fn a_wrong_stored_cli_path_is_named_in_status() {
+    let (dir, home) = fresh_home();
+    let file = if cfg!(windows) {
+        "gemini.cmd"
+    } else {
+        "gemini"
+    };
+    let wrong = dir.path().join("wrong").join(file);
+    std::fs::create_dir_all(&wrong).unwrap();
+    let env = [
+        ("PATH", ""),
+        ("JOBPILOT_GEMINI_BIN", ""),
+        ("JOBPILOT_CLAUDE_BIN", "not-a-path"),
+    ];
+    let args = ["ai", "cli-path", "gemini_cli", wrong.to_str().unwrap()];
+    let stored = run_env(&home, &args, &env);
+    assert!(stored.status.success(), "{}", stderr_text(&stored));
+
+    let status = stdout_json(&run_env(&home, &["ai", "status", "--json"], &env));
+    let rows = status["external"].as_array().unwrap();
+    let row = rows.iter().find(|row| row["name"] == "gemini_cli").unwrap();
+    assert_eq!(row["reason"], "wrong_path", "{row}");
+
+    let text = run_env(&home, &["ai", "status"], &env);
+    let text = String::from_utf8_lossy(&text.stdout).to_string();
+    assert!(
+        text.contains("the path set for it is not that program"),
+        "{text}"
+    );
+    assert!(!text.contains("wrong_path"), "{text}");
+}
+
 #[test]
 fn memory_refresh_with_no_ai_reports_skipped() {
     let (_dir, home) = fresh_home();
@@ -1046,13 +1180,13 @@ fn memory_refresh_prints_the_count_and_waits_for_yes() {
     let text = String::from_utf8_lossy(&asked.stdout);
     assert!(
         text.contains(
-            "This will make up to 3 Claude calls, limit 20. \
+            "This will make up to 3 paid or subscription calls, limit 20. \
              Run `jobpilot memory refresh --yes` to go ahead."
         ),
         "{text}"
     );
     let json = stdout_json(&run_env(&home, &["memory", "refresh", "--json"], &env));
-    assert_eq!(json["claude_calls"], 3);
+    assert_eq!(json["external_calls"], 3);
     let runs = stdout_json(&run(&home, &["agents", "list", "--json"]));
     assert!(runs.as_array().unwrap().is_empty(), "no run started");
 
@@ -1063,7 +1197,7 @@ fn memory_refresh_prints_the_count_and_waits_for_yes() {
     ));
     assert_eq!(done["classified"]["checked"], 3);
     assert_eq!(done["classified"]["raised"], 3);
-    assert_eq!(done["claude_calls"], 3, "the count it acted on");
+    assert_eq!(done["external_calls"], 3, "the count it acted on");
     let text = run_env(&home, &["memory", "refresh", "--yes"], &env);
     let text = String::from_utf8_lossy(&text.stdout);
     assert!(text.contains("Checked 0, raised 0, indexed 0"), "{text}");

@@ -115,11 +115,14 @@ export function AiView() {
 
   return (
     <div className="grid max-w-4xl gap-4">
-      <PageHeading>AI: Ollama and models</PageHeading>
+      <PageHeading>AI providers</PageHeading>
       <p className="text-sm">
         No AI is needed. JobPilot works with none. Local models run on this computer, so your data
-        stays here. Cloud models are off.
+        stays here. Ollama cloud models are off.
       </p>
+      {s && !Object.values(s.enabled).some(Boolean) && (
+        <p className="text-sm">JobPilot works without one. Tasks that need AI end with a manual path.</p>
+      )}
       <ErrorAlert
         error={
           ai.error ?? enable.error ?? setModels.error ?? setOrder.error ?? pickClaude.error ?? clearClaude.error ?? revoke.error ?? setUrl.error

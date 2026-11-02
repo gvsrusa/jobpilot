@@ -766,16 +766,29 @@ describe("career memory", () => {
     expect(await screen.findByText(/stay hidden until they can be sealed \(key_unavailable\)/)).toBeInTheDocument();
   });
 
-  it("refresh_shows_the_claude_count_before_the_press", async () => {
+  it("refresh_shows_the_external_count_before_the_press", async () => {
     const api = bank([], {
-      memory_refresh_plan: () => ({ pending: 3, claude_calls: 3 }),
+      memory_refresh_plan: () => ({ pending: 3, external_calls: 3 }),
     });
     const { user } = renderApp();
     await openMemory(user);
-    expect(await screen.findByText("Up to 3 Claude calls, limit 20")).toBeInTheDocument();
+    expect(await screen.findByText("Up to 3 paid or subscription calls, limit 20")).toBeInTheDocument();
     expect(api.calls.filter((c) => c.cmd === "memory_refresh")).toHaveLength(0);
     await user.click(screen.getByRole("button", { name: "Refresh index" }));
     await waitFor(() => expect(api.calls.filter((c) => c.cmd === "memory_refresh")).toHaveLength(1));
+  });
+
+  it("refresh_names_one_call_and_no_call_in_plain_words", async () => {
+    bank([], { memory_refresh_plan: () => ({ pending: 1, external_calls: 1 }) });
+    const first = renderApp();
+    await openMemory(first.user);
+    expect(await screen.findByText("Up to 1 paid or subscription call, limit 20")).toBeInTheDocument();
+    first.unmount();
+
+    bank([], { memory_refresh_plan: () => ({ pending: 2, external_calls: 0 }) });
+    const { user } = renderApp();
+    await openMemory(user);
+    expect(await screen.findByText("No outside calls")).toBeInTheDocument();
   });
 
   it("a_cleared_body_offers_no_show_and_no_approve", async () => {

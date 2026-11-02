@@ -138,7 +138,7 @@ static DRAFT_COVER_LETTER: TaskSpec = TaskSpec {
     categories: DRAFT_DATA,
     attempts: 2,
 };
-/// One attempt: a validation failure must not spend a second Claude call past the cap.
+/// One attempt: a validation failure must not spend a second paid call past the cap.
 static CLASSIFY_ANSWER: TaskSpec = TaskSpec {
     task: TaskType::ClassifyAnswer,
     schema: include_str!("../../schemas/classify_answer.json"),
@@ -154,7 +154,7 @@ static EMBED: TaskSpec = TaskSpec {
     attempts: 2,
 };
 
-/// Timeouts are not here: they come from `Declaration.timeout`, 180 s Claude, 300 s local.
+/// Timeouts are not here: they come from `Declaration.timeout`, per provider.
 pub fn spec(task: TaskType) -> &'static TaskSpec {
     match task {
         TaskType::ParseJob => &PARSE_JOB,
@@ -503,7 +503,8 @@ type CliRow = (bool, Option<String>, Option<String>, bool);
 /// an enabled one gets the login shell and the `--version` probe, which for Gemini includes its
 /// version floor. One discovery per row. An off CLI the folders do not show may still be one
 /// only the login shell finds, an nvm install under a GUI launch: it reads `not_searched`, and
-/// turning it on is what looks.
+/// turning it on is what looks. A stored path that names something else reads `wrong_path`, on
+/// or off: looking again cannot help until it changes.
 async fn cli_row(db: &Db, name: &str, enabled: bool) -> CliRow {
     let Some(spec) = child::spec_for(name) else {
         return (false, Some("not_built".into()), None, false);
@@ -515,7 +516,9 @@ async fn cli_row(db: &Db, name: &str, enabled: bool) -> CliRow {
     };
     let Ok(bin) = found else {
         let unsearched = !enabled && child::login_shell_may_find(spec);
-        let why = if unsearched {
+        let why = if child::stored_path_is_wrong(spec, db).await {
+            "wrong_path"
+        } else if unsearched {
             "not_searched"
         } else {
             "not_installed"

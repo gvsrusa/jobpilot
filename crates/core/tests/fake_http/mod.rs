@@ -54,6 +54,8 @@ impl Canned {
 type Seen = Arc<Mutex<Vec<(String, String, String)>>>;
 /// Path to its queue of replies.
 type Queues = Arc<Mutex<Vec<(&'static str, Vec<Canned>)>>>;
+/// Builds a reply from the JSON body of the request, for a server that reads what it was sent.
+type Answer = Arc<dyn Fn(&Value) -> Canned + Send + Sync>;
 
 pub struct Fake {
     pub url: String,
@@ -64,6 +66,19 @@ impl Fake {
     /// Routes sharing a path form a queue, served in order. The last reply repeats.
     /// A path with no route answers 404.
     pub fn start(routes: Vec<(&'static str, Canned)>) -> Fake {
+        Fake::serving(routes, None)
+    }
+
+    /// One path, answered by `answer` from each request's body. Any other path answers 404.
+    pub fn answering(
+        path: &'static str,
+        answer: impl Fn(&Value) -> Canned + Send + Sync + 'static,
+    ) -> Fake {
+        let unused = Canned::json(500, &Value::Null);
+        Fake::serving(vec![(path, unused)], Some(Arc::new(answer)))
+    }
+
+    fn serving(routes: Vec<(&'static str, Canned)>, answer: Option<Answer>) -> Fake {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let seen: Seen = Arc::default();
@@ -81,7 +96,8 @@ impl Fake {
                 let Ok(stream) = stream else { return };
                 let queues = queues.clone();
                 let log = log.clone();
-                std::thread::spawn(move || serve(stream, &queues, &log));
+                let answer = answer.clone();
+                std::thread::spawn(move || serve(stream, &queues, &log, answer.as_ref()));
             }
         });
         Fake { url, seen }
@@ -113,7 +129,7 @@ impl Fake {
     }
 }
 
-fn serve(mut stream: std::net::TcpStream, queues: &Queues, log: &Seen) {
+fn serve(mut stream: std::net::TcpStream, queues: &Queues, log: &Seen, answer: Option<&Answer>) {
     let mut raw = Vec::new();
     let mut buf = [0u8; 4096];
     let head_end = loop {
@@ -145,6 +161,7 @@ fn serve(mut stream: std::net::TcpStream, queues: &Queues, log: &Seen) {
     }
     let body = String::from_utf8_lossy(&raw[head_end..]).to_string();
     let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+    let parsed = answer.map(|_| serde_json::from_str(&body).unwrap_or(Value::Null));
     log.lock().unwrap().push((path.clone(), head, body));
 
     let canned = {
@@ -159,6 +176,10 @@ fn serve(mut stream: std::net::TcpStream, queues: &Queues, log: &Seen) {
                     queue[0].clone()
                 }
             })
+    };
+    let canned = match (canned, answer, parsed) {
+        (Some(_), Some(answer), Some(body)) => Some(answer(&body)),
+        (canned, ..) => canned,
     };
     let Some(canned) = canned else {
         let _ = stream.write_all(

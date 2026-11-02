@@ -16,6 +16,7 @@ const UNAVAILABLE: Record<string, string> = {
   no_endpoint: "no address set",
   not_installed: "not installed",
   not_searched: "turn on to look for it",
+  wrong_path: "the path set for it is not that program",
   version_failed: "did not answer --version",
   no_answer: "did not answer in time",
   cli_too_old: "older than the version JobPilot checked",
@@ -127,7 +128,7 @@ function CliControls({ row }: { row: ExternalStatus }) {
             {`Choose ${program}...`}
           </Button>
         )}
-        {row.path && (
+        {(row.path || row.reason === "wrong_path") && (
           <Button size="sm" variant="outline" disabled={clear.isPending} onClick={() => clear.mutate(undefined)}>
             Use automatic
           </Button>
@@ -189,7 +190,8 @@ export function ProviderRow(props: {
 }) {
   const { row, enabled } = props;
   const reason = row.reason ?? "";
-  // Turning it on is what runs the full search, so "not found yet" must not block that.
+  // Turning it on is what runs the full search, so "not found yet" must not block that, and
+  // nothing may stop a provider that is on from being turned off, least of all it being gone.
   const lookOnUse = reason === "not_searched";
   return (
     <li aria-label={row.label} className="grid gap-2 border-t pt-2 text-sm first:border-t-0 first:pt-0">
@@ -225,7 +227,7 @@ export function ProviderRow(props: {
             <input
               type="checkbox"
               checked={enabled}
-              disabled={!row.available && !lookOnUse}
+              disabled={!enabled && !row.available && !lookOnUse}
               onChange={(e) => props.onUse(e.target.checked)}
             />
             {`Use ${row.label}`}

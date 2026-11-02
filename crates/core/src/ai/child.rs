@@ -586,6 +586,16 @@ async fn find_cli_by(
     Err(not_found(spec))
 }
 
+/// Whether the stored path is what stopped `find_cli`: a search never gets past one that names
+/// something other than the program, so saying "not found" would send the owner the wrong way.
+pub async fn stored_path_is_wrong(spec: &CliSpec, db: &Db) -> bool {
+    let overridden = std::env::var_os(spec.env_bin).is_some_and(|bin| !bin.is_empty());
+    let stored = path_setting(spec, Some(db)).await.map(PathBuf::from);
+    !overridden
+        && stored
+            .is_some_and(|bin| !is_gone(&bin, spec) && checked(bin, spec, spec.setting).is_err())
+}
+
 fn is_gone(bin: &Path, spec: &CliSpec) -> bool {
     bin.is_absolute()
         && accepts_name(bin, spec, cfg!(windows))

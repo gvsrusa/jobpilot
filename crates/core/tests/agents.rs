@@ -1110,7 +1110,7 @@ async fn refresh_stops_at_the_batch_limit() {
 }
 
 #[tokio::test]
-async fn refresh_makes_at_most_twenty_claude_calls() {
+async fn refresh_makes_at_most_twenty_external_calls() {
     let (_tmp, db) = open().await;
     consent_to(&db, &[DataCategory::JobText]).await;
     questions(&db, 25).await;
@@ -1139,33 +1139,73 @@ async fn refresh_makes_at_most_twenty_claude_calls() {
 }
 
 #[tokio::test]
-async fn refresh_plan_counts_claude_calls_and_calls_no_provider() {
+async fn refresh_plan_counts_external_calls_and_calls_no_provider() {
     let (_tmp, db) = open().await;
     questions(&db, 25).await;
     let (provider, handles) = script(ProviderId::ClaudeCode, vec![]);
     let router = router_of(provider);
 
     let none = refresh_plan(&db, &router).await.unwrap();
-    assert_eq!((none.pending, none.claude_calls), (20, 0), "no consent");
+    assert_eq!((none.pending, none.external_calls), (20, 0), "no consent");
     consent_to(&db, &[DataCategory::JobText]).await;
     let plan = refresh_plan(&db, &router).await.unwrap();
-    assert_eq!((plan.pending, plan.claude_calls), (20, 20));
+    assert_eq!((plan.pending, plan.external_calls), (20, 20));
 
     consent_to(&db, &[DataCategory::ResumeText]).await;
-    assert_eq!(refresh_plan(&db, &router).await.unwrap().claude_calls, 0);
+    assert_eq!(refresh_plan(&db, &router).await.unwrap().external_calls, 0);
 
     let (local, _) = script(ProviderId::Ollama, vec![]);
     consent_to(&db, &[DataCategory::JobText]).await;
     let plan = refresh_plan(&db, &router_of(local)).await.unwrap();
     assert_eq!(
-        (plan.pending, plan.claude_calls),
+        (plan.pending, plan.external_calls),
         (20, 0),
-        "no Claude in the order"
+        "nothing external in the order"
     );
     assert_eq!(
         handles.calls() + handles.embed_calls.load(Ordering::SeqCst),
         0
     );
+}
+
+/// Whichever provider it is: the count follows the rule the router runs by, not a name.
+#[tokio::test]
+async fn refresh_plan_counts_any_external_provider_that_can_take_the_task() {
+    let (_tmp, db) = open().await;
+    questions(&db, 3).await;
+    let openai = |no_tools: bool| {
+        let (mut provider, _) = script(ProviderId::OpenAi, vec![]);
+        provider.no_tools = no_tools;
+        router_of(provider)
+    };
+    let calls = async |router: Router| refresh_plan(&db, &router).await.unwrap().external_calls;
+
+    assert_eq!(calls(openai(true)).await, 0, "no consent");
+    consent::give(
+        &db,
+        OPENAI,
+        &[DataCategory::ResumeText],
+        "2026-11-01",
+        "cli",
+    )
+    .await
+    .unwrap();
+    assert_eq!(calls(openai(true)).await, 0, "consent without job text");
+    consent::give(&db, OPENAI, &[DataCategory::JobText], "2026-11-01", "cli")
+        .await
+        .unwrap();
+    assert_eq!(calls(openai(true)).await, 3);
+    assert_eq!(calls(openai(false)).await, 0, "the router would skip it");
+
+    // Behind a provider that takes nothing, it still counts.
+    let (claude, _) = script(ProviderId::ClaudeCode, vec![]);
+    let (openai, _) = script(ProviderId::OpenAi, vec![]);
+    let both = Router::with_providers(vec![Box::new(claude), Box::new(openai)]);
+    assert_eq!(calls(both).await, 3);
+
+    consent::revoke(&db, OPENAI, "cli").await.unwrap();
+    let (gone, _) = script(ProviderId::OpenAi, vec![]);
+    assert_eq!(calls(router_of(gone)).await, 0, "revoked");
 }
 
 /// A halt the first time classify is asked, before it does anything: a refresh stopped at

@@ -130,7 +130,7 @@ export function backend(overrides: Record<string, Handler> = {}): Backend {
     memory_list: () => [],
     memory_application_answers: () => [],
     memory_search: () => [],
-    memory_refresh_plan: () => ({ pending: 0, claude_calls: 0 }),
+    memory_refresh_plan: () => ({ pending: 0, external_calls: 0 }),
     memory_refresh: () => ({
       sealed: 0,
       seal_blocked: null,

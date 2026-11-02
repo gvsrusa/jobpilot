@@ -485,26 +485,6 @@ async fn statuses_map_to_their_reasons() {
         ),
         (429, word("spend_limit"), "rate limited"),
         (400, word("spend_limit"), "failed: http_400"),
-        (
-            429,
-            word("enforced_spend_limit_reached"),
-            "refused: quota_exhausted",
-        ),
-        (
-            400,
-            word("enforced_spend_limit_reached"),
-            "refused: quota_exhausted",
-        ),
-        (
-            400,
-            json!({"error": {"message": USAGE_CAP}}),
-            "refused: quota_exhausted",
-        ),
-        (
-            429,
-            json!({"error": {"message": USAGE_CAP}}),
-            "refused: quota_exhausted",
-        ),
         (429, word("usage_limit"), "refused: quota_exhausted"),
         (
             400,
@@ -550,6 +530,29 @@ async fn statuses_map_to_their_reasons() {
     let outcome = parse(&router(vec![provider("openai", &fake)]), &db).await;
     assert_eq!(outcome, manual("quota_exhausted"));
     assert_eq!(fake.hits(PATH).len(), 1, "a quota error never retries");
+}
+
+/// Anthropic's and Google's words mean nothing here. A local server can echo any text it was
+/// sent, a posting included, and that text must not pick the reason a task ends with.
+#[tokio::test]
+async fn another_vendors_words_do_not_steer_the_chat_wire() {
+    let bodies = [
+        json!({"error": {"code": "enforced_spend_limit_reached"}}),
+        json!({"error": {"message": USAGE_CAP}}),
+        json!({"error": {"details": [{"reason": "API_KEY_INVALID"}]}}),
+    ];
+    for name in ["openai", "openrouter", "endpoint"] {
+        for body in &bodies {
+            for (status, expected) in [(400, "failed: http_400"), (429, "rate limited")] {
+                let fake = Fake::start(vec![(PATH, Canned::json(status, body))]);
+                let error = provider(name, &fake)
+                    .complete(&parse_prompt(), CancellationToken::new())
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.to_string(), expected, "{name} {status} {body}");
+            }
+        }
+    }
 }
 
 /// Past 64 KiB the body is not read at all, but the status still says what happened.
@@ -1321,16 +1324,8 @@ async fn availability_comes_from_settings_and_the_index_alone() {
             gemini.reason.as_deref(),
             gemini.path.as_deref()
         ),
-        // Off, so the login shell was not asked; Windows has none to ask.
-        (
-            false,
-            Some(if cfg!(unix) {
-                "not_searched"
-            } else {
-                "not_installed"
-            }),
-            None
-        )
+        // Off, and the stored path already says why: no search would get past it.
+        (false, Some("wrong_path"), None)
     );
 }
 

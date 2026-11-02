@@ -5,13 +5,13 @@
 use serde::Serialize;
 
 use super::{Class, mark_classified, raise_class};
-use crate::ai::router::Router;
-use crate::ai::{CancellationToken, DataCategory, Outcome, Prompt, ProviderId, TaskType, consent};
+use crate::ai::router::{Router, is_external};
+use crate::ai::{CancellationToken, Capability, DataCategory, Outcome, Prompt, TaskType, consent};
 use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::generate::{CLOSE, OPEN, neutralise};
 
-/// Questions one press looks at, and so the most Claude calls it makes: one attempt each.
+/// Questions one press looks at, and so the most calls it pays for: one attempt each.
 pub const CLASSIFY_BATCH: usize = 20;
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -27,7 +27,7 @@ pub struct Classified {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RefreshPlan {
     pub pending: usize,
-    pub claude_calls: usize,
+    pub external_calls: usize,
 }
 
 /// The question is data. It goes in whole, between the markers, and holds no answer.
@@ -109,18 +109,22 @@ pub async fn classify_pending(
 }
 
 /// What a press would spend. Reads only: it starts no provider and asks no key.
-/// `claude_calls` is an upper bound: with Ollama first and working, fewer happen.
+/// `external_calls` counts when an external provider declares `NoTools` and holds an active
+/// consent covering job text, as the router would then send the question out. It is an upper
+/// bound: with Ollama first and working, fewer happen.
+// ponytail: one call a question. A second eligible provider behind one whose reply fails can
+// add a call to that question. Count per provider if two ever run side by side for the owner.
 pub async fn refresh_plan(db: &Db, router: &Router) -> Result<RefreshPlan> {
     let pending = pending(db).await?.len();
-    let claude = router.provider_ids().contains(&ProviderId::ClaudeCode);
-    let consented = match claude {
-        true => consent::active(db, &ProviderId::ClaudeCode.to_string())
-            .await?
-            .is_some_and(|categories| categories.contains(&DataCategory::JobText)),
-        false => false,
-    };
+    let mut outside = false;
+    for declaration in router.declarations() {
+        if is_external(&declaration) && declaration.capabilities.contains(&Capability::NoTools) {
+            let granted = consent::active(db, &declaration.id.to_string()).await?;
+            outside |= granted.is_some_and(|c| c.contains(&DataCategory::JobText));
+        }
+    }
     Ok(RefreshPlan {
         pending,
-        claude_calls: if consented { pending } else { 0 },
+        external_calls: if outside { pending } else { 0 },
     })
 }

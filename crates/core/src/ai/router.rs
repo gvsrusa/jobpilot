@@ -171,6 +171,11 @@ impl Router {
         ids.chain([ProviderId::NoAi]).collect()
     }
 
+    /// What each provider declares, in routing order. No-AI declares nothing to check.
+    pub fn declarations(&self) -> Vec<Declaration> {
+        self.providers.iter().map(|p| p.declaration()).collect()
+    }
+
     pub async fn run(
         &self,
         db: &Db,
@@ -530,7 +535,7 @@ pub(crate) fn run_reason(error: &Error) -> &'static str {
 }
 
 /// Data leaves the machine. Fails closed: anything but Ollama counts, whatever it declares.
-fn is_external(declaration: &Declaration) -> bool {
+pub(crate) fn is_external(declaration: &Declaration) -> bool {
     declaration.id != ProviderId::Ollama
 }
 

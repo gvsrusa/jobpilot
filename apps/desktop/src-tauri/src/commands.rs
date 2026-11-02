@@ -847,7 +847,7 @@ pub async fn memory_refresh_plan(state: State<'_, AppState>) -> Result<RefreshPl
     memory::refresh_plan(&db, &router).await
 }
 
-/// Only a person's press starts it. With Claude calls ahead, the count is named in a native
+/// Only a person's press starts it. With outside calls ahead, the count is named in a native
 /// dialog first, with no `work` held, and the plan is read again after the answer: a count
 /// that moved in between is refused, so the yes covers what ran.
 #[tauri::command]
@@ -858,11 +858,11 @@ pub async fn memory_refresh<R: Runtime>(
     let asked = {
         let db = state.work().await?;
         let router = Router::from_settings(&db).await?;
-        memory::refresh_plan(&db, &router).await?.claude_calls
+        memory::refresh_plan(&db, &router).await?.external_calls
     };
     if asked > 0 {
         let message = format!(
-            "This will make up to {asked} Claude calls, limit {}.",
+            "This will make up to {asked} paid or subscription calls, limit {}.",
             memory::CLASSIFY_BATCH
         );
         native::confirmed(&app, "Refresh career memory", message, "Refresh").await?;
@@ -870,9 +870,9 @@ pub async fn memory_refresh<R: Runtime>(
     let running = state.ai.begin()?;
     let db = state.work().await?;
     let router = Router::from_settings(&db).await?;
-    if memory::refresh_plan(&db, &router).await?.claude_calls != asked {
+    if memory::refresh_plan(&db, &router).await?.external_calls != asked {
         return Err(Error::Validation(
-            "the number of Claude calls changed since you were asked; press Refresh again".into(),
+            "the number of outside calls changed since you were asked; press Refresh again".into(),
         ));
     }
     agents::memory_refresh(&db, &router, ACTOR, running.token.clone()).await
@@ -3410,6 +3410,62 @@ mod tests {
         );
     }
 
+    /// Every provider off is a state the app runs in, not an error: the screen loads, a task
+    /// ends on the manual path, and nothing is sent.
+    #[test]
+    fn no_provider_screen_is_a_normal_state() {
+        let h = ready();
+        // A setting that names another program stops discovery: no installed `claude` runs.
+        with_db(&h, |db| async move {
+            let claude = json!("/bin/sh");
+            jobpilot_core::settings::set(&db, "ai.claude_path", &claude)
+                .await
+                .unwrap();
+        });
+        h.ok(
+            "ai_enable",
+            json!({ "provider": "ollama", "enabled": false }),
+        );
+
+        let status = h.ok("ai_status", json!({}));
+        let enabled = status["enabled"].as_object().unwrap();
+        assert!(enabled.values().all(|on| on == false), "{status}");
+        h.assert_ready();
+
+        let job = h.ok(
+            "job_paste",
+            json!({ "title": "Rust role", "raw": "Write Rust" }),
+        );
+        h.ok(
+            "kb_add",
+            json!({ "kind": "experience", "body": "Shipped the Rust compiler" }),
+        );
+        let error = h
+            .call(
+                "resume_generate",
+                json!({ "jobTextId": job["id"], "export": null }),
+            )
+            .unwrap_err();
+        assert_eq!(error["code"], "manual_required", "{error}");
+        assert!(
+            error["message"].as_str().unwrap().contains("no_ai"),
+            "{error}"
+        );
+        h.assert_ready();
+        h.ok(
+            "draft_save",
+            json!({ "kind": "resume", "lineageId": null, "doc": {} }),
+        );
+
+        let calls: i64 = with_db(&h, |db| async move {
+            sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = 'ai_external_call'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap()
+        });
+        assert_eq!(calls, 0);
+    }
+
     /// Off, so found and not started, and a posting can go to it: it declares no tools.
     #[test]
     fn ai_status_lists_gemini_with_its_path() {
@@ -4983,7 +5039,7 @@ mod tests {
         claude_on_with_questions(&h);
         let plan = h.ok("memory_refresh_plan", json!({}));
         assert_eq!(
-            (plan["pending"].clone(), plan["claude_calls"].clone()),
+            (plan["pending"].clone(), plan["external_calls"].clone()),
             (json!(2), json!(2))
         );
 
@@ -4993,7 +5049,7 @@ mod tests {
         let dialog = asked.last().unwrap();
         assert!(
             dialog.contains("Refresh career memory")
-                && dialog.contains("This will make up to 2 Claude calls, limit 20."),
+                && dialog.contains("This will make up to 2 paid or subscription calls, limit 20."),
             "{asked:?}"
         );
         assert_eq!(
@@ -5024,21 +5080,27 @@ mod tests {
         h.answer(true);
         let refused = h.call("memory_refresh", json!({}));
         assert_eq!(code_of(refused), "validation");
-        assert!(h.asked().last().unwrap().contains("up to 2 Claude calls"));
+        let asked = h.asked();
+        assert!(
+            asked
+                .last()
+                .unwrap()
+                .contains("up to 2 paid or subscription calls")
+        );
         assert_eq!(h.ok("agents_list", json!({ "limit": 10 })), json!([]));
         let plan = h.ok("memory_refresh_plan", json!({}));
-        assert_eq!(plan["claude_calls"], 3, "the new question is counted now");
+        assert_eq!(plan["external_calls"], 3, "the new question is counted now");
     }
 
     #[test]
-    fn memory_refresh_asks_nothing_when_no_claude_call_is_ahead() {
+    fn memory_refresh_asks_nothing_when_no_external_call_is_ahead() {
         let h = ready();
         h.ok(
             "memory_add_question",
             json!({ "text": "Describe project one", "country": null }),
         );
         let plan = h.ok("memory_refresh_plan", json!({}));
-        assert_eq!(plan["claude_calls"], 0);
+        assert_eq!(plan["external_calls"], 0);
         h.answer(false);
         let done = h.ok("memory_refresh", json!({}));
         assert_eq!(done["classified"]["skipped"], true);

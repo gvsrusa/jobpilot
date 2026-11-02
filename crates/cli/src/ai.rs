@@ -230,6 +230,7 @@ pub async fn ai(db: &Db, command: AiCommand) -> Result<Output> {
                     let state = match row.reason.as_deref() {
                         _ if row.available => "available",
                         Some("not_searched") => "turn on to look for it",
+                        Some("wrong_path") => "the path set for it is not that program",
                         reason => reason.unwrap_or("unavailable"),
                     };
                     let word = if on(&row.name) { "enabled" } else { "disabled" };

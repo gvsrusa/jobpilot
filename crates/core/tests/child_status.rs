@@ -93,6 +93,26 @@ async fn detection_follows_the_override_then_the_setting_and_probes_only_enabled
     );
     assert_eq!(settings::get(&db, "ai.gemini_path").await.unwrap(), None);
 
+    // Stored by name alone, and not a program: no search can get past it, off or on.
+    let wrong = tmp.path().join("wrong").join(GEMINI_FILE);
+    std::fs::create_dir_all(&wrong).unwrap();
+    set_cli_path(&db, "gemini_cli", wrong.to_str().unwrap())
+        .await
+        .unwrap();
+    for on in [false, true] {
+        ai::set_enabled(&db, "gemini_cli", on).await.unwrap();
+        let status = ai::status(&db).await.unwrap();
+        let row = status
+            .external
+            .iter()
+            .find(|r| r.name == "gemini_cli")
+            .unwrap();
+        assert!(!row.available, "{row:?}");
+        assert_eq!(row.reason.as_deref(), Some("wrong_path"), "on: {on}");
+        assert_eq!(row.path, None);
+    }
+    ai::set_enabled(&db, "gemini_cli", false).await.unwrap();
+
     set_cli_path(&db, "gemini_cli", gemini.to_str().unwrap())
         .await
         .unwrap();
