@@ -99,9 +99,8 @@ impl ExportFormat {
 /// Matched at the start of a word of the folded text, so `citizenship` counts and
 /// `noncitizen` needs its own entry; [`WHOLE_WORD_PATTERNS`] must match a word exactly.
 // ponytail: this matches words, not meaning. A paraphrase passes ("my papers are in order"),
-// a look-alike letter from another script passes, and an honest "Visa Inc.", "opt in", or
-// "able to work in a team" is flagged until it is reworded or entered by the user. The
-// compare screen is the next gate.
+// a look-alike letter from another script passes, and an honest "Visa Inc." or "opt in" is
+// flagged until it is reworded or entered by the user. The compare screen is the next gate.
 pub const AUTHORIZATION_PATTERNS: &[&str] = &[
     "authorized to work",
     "authorised to work",
@@ -131,7 +130,6 @@ pub const AUTHORIZATION_PATTERNS: &[&str] = &[
     "allowed to work",
     "permitted to work",
     "entitled to work",
-    "able to work",
     "immigration",
     "legally authorized",
     "legally authorised",
@@ -147,6 +145,81 @@ pub const AUTHORIZATION_PATTERNS: &[&str] = &[
     "h 1 b",
     "ead",
     "opt",
+];
+
+/// After "able to work in", in lower case. A name not here still counts when capitalized.
+// ponytail: the countries job applications name most, not all of them. A lower-case or
+// all-caps "able to work in chile" passes; add a name when one is missed.
+const COUNTRIES: &[&str] = &[
+    "argentina",
+    "australia",
+    "austria",
+    "belgium",
+    "brazil",
+    "bulgaria",
+    "canada",
+    "china",
+    "croatia",
+    "cyprus",
+    "czechia",
+    "czech republic",
+    "denmark",
+    "egypt",
+    "england",
+    "estonia",
+    "finland",
+    "france",
+    "germany",
+    "greece",
+    "hong kong",
+    "hungary",
+    "iceland",
+    "india",
+    "indonesia",
+    "ireland",
+    "israel",
+    "italy",
+    "japan",
+    "latvia",
+    "lithuania",
+    "luxembourg",
+    "malaysia",
+    "malta",
+    "mexico",
+    "netherlands",
+    "new zealand",
+    "nigeria",
+    "norway",
+    "pakistan",
+    "philippines",
+    "poland",
+    "portugal",
+    "romania",
+    "scotland",
+    "singapore",
+    "slovakia",
+    "slovenia",
+    "south africa",
+    "south korea",
+    "spain",
+    "sweden",
+    "switzerland",
+    "taiwan",
+    "thailand",
+    "turkey",
+    "ukraine",
+    "united arab emirates",
+    "united kingdom",
+    "united states",
+    "uk",
+    "usa",
+    "vietnam",
+    "wales",
+];
+/// Capitalized at the start of a heading or a title, and no place.
+const NOT_PLACES: &[&str] = &[
+    "a", "an", "fast", "remote", "remotely", "shift", "shifts", "team", "teams", "weekend",
+    "weekends",
 ];
 
 /// In [`AUTHORIZATION_PATTERNS`]: short enough to begin other words (`visage`, `option`).
@@ -229,13 +302,59 @@ pub(crate) fn fold(text: &str) -> String {
 
 pub(crate) fn states_authorization(text: &str) -> bool {
     let folded = format!(" {} ", fold(text));
-    AUTHORIZATION_PATTERNS.iter().any(|pattern| {
+    let listed = AUTHORIZATION_PATTERNS.iter().any(|pattern| {
         if WHOLE_WORD_PATTERNS.contains(pattern) {
             folded.contains(&format!(" {pattern} "))
         } else {
             folded.contains(&format!(" {pattern}"))
         }
+    });
+    listed || able_to_work_in_a_place(text)
+}
+
+/// "Able to work in a team" is an honest line on a resume, so this phrase needs a place
+/// after it. The text keeps its case here, as [`fold`] would lose a capitalized place.
+// ponytail: a capital is all that marks an unlisted place, so "Able to work in Python" is
+// flagged until it is reworded, and all-caps text counts only [`COUNTRIES`].
+fn able_to_work_in_a_place(text: &str) -> bool {
+    let spaced: String = text
+        .nfkd()
+        .filter(|c| !is_combining_mark(*c) && !hides(*c))
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect();
+    let words: Vec<&str> = spaced.split_whitespace().collect();
+    let lower: Vec<String> = words.iter().map(|word| word.to_lowercase()).collect();
+    let cased = text.chars().any(char::is_lowercase);
+    lower.windows(4).enumerate().any(|(at, phrase)| {
+        phrase == ["able", "to", "work", "in"]
+            && names_a_place(&words[at + 4..], &lower[at + 4..], cased)
     })
+}
+
+fn names_a_place(words: &[&str], lower: &[String], cased: bool) -> bool {
+    let Some(first) = lower.first() else {
+        return false;
+    };
+    let the = first == "the";
+    let name = if the { &lower[1..] } else { lower };
+    if the
+        && name
+            .first()
+            .is_some_and(|word| matches!(word.as_str(), "us" | "eu"))
+    {
+        return true;
+    }
+    if COUNTRIES.iter().any(|country| {
+        let parts = country.split(' ').count();
+        name.len() >= parts
+            && country
+                .split(' ')
+                .eq(name[..parts].iter().map(String::as_str))
+    }) {
+        return true;
+    }
+    let capitalized = words[0].chars().next().is_some_and(char::is_uppercase);
+    !the && cased && capitalized && !NOT_PLACES.contains(&first.as_str())
 }
 
 /// For each line, whether `hit` holds for it, or for it and its neighbour read as one line,
@@ -1040,6 +1159,40 @@ mod tests {
         let mut claims = [claim(text, status)];
         flag_sealed(&mut claims, evidence, s);
         claims[0].status.clone()
+    }
+
+    #[test]
+    fn able_to_work_in_counts_only_before_a_place() {
+        for text in [
+            "Are you able to work in Germany?",
+            "able to work in germany",
+            "ABLE TO WORK IN GERMANY",
+            "able to work in new zealand",
+            "Able to work in the US",
+            "able to work in the uk",
+            "Able to work in the EU",
+            "Able to work in Lisbon",
+            "able to w\u{200b}ork in Germany",
+            "Legally able to work",
+        ] {
+            assert!(states_authorization(text), "{text}");
+        }
+        for text in [
+            "Able to work in a team",
+            "Able to work in teams",
+            "Able To Work In Teams",
+            "Able to work in remote teams",
+            "Able to work in Remote settings",
+            "Are you able to work weekends?",
+            "Able to work in shifts",
+            "Able to work in fast-paced settings",
+            "Able to work in Fast-paced settings",
+            "Able to work in the office",
+            "ABLE TO WORK IN AGILE TEAMS",
+            "Able to work in",
+        ] {
+            assert!(!states_authorization(text), "{text}");
+        }
     }
 
     #[test]
