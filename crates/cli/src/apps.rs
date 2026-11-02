@@ -81,6 +81,10 @@ pub enum AppCommand {
         id: String,
         text: String,
     },
+    /// The answers this application has used or confirmed, with no answer text.
+    Answers {
+        id: String,
+    },
     Remove {
         id: String,
     },
@@ -193,6 +197,31 @@ pub async fn app(db: &Db, command: AppCommand) -> Result<Output> {
         AppCommand::Note { id, text } => {
             applications::add_note(db, ACTOR, &id, &text).await?;
             out(serde_json::json!({ "id": id }), "noted".into())
+        }
+        AppCommand::Answers { id } => {
+            let answers = jobpilot_core::memory::application_answers(db, &id).await?;
+            let text = answers
+                .iter()
+                .map(|a| {
+                    let state = if a.current {
+                        "confirmed"
+                    } else {
+                        "needs confirmation"
+                    };
+                    let used = a
+                        .used_at
+                        .as_deref()
+                        .map_or(String::new(), |at| format!("  used {at}"));
+                    format!(
+                        "{}  {}  {state}{used}  {}",
+                        a.answer_id,
+                        a.class.as_str(),
+                        a.question
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            out(answers, text)
         }
         AppCommand::Remove { id } => {
             applications::remove(db, ACTOR, &id).await?;

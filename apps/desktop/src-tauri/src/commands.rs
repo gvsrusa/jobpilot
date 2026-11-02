@@ -23,7 +23,9 @@ use jobpilot_core::drafts::{self, ClaimInput, Compare, Draft, ExportFormat};
 use jobpilot_core::embed::{self, Hit};
 use jobpilot_core::generate::{self, Generated};
 use jobpilot_core::knowledge::{self, JobText, KnowledgeItem};
-use jobpilot_core::memory::{self, Answer, Class, Question, QuestionRow};
+use jobpilot_core::memory::{
+    self, Answer, AppliedAnswer, AuthorizationAnswer, Class, Question, QuestionRow, UsedAnswer,
+};
 use jobpilot_core::parse::{self, Imported};
 use jobpilot_core::profile::{self, Profile, ProfileBasic, WorkAuthorization};
 use jobpilot_core::recovery::{self, RecoveryReceipt};
@@ -95,6 +97,10 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         memory_mark_reviewed,
         memory_set_class,
         memory_reveal,
+        memory_confirm_use,
+        memory_use,
+        memory_application_answers,
+        memory_authorization,
         memory_remove_question,
         memory_remove_answer,
         resume_import,
@@ -694,6 +700,64 @@ pub async fn memory_reveal<R: Runtime>(
         native::confirmed(&app, "Show sealed text", message, "Show").await?;
     }
     memory::reveal(&*state.work().await?, ACTOR, &answer_id).await
+}
+
+/// Confirming a use always asks a native yes, whatever the class, so script in the webview
+/// cannot make a sealed answer usable. The dialog names the class, the application, and the
+/// question, never the answer's value. Each `state.work()` here ends before the dialog.
+#[tauri::command]
+pub async fn memory_confirm_use<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    answer_id: String,
+    application_id: String,
+) -> Result<()> {
+    let message = {
+        let db = state.work().await?;
+        let (class, answer) = memory::find_answer(&db, &answer_id).await?;
+        let question = memory::get(&db, &answer.question_id).await?.question;
+        let application = applications::get(&db, &application_id).await?;
+        let stale = match answer.stale {
+            true => "\n\nThis answer has not been reviewed for over 180 days.",
+            false => "",
+        };
+        format!(
+            "Use the {} answer to \"{}\" for {} / {}?\n\nYou confirm this is true today.{stale}",
+            class.as_str(),
+            question.text.chars().take(300).collect::<String>(),
+            application.company,
+            application.role
+        )
+    };
+    native::confirmed(&app, "Confirm this answer", message, "Confirm").await?;
+    memory::confirm_use(&*state.work().await?, ACTOR, &answer_id, &application_id).await
+}
+
+/// The text of one answer for one application. Core refuses a sealed class with no current
+/// confirmation, so this opens no dialog of its own.
+#[tauri::command]
+pub async fn memory_use(
+    state: State<'_, AppState>,
+    answer_id: String,
+    application_id: String,
+) -> Result<UsedAnswer> {
+    memory::use_answer(&*state.work().await?, ACTOR, &answer_id, &application_id).await
+}
+
+#[tauri::command]
+pub async fn memory_application_answers(
+    state: State<'_, AppState>,
+    application_id: String,
+) -> Result<Vec<AppliedAnswer>> {
+    memory::application_answers(&*state.work().await?, &application_id).await
+}
+
+#[tauri::command]
+pub async fn memory_authorization(
+    state: State<'_, AppState>,
+    country: String,
+) -> Result<AuthorizationAnswer> {
+    memory::authorization_for(&*state.work().await?, &country).await
 }
 
 #[tauri::command]
@@ -2204,6 +2268,10 @@ mod tests {
         "memory_mark_reviewed",
         "memory_set_class",
         "memory_reveal",
+        "memory_confirm_use",
+        "memory_use",
+        "memory_application_answers",
+        "memory_authorization",
         "memory_remove_question",
         "memory_remove_answer",
         "resume_import",
@@ -3457,6 +3525,111 @@ mod tests {
         assert!(!log.to_string().contains("ZXQ-SEALED"), "{log}");
     }
 
+    /// A Sensitive-class answer whose approved body waits to be sealed, so no key is needed,
+    /// and an application to use it for.
+    fn waiting_sensitive_answer(h: &Harness) -> (String, String) {
+        let added = h.ok(
+            "memory_add_question",
+            json!({ "text": "Why this job?", "country": null }),
+        );
+        let answer = h.ok(
+            "memory_add_answer",
+            json!({ "questionId": added["id"], "text": "ZXQ-CANARY", "sourceRef": null }),
+        );
+        let id = answer["id"].as_str().unwrap().to_owned();
+        with_db(h, |db| async move {
+            sqlx::query("UPDATE memory_questions SET class = 'sensitive'")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE memory_answers SET approved = 1")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        });
+        let application = h.ok(
+            "app_add",
+            json!({ "input": {
+                "company": "Acme", "role": "Engineer", "job_text_id": null,
+                "resume_draft_id": null, "letter_draft_id": null, "link": "",
+                "country": "", "notes": ""
+            } }),
+        );
+        (id, application["id"].as_str().unwrap().to_owned())
+    }
+
+    #[test]
+    fn confirm_use_opens_a_native_dialog_without_the_value() {
+        let h = ready();
+        let (id, app) = waiting_sensitive_answer(&h);
+        let args = json!({ "answerId": id, "applicationId": app });
+
+        let refused = h.call("memory_use", args.clone());
+        assert_eq!(code_of(refused), "confirmation_required");
+        assert!(h.asked().is_empty(), "use opens no dialog of its own");
+
+        h.answer(true);
+        h.ok("memory_confirm_use", args.clone());
+        let asked = h.asked();
+        assert_eq!(asked.len(), 1);
+        assert!(!asked[0].contains("ZXQ-CANARY"), "{asked:?}");
+        for part in [
+            "Confirm this answer",
+            "sensitive",
+            "Why this job?",
+            "Acme / Engineer",
+            "You confirm this is true today",
+        ] {
+            assert!(asked[0].contains(part), "{part}: {asked:?}");
+        }
+        assert!(!asked[0].contains("180 days"), "{asked:?}");
+
+        let used = h.ok("memory_use", args);
+        assert_eq!(used["text"], "ZXQ-CANARY");
+        let listed = h.ok(
+            "memory_application_answers",
+            json!({ "applicationId": app }),
+        );
+        assert_eq!(listed[0]["current"], true);
+        assert!(!listed.to_string().contains("ZXQ-CANARY"));
+        let log = h.ok("audit_recent", json!({ "limit": 20 }));
+        assert!(log.to_string().contains("answer_confirmed"), "{log}");
+        assert!(log.to_string().contains("answer_used"), "{log}");
+        assert!(!log.to_string().contains("ZXQ-CANARY"), "{log}");
+    }
+
+    #[test]
+    fn a_refused_dialog_records_no_confirmation() {
+        let h = ready();
+        let (id, app) = waiting_sensitive_answer(&h);
+        let args = json!({ "answerId": id, "applicationId": app });
+
+        h.answer(false);
+        let refused = h.call("memory_confirm_use", args.clone());
+
+        assert_eq!(code_of(refused), "confirmation_required");
+        assert_eq!(h.asked().len(), 1);
+        let listed = h.ok(
+            "memory_application_answers",
+            json!({ "applicationId": app }),
+        );
+        assert_eq!(listed.as_array().unwrap().len(), 0);
+        assert_eq!(code_of(h.call("memory_use", args)), "confirmation_required");
+        let log = h.ok("audit_recent", json!({ "limit": 20 }));
+        assert!(!log.to_string().contains("answer_confirmed"), "{log}");
+    }
+
+    #[test]
+    fn memory_authorization_reads_the_profile_by_country() {
+        let h = ready();
+        let none = h.ok("memory_authorization", json!({ "country": "ca" }));
+        assert_eq!(none["stated"], false);
+        assert_eq!(none["country"], "CA");
+        assert_eq!(none["authorized"], "not_stated");
+        let bad = h.call("memory_authorization", json!({ "country": "canada" }));
+        assert_eq!(code_of(bad), "validation");
+    }
+
     #[test]
     fn memory_reveal_of_a_plain_answer_or_an_unknown_id_asks_nothing() {
         let h = ready();
@@ -3482,8 +3655,20 @@ mod tests {
     fn no_memory_dialog_holds_the_handle() {
         let h = ready();
         let question = seal_answer_without_a_key(&h, "sensitive", "s1");
+        let app = h.ok(
+            "app_add",
+            json!({ "input": {
+                "company": "Acme", "role": "Engineer", "job_text_id": null,
+                "resume_draft_id": null, "letter_draft_id": null, "link": "",
+                "country": "", "notes": ""
+            } }),
+        );
         h.answer(false);
         for result in [
+            h.call(
+                "memory_confirm_use",
+                json!({ "answerId": "s1", "applicationId": app["id"] }),
+            ),
             h.call(
                 "memory_approve",
                 json!({ "answerId": "s1", "approved": true }),
@@ -3498,7 +3683,7 @@ mod tests {
             assert_eq!(code_of(result), "confirmation_required");
         }
         let hook = h.app.state::<NativeHook>();
-        assert_eq!(*hook.work_at_dialog.lock().unwrap(), [false; 4]);
+        assert_eq!(*hook.work_at_dialog.lock().unwrap(), [false; 5]);
     }
 
     fn code_of(result: Result<Value, Value>) -> String {

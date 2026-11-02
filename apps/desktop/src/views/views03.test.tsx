@@ -1,7 +1,9 @@
 import { screen, waitFor, within } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type {
   Answer,
+  AppliedAnswer,
+  AuthorizationAnswer,
   Application,
   ApplicationEvent,
   ApplicationInput,
@@ -556,5 +558,208 @@ describe("career memory", () => {
     await user.type(screen.getByLabelText("Question"), "Why?");
     await user.click(screen.getByRole("button", { name: "Add question" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("code: validation");
+  });
+});
+
+describe("answers for an application", () => {
+  const SECRET = "ZXQ-SENSITIVE-TEXT";
+  const application: Application = {
+    id: "app1",
+    company: "Acme",
+    role: "Engineer",
+    job_text_id: null,
+    resume_draft_id: null,
+    letter_draft_id: null,
+    link: "",
+    country: "CA",
+    notes: "",
+    status: "saved",
+    applied_on: null,
+    created_at: AT,
+    updated_at: AT,
+  };
+
+  /** A bank of one normal, one sensitive, and one work authorization question. */
+  function answers(overrides: Record<string, (args: Args) => unknown> = {}) {
+    const applied: AppliedAnswer[] = [];
+    const rows: QuestionRow[] = [
+      {
+        question: questionOf("q1", "Why this job?"),
+        answers: [answerOf("a1", "q1", { approved: true })],
+      },
+      {
+        question: questionOf("q2", "What is your salary?", { class: "sensitive" }),
+        answers: [answerOf("a2", "q2", { approved: true, sealed: true }), answerOf("a3", "q2")],
+      },
+      { question: questionOf("q3", "Are you authorized to work here?", { class: "work_authorization" }), answers: [] },
+    ];
+    const texts: Record<string, string> = { a1: "Because I like it", a2: SECRET };
+    const api = backend({
+      app_list: () => [application],
+      app_get: () => application,
+      memory_list: () => rows,
+      memory_application_answers: () => applied,
+      memory_confirm_use: ({ answerId }: Args) => {
+        const found = rows.flatMap((r) => r.answers).find((a) => a.id === answerId)!;
+        const question = rows.find((r) => r.answers.includes(found))!.question;
+        applied.push({
+          answer_id: found.id,
+          question: question.text,
+          class: question.class,
+          confirmed_at: AT,
+          used_at: null,
+          current: true,
+        });
+      },
+      memory_use: ({ answerId, applicationId }: Args) => ({
+        application_id: applicationId,
+        answer_id: answerId,
+        class: answerId === "a1" ? "normal" : "sensitive",
+        text: texts[String(answerId)],
+        stale: false,
+      }),
+      memory_authorization: ({ country }: Args): AuthorizationAnswer => ({
+        country: String(country),
+        authorized: "not_stated",
+        needs_sponsorship: "not_stated",
+        note: "",
+        stated: false,
+      }),
+      ...overrides,
+    });
+    return api;
+  }
+
+  async function select(user: ReturnType<typeof renderApp>["user"], option: RegExp) {
+    await open(user);
+    await user.click(await screen.findByRole("button", { name: "Acme" }));
+    const picker = await screen.findByLabelText("Answer to use");
+    const choice = within(picker).getByRole("option", { name: option });
+    await user.selectOptions(picker, choice);
+  }
+
+  it("sensitive_answer_shows_confirm_and_copy_never_copy", async () => {
+    const api = answers();
+    const { user } = renderApp();
+    const write = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+    await select(user, /salary/);
+
+    expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Confirm and copy" }));
+
+    expect(await screen.findByLabelText("Answer text")).toHaveValue(SECRET);
+    expect(screen.getByLabelText("Answer text")).toHaveAttribute("readonly");
+    await waitFor(() => expect(write).toHaveBeenCalledWith(SECRET));
+    const order = api.calls.map((c) => c.cmd).filter((c) => c === "memory_confirm_use" || c === "memory_use");
+    expect(order).toEqual(["memory_confirm_use", "memory_use"]);
+    // The confirmation now matches, so the next press needs no dialog.
+    expect(await screen.findByRole("button", { name: "Copy" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Confirm and copy" })).toBeNull();
+  });
+
+  it("a_normal_answer_copies_with_one_press_and_no_confirmation", async () => {
+    const api = answers();
+    const { user } = renderApp();
+    vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+    await select(user, /Why this job/);
+
+    await user.click(screen.getByRole("button", { name: "Copy" }));
+
+    expect(await screen.findByLabelText("Answer text")).toHaveValue("Because I like it");
+    expect(count(api, "memory_confirm_use")).toBe(0);
+    expect(count(api, "memory_use")).toBe(1);
+  });
+
+  it("only_approved_answers_are_offered", async () => {
+    answers();
+    const { user } = renderApp();
+    await select(user, /Why this job/);
+    const picker = screen.getByLabelText("Answer to use");
+    // The sensitive question has one approved and one unapproved answer.
+    expect(within(picker).getAllByRole("option", { name: /salary/ })).toHaveLength(1);
+  });
+
+  it("a_cancelled_confirmation_shows_no_text", async () => {
+    const api = answers({
+      memory_confirm_use: () => {
+        throw { code: "confirmation_required", message: "this needs your confirmation" };
+      },
+    });
+    const { user } = renderApp();
+    const write = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+    await select(user, /salary/);
+
+    await user.click(screen.getByRole("button", { name: "Confirm and copy" }));
+
+    await waitFor(() => expect(count(api, "memory_confirm_use")).toBe(1));
+    expect(count(api, "memory_use")).toBe(0);
+    expect(screen.queryByLabelText("Answer text")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(write).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Confirm and copy" })).toBeInTheDocument();
+  });
+
+  it("a_clipboard_failure_leaves_the_text_in_the_field", async () => {
+    answers();
+    const { user } = renderApp();
+    vi.spyOn(navigator.clipboard, "writeText").mockRejectedValue(new Error("denied"));
+    await select(user, /Why this job/);
+
+    await user.click(screen.getByRole("button", { name: "Copy" }));
+
+    expect(await screen.findByLabelText("Answer text")).toHaveValue("Because I like it");
+    expect(await screen.findByText(/could not copy/i)).toBeInTheDocument();
+  });
+
+  it("a_refusal_shows_its_code", async () => {
+    answers({
+      memory_use: () => {
+        throw { code: "refused", message: "answer_not_approved" };
+      },
+    });
+    const { user } = renderApp();
+    await select(user, /Why this job/);
+    await user.click(screen.getByRole("button", { name: "Copy" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("code: refused");
+    expect(screen.queryByLabelText("Answer text")).toBeNull();
+  });
+
+  it("work_authorization_row_has_no_value_input", async () => {
+    const api = answers();
+    const { user } = renderApp();
+    await select(user, /authorized to work/);
+
+    expect(screen.getByLabelText("Authorization country")).toHaveValue("CA");
+    expect(screen.queryByLabelText("Answer text")).toBeNull();
+    expect(screen.queryByRole("button", { name: /copy/i })).toBeNull();
+    // The only text box here is the country; no value can be typed for the answer.
+    const boxes = within(screen.getByRole("region", { name: "Answers for this application" })).getAllByRole(
+      "textbox",
+    );
+    expect(boxes).toHaveLength(1);
+
+    await user.click(screen.getByRole("button", { name: "Show what I stated" }));
+    expect(await screen.findByText("Not stated by you")).toBeInTheDocument();
+    expect(api.calls.find((c) => c.cmd === "memory_authorization")!.args).toEqual({ country: "CA" });
+    expect(screen.getByRole("button", { name: "Open Profile" })).toBeInTheDocument();
+  });
+
+  it("a_stated_country_shows_its_values_as_text", async () => {
+    answers({
+      memory_authorization: ({ country }: Args) => ({
+        country: String(country),
+        authorized: "yes",
+        needs_sponsorship: "no",
+        note: "<b>citizen</b>",
+        stated: true,
+      }),
+    });
+    const { user, container } = renderApp();
+    await select(user, /authorized to work/);
+    await user.click(screen.getByRole("button", { name: "Show what I stated" }));
+    expect(await screen.findByText(/Authorized: Yes/)).toBeInTheDocument();
+    expect(screen.getByText(/Needs sponsorship: No/)).toBeInTheDocument();
+    expect(screen.getByText("<b>citizen</b>")).toBeInTheDocument();
+    expect(container.querySelectorAll("main a, main b")).toHaveLength(0);
   });
 });

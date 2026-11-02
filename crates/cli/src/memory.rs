@@ -2,7 +2,8 @@
 
 use clap::Subcommand;
 use jobpilot_core::memory::{self, Answer, Class, QuestionRow};
-use jobpilot_core::{Db, Result};
+use jobpilot_core::profile::Stated;
+use jobpilot_core::{Db, Error, Result};
 use serde_json::json;
 
 use crate::{ACTOR, Output, out};
@@ -54,12 +55,40 @@ pub enum MemoryCommand {
     Reveal {
         answer: String,
     },
+    /// You confirm this answer is true today for one application, and it is marked reviewed.
+    /// Do this in an ordinary terminal or in the app.
+    Confirm {
+        answer: String,
+        #[arg(long)]
+        application: String,
+    },
+    /// Prints an answer for one application. A sensitive or legal answer needs a current
+    /// confirmation first.
+    Use {
+        answer: String,
+        #[arg(long)]
+        application: String,
+    },
+    /// Your work authorization for one country, from your profile: "not stated" when you have
+    /// not stated it.
+    Authorization {
+        /// Two letters, like PT.
+        country: String,
+    },
     RemoveQuestion {
         id: String,
     },
     RemoveAnswer {
         id: String,
     },
+}
+
+fn stated(value: &Stated) -> &'static str {
+    match value {
+        Stated::Yes => "yes",
+        Stated::No => "no",
+        Stated::NotStated => "not stated",
+    }
 }
 
 fn answer_line(answer: &Answer) -> String {
@@ -151,6 +180,54 @@ pub async fn memory(db: &Db, command: MemoryCommand) -> Result<Output> {
         MemoryCommand::Reveal { answer } => {
             let body = memory::reveal(db, ACTOR, &answer).await?;
             out(json!({ "id": answer, "body": body }), body)
+        }
+        MemoryCommand::Confirm {
+            answer,
+            application,
+        } => {
+            memory::confirm_use(db, ACTOR, &answer, &application).await?;
+            let done = json!({ "answer": answer, "application": application });
+            out(done, "confirmed".into())
+        }
+        MemoryCommand::Use {
+            answer,
+            application,
+        } => {
+            let used = memory::use_answer(db, ACTOR, &answer, &application)
+                .await
+                .inspect_err(|error| {
+                    if matches!(error, Error::ConfirmationRequired) {
+                        eprintln!(
+                            "Confirm it first in an ordinary terminal: \
+                             jobpilot memory confirm <answer> --application <application>"
+                        );
+                    }
+                })?;
+            let text = if used.stale {
+                format!("{}\n(not reviewed for over 180 days)", used.text)
+            } else {
+                used.text.clone()
+            };
+            out(&used, text)
+        }
+        MemoryCommand::Authorization { country } => {
+            let answer = memory::authorization_for(db, &country).await?;
+            let text = if answer.stated {
+                format!(
+                    "{}: authorized {}, needs sponsorship {}{}",
+                    answer.country,
+                    stated(&answer.authorized),
+                    stated(&answer.needs_sponsorship),
+                    if answer.note.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\nnote: {}", answer.note)
+                    }
+                )
+            } else {
+                format!("{}: not stated by you", answer.country)
+            };
+            out(&answer, text)
         }
         MemoryCommand::RemoveQuestion { id } => {
             memory::remove_question(db, &id).await?;

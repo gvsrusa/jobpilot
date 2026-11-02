@@ -107,6 +107,9 @@ impl Command {
                         | MemoryCommand::Reviewed { .. }
                         | MemoryCommand::SetClass { .. }
                         | MemoryCommand::Reveal { .. }
+                        | MemoryCommand::Confirm { .. }
+                        | MemoryCommand::Use { .. }
+                        | MemoryCommand::Authorization { .. }
                 )
                 | Command::Job(JobCommand::Paste { file: Some(_), .. })
                 | Command::Resume(
@@ -337,6 +340,10 @@ mod tests {
         ("memory reviewed a", true),
         ("memory set-class q normal", true),
         ("memory reveal a", true),
+        ("memory confirm a --application x", true),
+        ("memory use a --application x", true),
+        ("memory authorization PT", true),
+        ("app answers i", false),
         ("ai status", false),
         ("ai models", false),
         ("ai pull m", true),

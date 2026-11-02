@@ -33,8 +33,6 @@ export type KeyState =
 export type RecoveryReceipt = { key_id: string; path: string };
 
 export type WorkMode = "remote" | "hybrid" | "onsite";
-export type Stated = "not_stated" | "yes" | "no";
-
 export type ProfileBasic = {
   name: string;
   email: string;
@@ -159,6 +157,39 @@ export type Answer = {
 };
 
 export type QuestionRow = { question: Question; answers: Answer[] };
+
+/** What `memoryUse` returns. The only place an answer's text reaches the screen for an
+ * application. Render it as text only. */
+export type UsedAnswer = {
+  application_id: string;
+  answer_id: string;
+  class: MemoryClass;
+  text: string;
+  stale: boolean;
+};
+
+/** An answer an application has used or confirmed. It never holds the answer's text. */
+export type AppliedAnswer = {
+  answer_id: string;
+  question: string;
+  class: MemoryClass;
+  confirmed_at: string | null;
+  used_at: string | null;
+  /** The confirmation matches the answer's version and the answer is not stale. */
+  current: boolean;
+};
+
+export type Stated = "not_stated" | "yes" | "no";
+
+/** Work authorization for one exact country, from the profile. `stated` is false when the
+ * profile has no row for it. */
+export type AuthorizationAnswer = {
+  country: string;
+  authorized: Stated;
+  needs_sponsorship: Stated;
+  note: string;
+  stated: boolean;
+};
 
 export type Application = ApplicationInput & {
   id: string;
@@ -357,6 +388,15 @@ export const ipc = {
     invoke<Question>("memory_set_class", { questionId, class: cls }),
   /** Rust asks the user in a native dialog each time; script cannot answer it. */
   memoryReveal: (answerId: string) => invoke<string>("memory_reveal", { answerId }),
+  /** Rust always asks the user in a native dialog; the dialog never holds the answer. */
+  memoryConfirmUse: (answerId: string, applicationId: string) =>
+    invoke<void>("memory_confirm_use", { answerId, applicationId }),
+  memoryUse: (answerId: string, applicationId: string) =>
+    invoke<UsedAnswer>("memory_use", { answerId, applicationId }),
+  memoryApplicationAnswers: (applicationId: string) =>
+    invoke<AppliedAnswer[]>("memory_application_answers", { applicationId }),
+  memoryAuthorization: (country: string) =>
+    invoke<AuthorizationAnswer>("memory_authorization", { country }),
   memoryRemoveQuestion: (id: string) => invoke<void>("memory_remove_question", { id }),
   memoryRemoveAnswer: (id: string) => invoke<void>("memory_remove_answer", { id }),
 

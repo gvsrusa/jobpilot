@@ -95,6 +95,7 @@ export function backend(overrides: Record<string, Handler> = {}): Backend {
     job_list: () => [],
     kb_list: () => [],
     memory_list: () => [],
+    memory_application_answers: () => [],
     resume_list: () => [],
     key_state: () => ({ state: "key_not_loaded" }),
     settings_get: () => null,

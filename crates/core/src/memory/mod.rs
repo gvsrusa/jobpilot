@@ -7,6 +7,12 @@
 //! here: that question is answered from the encrypted profile row, one country at a time.
 
 pub mod rules;
+pub mod usage;
+
+pub use usage::{
+    AppliedAnswer, AuthorizationAnswer, UsedAnswer, application_answers, authorization_for,
+    confirm_use, use_answer,
+};
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -216,7 +222,7 @@ fn bad(message: &str) -> Error {
     Error::Validation(message.into())
 }
 
-fn changed() -> Error {
+pub(super) fn changed() -> Error {
     Error::Refused("this changed while it was being updated, and nothing was changed".into())
 }
 
@@ -228,7 +234,7 @@ fn person(actor: &str) -> Result<()> {
     }
 }
 
-fn clean_country(country: &str) -> Result<String> {
+pub(crate) fn clean_country(country: &str) -> Result<String> {
     let country = country.trim().to_ascii_uppercase();
     if country.len() == 2 && country.bytes().all(|b| b.is_ascii_uppercase()) {
         Ok(country)

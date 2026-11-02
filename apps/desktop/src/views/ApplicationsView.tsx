@@ -8,13 +8,17 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
+import { useUiStore } from "@/lib/store";
 import {
   ipc,
   STATUSES,
+  toAppError,
   type Application,
   type ApplicationEvent,
   type ApplicationInput,
   type ApplicationStatus,
+  type Answer,
+  type Question,
 } from "@/lib/ipc";
 import { formatDate, formatDay } from "@/lib/utils";
 
@@ -29,6 +33,9 @@ const EMPTY: ApplicationInput = {
   country: "",
   notes: "",
 };
+
+const CANCELLED = "confirmation_required";
+const STATED = { yes: "Yes", no: "No", not_stated: "Not stated by you" } as const;
 
 const label = (status: string) => status.charAt(0).toUpperCase() + status.slice(1);
 
@@ -57,6 +64,174 @@ function describe(event: ApplicationEvent): string {
     case "edited":
       return "Details edited";
   }
+}
+
+type Choice = { value: string; text: string; question: Question; answer: Answer | null };
+
+/**
+ * Taking an answer's text for one application. A sensitive or legal answer is confirmed in a
+ * native dialog first, then used, and the text lands in a read-only field and on the
+ * clipboard. A work authorization question has no stored answer: it shows what the profile
+ * says for one country, and there is no way to type or suggest a value here.
+ */
+function ApplicationAnswers({ application }: { application: Application }) {
+  const client = useQueryClient();
+  const [choice, setChoice] = useState("");
+  const [country, setCountry] = useState(application.country);
+  const [text, setText] = useState<string | null>(null);
+  const [stale, setStale] = useState(false);
+  const [copy, setCopy] = useState<"copied" | "failed" | null>(null);
+
+  const bank = useQuery({ queryKey: ["memory", "for-use"], queryFn: () => ipc.memoryList(null) });
+  const key = ["applications", "answers", application.id];
+  const applied = useQuery({ queryKey: key, queryFn: () => ipc.memoryApplicationAnswers(application.id) });
+
+  const items = (bank.data ?? []).flatMap(({ question, answers }): Choice[] => {
+    if (question.class === "work_authorization") {
+      return [{ value: `q:${question.id}`, text: `${question.text} (work authorization)`, question, answer: null }];
+    }
+    const ready = answers.filter((a) => a.approved);
+    return ready.map((answer, at) => ({
+      value: `a:${answer.id}`,
+      text: `${question.text} (${question.class}${ready.length > 1 ? `, answer ${at + 1}` : ""})`,
+      question,
+      answer,
+    }));
+  });
+  const item = items.find((i) => i.value === choice);
+  const current = item?.answer ? applied.data?.find((a) => a.answer_id === item.answer!.id)?.current : false;
+  const needsConfirm = item?.question.class !== "normal" && !current;
+
+  const use = useMutation({
+    mutationFn: async (answerId: string) => {
+      if (needsConfirm) await ipc.memoryConfirmUse(answerId, application.id);
+      return ipc.memoryUse(answerId, application.id);
+    },
+    onMutate: () => {
+      setText(null);
+      setCopy(null);
+    },
+    onSuccess: async (used) => {
+      setText(used.text);
+      setStale(used.stale);
+      try {
+        await navigator.clipboard.writeText(used.text);
+        setCopy("copied");
+      } catch {
+        setCopy("failed");
+      }
+    },
+    onSettled: () => client.invalidateQueries({ queryKey: key }),
+  });
+  const stated = useMutation({ mutationFn: () => ipc.memoryAuthorization(country) });
+
+  const pick = (value: string) => {
+    setChoice(value);
+    setText(null);
+    setCopy(null);
+    use.reset();
+    stated.reset();
+  };
+  // A cancelled dialog is the user's own answer, not an error.
+  const useError = use.error && toAppError(use.error).code !== CANCELLED ? use.error : null;
+
+  return (
+    <section className="grid gap-3" aria-labelledby="app-answers-heading">
+      <h2 id="app-answers-heading" className="text-sm font-semibold">
+        Answers for this application
+      </h2>
+      <ErrorAlert error={bank.error ?? applied.error} />
+      <div className="grid gap-1.5">
+        <Label htmlFor="app-answer-pick">Answer to use</Label>
+        <select
+          id="app-answer-pick"
+          className={selectClass}
+          value={choice}
+          onChange={(e) => pick(e.target.value)}
+        >
+          <option value="">Choose an answer</option>
+          {items.map((i) => (
+            <option key={i.value} value={i.value}>
+              {i.text}
+            </option>
+          ))}
+        </select>
+        {bank.isSuccess && items.length === 0 && (
+          <p className="text-sm text-muted-foreground">
+            No approved answers yet. Approve one on the Memory screen.
+          </p>
+        )}
+      </div>
+      {item?.answer && (
+        <div className="grid gap-2">
+          <div>
+            <Button type="button" disabled={use.isPending} onClick={() => use.mutate(item.answer!.id)}>
+              {use.isPending ? "Working..." : needsConfirm ? "Confirm and copy" : "Copy"}
+            </Button>
+          </div>
+          <ErrorAlert error={useError} />
+          {text !== null && (
+            <div className="grid gap-1.5">
+              <Label htmlFor="app-answer-text">Answer text</Label>
+              <Textarea id="app-answer-text" readOnly rows={4} className="select-text" value={text} />
+              {stale && (
+                <p className="text-sm">This answer has not been reviewed for over 180 days.</p>
+              )}
+              <p className="text-sm text-muted-foreground" role="status">
+                {copy === "copied" && "Copied to the clipboard."}
+                {copy === "failed" && "Could not copy. The text is above to select and copy."}
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+      {item && !item.answer && (
+        <div className="grid gap-2">
+          <p className="text-sm text-muted-foreground">
+            Work authorization is read from your profile, one country at a time. Nothing is guessed
+            from another country.
+          </p>
+          <div className="grid gap-1.5">
+            <Label htmlFor="app-authz-country">Authorization country</Label>
+            <Input
+              id="app-authz-country"
+              className="max-w-24"
+              value={country}
+              onChange={(e) => {
+                setCountry(e.target.value);
+                stated.reset();
+              }}
+            />
+          </div>
+          <div className="flex gap-2">
+            <Button
+              type="button"
+              disabled={stated.isPending || country.trim() === ""}
+              onClick={() => stated.mutate()}
+            >
+              Show what I stated
+            </Button>
+            <Button type="button" variant="outline" onClick={() => useUiStore.getState().setView("profile")}>
+              Open Profile
+            </Button>
+          </div>
+          <ErrorAlert error={stated.error} />
+          {stated.data &&
+            (stated.data.stated ? (
+              <ul aria-label="Stated values" className="text-sm">
+                <li>
+                  {stated.data.country} - Authorized: {STATED[stated.data.authorized]}
+                </li>
+                <li>Needs sponsorship: {STATED[stated.data.needs_sponsorship]}</li>
+                {stated.data.note && <li className="select-text">{stated.data.note}</li>}
+              </ul>
+            ) : (
+              <p className="text-sm">{STATED.not_stated}</p>
+            ))}
+        </div>
+      )}
+    </section>
+  );
 }
 
 export function ApplicationsView() {
@@ -347,6 +522,7 @@ export function ApplicationsView() {
                     </Button>
                   </div>
                 </form>
+                <ApplicationAnswers key={current.id} application={current} />
                 <section className="grid gap-2">
                   <h2 className="text-sm font-semibold">History</h2>
                   <ErrorAlert error={history.error} />

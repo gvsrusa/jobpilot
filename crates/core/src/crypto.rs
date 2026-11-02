@@ -1284,6 +1284,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(calls(), before);
+
+        // Confirming a sealed answer, listing its use, and a country with no row ask no one.
+        let app = crate::applications::add(
+            &db,
+            "cli",
+            crate::applications::ApplicationInput {
+                company: "Acme".into(),
+                role: "Engineer".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        memory::approve(&db, "cli", "s1", true).await.unwrap();
+        memory::confirm_use(&db, "cli", "s1", &app.id)
+            .await
+            .unwrap();
+        memory::application_answers(&db, &app.id).await.unwrap();
+        assert!(!memory::authorization_for(&db, "CA").await.unwrap().stated);
+        assert_eq!(calls(), before);
         db.close().await;
 
         // The seam itself: an empty name stops before the OS, but it passed through.

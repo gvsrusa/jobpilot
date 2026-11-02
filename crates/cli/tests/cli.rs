@@ -979,3 +979,145 @@ async fn memory_lists_a_sealed_answer_empty_and_reveal_needs_its_key() {
         stderr_text(&revealed)
     );
 }
+
+#[tokio::test]
+async fn memory_use_is_refused_until_confirmed_and_prints_the_hint() {
+    let (_dir, home) = fresh_home();
+    let added = stdout_json(&run(
+        &home,
+        &["memory", "add-question", "Your salary?", "--json"],
+    ));
+    let question = added["id"].as_str().unwrap().to_string();
+    let app = stdout_json(&run(
+        &home,
+        &[
+            "app",
+            "add",
+            "--company",
+            "Acme",
+            "--role",
+            "Engineer",
+            "--json",
+        ],
+    ));
+    let app = app["id"].as_str().unwrap().to_string();
+
+    // A sealed, approved row under a key this root never had: the gate refuses before any key.
+    let db = Db::open(&AppPaths::new(&home)).await.unwrap();
+    let mut connection = db.pool.acquire().await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO memory_answers (id, question_id, body, body_enc, key_id, source, \
+         approved, reviewed_at, created_at, updated_at) \
+         VALUES ('sealed1', ?, '', x'00', 'gone', 'user', 1, \
+         strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 't', 't')",
+    )
+    .bind(&question)
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+    drop(connection);
+    db.close().await;
+
+    let service = format!("jobpilot-test-unused-{}", std::process::id());
+    let env = [("JOBPILOT_SECRET_SERVICE", service.as_str())];
+    let refused = run_env(
+        &home,
+        &["memory", "use", "sealed1", "--application", &app],
+        &env,
+    );
+    assert_eq!(refused.status.code(), Some(1));
+    let text = stderr_text(&refused);
+    assert!(text.contains("confirmation_required"), "{text}");
+    assert!(
+        text.contains(
+            "Confirm it first in an ordinary terminal: jobpilot memory confirm <answer> \
+             --application <application>"
+        ),
+        "{text}"
+    );
+
+    let confirmed = run_env(
+        &home,
+        &["memory", "confirm", "sealed1", "--application", &app],
+        &env,
+    );
+    assert!(confirmed.status.success(), "{}", stderr_text(&confirmed));
+    let listed = stdout_json(&run_env(&home, &["app", "answers", &app, "--json"], &env));
+    assert_eq!(listed[0]["answer_id"], "sealed1");
+    assert_eq!(listed[0]["current"], true);
+}
+
+#[test]
+fn memory_use_prints_a_normal_answer_and_authorization_says_not_stated() {
+    let (_dir, home) = fresh_home();
+    let question = stdout_json(&run(
+        &home,
+        &["memory", "add-question", "Why this job?", "--json"],
+    ))["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let answer = stdout_json(&run(
+        &home,
+        &["memory", "add-answer", &question, "Because", "--json"],
+    ))["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ok(&home, &["memory", "approve", &answer]);
+    let app = stdout_json(&run(
+        &home,
+        &[
+            "app",
+            "add",
+            "--company",
+            "Acme",
+            "--role",
+            "Engineer",
+            "--json",
+        ],
+    ))["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let used = stdout_json(&run(
+        &home,
+        &["memory", "use", &answer, "--application", &app, "--json"],
+    ));
+    assert_eq!(used["text"], "Because");
+
+    let none = stdout_json(&run(&home, &["memory", "authorization", "CA", "--json"]));
+    assert_eq!(none["stated"], false);
+    assert_eq!(none["authorized"], "not_stated");
+    let text =
+        String::from_utf8_lossy(&ok(&home, &["memory", "authorization", "ca"]).stdout).into_owned();
+    assert!(text.contains("not stated by you"), "{text}");
+    let bad = run(&home, &["memory", "authorization", "canada"]);
+    assert_eq!(bad.status.code(), Some(1));
+}
+
+#[test]
+fn panel_refuses_confirm_use_and_authorization() {
+    let (_dir, home) = fresh_home();
+    let panel = [("JOBPILOT_PANEL", "1")];
+    for args in [
+        vec!["memory", "confirm", "a", "--application", "x"],
+        vec!["memory", "use", "a", "--application", "x"],
+        vec!["memory", "authorization", "PT"],
+    ] {
+        let refused = run_env(&home, &args, &panel);
+        assert_eq!(refused.status.code(), Some(1), "{args:?}");
+        assert!(stderr_text(&refused).contains("panel_refused"), "{args:?}");
+    }
+    let listed = run_env(&home, &["app", "answers", "x"], &panel);
+    assert!(
+        !stderr_text(&listed).contains("panel_refused"),
+        "{}",
+        stderr_text(&listed)
+    );
+}
