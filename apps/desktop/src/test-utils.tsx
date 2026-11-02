@@ -90,6 +90,10 @@ export function backend(overrides: Record<string, Handler> = {}): Backend {
       secrets.splice(secrets.indexOf(String(name)), 1);
     },
     audit_recent: () => [],
+    app_list: () => [],
+    app_history: () => [],
+    job_list: () => [],
+    resume_list: () => [],
     key_state: () => ({ state: "key_not_loaded" }),
     settings_get: () => null,
     settings_set: () => undefined,

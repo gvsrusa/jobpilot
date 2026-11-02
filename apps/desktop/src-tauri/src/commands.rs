@@ -14,6 +14,7 @@ use jobpilot_core::ai::claude_code::{self, TERMS_DATE};
 use jobpilot_core::ai::ollama::Ollama;
 use jobpilot_core::ai::router::{Router, ollama_from_settings};
 use jobpilot_core::ai::{self, AiStatus, DataCategory, ProviderId, consent};
+use jobpilot_core::applications::{self, Application, ApplicationEvent, ApplicationInput};
 use jobpilot_core::audit::{self, AuditEntry};
 use jobpilot_core::backup::{self, BackupInfo};
 use jobpilot_core::crypto::{self, KeyState};
@@ -76,6 +77,14 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         job_paste,
         job_list,
         job_get,
+        app_list,
+        app_get,
+        app_add,
+        app_update,
+        app_set_status,
+        app_note,
+        app_history,
+        app_remove,
         resume_import,
         resume_list,
         resume_versions,
@@ -481,6 +490,67 @@ pub async fn job_list(state: State<'_, AppState>) -> Result<Vec<JobText>> {
 #[tauri::command]
 pub async fn job_get(state: State<'_, AppState>, id: String) -> Result<JobText> {
     knowledge::get_job_text(&*state.work().await?, &id).await
+}
+
+#[tauri::command]
+pub async fn app_list(
+    state: State<'_, AppState>,
+    status: Option<String>,
+) -> Result<Vec<Application>> {
+    applications::list(&*state.work().await?, status.as_deref()).await
+}
+
+#[tauri::command]
+pub async fn app_get(state: State<'_, AppState>, id: String) -> Result<Application> {
+    applications::get(&*state.work().await?, &id).await
+}
+
+#[tauri::command]
+pub async fn app_add(state: State<'_, AppState>, input: ApplicationInput) -> Result<Application> {
+    applications::add(&*state.work().await?, ACTOR, input).await
+}
+
+#[tauri::command]
+pub async fn app_update(
+    state: State<'_, AppState>,
+    id: String,
+    input: ApplicationInput,
+) -> Result<Application> {
+    applications::update(&*state.work().await?, ACTOR, &id, input).await
+}
+
+#[tauri::command]
+pub async fn app_set_status(
+    state: State<'_, AppState>,
+    id: String,
+    status: String,
+    on: Option<String>,
+    note: String,
+) -> Result<Application> {
+    applications::set_status(
+        &*state.work().await?,
+        ACTOR,
+        &id,
+        &status,
+        on.as_deref(),
+        &note,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn app_note(state: State<'_, AppState>, id: String, note: String) -> Result<()> {
+    applications::add_note(&*state.work().await?, ACTOR, &id, &note).await
+}
+
+#[tauri::command]
+pub async fn app_history(state: State<'_, AppState>, id: String) -> Result<Vec<ApplicationEvent>> {
+    applications::history(&*state.work().await?, &id).await
+}
+
+#[tauri::command]
+pub async fn app_remove(state: State<'_, AppState>, id: String) -> Result<()> {
+    applications::remove(&*state.work().await?, ACTOR, &id).await
 }
 
 /// The path comes from the picker: the webview never names a file to read. Closing the
@@ -1964,6 +2034,14 @@ mod tests {
         "job_paste",
         "job_list",
         "job_get",
+        "app_list",
+        "app_get",
+        "app_add",
+        "app_update",
+        "app_set_status",
+        "app_note",
+        "app_history",
+        "app_remove",
         "resume_import",
         "resume_list",
         "resume_versions",
@@ -2910,6 +2988,60 @@ mod tests {
             assert!(Instant::now() < until, "timed out");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn app_commands_reach_core() {
+        let h = ready();
+        let added = h.ok(
+            "app_add",
+            json!({ "input": { "company": "Acme", "role": "Engineer", "country": "pt" } }),
+        );
+        let id = added["id"].as_str().unwrap().to_owned();
+        assert_eq!(added["status"], "saved");
+        assert_eq!(added["country"], "PT");
+        let moved = h.ok(
+            "app_set_status",
+            json!({ "id": id, "status": "applied", "on": "2026-10-02", "note": "sent" }),
+        );
+        assert_eq!(moved["applied_on"], "2026-10-02");
+        let history = h.ok("app_history", json!({ "id": id }));
+        assert_eq!(history.as_array().unwrap().len(), 2);
+        h.ok("app_note", json!({ "id": id, "note": "called" }));
+        assert_eq!(
+            h.ok("app_history", json!({ "id": id }))
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        let edited = h.ok(
+            "app_update",
+            json!({ "id": id, "input": { "company": "Acme", "role": "Staff" } }),
+        );
+        assert_eq!(edited["role"], "Staff");
+        assert_eq!(h.ok("app_get", json!({ "id": id }))["status"], "applied");
+        assert_eq!(
+            h.ok("app_list", json!({ "status": "applied" }))
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            h.ok("app_list", json!({ "status": null }))
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let refused = h.call(
+            "app_set_status",
+            json!({ "id": id, "status": "ghosted", "on": null, "note": "" }),
+        );
+        assert_eq!(code_of(refused), "validation");
+        h.ok("app_remove", json!({ "id": id }));
+        assert_eq!(code_of(h.call("app_get", json!({ "id": id }))), "not_found");
     }
 
     fn code_of(result: Result<Value, Value>) -> String {

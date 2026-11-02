@@ -693,3 +693,99 @@ async fn kb_reveal_prints_a_text_and_a_sealed_item_lists_empty() {
         stderr_text(&revealed)
     );
 }
+
+#[test]
+fn app_add_status_list_and_history_round_trip() {
+    let (_dir, home) = fresh_home();
+    let added = stdout_json(&run(
+        &home,
+        &[
+            "app",
+            "add",
+            "--company",
+            "Acme",
+            "--role",
+            "Engineer",
+            "--country",
+            "pt",
+            "--link",
+            "https://example.com/j",
+            "--json",
+        ],
+    ));
+    let id = added["id"].as_str().unwrap().to_string();
+    assert_eq!(added["status"], "saved");
+    assert_eq!(added["country"], "PT");
+    let moved = stdout_json(&run(
+        &home,
+        &[
+            "app",
+            "status",
+            &id,
+            "applied",
+            "--on",
+            "2026-10-02",
+            "--note",
+            "sent",
+            "--json",
+        ],
+    ));
+    assert_eq!(moved["applied_on"], "2026-10-02");
+    ok(&home, &["app", "note", &id, "recruiter called"]);
+    ok(&home, &["app", "edit", &id, "--role", "Staff Engineer"]);
+    let shown = stdout_json(&run(&home, &["app", "show", &id, "--json"]));
+    assert_eq!(shown["role"], "Staff Engineer");
+    assert_eq!(shown["company"], "Acme");
+    assert_eq!(shown["link"], "https://example.com/j");
+    let applied = stdout_json(&run(
+        &home,
+        &["app", "list", "--status", "applied", "--json"],
+    ));
+    assert_eq!(applied.as_array().unwrap().len(), 1);
+    let saved = stdout_json(&run(&home, &["app", "list", "--status", "saved", "--json"]));
+    assert!(saved.as_array().unwrap().is_empty());
+    let history = stdout_json(&run(&home, &["app", "history", &id, "--json"]));
+    let kinds: Vec<_> = history
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["created", "status", "note", "edited"]);
+    let text = run(&home, &["app", "history", &id]);
+    assert!(String::from_utf8_lossy(&text.stdout).contains("saved -> applied"));
+    let bad = run(&home, &["app", "status", &id, "ghosted"]);
+    assert_eq!(bad.status.code(), Some(1));
+    assert!(stderr_text(&bad).starts_with("error[validation]"));
+    ok(&home, &["app", "remove", &id]);
+    let gone = run(&home, &["app", "show", &id]);
+    assert!(stderr_text(&gone).starts_with("error[not_found]"));
+}
+
+#[test]
+fn panel_runs_tracking_commands() {
+    let (_dir, home) = fresh_home();
+    let panel = [("JOBPILOT_PANEL", "1")];
+    let added = run_env(
+        &home,
+        &["app", "add", "--company", "Acme", "--role", "Dev", "--json"],
+        &panel,
+    );
+    let id = stdout_json(&added)["id"].as_str().unwrap().to_string();
+    for args in [
+        vec!["app", "list"],
+        vec!["app", "show", &id],
+        vec!["app", "status", &id, "applied"],
+        vec!["app", "note", &id, "n"],
+        vec!["app", "edit", &id, "--role", "r"],
+        vec!["app", "history", &id],
+        vec!["app", "remove", &id],
+    ] {
+        let output = run_env(&home, &args, &panel);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            stderr_text(&output)
+        );
+    }
+}

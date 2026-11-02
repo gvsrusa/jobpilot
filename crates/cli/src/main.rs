@@ -1,6 +1,7 @@
 //! JobPilot CLI: a thin adapter over `jobpilot-core`. Parse, call core, print.
 
 mod ai;
+mod apps;
 mod data;
 mod profile;
 mod resume;
@@ -57,6 +58,9 @@ pub enum Command {
     /// Cover letter drafts.
     #[command(subcommand)]
     Letter(resume::LetterCommand),
+    /// Applications you are tracking.
+    #[command(subcommand)]
+    App(apps::AppCommand),
     /// AI providers, models, and consent.
     #[command(subcommand)]
     Ai(ai::AiCommand),
@@ -236,6 +240,7 @@ async fn with_db(db: &Db, command: Command) -> Result<Output> {
         Command::Job(command) => profile::job(db, command).await,
         Command::Resume(command) => resume::resume(db, command).await,
         Command::Letter(command) => resume::letter(db, command).await,
+        Command::App(command) => apps::app(db, command).await,
         Command::Ai(command) => ai::ai(db, command).await,
         // `main` and the shell handle this before any command runs.
         Command::Shell => Err(Error::PanelRefused),
@@ -300,6 +305,14 @@ mod tests {
         ("letter generate j", false),
         ("letter export d --format pdf", false),
         ("letter export d --format pdf --out /o", true),
+        ("app add --company c --role r", false),
+        ("app list", false),
+        ("app show i", false),
+        ("app history i", false),
+        ("app edit i --role r", false),
+        ("app status i applied", false),
+        ("app note i n", false),
+        ("app remove i", false),
         ("ai status", false),
         ("ai models", false),
         ("ai pull m", true),

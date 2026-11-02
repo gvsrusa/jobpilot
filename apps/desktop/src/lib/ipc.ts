@@ -98,6 +98,48 @@ export type ResumeDoc = {
   sections: Section[];
 };
 
+export const STATUSES = [
+  "saved",
+  "applied",
+  "screening",
+  "interviewing",
+  "offer",
+  "accepted",
+  "rejected",
+  "withdrawn",
+] as const;
+export type ApplicationStatus = (typeof STATUSES)[number];
+
+/** What the form sends. Optional ids are null when nothing is linked. */
+export type ApplicationInput = {
+  company: string;
+  role: string;
+  job_text_id: string | null;
+  resume_draft_id: string | null;
+  letter_draft_id: string | null;
+  link: string;
+  country: string;
+  notes: string;
+};
+
+export type Application = ApplicationInput & {
+  id: string;
+  status: ApplicationStatus;
+  applied_on: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ApplicationEvent = {
+  id: number;
+  at: string;
+  actor: string;
+  kind: "created" | "status" | "note" | "edited";
+  from_status: ApplicationStatus | null;
+  to_status: ApplicationStatus | null;
+  note: string;
+};
+
 export type DraftKind = "resume" | "cover_letter";
 export type Template = "classic" | "compact";
 export type ExportFormat = "docx" | "pdf";
@@ -245,6 +287,19 @@ export const ipc = {
   jobPaste: (title: string, raw: string) => invoke<JobText>("job_paste", { title, raw }),
   jobList: () => invoke<JobText[]>("job_list"),
   jobGet: (id: string) => invoke<JobText>("job_get", { id }),
+
+  appList: (status: ApplicationStatus | null) =>
+    invoke<Application[]>("app_list", { status }),
+  appGet: (id: string) => invoke<Application>("app_get", { id }),
+  appAdd: (input: ApplicationInput) => invoke<Application>("app_add", { input }),
+  appUpdate: (id: string, input: ApplicationInput) =>
+    invoke<Application>("app_update", { id, input }),
+  /** `on` is YYYY-MM-DD and only matters for the first move to applied. */
+  appSetStatus: (id: string, status: ApplicationStatus, on: string | null, note: string) =>
+    invoke<Application>("app_set_status", { id, status, on, note }),
+  appNote: (id: string, note: string) => invoke<void>("app_note", { id, note }),
+  appHistory: (id: string) => invoke<ApplicationEvent[]>("app_history", { id }),
+  appRemove: (id: string) => invoke<void>("app_remove", { id }),
 
   /** Rust opens the picker. Rejects with `cancelled` when the user closes it. */
   resumeImport: () => invoke<Imported>("resume_import"),
