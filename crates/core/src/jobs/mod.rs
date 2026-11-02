@@ -3,7 +3,10 @@
 //! `job_text_id` and a job id name the same thing.
 
 pub mod dedupe;
+pub mod geo;
 pub mod link;
+pub mod pay;
+pub mod rules;
 
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
@@ -259,7 +262,10 @@ pub async fn import_pasted(db: &Db, input: PastedJob) -> Result<Job> {
     let text = knowledge::import_job_text(db, &input.title, &input.text).await?;
     let made = store(db, &text, company, connector, url, attribution).await;
     match made {
-        Ok(()) => get(db, &text.id).await,
+        Ok(()) => {
+            apply_rules(db, &text.id).await?;
+            get(db, &text.id).await
+        }
         Err(error) => {
             // The text exists only for this job, so a failed job leaves nothing behind.
             let _ = sqlx::query("DELETE FROM job_texts WHERE id = ?")
@@ -476,8 +482,14 @@ pub async fn upsert_posting(
             .map(|()| text.id.clone()),
     };
     match (written, existing) {
-        (Ok(id), Some(_)) => Ok(Upserted::Updated(id)),
-        (Ok(id), None) => Ok(Upserted::Added(id)),
+        (Ok(id), Some(_)) => {
+            apply_rules(db, &id).await?;
+            Ok(Upserted::Updated(id))
+        }
+        (Ok(id), None) => {
+            apply_rules(db, &id).await?;
+            Ok(Upserted::Added(id))
+        }
         (Err(error), _) => {
             // A text no job holds is left to nothing.
             let _ = sqlx::query("DELETE FROM job_texts WHERE id = ?")
@@ -568,7 +580,7 @@ async fn insert_posting(
     Ok(())
 }
 
-/// Moves a job to its new text and fields, and drops its score and its old search row.
+/// Moves a job to its new text and fields (the rules refill what the new text leaves blank), and drops its score and its old search row.
 async fn revise(db: &Db, id: &str, text: &knowledge::JobText, posting: &Posting) -> Result<()> {
     let mut tx = db.pool.begin().await?;
     let company = company_id(&mut tx, &posting.company).await?;
@@ -577,6 +589,7 @@ async fn revise(db: &Db, id: &str, text: &knowledge::JobText, posting: &Posting)
         "UPDATE jobs SET job_text_id = ?, title = ?, company_id = ?, location = ?, country = ?, \
                 work_mode = ?, employment_type = ?, url = ?, apply_url = ?, posted_on = ?, \
                 pay_min = ?, pay_max = ?, pay_currency = ?, pay_period = ?, skills = ?, \
+                seniority = NULL, mentions_authorization = 0, dedupe_key = '', \
                 last_seen_at = ",
         now!(),
         " WHERE id = ? RETURNING seq"
@@ -752,4 +765,100 @@ pub async fn group(db: &Db, id: &str) -> Result<Vec<Job>> {
     .fetch_all(&db.pool)
     .await?;
     rows.into_iter().map(JobRow::into_job).collect()
+}
+
+#[derive(FromRow)]
+struct RulesRow {
+    title: String,
+    company: Option<String>,
+    location: String,
+    country: Option<String>,
+    work_mode: Option<String>,
+    pay_min: Option<i64>,
+    pay_max: Option<i64>,
+    skills: String,
+    fields_by: String,
+    dedupe_key: String,
+    normalized: String,
+}
+
+/// Fills a job's empty columns by rules, so it is usable at once with no agent. A column that
+/// holds anything stays as it is. `fields_by` becomes `rules` only from `none`: a job a
+/// connector filled stays the connector's, and one a person or a model set is not touched at
+/// all. The dedupe key is filled for every job, since it is not a field anyone sets.
+// ponytail: the candidate's own skills do not join the vocabulary yet; nothing stores them in a
+// form this can read without a profile call, so only `skills.txt` is matched.
+pub async fn apply_rules(db: &Db, id: &str) -> Result<()> {
+    let row: RulesRow = sqlx::query_as(
+        "SELECT j.title, c.name AS company, j.location, j.country, j.work_mode, j.pay_min, \
+                j.pay_max, j.skills, j.fields_by, j.dedupe_key, t.normalized \
+         FROM jobs j JOIN job_texts t ON t.id = j.job_text_id \
+         LEFT JOIN companies c ON c.id = j.company_id WHERE j.id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&db.pool)
+    .await?
+    .ok_or(Error::NotFound)?;
+    let mut country = row.country.clone();
+    let mut work_mode = row.work_mode.clone();
+    let mut tx = db.pool.begin().await?;
+    if matches!(row.fields_by.as_str(), "none" | "connector") {
+        let found = rules::fields(
+            &row.title,
+            &row.location,
+            &row.normalized,
+            &[],
+            &rules::vocabulary(&[]),
+        );
+        country = country.or(found.country);
+        work_mode = work_mode.or_else(|| found.work_mode.map(str::to_owned));
+        let empty_skills = row.skills.trim() == "[]";
+        let skills = (empty_skills && !found.skills.is_empty())
+            .then(|| serde_json::to_string(&found.skills))
+            .transpose()
+            .map_err(|error| bad(&error.to_string()))?;
+        let pay = found
+            .pay
+            .filter(|_| row.pay_min.is_none() && row.pay_max.is_none());
+        sqlx::query(
+            "UPDATE jobs SET country = ?, work_mode = ?, \
+                    seniority = coalesce(seniority, ?), skills = coalesce(?, skills), \
+                    pay_min = coalesce(pay_min, ?), pay_max = coalesce(pay_max, ?), \
+                    pay_currency = coalesce(pay_currency, ?), pay_period = coalesce(pay_period, ?), \
+                    mentions_authorization = max(mentions_authorization, ?) WHERE id = ?",
+        )
+        .bind(&country)
+        .bind(&work_mode)
+        .bind(found.seniority.map(rules::Seniority::as_str))
+        .bind(skills)
+        .bind(pay.as_ref().and_then(|p| p.min))
+        .bind(pay.as_ref().and_then(|p| p.max))
+        .bind(pay.as_ref().and_then(|p| p.currency.as_deref()))
+        .bind(pay.as_ref().and_then(|p| p.period).map(PayPeriod::column))
+        .bind(found.mentions_authorization)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        if row.fields_by == "none" {
+            sqlx::query("UPDATE jobs SET fields_by = 'rules' WHERE id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    if row.dedupe_key.is_empty() {
+        let key = dedupe::dedupe_key(
+            row.company.as_deref().unwrap_or(""),
+            &row.title,
+            country.as_deref(),
+            work_mode.as_deref(),
+        );
+        sqlx::query("UPDATE jobs SET dedupe_key = ? WHERE id = ?")
+            .bind(key)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }

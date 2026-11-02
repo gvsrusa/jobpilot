@@ -38,7 +38,7 @@ async fn a_pasted_posting_is_a_job_and_keeps_its_text_id() {
     assert_eq!(job.id, job.job_text_id);
     assert_eq!(job.connector, "import");
     assert_eq!(job.company.as_deref(), Some("Acme"));
-    assert_eq!(job.fields_by, "none");
+    assert_eq!(job.fields_by, "rules");
     assert_eq!(job.duplicates, 0);
     assert_eq!(job.score, None);
     assert_eq!(text_id(&db, &job.id).await.unwrap(), job.id);

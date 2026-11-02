@@ -1,0 +1,325 @@
+# kind<TAB>key<TAB>names (first is the name, ; between aliases)<TAB>extra
+# C: ISO 3166-1 alpha-2 code and its names. S: US state or Canadian province (key is the country, extra its two-letter form).
+# R: region (extra lists country codes, or other region keys).
+C	AD	Andorra	
+C	AE	United Arab Emirates;UAE;Emirates	
+C	AF	Afghanistan	
+C	AG	Antigua and Barbuda	
+C	AI	Anguilla	
+C	AL	Albania	
+C	AM	Armenia	
+C	AO	Angola	
+C	AQ	Antarctica	
+C	AR	Argentina	
+C	AS	American Samoa	
+C	AT	Austria;Österreich	
+C	AU	Australia	
+C	AW	Aruba	
+C	AX	Åland Islands	
+C	AZ	Azerbaijan	
+C	BA	Bosnia and Herzegovina;Bosnia	
+C	BB	Barbados	
+C	BD	Bangladesh	
+C	BE	Belgium;Belgique;België	
+C	BF	Burkina Faso	
+C	BG	Bulgaria	
+C	BH	Bahrain	
+C	BI	Burundi	
+C	BJ	Benin	
+C	BL	Saint Barthélemy	
+C	BM	Bermuda	
+C	BN	Brunei Darussalam;Brunei	
+C	BO	Bolivia	
+C	BQ	Bonaire Sint Eustatius and Saba	
+C	BR	Brazil;Brasil	
+C	BS	Bahamas	
+C	BT	Bhutan	
+C	BV	Bouvet Island	
+C	BW	Botswana	
+C	BY	Belarus	
+C	BZ	Belize	
+C	CA	Canada	
+C	CC	Cocos (Keeling) Islands	
+C	CD	Congo (Democratic Republic);DR Congo;DRC	
+C	CF	Central African Republic	
+C	CG	Congo	
+C	CH	Switzerland;Schweiz;Suisse;Svizzera	
+C	CI	Côte d'Ivoire;Ivory Coast	
+C	CK	Cook Islands	
+C	CL	Chile	
+C	CM	Cameroon	
+C	CN	China	
+C	CO	Colombia	
+C	CR	Costa Rica	
+C	CU	Cuba	
+C	CV	Cabo Verde;Cape Verde	
+C	CW	Curaçao	
+C	CX	Christmas Island	
+C	CY	Cyprus	
+C	CZ	Czechia;Czech Republic	
+C	DE	Germany;Deutschland	
+C	DJ	Djibouti	
+C	DK	Denmark;Danmark	
+C	DM	Dominica	
+C	DO	Dominican Republic	
+C	DZ	Algeria	
+C	EC	Ecuador	
+C	EE	Estonia	
+C	EG	Egypt	
+C	EH	Western Sahara	
+C	ER	Eritrea	
+C	ES	Spain;España	
+C	ET	Ethiopia	
+C	FI	Finland	
+C	FJ	Fiji	
+C	FK	Falkland Islands	
+C	FM	Micronesia	
+C	FO	Faroe Islands	
+C	FR	France	
+C	GA	Gabon	
+C	GB	United Kingdom;UK;U.K.;Great Britain;Britain;England;Scotland;Wales;Northern Ireland	
+C	GD	Grenada	
+C	GE	Georgia (country)	
+C	GF	French Guiana	
+C	GG	Guernsey	
+C	GH	Ghana	
+C	GI	Gibraltar	
+C	GL	Greenland	
+C	GM	Gambia	
+C	GN	Guinea	
+C	GP	Guadeloupe	
+C	GQ	Equatorial Guinea	
+C	GR	Greece	
+C	GS	South Georgia and the South Sandwich Islands	
+C	GT	Guatemala	
+C	GU	Guam	
+C	GW	Guinea-Bissau	
+C	GY	Guyana	
+C	HK	Hong Kong	
+C	HM	Heard Island and McDonald Islands	
+C	HN	Honduras	
+C	HR	Croatia	
+C	HT	Haiti	
+C	HU	Hungary	
+C	ID	Indonesia	
+C	IE	Ireland	
+C	IL	Israel	
+C	IM	Isle of Man	
+C	IN	India	
+C	IO	British Indian Ocean Territory	
+C	IQ	Iraq	
+C	IR	Iran	
+C	IS	Iceland	
+C	IT	Italy;Italia	
+C	JE	Jersey	
+C	JM	Jamaica	
+C	JO	Jordan	
+C	JP	Japan	
+C	KE	Kenya	
+C	KG	Kyrgyzstan	
+C	KH	Cambodia	
+C	KI	Kiribati	
+C	KM	Comoros	
+C	KN	Saint Kitts and Nevis	
+C	KP	North Korea	
+C	KR	South Korea;Korea;Republic of Korea	
+C	KW	Kuwait	
+C	KY	Cayman Islands	
+C	KZ	Kazakhstan	
+C	LA	Laos	
+C	LB	Lebanon	
+C	LC	Saint Lucia	
+C	LI	Liechtenstein	
+C	LK	Sri Lanka	
+C	LR	Liberia	
+C	LS	Lesotho	
+C	LT	Lithuania	
+C	LU	Luxembourg	
+C	LV	Latvia	
+C	LY	Libya	
+C	MA	Morocco	
+C	MC	Monaco	
+C	MD	Moldova	
+C	ME	Montenegro	
+C	MF	Saint Martin	
+C	MG	Madagascar	
+C	MH	Marshall Islands	
+C	MK	North Macedonia	
+C	ML	Mali	
+C	MM	Myanmar	
+C	MN	Mongolia	
+C	MO	Macao	
+C	MP	Northern Mariana Islands	
+C	MQ	Martinique	
+C	MR	Mauritania	
+C	MS	Montserrat	
+C	MT	Malta	
+C	MU	Mauritius	
+C	MV	Maldives	
+C	MW	Malawi	
+C	MX	Mexico;México	
+C	MY	Malaysia	
+C	MZ	Mozambique	
+C	NA	Namibia	
+C	NC	New Caledonia	
+C	NE	Niger	
+C	NF	Norfolk Island	
+C	NG	Nigeria	
+C	NI	Nicaragua	
+C	NL	Netherlands;The Netherlands;Holland;Nederland	
+C	NO	Norway	
+C	NP	Nepal	
+C	NR	Nauru	
+C	NU	Niue	
+C	NZ	New Zealand	
+C	OM	Oman	
+C	PA	Panama	
+C	PE	Peru	
+C	PF	French Polynesia	
+C	PG	Papua New Guinea	
+C	PH	Philippines	
+C	PK	Pakistan	
+C	PL	Poland;Polska	
+C	PM	Saint Pierre and Miquelon	
+C	PN	Pitcairn	
+C	PR	Puerto Rico	
+C	PS	Palestine	
+C	PT	Portugal	
+C	PW	Palau	
+C	PY	Paraguay	
+C	QA	Qatar	
+C	RE	Réunion	
+C	RO	Romania	
+C	RS	Serbia	
+C	RU	Russia	
+C	RW	Rwanda	
+C	SA	Saudi Arabia	
+C	SB	Solomon Islands	
+C	SC	Seychelles	
+C	SD	Sudan	
+C	SE	Sweden;Sverige	
+C	SG	Singapore	
+C	SH	Saint Helena	
+C	SI	Slovenia	
+C	SJ	Svalbard and Jan Mayen	
+C	SK	Slovakia	
+C	SL	Sierra Leone	
+C	SM	San Marino	
+C	SN	Senegal	
+C	SO	Somalia	
+C	SR	Suriname	
+C	SS	South Sudan	
+C	ST	Sao Tome and Principe	
+C	SV	El Salvador	
+C	SX	Sint Maarten	
+C	SY	Syria	
+C	SZ	Eswatini	
+C	TC	Turks and Caicos Islands	
+C	TD	Chad	
+C	TF	French Southern Territories	
+C	TG	Togo	
+C	TH	Thailand	
+C	TJ	Tajikistan	
+C	TK	Tokelau	
+C	TL	Timor-Leste	
+C	TM	Turkmenistan	
+C	TN	Tunisia	
+C	TO	Tonga	
+C	TR	Türkiye;Turkey;Turkiye	
+C	TT	Trinidad and Tobago	
+C	TV	Tuvalu	
+C	TW	Taiwan	
+C	TZ	Tanzania	
+C	UA	Ukraine	
+C	UG	Uganda	
+C	UM	United States Minor Outlying Islands	
+C	US	United States;USA;United States of America;U.S.;U.S.A.	
+C	UY	Uruguay	
+C	UZ	Uzbekistan	
+C	VA	Holy See;Vatican	
+C	VC	Saint Vincent and the Grenadines	
+C	VE	Venezuela	
+C	VG	British Virgin Islands	
+C	VI	U.S. Virgin Islands	
+C	VN	Vietnam;Viet Nam	
+C	VU	Vanuatu	
+C	WF	Wallis and Futuna	
+C	WS	Samoa	
+C	YE	Yemen	
+C	YT	Mayotte	
+C	ZA	South Africa	
+C	ZM	Zambia	
+C	ZW	Zimbabwe	
+S	US	Alabama	AL
+S	US	Alaska	AK
+S	US	Arizona	AZ
+S	US	Arkansas	AR
+S	US	California	CA
+S	US	Colorado	CO
+S	US	Connecticut	CT
+S	US	Delaware	DE
+S	US	Florida	FL
+S	US	Georgia (state)	GA
+S	US	Hawaii	HI
+S	US	Idaho	ID
+S	US	Illinois	IL
+S	US	Indiana	IN
+S	US	Iowa	IA
+S	US	Kansas	KS
+S	US	Kentucky	KY
+S	US	Louisiana	LA
+S	US	Maine	ME
+S	US	Maryland	MD
+S	US	Massachusetts	MA
+S	US	Michigan	MI
+S	US	Minnesota	MN
+S	US	Mississippi	MS
+S	US	Missouri	MO
+S	US	Montana	MT
+S	US	Nebraska	NE
+S	US	Nevada	NV
+S	US	New Hampshire	NH
+S	US	New Jersey	NJ
+S	US	New Mexico	NM
+S	US	New York	NY
+S	US	North Carolina	NC
+S	US	North Dakota	ND
+S	US	Ohio	OH
+S	US	Oklahoma	OK
+S	US	Oregon	OR
+S	US	Pennsylvania	PA
+S	US	Rhode Island	RI
+S	US	South Carolina	SC
+S	US	South Dakota	SD
+S	US	Tennessee	TN
+S	US	Texas	TX
+S	US	Utah	UT
+S	US	Vermont	VT
+S	US	Virginia	VA
+S	US	Washington	WA
+S	US	West Virginia	WV
+S	US	Wisconsin	WI
+S	US	Wyoming	WY
+S	US	District of Columbia	DC
+S	CA	Alberta	AB
+S	CA	British Columbia	BC
+S	CA	Manitoba	MB
+S	CA	New Brunswick	NB
+S	CA	Newfoundland and Labrador	NL
+S	CA	Nova Scotia	NS
+S	CA	Northwest Territories	NT
+S	CA	Nunavut	NU
+S	CA	Ontario	ON
+S	CA	Prince Edward Island	PE
+S	CA	Quebec;Québec	QC
+S	CA	Saskatchewan	SK
+S	CA	Yukon	YT
+R	EU	European Union	AT;BE;BG;HR;CY;CZ;DK;EE;FI;FR;DE;GR;HU;IE;IT;LV;LT;LU;MT;NL;PL;PT;RO;SK;SI;ES;SE
+R	EUROPE	Europe	AT;BE;BG;HR;CY;CZ;DK;EE;FI;FR;DE;GR;HU;IE;IT;LV;LT;LU;MT;NL;PL;PT;RO;SK;SI;ES;SE;GB;NO;CH;IS;LI;AL;AD;BA;BY;MD;ME;MK;MC;RS;SM;UA;VA;GI;GG;JE;IM;FO;AX;SJ;RU;TR
+R	MIDDLE EAST	-	AE;BH;IL;IQ;IR;JO;KW;LB;OM;PS;QA;SA;SY;YE;EG
+R	AFRICA	-	DZ;AO;BJ;BW;BF;BI;CM;CV;CF;TD;KM;CG;CD;CI;DJ;GQ;ER;SZ;ET;GA;GM;GH;GN;GW;KE;LS;LR;LY;MG;MW;ML;MR;MU;YT;MA;MZ;NA;NE;NG;RE;RW;SH;ST;SN;SC;SL;SO;ZA;SS;SD;TZ;TG;TN;UG;EH;ZM;ZW
+R	EMEA	Europe Middle East and Africa	EUROPE;MIDDLE EAST;AFRICA
+R	APAC	Asia Pacific	AF;AU;BD;BT;BN;KH;CN;FJ;HK;IN;ID;JP;KZ;KG;LA;MO;MY;MV;MN;MM;NP;NZ;KP;KR;PK;PG;PH;SG;LK;TW;TJ;TH;TL;TM;UZ;VN;WS;TO;VU;SB;FM;PW;MH;KI;NR;TV;CK;NU;TK;NC;PF;GU;MP;AS;WF;PN;NF;CC;CX;AQ;HM
+R	LATAM	Latin America	AR;BO;BR;CL;CO;CR;CU;DO;EC;SV;GT;HN;HT;MX;NI;PA;PY;PE;PR;UY;VE;BZ;GY;SR;GF
+R	NORTH AMERICA	North America	US;CA;MX;BM;GL;PM
+R	AMERICAS	The Americas	NORTH AMERICA;LATAM;AG;AI;AW;BS;BB;BQ;KY;CW;DM;GD;GP;JM;MQ;MS;BL;KN;LC;MF;VC;SX;TT;TC;VG;VI

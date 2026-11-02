@@ -1,0 +1,168 @@
+Agile
+Airflow
+Android
+Angular|AngularJS
+Ansible
+Arduino
+ASP.NET
+AWS|Amazon Web Services
+Azure
+Bash
+BigQuery
+Blockchain
+Bun
+C#|CSharp
+C++|Cpp
+Cassandra
+CI/CD
+CircleCI
+Clojure
+COBOL
+Computer Vision
+Confluence
+CSS
+Cypress
+Dart
+Databricks
+Datadog
+dbt
+Deep Learning
+Deno
+Django
+Docker
+DynamoDB
+Elasticsearch|OpenSearch
+Electron
+Elixir
+Erlang
+Ethereum
+=Excel
+Express.js
+F#
+FastAPI
+Figma
+Flask
+Flink
+Flutter
+Fortran
+FPGA
+GCP|Google Cloud
+Git
+GitHub Actions
+GitLab CI
+Golang|=Go
+Grafana
+GraphQL
+gRPC
+Hadoop
+Haskell
+Helm
+HTML
+HubSpot
+Illustrator
+iOS
+Java
+JavaScript|JS
+Jenkins
+Jest
+Jira
+Julia
+Jupyter
+Kafka|Apache Kafka
+Kanban
+Keras
+Kotlin
+Kubernetes|k8s
+AWS Lambda
+Laravel
+Linux
+LLM|LLMs
+Looker
+Lua
+Machine Learning
+macOS
+MariaDB
+MATLAB
+Microservices
+MongoDB
+MySQL
+Neo4j
+NestJS
+.NET|dotnet|dot net
+Next.js|NextJS
+Nginx
+Nim
+NLP
+Node.js|NodeJS
+NumPy
+Nuxt
+OAuth
+Objective-C
+OCaml
+OpenTelemetry
+Oracle
+Pandas
+Perl
+Photoshop
+PHP
+Playwright
+PostgreSQL|Postgres
+Power BI
+PowerShell
+Prometheus
+Pulumi
+Python|Python3
+PyTorch
+=R
+RabbitMQ
+React|React.js|ReactJS
+React Native
+Redis
+Redshift
+Redux
+=REST|RESTful
+Ruby
+Ruby on Rails|Rails
+Rust
+Salesforce
+SAP
+Sass
+Scala
+scikit-learn|sklearn
+SciPy
+Scrum
+Selenium
+Sentry
+Serverless
+=Sketch
+Snowflake
+Solidity
+=Spark|Apache Spark
+Spring Boot
+SQL
+SQL Server
+SQLite
+Storybook
+Svelte
+Swift
+SwiftData
+SwiftUI
+Symfony
+Tableau
+Tailwind|Tailwind CSS
+Tauri
+TensorFlow
+Terraform
+Terraform Cloud
+tRPC
+TypeScript|TS
+Unity
+Unreal Engine
+Verilog
+VHDL
+Vite
+Vue|Vue.js|VueJS
+WebAssembly|WASM
+Webpack
+WebSockets
+Zig
