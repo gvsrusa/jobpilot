@@ -68,7 +68,8 @@ fn every_src_file() -> Vec<(String, String)> {
         .into_iter()
         .map(|path| {
             let text = fs::read_to_string(&path).unwrap();
-            (path.to_string_lossy().into_owned(), text)
+            // Forward slashes on every system, so a check on a path reads the same on Windows.
+            (path.to_string_lossy().replace('\\', "/"), text)
         })
         .collect()
 }
