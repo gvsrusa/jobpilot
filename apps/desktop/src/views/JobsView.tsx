@@ -66,11 +66,14 @@ function authText(note: AuthNote): string {
 }
 
 /** What a source row says about a stop. `code` is shown beside it. */
-function problem(code: string, status: SourceStatus, message?: string): string {
+function problem(code: string, nextAt: string | null, message?: string): string {
   if (code.startsWith("policy_")) return `Refused by policy: ${code.slice(7).replace(/_/g, " ")}`;
   if (code === "rate_limited") {
-    const next = new Date(Date.now() + (status.min_interval_secs ?? 60) * 1000);
-    return `Rate limited. Next fetch at ${next.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}.`;
+    // The time comes from the stored hold, so a long Retry-After shows as long.
+    const next = nextAt ? new Date(nextAt) : null;
+    return next && !Number.isNaN(next.getTime())
+      ? `Rate limited. Next fetch at ${next.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}.`
+      : "Rate limited. Try again later.";
   }
   const known: Record<string, string> = {
     source_blocked: "The source refused or showed a challenge page. JobPilot stops there.",
@@ -81,7 +84,7 @@ function problem(code: string, status: SourceStatus, message?: string): string {
   return known[code] ?? message ?? `Stopped: ${code}`;
 }
 
-function ImportDialog({ onClose }: { onClose(): void }) {
+function ImportDialog({ onClose, onSaved }: { onClose(): void; onSaved(): void }) {
   const client = useQueryClient();
   const [title, setTitle] = useState("");
   const [company, setCompany] = useState("");
@@ -91,6 +94,7 @@ function ImportDialog({ onClose }: { onClose(): void }) {
     mutationFn: () => ipc.jobImport({ title, company, url: link.trim() || null, text }),
     onSuccess: async () => {
       await client.invalidateQueries({ queryKey: ["jobs"] });
+      onSaved();
       onClose();
     },
   });
@@ -304,7 +308,7 @@ function JobTable({
 
 type Outcome = { result?: SourceResult; error?: unknown };
 
-function SourceItem({ status, existing }: { status: SourceStatus; existing: string }) {
+function SourceItem({ status, existing, onFetched }: { status: SourceStatus; existing: string; onFetched(): void }) {
   const client = useQueryClient();
   const [typed, setTyped] = useState<string | null>(null);
   const board = typed ?? existing;
@@ -323,6 +327,7 @@ function SourceItem({ status, existing }: { status: SourceStatus; existing: stri
     onSettled: async () => {
       await client.invalidateQueries({ queryKey: ["jobs"] });
       await client.invalidateQueries({ queryKey: ["job-sources"] });
+      onFetched();
     },
   });
   const read = { allowed: "allowed", silent_read: "owner decision", blocked: "blocked", user_assisted: "unknown", unknown: "unknown" }[status.read];
@@ -364,7 +369,7 @@ function SourceItem({ status, existing }: { status: SourceStatus; existing: stri
       {status.note && <p className="text-muted-foreground">{status.note}</p>}
       {code && (
         <p role="alert" className="text-destructive">
-          {problem(code, status, thrown?.message)} <span className="font-mono text-xs">code: {code}</span>
+          {problem(code, outcome.result?.next_at ?? null, thrown?.message)} <span className="font-mono text-xs">code: {code}</span>
         </p>
       )}
       {outcome.result && !stop && (
@@ -376,7 +381,7 @@ function SourceItem({ status, existing }: { status: SourceStatus; existing: stri
   );
 }
 
-function Sources({ statuses }: { statuses: SourceStatus[] }) {
+function Sources({ statuses, onFetched }: { statuses: SourceStatus[]; onFetched(): void }) {
   const rows = useQuery({ queryKey: ["job-sources"], queryFn: ipc.jobSourcesList });
   return (
     <section aria-labelledby="sources-heading" className="grid gap-1">
@@ -386,7 +391,12 @@ function Sources({ statuses }: { statuses: SourceStatus[] }) {
       <ErrorAlert error={rows.error} />
       <ul>
         {statuses.map((s) => (
-          <SourceItem key={s.name} status={s} existing={rows.data?.find((r) => r.connector === s.name)?.target ?? ""} />
+          <SourceItem
+            key={s.name}
+            status={s}
+            existing={rows.data?.find((r) => r.connector === s.name)?.target ?? ""}
+            onFetched={onFetched}
+          />
         ))}
       </ul>
     </section>
@@ -398,6 +408,17 @@ function List({ focusId, onOpen }: { focusId: string | null; onOpen(id: string):
   const [importing, setImporting] = useState(false);
   const jobs = useQuery({ queryKey: ["jobs", filter], queryFn: () => ipc.jobsList(filter, LIMIT) });
   const statuses = useQuery({ queryKey: ["job-sources-status"], queryFn: ipc.jobSourcesStatus });
+  // The rules score needs no model: it runs on load and after a fetch or an import, for every
+  // job that has none or whose inputs changed.
+  const client = useQueryClient();
+  const score = useMutation({
+    mutationFn: () => ipc.jobsAnalyze([], false),
+    onSettled: () => client.invalidateQueries({ queryKey: ["jobs"] }),
+  });
+  const rescore = score.mutate;
+  useEffect(() => {
+    rescore();
+  }, [rescore]);
   return (
     <div className="grid gap-4">
       <div className="flex items-center justify-between">
@@ -407,7 +428,7 @@ function List({ focusId, onOpen }: { focusId: string | null; onOpen(id: string):
         </Button>
       </div>
       <Filters onApply={setFilter} />
-      <ErrorAlert error={jobs.error ?? statuses.error} />
+      <ErrorAlert error={jobs.error ?? statuses.error ?? score.error} />
       {jobs.isSuccess && jobs.data.length === 0 && (
         <p className="text-sm text-muted-foreground">
           No jobs yet. Import a posting, or fetch from a source marked allowed.
@@ -425,8 +446,8 @@ function List({ focusId, onOpen }: { focusId: string | null; onOpen(id: string):
           />
         </>
       )}
-      {statuses.isSuccess && <Sources statuses={statuses.data} />}
-      {importing && <ImportDialog onClose={() => setImporting(false)} />}
+      {statuses.isSuccess && <Sources statuses={statuses.data} onFetched={() => rescore()} />}
+      {importing && <ImportDialog onClose={() => setImporting(false)} onSaved={() => rescore()} />}
     </div>
   );
 }
@@ -607,7 +628,7 @@ function Detail({ id, onBack }: { id: string; onBack(): void }) {
               onConfirm={() => remove.mutate()}
               onCancel={() => setRemoving(false)}
             >
-              <p>The stored posting text stays in your data until you delete it.</p>
+              <p>The posting text is deleted with the job, unless a draft cites it.</p>
             </ConfirmDialog>
           )}
         </>

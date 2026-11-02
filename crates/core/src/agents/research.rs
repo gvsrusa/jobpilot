@@ -212,7 +212,8 @@ pub async fn research_company(
 }
 
 /// What a press would spend, at most: one summary call to each external provider that
-/// declares `NoTools` and holds an active consent for company and job text. `jobs` is the
+/// declares `NoTools` and holds an active consent for company and job text, times the attempts
+/// of the task. `jobs` is the
 /// number of stored texts it would read. Reads only: it starts no provider and asks no key.
 pub async fn research_plan(db: &Db, router: &Router, company_id: &str) -> Result<AiPlan> {
     company::name(db, company_id).await?;
@@ -234,6 +235,11 @@ pub async fn research_plan(db: &Db, router: &Router, company_id: &str) -> Result
     }
     Ok(AiPlan {
         jobs: texts,
-        external_calls: if texts == 0 { 0 } else { providers },
+        // A bad reply is asked for again, so the ceiling is every attempt of the task.
+        external_calls: if texts == 0 {
+            0
+        } else {
+            providers * spec(TaskType::SummarizeCompany).attempts as usize
+        },
     })
 }

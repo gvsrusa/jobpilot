@@ -428,3 +428,31 @@ fn a_bare_apex_routes_to_its_connector() {
         LinkRoute::Workday
     ));
 }
+
+#[tokio::test]
+async fn a_link_with_a_user_name_or_plain_http_is_refused_at_import() {
+    let (_tmp, db) = open().await;
+    for bad in [
+        "https://user:secret@evil.example/x",
+        "https://user@evil.example/x",
+        "http://example.com/x",
+        "https://example.com:8443/x",
+    ] {
+        let e = import_pasted(&db, pasted("T", "C", Some(bad), "text"))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), "validation", "{bad}");
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "a refused link stores nothing");
+    let ok = import_pasted(
+        &db,
+        pasted("T", "C", Some("https://example.com/jobs/1"), "text"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ok.url.as_deref(), Some("https://example.com/jobs/1"));
+}

@@ -47,6 +47,9 @@ pub struct SourceResult {
     pub skipped: usize,
     /// Why the source stopped early: a refusal code, or a failure's code.
     pub reason: Option<String>,
+    /// When a rate-limited source may be read again (UTC, ISO 8601), from the stored hold. It
+    /// is the wait the source or the limit asked for, so a long `Retry-After` shows as long.
+    pub next_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -149,6 +152,7 @@ impl<'f> DiscoveryWorkflow<'f> {
             updated: 0,
             skipped: 0,
             reason: None,
+            next_at: None,
         };
         let Some(connector) = connectors::find(&source.connector) else {
             result.reason = Some("source_unknown".into());
@@ -180,6 +184,12 @@ impl<'f> DiscoveryWorkflow<'f> {
                     return Err(error);
                 }
                 Err(error) => {
+                    if let Error::RateLimited {
+                        retry_after: Some(wait),
+                    } = &error
+                    {
+                        result.next_at = after(db, *wait).await?;
+                    }
                     result.reason = Some(match error {
                         Error::Refused(why) => why,
                         other => other.code().to_owned(),
@@ -221,6 +231,16 @@ impl<'f> DiscoveryWorkflow<'f> {
             }
         }
     }
+}
+
+/// The UTC time `wait` from now, from SQLite so no date crate is needed.
+async fn after(db: &Db, wait: std::time::Duration) -> Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)")
+            .bind(format!("+{} seconds", wait.as_secs().max(1)))
+            .fetch_optional(&db.pool)
+            .await?,
+    )
 }
 
 async fn set_cursor(db: &Db, id: &str, cursor: i64) -> Result<()> {

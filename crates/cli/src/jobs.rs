@@ -442,6 +442,9 @@ async fn fetch(db: &Db, src: Vec<String>) -> Result<Output> {
                 "    stopped: {}",
                 source_reason(reason).unwrap_or(reason)
             ));
+            if let Some(at) = &s.next_at {
+                lines.push(format!("    next fetch at {at} (UTC)"));
+            }
         }
     }
     lines.push(format!("{} grouped as duplicates", report.grouped));

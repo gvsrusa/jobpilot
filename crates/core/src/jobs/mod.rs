@@ -286,6 +286,12 @@ pub async fn import_pasted(db: &Db, input: PastedJob) -> Result<Job> {
         .filter(|url| !url.is_empty());
     let routed = match url {
         Some(url) if url.chars().count() > URL_LIMIT => return Err(bad("a link is too long")),
+        // The same rule a fetched link passes: https, no user name, no port.
+        Some(url) if !crate::connectors::link_ok(url, &[]) => {
+            return Err(bad(
+                "a link is https with no user name or port, such as https://example.com/job",
+            ));
+        }
         Some(url) => Some(route(url)?),
         None => None,
     };

@@ -1,6 +1,6 @@
 import { screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import type { Job, JobDetail, SourceRow, SourceStatus } from "../lib/ipc";
+import type { AiStatus, Job, JobDetail, SourceRow, SourceStatus } from "../lib/ipc";
 import { backend, count, renderApp } from "../test-utils";
 
 type Args = Record<string, unknown>;
@@ -237,5 +237,80 @@ describe("Jobs screen", () => {
     row.focus();
     await user.keyboard("{Enter}");
     expect(await screen.findByText(/70000-80000 EUR, period not stated/)).toBeInTheDocument();
+  });
+});
+
+const AI_OFF: AiStatus = {
+  ollama: { state: "not_running", url: "http://127.0.0.1:11434" },
+  claude_code: { available: false, path: null, consent: null, suspended: false },
+  external: [],
+  register_date: "2026-11-01",
+  hardware: { total_memory: 16 * 2 ** 30, cpus: 8, gpu: "no GPU found", free_disk: 100 * 2 ** 30 },
+  order: ["ollama"],
+  enabled: { ollama: true, claude_code: false },
+  drafting_model: null,
+  embedding_model: null,
+};
+
+describe("Jobs screen scoring and copy", () => {
+  it("scores with rules on load, so a full profile shows a number", async () => {
+    let scored = false;
+    const b = jobsBackend([], {
+      jobs_analyze: () => {
+        scored = true;
+        return { scored: 1, parsed: 0, evaluated: 0, dropped: 0, reason: null };
+      },
+      jobs_list: () => [job({ id: "s1", title: "Scored Role", score: scored ? 77 : null })],
+    });
+    await openJobs();
+    const row = await screen.findByRole("row", { name: /Scored Role/ });
+    await waitFor(() => expect(within(row).getByText("77")).toBeInTheDocument());
+    expect(within(row).queryByText("--")).toBeNull();
+    expect(b.calls.find((c) => c.cmd === "jobs_analyze")!.args).toEqual({ ids: [], ai: false });
+  });
+
+  it("scores again after a fetch", async () => {
+    const row: SourceRow = { id: "s1", connector: "lever", target: "acme", query: "", cursor: 0, created_at: "t" };
+    const b = jobsBackend([], {
+      jobs_fetch: () => ({
+        sources: [{ source_id: "s1", connector: "lever", target: "acme", added: 1, updated: 0, skipped: 0, reason: null, next_at: null }],
+        grouped: 0,
+      }),
+    }, [row]);
+    const { user } = await openJobs();
+    const lever = await screen.findByRole("listitem", { name: "Lever" });
+    await waitFor(() => expect(count(b, "jobs_analyze")).toBe(1));
+    await user.click(within(lever).getByRole("button", { name: "Fetch Lever" }));
+    await waitFor(() => expect(count(b, "jobs_analyze")).toBe(2));
+  });
+
+  it("shows the true next fetch time from the stored hold", async () => {
+    const row: SourceRow = { id: "s1", connector: "lever", target: "acme", query: "", cursor: 0, created_at: "t" };
+    const next = "2026-11-02T16:30:00Z";
+    jobsBackend([], {
+      jobs_fetch: () => ({
+        sources: [{ source_id: "s1", connector: "lever", target: "acme", added: 0, updated: 0, skipped: 0, reason: "rate_limited", next_at: next }],
+        grouped: 0,
+      }),
+    }, [row]);
+    const { user } = await openJobs();
+    const lever = await screen.findByRole("listitem", { name: "Lever" });
+    await user.click(within(lever).getByRole("button", { name: "Fetch Lever" }));
+    const alert = await within(lever).findByRole("alert");
+    const when = new Date(next).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+    expect(alert).toHaveTextContent(`Rate limited. Next fetch at ${when}.`);
+  });
+
+  it("says what Remove really does to the posting text", async () => {
+    const j = job();
+    jobsBackend([j], { ai_status: () => AI_OFF });
+    const { user } = await openJobs();
+    const r = await screen.findByRole("row", { name: /Backend Engineer/ });
+    r.focus();
+    await user.keyboard("{Enter}");
+    await user.click(await screen.findByRole("button", { name: "Remove job" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent("The posting text is deleted with the job, unless a draft cites it.");
+    expect(dialog).not.toHaveTextContent("stays in your data");
   });
 });

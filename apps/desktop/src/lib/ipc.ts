@@ -587,6 +587,8 @@ export type SourceResult = {
   updated: number;
   skipped: number;
   reason: string | null;
+  /** When a rate-limited source may be read again, from the stored hold. */
+  next_at: string | null;
 };
 export type DiscoveryReport = { sources: SourceResult[]; grouped: number };
 export type MatchReport = { scored: number; parsed: number; evaluated: number; dropped: number; reason: string | null };

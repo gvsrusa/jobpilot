@@ -419,7 +419,14 @@ async fn research_opens_no_socket() {
     listener.set_nonblocking(true).unwrap();
     let url = format!("http://{}/about", listener.local_addr().unwrap());
     let (tmp, db) = open().await;
-    let job = paste_at(&db, Some(&url), POSTING).await;
+    let job = paste_at(&db, Some("https://example.com/about"), POSTING).await;
+    // Import refuses a link like this one, so a stored row is changed to hold it.
+    sqlx::query("UPDATE jobs SET url = ? WHERE id = ?")
+        .bind(&url)
+        .bind(&job.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
     let w = World {
         _tmp: tmp,
         company: job.company_id.clone().unwrap(),
@@ -899,7 +906,12 @@ async fn the_plan_counts_external_providers_with_both_consents() {
     assert_eq!(plan.external_calls, 0, "company text is not covered");
     consent_to(&w.db, &[DataCategory::JobText, DataCategory::CompanyText]).await;
     let plan = research_plan(&w.db, &router, &w.company).await.unwrap();
-    assert_eq!((plan.jobs, plan.external_calls), (1, 1));
+    assert_eq!(
+        (plan.jobs, plan.external_calls),
+        (1, spec(TaskType::SummarizeCompany).attempts as usize),
+        "a bad first reply is retried, so the ceiling is every attempt"
+    );
+    assert!(plan.external_calls >= 2);
     assert_eq!(handles.calls(), 0, "a plan asks nothing");
     let error = research_plan(&w.db, &router, "nosuchcompany")
         .await

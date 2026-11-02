@@ -360,6 +360,49 @@ async fn one_refused_source_does_not_stop_the_next() {
 }
 
 #[tokio::test]
+async fn a_long_retry_after_reports_the_true_next_time() {
+    let (_t, db) = open().await;
+    let fake = Fake::start(vec![(
+        route(0),
+        Canned {
+            status: 429,
+            headers: vec![
+                ("Content-Type", "text/plain".into()),
+                ("Retry-After", "3600".into()),
+            ],
+            body: String::new(),
+            hold: Duration::ZERO,
+            announced: None,
+        },
+    )]);
+    let fetcher = Fetcher::for_test(&fake.url).unwrap();
+    let id = source(&db, "lever", "acme", "").await;
+    let report = discover_with(&db, &fetcher, "cli", vec![id.clone()], token())
+        .await
+        .unwrap();
+    assert_eq!(report.sources[0].reason.as_deref(), Some("rate_limited"));
+    let at = report.sources[0].next_at.clone().expect("a next time");
+    async fn bound(db: &Db, secs: i64) -> String {
+        sqlx::query_scalar::<_, String>("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now', ?)")
+            .bind(format!("+{secs} seconds"))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+    }
+    assert!(
+        at > bound(&db, 3500).await && at < bound(&db, 3700).await,
+        "{at}"
+    );
+    // A second press before the hold ends reports the same hold, not a short interval.
+    let again = discover_with(&db, &fetcher, "cli", vec![id], token())
+        .await
+        .unwrap();
+    assert_eq!(again.sources[0].reason.as_deref(), Some("rate_limited"));
+    let later = again.sources[0].next_at.clone().expect("a next time");
+    assert!(later > bound(&db, 3400).await, "{later}");
+}
+
+#[tokio::test]
 async fn adding_a_source_with_no_read_is_refused() {
     let (_t, db) = open().await;
     let e = add_source(&db, "linkedin", "acme", "").await.unwrap_err();

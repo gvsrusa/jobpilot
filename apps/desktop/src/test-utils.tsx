@@ -127,6 +127,7 @@ export function backend(overrides: Record<string, Handler> = {}): Backend {
     analytics_latest: () => null,
     job_list: () => [],
     jobs_list: () => [],
+    jobs_analyze: () => ({ scored: 0, parsed: 0, evaluated: 0, dropped: 0, reason: null }),
     job_sources_status: () => [],
     job_sources_list: () => [],
     kb_list: () => [],

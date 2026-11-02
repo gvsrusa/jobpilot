@@ -612,10 +612,8 @@ pub async fn job_open<R: Runtime>(
 ) -> Result<()> {
     let job = jobs_core::get(&*state.work().await?, &id).await?;
     let url = job.url.as_deref().map(str::trim).unwrap_or_default();
-    if !url
-        .get(..8)
-        .is_some_and(|head| head.eq_ignore_ascii_case("https://"))
-    {
+    // The rule a fetched link passes: https, no user name or password, no port.
+    if !connectors::link_ok(url, &[]) {
         return Err(Error::Refused("this job has no https link to open".into()));
     }
     native::open_url(&app, url).await
@@ -627,7 +625,8 @@ pub async fn job_to_app(state: State<'_, AppState>, id: String) -> Result<Applic
     let db = state.work().await?;
     let job = jobs_core::get(&db, &id).await?;
     let input = ApplicationInput {
-        company: job.company.unwrap_or_default(),
+        // A tracker entry needs a company: say plainly when the posting named none.
+        company: job.company.unwrap_or_else(|| "Company not stated".into()),
         role: job.title,
         job_text_id: Some(job.job_text_id),
         link: job.url.unwrap_or_default(),
@@ -5681,6 +5680,48 @@ mod tests {
 
         let bare = import_job(&h, None)["id"].clone();
         assert_eq!(h.code("job_open", json!({ "id": bare })), "refused");
+    }
+
+    #[test]
+    fn job_open_refuses_a_link_with_a_user_name_or_a_port() {
+        let h = ready();
+        let id = import_job(&h, Some("https://example.com/jobs/1"))["id"].clone();
+        let hook = h.app.state::<NativeHook>();
+        for bad in [
+            "https://user:secret@evil.example/x",
+            "https://user@evil.example/x",
+            "https://evil.example:8443/x",
+        ] {
+            with_db(&h, |db| async move {
+                sqlx::query("UPDATE jobs SET url = ?")
+                    .bind(bad)
+                    .execute(&db.pool)
+                    .await
+                    .unwrap();
+            });
+            assert_eq!(h.code("job_open", json!({ "id": id })), "refused", "{bad}");
+        }
+        assert!(hook.opened.lock().unwrap().is_empty());
+        let input = json!({
+            "title": "T", "company": "Acme", "text": "Rust",
+            "url": "https://user:secret@evil.example/x",
+        });
+        assert_eq!(
+            h.code("job_import", json!({ "input": input })),
+            "validation"
+        );
+    }
+
+    #[test]
+    fn job_to_app_stores_a_job_with_no_company() {
+        let h = ready();
+        let input =
+            json!({ "title": "Backend Engineer", "company": "", "url": null, "text": "Rust" });
+        let job = h.ok("job_import", json!({ "input": input }));
+        assert_eq!(job["company"], Value::Null);
+        let app = h.ok("job_to_app", json!({ "id": job["id"] }));
+        assert_eq!(app["company"], "Company not stated");
+        assert_eq!(app["role"], "Backend Engineer");
     }
 
     #[test]

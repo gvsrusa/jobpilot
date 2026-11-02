@@ -191,7 +191,7 @@ fn cut_bytes(text: &mut String, max: usize) {
 }
 
 /// A stored link is https, names no user or port, and sits on one of `hosts` when any are given.
-fn link_ok(link: &str, hosts: &[&str]) -> bool {
+pub fn link_ok(link: &str, hosts: &[&str]) -> bool {
     let Ok(url) = reqwest::Url::parse(link) else {
         return false;
     };
