@@ -178,15 +178,15 @@ Details and the full lists are in [release 0.5.0](releases/0.5.0.md). Rows marke
 
 | Gate | Result |
 |---|---|
-| 1. Build | `PLACEHOLDER_TASK_15_BUILD` (the figures from the Task 14 run are in the [release note](releases/0.5.0.md#tests)) |
-| 2. Tests | Local macOS: see [release 0.5.0](releases/0.5.0.md#tests). Keychain suites: `PLACEHOLDER_TASK_15_KEYCHAIN`. |
-| 3. Migrations | `a_fresh_database_is_schema_15` and `a_0_4_database_upgrades_to_0_5` (figures in the release note). An upgrade of a database made by the real 0.4 binary: `PLACEHOLDER_TASK_15_UPGRADE`. |
+| 1. Build | `scripts/ci-local.sh --fast` passed; `pnpm tauri build --no-bundle` built v0.5.0 (figures in the [release note](releases/0.5.0.md#tests)) |
+| 2. Tests | Local macOS: see [release 0.5.0](releases/0.5.0.md#tests). Keychain suites: macOS CI; a local run stopped at its 25-minute limit with 90 passed and 0 failed. |
+| 3. Migrations | `a_fresh_database_is_schema_15` and `a_0_4_database_upgrades_to_0_5` (figures in the release note). An upgrade of a database made by the real 0.4 binary: passed: a database from the real 0.4 CLI (schema 12) opened at schema 15 and its job gained skills, seniority, pay, and the authorization mention. |
 | 4. Windows and macOS | `PLACEHOLDER_TASK_15_CI`. CI runs no job source, and `job_open` and a live fetch are not run on Windows by anyone. |
 | 5. Docs and risks | Updated: connector SDK (rewritten from a stub), policy register (site rows only; no AI provider row and no owner decision line), agents, architecture, database schema, AI providers, threat model, wireframes (screens 8 and 9), development guide, PRD, README, changelog, and the release note. Risks are in the release note. |
 
 Exit tests not proven end to end:
-- "A read connector runs for a source whose register read verdict is `allowed` or `silent-read`": proven against recorded shapes and a loopback fake. A live read of each source is `PLACEHOLDER_TASK_15_LIVE`.
-- "Semantic evaluation runs only when an AI backend is configured": proven with scripted model replies. A real model call is `PLACEHOLDER_TASK_15_MODEL`.
+- "A read connector runs for a source whose register read verdict is `allowed` or `silent-read`": proven against recorded shapes and a loopback fake. A live read of each source is done once on 2026-11-02, see the release note.
+- "Semantic evaluation runs only when an AI backend is configured": proven with scripted model replies. A real model call is done with Claude Code and Ollama, see the release note.
 - The Greenhouse and Ashby reads rest on ruling R1, which the owner has not been asked about.
 - "Windows and macOS: connector tests and the job CLI commands pass on both" rests on the CI run recorded in the Windows row. Nobody used the Jobs screen on Windows.
 
