@@ -474,13 +474,12 @@ async fn rules_never_touch_a_field_a_person_set() {
 #[test]
 fn a_suffix_that_is_both_a_region_and_a_country_is_unknown() {
     for place in [
-        "Berlin, DE",
-        "Amsterdam, NL",
-        "Toronto, CA",
-        "Mumbai, IN",
+        "Lausanne, DE",
+        "Leiden, NL",
         "Remote, IN",
-        "Tel Aviv, IL",
-        "Lima, PE",
+        "Remote, CA",
+        "Eilat, IL",
+        "Trujillo, PE",
     ] {
         assert!(matches!(scope_of(place), Scope::Unknown), "{place}");
     }
@@ -659,4 +658,35 @@ async fn a_changed_text_keeps_what_a_person_or_model_set_and_recomputes_rules() 
     assert_eq!(seniority.as_deref(), Some("junior"));
     assert_eq!(fields_by, "rules");
     assert_eq!(flag, 1);
+}
+
+#[test]
+fn a_known_city_settles_an_ambiguous_suffix() {
+    for (place, code) in [
+        ("San Francisco, CA", "US"),
+        ("Boston, MA", "US"),
+        ("Indianapolis, IN", "US"),
+        ("Toronto, CA", "CA"),
+        ("Mumbai, IN", "IN"),
+        ("Berlin, DE", "DE"),
+        ("Bogota, CO", "CO"),
+        ("Amsterdam, NL", "NL"),
+        ("Tel Aviv, IL", "IL"),
+        ("Lima, PE", "PE"),
+        ("Casablanca, MA", "MA"),
+        ("Remote - Berlin, DE", "DE"),
+        ("Denver, CO", "US"),
+    ] {
+        assert_eq!(country_code(place), Some(code), "{place}");
+    }
+    // A suffix that does not fit the city, a city not in the table, and no city all stay unknown.
+    for place in [
+        "Berlin, CA",
+        "Lausanne, CA",
+        "Remote, IN",
+        "Mumbai, DE",
+        "Boston, IN",
+    ] {
+        assert!(matches!(scope_of(place), Scope::Unknown), "{place}");
+    }
 }

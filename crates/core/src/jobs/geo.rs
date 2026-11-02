@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
 const TABLE: &str = include_str!("../../data/countries.tsv");
+const CITIES: &str = include_str!("../../data/cities.tsv");
 
 /// The longest phrase in the table, in words, so a scan never looks further.
 const LONGEST: usize = 8;
@@ -38,6 +39,8 @@ struct Table {
     /// `TX`, `ON`: a state or province's two-letter form, matched after a comma only.
     subdivisions: HashMap<&'static str, &'static str>,
     codes: HashMap<&'static str, &'static str>,
+    /// A folded city to its country and, for a US or Canadian city, its state or province.
+    cities: HashMap<String, (&'static str, &'static str)>,
     /// A region's key to the country codes it holds, other regions already expanded.
     regions: HashMap<&'static str, Vec<&'static str>>,
 }
@@ -64,6 +67,7 @@ fn build() -> Table {
         phrases: HashMap::new(),
         subdivisions: HashMap::new(),
         codes: HashMap::new(),
+        cities: HashMap::new(),
         regions: HashMap::new(),
     };
     let mut raw_regions: Vec<(&'static str, Vec<&'static str>)> = Vec::new();
@@ -101,6 +105,15 @@ fn build() -> Table {
             if !phrase.is_empty() {
                 table.phrases.insert(phrase, scope);
             }
+        }
+    }
+    for line in CITIES
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        let mut cols = line.split('\t');
+        if let (Some(city), Some(country), Some(sub)) = (cols.next(), cols.next(), cols.next()) {
+            table.cities.insert(fold(city), (country, sub));
         }
     }
     for word in ANYWHERE {
@@ -176,7 +189,8 @@ pub fn scope_of(location: &str) -> Scope {
     }
     // After a comma, the first word of a part, in capitals, as it was written. A form that is
     // both a state or province and a country code (`DE`, `IN`, `NL`, `CA`) is not decided.
-    for part in location.split(',').skip(1) {
+    let parts: Vec<&str> = location.split(',').collect();
+    for (at, part) in parts.iter().enumerate().skip(1) {
         let Some(word) = part.split_whitespace().next() else {
             continue;
         };
@@ -185,7 +199,15 @@ pub fn scope_of(location: &str) -> Scope {
             continue;
         }
         match (table.subdivisions.get(word), table.codes.get(word)) {
-            (Some(_), Some(_)) => return Scope::Unknown,
+            (Some(_), Some(_)) => match city_fitting(table, parts[at - 1], word) {
+                Some(country) => {
+                    let scope = Scope::Country(country);
+                    if !named.contains(&scope) {
+                        named.push(scope);
+                    }
+                }
+                None => return Scope::Unknown,
+            },
             (Some(&country), None) | (None, Some(&country)) => {
                 let scope = Scope::Country(country);
                 if !named.contains(&scope) {
@@ -209,6 +231,20 @@ pub fn scope_of(location: &str) -> Scope {
         [one] => *one,
         _ => Scope::Unknown,
     }
+}
+
+/// The country of the city that ends `part` (`Remote - Berlin`), when the suffix is that city's
+/// country code or its state or province. A city not in the table, or one the suffix does not
+/// fit (`Berlin, CA`), settles nothing.
+// ponytail: about 200 major cities; a smaller city with an ambiguous suffix stays unknown.
+fn city_fitting(table: &Table, part: &str, suffix: &str) -> Option<&'static str> {
+    let folded = fold(part);
+    let words: Vec<&str> = folded.split(' ').collect();
+    (1..=3.min(words.len())).find_map(|len| {
+        let city = words[words.len() - len..].join(" ");
+        let &(country, sub) = table.cities.get(&city)?;
+        (suffix == country || (!sub.is_empty() && suffix == sub)).then_some(country)
+    })
 }
 
 /// Whether the region (`EMEA`, `eu`) holds the country code. An unknown region holds nothing.
