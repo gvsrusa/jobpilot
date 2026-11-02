@@ -10,22 +10,22 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-01-jobpilot-master-spec.md` section 3 (authority). Derived: `docs/milestones.md` (Release 0.4), `docs/prd.md` FR-3.10, FR-3.11, FR-3.15 to FR-3.19, `docs/ai-providers.md`, `docs/policy-register.md` (Owner decisions), `docs/security/threat-model.md` (M-15, M-21, M-29, M-30, M-31, M-32, M-40, section 7), `docs/wireframes.md` section 13.
 
-**Branch:** `feat/v0.4-external-ai`, cut from `main` after `feat/v0.3-memory-tracking` merges. Every signature below was checked at `bd4915d`; the first implementer confirms the merge changed none. Commit locally; the owner decides when to push.
+**Branch:** `feat/v0.4-external-ai`, cut from `main` after `feat/v0.3-memory-tracking` merges. Every signature below was rechecked at `afdfbbe`, whose tree is identical to `bd4915d`, in the pre-flight scan. Implementers commit locally and never push. Gate 4 needs a CI run, so the controller pushes when that step comes.
 
 ## Global Constraints
 
 - No mandatory API keys, API credits, hosted backend, or cloud account. Every provider defaults off except Ollama, and nothing needs a key to work.
-- Owner direction, binding: personal, non-commercial app. AI subscription and license terms are waived and are not re-raised in this plan or its copy, beyond the vendor data-use disclosure the consent screen already carries. Security controls stay: `no_tools` for untrusted job and company text, consent records, validated output, no fabrication (FR-7.12), no inferred work authorization (FR-4.10).
+- Owner direction, binding: personal, non-commercial app. AI subscription and license terms are waived and are not re-raised in this plan or its copy, beyond the vendor data-use disclosure the consent screen already carries. Re-reading a provider's terms or usage policy is not a release step. Security controls stay: `no_tools` for untrusted job and company text, consent records, validated output, no fabrication (FR-7.12), no inferred work authorization (FR-4.10).
 - Claude Code runs on the owner's subscription, through the installed CLI. No token extraction, no bundled vendor CLI, no read of a CLI's login files, including `~/.gemini/oauth_creds.json` and `~/.codex/auth.json` (M-32).
 - Targets: macOS (arm64, x86_64) and Windows x64. Toolchain pins stay. SQL uses runtime `sqlx::query`, never `query!`. `*.sql` is LF.
 - **Network.** Hosted calls go only to the four fixed vendor hosts over HTTPS. Loopback rules (M-21) are unchanged for Ollama and apply to the endpoint. No new listener, no telemetry. The webview CSP does not change: all network is in Rust.
-- **Network tests.** Every test talks to a local fake on `127.0.0.1` or a mock CLI script. No test makes a real paid call. Only Task 11 touches a real provider.
+- **Network tests.** Every test talks to a local fake on `127.0.0.1` or a mock CLI script. No test makes a real paid call. Only Task 11 touches a real provider, and CI's `real_tls_handshake` step opens a connection to the four hosts with no key and no body.
 - **Keys.** A key lives in the OS credential store under `ai-key-<name>`, and only there. Never in the database, logs, `task_runs`, audit rows, exports, backups, argv, a child's environment, or the panel. `secret_index` holds the name. No command returns a key. Reads go through `secrets::keychain`, only inside a send, never for status.
 - **Provider text.** A vendor's error body and reply text never reach a log, an error message, or `task_runs`. Failures are codes on `RUN_REASONS`. Bodies are read only to match fixed words, capped at 64 KiB.
 - Migrations continue at `0012`. Applied files are never edited. Final `schema_version` is 12. New personal-data tables or columns carry a rule 7 comment.
 - **Seam check.** A task is done only when its feature is reachable from the GUI and the CLI. Each feature task ends with a CLI integration test, a Tauri command test through the harness in `commands.rs`, and a view test. Reviewers reject a core function with no adapter caller.
-- **Keychain in tests.** Tests never touch the real keychain unless `#[ignore]`d. Providers under test take `KeySource::Fixed`. `ai::status` and every read path stay off the keychain: `key_stored` comes from `secret_index`.
-- **Windows.** Gate every `cfg` item on both sides. Any task touching `cfg`, a child process, a dependency with C code, or Tauri plugins runs `scripts/ci-local.sh --fast`, whose `windows type-check` step must stay green. It type-checks only.
+- **Keychain in tests.** Tests never touch the real keychain unless `#[ignore]`d. Providers under test take `KeySource::Fixed`. `ai::status` and every read path stay off the keychain: `key_stored` comes from `secret_index`. Implementers run an `--ignored` keychain suite only when the controller says, with `--test-threads=1`. `JOBPILOT_SECRET_SERVICE` is honoured only in debug and test builds: a release binary always uses the real service.
+- **Windows.** Gate every `cfg` item on both sides. Any task touching `cfg`, a child process, a dependency with C code, or Tauri plugins runs `scripts/ci-local.sh --fast`, whose `windows type-check` step must stay green. It type-checks only. CI's `windows-latest` job is the run evidence, so every test must pass there: build expected paths with `Path::join`, and give each child-process test a Windows twin or a `cfg(unix)` gate.
 - **Panel.** Each new CLI command gets a row in `PANEL` in `crates/cli/src/main.rs` and, when refused, a `matches!` arm in `refused_in_panel`. The table below is binding.
 - **Tauri commands.** Each new `#[tauri::command]` goes in `handler()`, in `ALLOWED_COMMANDS`, and in `ipc.ts` with matching types, with a `backend()` default in `test-utils.tsx` when a test needs one. Settings stay under the `ai.` prefix, which `OWNED_SETTINGS` keeps from the generic settings command.
 - **GUI rules.** Text from outside the app renders as inert text, no anchors. Every control has a visible label and works by keyboard. Errors appear in `role="alert"` with their code. No `dangerouslySetInnerHTML`. Consent dialog focus starts on Cancel, as wireframe 13 says.
@@ -48,7 +48,7 @@ Nobody was asked. Each is the implementer's instruction, with the price of being
 
 | # | Question | Decision | Why | Cost if wrong |
 |---|---|---|---|---|
-| 1 | TLS backend | `native-tls-no-alpn`: Schannel on Windows, Security.framework on macOS. The hosted client sets `.https_only(true)`, `.tls_version_min(Version::TLS_1_2)`, `.no_proxy()`, `.redirect(Policy::none())`. | reqwest's default `rustls` pulls `aws-lc-sys`, which needs a real C toolchain and breaks the stub `windows type-check` that is the only Windows gate today. Native TLS adds no C build on either target, uses the OS trust store and OS patching, and `security-framework` is already in the tree through `keyring`. | macOS native TLS tops out at TLS 1.2. If a vendor goes 1.3-only, swap to `rustls`, a feature change plus real MinGW in the Windows check. Task 11's handshake step is the early warning. |
+| 1 | TLS backend | `native-tls-no-alpn`: Schannel on Windows, Security.framework on macOS. The hosted client sets `.https_only(true)`, `.tls_version_min(Version::TLS_1_2)`, `.no_proxy()`, `.redirect(Policy::none())`. | reqwest's default `rustls` pulls `aws-lc-sys`, which needs a real C toolchain and breaks the stub `windows type-check` that runs before every commit. Native TLS adds no C build on either target, uses the OS trust store and OS patching, and `security-framework` is already in the tree through `keyring`. | macOS native TLS tops out at TLS 1.2. If a vendor goes 1.3-only, swap to `rustls`, a feature change plus real MinGW in the Windows check. Task 11's handshake step is the early warning. |
 | 2 | How a key enters the GUI | Rust reads the clipboard after a button press, shows a native dialog naming the provider and the key's last four characters, stores it, and clears the clipboard. The webview sends only a provider name. | `ai-providers.md` says keys "never cross IPC" and threat model B1 says the webview "never holds a secret value". A password field would break both. Script in the webview cannot answer the native dialog. | A slightly odd flow, copy then press. If the plugin misbehaves on Windows WebView2, fall back to a Rust-owned window, one task of work. |
 | 3 | How a key enters the CLI | `ai key set <provider>` reads a hidden prompt on a terminal, one line on piped stdin. Never argv. Refused in the panel. | argv leaks through process lists and shell history. | None worth naming. |
 | 4 | Generic `secret_set` | Stays for other names. `ai-key-` joins `data-key-` as a reserved prefix, so script calling `secret_set` or `secret_delete` cannot swap a provider key for its own and route the user's data to another account. | The swap attack is real: `secret_set` is open to the webview. | Nothing: the DataView secrets form is not how keys enter. |
@@ -60,7 +60,7 @@ Nobody was asked. Each is the implementer's instruction, with the price of being
 | 10 | OpenRouter models | Allowed only with an `openai/`, `anthropic/`, or `google/` prefix and no `:free` suffix. Sent with `provider: {data_collection: "deny", require_parameters: true}`. | Routing check 2: an aggregator cannot widen a vendor's verdict. `:free` is the free-tier row. | Other models stay off until a register row exists for them. |
 | 11 | Retries on hosted providers | One retry on 429, 503, or 529 only when `Retry-After` gives whole seconds, at most 30. No header, a date form, or a longer wait ends that provider with `rate_limited`. Timeouts, network errors, and other 5xx stay unretried, and quota errors never retry. Attempts stay `spec.attempts`, so `classify_answer` stays one attempt. | The milestone asks for `Retry-After`, and `ai-providers.md` says external providers retry validation only while `agents.md` says otherwise. A 429 spent nothing, a timeout may have. Anthropic's spend-cap 429 has no header, so it must not loop. | A provider that would have recovered moves to the next one. `ai-providers.md` and `agents.md` are corrected in Task 10. |
 | 12 | Register changes and consent | `consent.register_row` holds the provider's row text, date read excluded, built from `include_str!` of the register. Unequal to the build's text means suspended, computed on read. | No version to forget, and a date re-read does not suspend anyone. | Any edit to a row suspends, even a typo fix: one click. |
-| 13 | The owner's existing Claude consent on upgrade | Suspended by the migration default `''`. The owner re-confirms once. | It fails closed, and the screen now shows what will be sent. | One click, and Claude Code stops with `consent_suspended` until then. |
+| 13 | The owner's existing Claude consent on upgrade | Suspended by the migration default `''`. The owner re-confirms once. The AI screen says why in `role="alert"` and offers one `Review consent...` button. The dialog opens with the old categories ticked, so `Allow selected` is the one click; Rust's native confirmation stays behind it (M-13). The Resumes screen says why Generate is gone. | It fails closed, and the screen now shows what will be sent. A suspension the GUI does not explain is not acceptable (controller ruling). | One click, and Claude Code stops with `consent_suspended` until then. |
 | 14 | No audit row for a suspension | None: nothing happens at that moment. `task_runs` logs each skip, and the new `consent_given` is audited. | A read must not write. | The audit log shows no moment of suspension. |
 | 15 | Gemini CLI no-tools | **Proven in docs, declared `no_tools`**, on these flags at version 0.40.0 or later, with a run-time guard. See "No-tools evidence". | Docs say denied tools are "completely excluded from the model's memory". | A later CLI changes this. The version floor, the `tool_use` guard, and the ignored smoke test limit the damage. Remove the capability if the smoke fails. |
 | 16 | Codex CLI no-tools | **Not proven, not declared.** See "No-tools evidence". Every task at HEAD requires `NoTools`, so Codex runs no task today, and the screen says so. | The rule says skip unless proven. | The adapter ships inert. When OpenAI documents a way to remove `apply_patch`, adding the flag and the capability is a small change. |
@@ -75,6 +75,7 @@ Nobody was asked. Each is the implementer's instruction, with the price of being
 | 25 | `gemini` and `codex` in the terminal panel | Not added. `claude` stays the only allowed session. | Not in the exit tests. M-14 allows them but does not require them. | The owner uses an ordinary terminal for those. M-14's text is corrected in Task 10. |
 | 26 | Mode check | Stays a comment. No `unreviewed` task exists until 0.6, when `TaskSpec` gains a mode. Model origin is kept where 0.6 needs it, in `Wire` and the model name. | Nothing to refuse today. | 0.6 adds it, as already planned. |
 | 27 | Vertex AI | No variant, so no way in. Its unread terms stay unread. | D4 chose paid keys. | A later release reads the terms and adds a row. |
+| 28 | Probing a CLI that is off | `ai::status` runs `version_of` only for an enabled CLI provider. An off one reports `available: true` when a path was found, and reason `not_installed` when none was. | `status` runs on every AI screen refresh, a Node CLI takes seconds to start, and `cargo test` must never start a real `gemini` or `codex`. All CLI providers default off. | A CLI too old for the floor reads fine until it is enabled, then says `cli_too_old`. |
 
 ## No-tools evidence
 
@@ -193,17 +194,17 @@ Binding. "Refused" means a row with `true` and a `matches!` arm in `refused_in_p
 
 ## Windows story
 
-Nothing has linked or run on Windows since 0.2's CI run, and Actions minutes are out. This release plans for that honestly.
+The repo is public, so GitHub Actions minutes are not a limit. CI's `windows-latest` job links and runs the suite, and that run is Gate 4's evidence.
 
 | Item | Built in | Proven by |
 |---|---|---|
-| Keys in Credential Manager | Task 3: same `keyring` path as the data key; length cap 512 keeps under the 2,560-byte blob limit | `#[ignore]`d `secrets_store.rs` tests, in the Windows gate |
-| CLI detection | Task 6: `gemini.cmd`, `gemini.exe`, `codex.cmd`, `codex.exe`; `%APPDATA%\npm`, `%LOCALAPPDATA%\Volta\bin`, `%USERPROFILE%\scoop\shims`, `%ProgramFiles%\nodejs` | Pure functions run on macOS with `windows: true`; `#[cfg(windows)]` tests in the gate |
-| `.cmd` shims | Task 6: args via Rust's batch escaping, never a shell string. An argument it refuses is `cli_error`. No line breaks in argv. Nothing long in argv either: Gemini's prompt, system text, and policy all go by stdin or file, so cmd.exe's 8,191-character limit never bites. `taskkill /T /F` ends the Node child behind the shim. | `cmd_shim_takes_spaces_stdin_and_exit_code` with a path holding a space, in the gate |
-| TLS | Task 1: Schannel | Task 11 cannot prove it; the gate's `real_tls_handshake` can |
-| Everything | Task 10: `scripts/windows-gate.ps1`, one command for a Windows machine, writing a result file | A person on Windows, or CI when minutes return |
+| Keys in Credential Manager | Task 3: same `keyring` path as the data key; length cap 512 keeps under the 2,560-byte blob limit | `#[ignore]`d `secrets_store.rs` tests, in CI's "Keychain tests (Windows)" step |
+| CLI detection | Task 6: `gemini.cmd`, `gemini.exe`, `codex.cmd`, `codex.exe`; `%APPDATA%\npm`, `%LOCALAPPDATA%\Volta\bin`, `%USERPROFILE%\scoop\shims`, `%ProgramFiles%\nodejs` | Pure functions run on both with `windows: true`; `#[cfg(windows)]` tests in CI |
+| `.cmd` shims | Task 6: args via Rust's batch escaping, never a shell string. An argument it refuses is `cli_error`. No line breaks in argv. Nothing long in argv either: Gemini's prompt, system text, and policy all go by stdin or file, so cmd.exe's 8,191-character limit never bites. `taskkill /T /F` ends the Node child behind the shim. | `cmd_shim_takes_spaces_stdin_and_exit_code` with a path holding a space, in CI |
+| TLS | Task 1: Schannel | `real_tls_handshake`, a CI step on both systems, added in Task 10 |
+| Real `gemini` and `codex` on Windows, the GUI, native dialogs, the clipboard | Tasks 3, 6, 7, 8 | Not run by CI. Gate 4 lists them as not exercised. |
 
-Gate 4 for 0.4 therefore records "type-checked only" unless someone runs that script. That is stated in the gate record, not hidden.
+Gate 4 for 0.4 records the CI run id and its Windows result, from Task 11. `scripts/ci-local.sh --fast` stays the pre-commit check, and its Windows step only type-checks.
 
 ## Review Focus
 
@@ -235,7 +236,7 @@ crates/cli/src/{ai,main,data,memory}.rs, crates/cli/tests/cli.rs                
 apps/desktop/src-tauri/src/{commands,native,lib}.rs                                    Tasks 2 to 8
 apps/desktop/src/components/{ConsentDialog,ProviderRow}.tsx   new                      Tasks 2, 3
 apps/desktop/src/views/{AiView,ResumesView,MemoryView}.tsx, lib/{ipc,reasons}.ts       Tasks 2 to 9
-docs, scripts/windows-gate.ps1, version bump                                           Task 10
+docs, scripts/ci-local.sh, .github/workflows/ci.yml, version bump                      Task 10
 ```
 
 ---
@@ -244,7 +245,7 @@ docs, scripts/windows-gate.ps1, version bump                                    
 
 **Files:**
 - Create: `crates/core/src/ai/net.rs`, `crates/core/tests/net.rs`, `crates/core/tests/fake_http/mod.rs`
-- Modify: `crates/core/Cargo.toml`, `Cargo.lock`, `crates/core/src/error.rs`, `crates/core/src/ai/{mod,ollama,router}.rs`, `crates/core/tests/{router,ollama}.rs`, `crates/cli/src/main.rs`, `apps/desktop/src/lib/reasons.ts`
+- Modify: `crates/core/Cargo.toml`, `Cargo.lock`, `crates/core/src/error.rs`, `crates/core/src/ai/{mod,ollama,router}.rs`, `crates/core/tests/{router,ollama}.rs`, `crates/cli/src/main.rs`, `apps/desktop/src/lib/reasons.ts`, `apps/desktop/src/views/views02.test.tsx`
 
 **Interfaces:**
 - Consumes: `Ollama::new(&str, Option<String>, Option<String>) -> Result<Ollama>`, `bounded` and `try_provider` in `router.rs`, `RUN_REASONS`.
@@ -256,7 +257,8 @@ pub(crate) const MAX_ERROR_BODY: u64 = 64 * 1024;
 pub const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
 /// M-21, moved from `Ollama::new`: http only, 127.0.0.1, [::1], or localhost pinned to 127.0.0.1.
 pub fn loopback_client(url: &str) -> Result<(Url, Client)>;
-pub(crate) fn hosted_client() -> Result<Client>;
+/// `pub` only so `tests/net.rs` can test the real client settings.
+#[doc(hidden)] pub fn hosted_client() -> Result<Client>;
 /// Whole seconds only. A date, a negative, or garbage is `None`.
 pub fn retry_after(header: Option<&str>) -> Option<Duration>;
 pub(crate) async fn read_capped(response: Response, limit: u64) -> Result<Vec<u8>>;
@@ -264,7 +266,7 @@ pub(crate) fn net(error: reqwest::Error) -> Error; // moved from ollama.rs
 ```
 
 - Produces, in `error`: `Error::RateLimited { retry_after: Option<Duration> }`, code `rate_limited`, message "rate limited".
-- Produces in tests: `fake_http::Fake::start(routes: Vec<(&'static str, Canned)>) -> Fake`, with `url`, `hits(path) -> Vec<Value>`, `headers(path) -> Vec<String>`, `paths() -> Vec<String>`, and `Canned { status, headers, body, hold }`. A route takes a queue of replies, so a test can script 429 then 200.
+- Produces in tests: `fake_http::Fake::start(routes: Vec<(&'static str, Canned)>) -> Fake`, with `url`, `hits(path) -> Vec<Value>`, `headers(path) -> Vec<String>`, `paths() -> Vec<String>`, and `Canned { status, headers, body, hold }`. A route takes a queue of replies, so a test can script 429 then 200. The file starts `#![allow(dead_code)]`: each test binary uses part of it, and clippy runs with `-D warnings` on all targets.
 
 - [ ] **Step 1: Write the failing tests** in `crates/core/tests/net.rs` and `router.rs`
 
@@ -315,7 +317,7 @@ Expected: FAIL, `net` and `RateLimited` not found.
 
 Change the `reqwest` line to features `["json", "stream", "native-tls-no-alpn"]`, and keep `=0.13.5`. Move the host and port checks out of `Ollama::new` into `loopback_client`, unchanged, including `.no_proxy()`, `.redirect(Policy::none())`, and the `localhost` pin. `Ollama::new` then keeps `parsed.origin()` and takes the client. `hosted_client` builds as decision 1 says, with `connect_timeout(10 s)`.
 
-Add `only_native_tls_is_linked` to `crates/core/tests/net.rs`: `Cargo.lock` holds no `rustls`, `aws-lc-sys`, or `ring` package. Add `hosted_client_refuses_plain_http` as a unit test inside `net.rs`, since `hosted_client` is `pub(crate)`.
+Add `only_native_tls_is_linked` to `crates/core/tests/net.rs`: `Cargo.lock` holds no `rustls`, `aws-lc-sys`, or `ring` package. Add `hosted_client_refuses_plain_http` to the same file.
 
 - [ ] **Step 4: Teach Ollama the new error**
 
@@ -344,7 +346,7 @@ match error {
 }
 ```
 
-`rate_limited` joins `weight`'s default rank, so a real attempt's reason outranks a skip. Add to `RUN_REASONS`: `rate_limited`, `auth_failed`, `quota_exhausted`, `model_refused`, `model_not_found`, `output_truncated`, `no_key`, `no_api_model`, `consent_suspended`, `cli_too_old`, `origin_refused`. Treat `auth_failed` and `quota_exhausted` as `not_logged_in` is treated: `Step::Manual(reason)`.
+`rate_limited` joins `weight`'s default rank, so a real attempt's reason outranks a skip. `no_key`, `no_api_model`, and `cli_too_old` join rank 0 with `no_model_set`: each says a provider is not ready, and none may outrank `consent_needed`. Add to `RUN_REASONS`: `rate_limited`, `auth_failed`, `quota_exhausted`, `model_refused`, `model_not_found`, `output_truncated`, `no_key`, `no_api_model`, `consent_suspended`, `cli_too_old`, `origin_refused`. Treat `auth_failed` and `quota_exhausted` as `not_logged_in` is treated: `Step::Manual(reason)`.
 
 Copy, in `main.rs::message` and `reasons.ts`:
 
@@ -372,7 +374,7 @@ git commit -m "feat: TLS for hosted calls, loopback rules in one place, Retry-Af
 
 **Files:**
 - Create: `crates/core/migrations/0012_consent_register_row.sql`, `crates/core/src/ai/register.rs`, `crates/core/tests/register.rs`, `apps/desktop/src/components/{ConsentDialog,ProviderRow}.tsx`
-- Modify: `crates/core/src/ai/{mod,router,consent}.rs`, `crates/core/src/{generate,backup}.rs`, `crates/core/src/agents/{draft,memory}.rs`, `crates/core/tests/{db,backup,router}.rs`, `crates/cli/src/{ai,data,main}.rs`, `crates/cli/tests/cli.rs`, `apps/desktop/src-tauri/src/commands.rs`, `apps/desktop/src/views/{AiView,ResumesView}.tsx`, `apps/desktop/src/lib/{ipc,reasons}.ts`, `apps/desktop/src/test-utils.tsx`, `apps/desktop/src/views/views02.test.tsx`
+- Modify: `crates/core/src/ai/{mod,router,consent}.rs`, `crates/core/src/{generate,backup}.rs`, `crates/core/src/agents/{draft,memory}.rs`, `crates/core/tests/{db,backup,router,agents,generate,claude_code}.rs`, `crates/cli/src/{ai,data,main}.rs`, `crates/cli/tests/cli.rs`, `apps/desktop/src-tauri/src/commands.rs`, `apps/desktop/src/views/{AiView,ResumesView}.tsx`, `apps/desktop/src/lib/{ipc,reasons}.ts`, `apps/desktop/src/test-utils.tsx`, `apps/desktop/src/views/views02.test.tsx`
 
 **Interfaces:**
 - Consumes: `consent::give(db, provider, categories, terms_date, actor)`, `consent::revoke(db, provider, actor)`, `consent::active(db, provider)`, `provider_settings`, `set_order`, `set_enabled`, `generate::build_prompt`, `knowledge::get_job_text`, `knowledge::evidence`, `profile::basic`, `native::confirmed`.
@@ -421,7 +423,6 @@ pub fn info_for(key: &str) -> Option<&'static ProviderInfo>; // by consent key
 /// Vendor row cells except Date read, then the owner row line, `\n`-joined, `\r` stripped.
 pub fn row_text(key: &str) -> Option<String>;
 pub fn date_read(key: &str) -> Option<String>;
-pub fn verdict(key: &str) -> Option<String>;
 pub fn register_date() -> String;
 pub const REGISTER: &str;
 #[doc(hidden)] pub fn rows_of(register: &str, key: &str) -> Option<String>; // `row_text` on any text
@@ -438,7 +439,7 @@ pub async fn state(db: &Db, provider: &str) -> Result<ConsentState>;
 pub async fn give_for(db: &Db, name: &str, categories: &[DataCategory], attested: bool, actor: &str) -> Result<()>;
 ```
 
-`consent::give` keeps its signature and writes `register_row`, `''` for a name the table does not hold, as `router.rs` tests give `"claude_code"` and `"ollama"` to prove those names unlock nothing. `consent::active` returns `None` while suspended, so every caller fails closed.
+`consent::give` keeps its signature and writes `register_row`, `''` for a name the table does not hold, as `router.rs` tests give `"claude_code"` and `"ollama"` to prove those names unlock nothing. Its `ON CONFLICT` clause sets `register_row` too, or a second consent in one millisecond stays suspended. `consent::active` returns `None` while suspended, so every caller fails closed.
 
 - Produces, in `ai`:
 
@@ -447,11 +448,13 @@ pub struct TaskSharing { pub task: TaskType, pub categories: Vec<DataCategory>, 
 pub struct Sharing {
     pub name: String, pub label: String, pub key: String, pub destination: String,
     pub path: Option<String>, pub tasks: Vec<TaskSharing>, pub data_use: String,
-    pub terms_date: String, pub verdict: String, pub attestation: Option<String>,
+    pub terms_date: String, pub attestation: Option<String>,
     pub suspended: bool, pub given: Option<Vec<DataCategory>>,
 }
 pub async fn sharing(db: &Db, name: &str) -> Result<Sharing>;
 ```
+
+`tasks` lists the four completion tasks; `Embed` is local only and is left out. `given` holds the categories of an active or a suspended record, so a review starts ticked. There is no verdict field: the owner decisions govern what ships, and no screen re-raises a vendor's verdict.
 
 - Produces, in `generate`: `pub struct PromptPreview { pub task: TaskType, pub system: String, pub user: String }` and `pub async fn preview(db: &Db, task: TaskType, job_text_id: &str) -> Result<PromptPreview>`.
 - Produces, Tauri: `ai_sharing(provider) -> Sharing`, `ai_preview(job_text_id) -> PromptPreview`. `ai_consent_give` and `ai_consent_revoke` take any external name.
@@ -467,7 +470,7 @@ pub async fn sharing(db: &Db, name: &str) -> Result<Sharing>;
 | `gemini_cli` | `Gemini CLI`, `` JobPilot runs `gemini` with the user's paid Gemini API key `` | `Gemini CLI and Codex CLI adapters` | "Gemini CLI here is not signed in with a free Gemini API key. A free key is refused for personal data." |
 | `codex_cli` | `Codex CLI`, `` JobPilot runs `codex exec` in the background on the user's saved ChatGPT login `` | `Gemini CLI and Codex CLI adapters` | none |
 
-`data_use` copies the disclosure table in `docs/ai-providers.md`, "Consent record". `capabilities` is `[StructuredOutput, NoTools]` for all but `codex_cli`, which has `[StructuredOutput]`. Task 7's and Task 8's `declaration()` read this table, so the screen and the router cannot differ.
+`data_use` copies the disclosure table in `docs/ai-providers.md`, "Consent record". That table has no endpoint row, so `endpoint` reads: "This goes to the server you named at this address. What that server does with it is up to that server." `capabilities` is `[StructuredOutput, NoTools]` for all but `codex_cli`, which has `[StructuredOutput]`. Task 7's and Task 8's `declaration()` read this table, so the screen and the router cannot differ.
 
 - [ ] **Step 1: Write the migration**
 
@@ -558,7 +561,7 @@ Expected: FAIL, `register` not found.
 
 `const REGISTER: &str = include_str!("../../../../docs/policy-register.md");`. A row is the line whose first two `|`-split cells, trimmed, equal `vendor_row`. Split on `" | "`, as cells hold no such text, and a test proves each mapped row has seven cells. `register_date` reads `Register date: ` from the file's third line. Drop `TERMS_DATE`'s use from adapters; keep the const, which tests use.
 
-`provider_settings` gives every new name `false`. `known`'s message lists the names from `PROVIDER_NAMES`. Fix the two hard-coded lists: `agents/draft.rs::rebuild` searches `ProviderId::ALL`, and `agents/memory.rs::asked_since` prefers any external id over Ollama, by `ProviderId::ALL`.
+`provider_settings` gives every new name `false`. `known`'s message lists the names from `PROVIDER_NAMES`. Fix the two hard-coded lists: `agents/draft.rs::rebuild` searches `ProviderId::ALL`, and `agents/memory.rs::asked_since` prefers any external id over Ollama, by `ProviderId::ALL`. `crates/core/tests/claude_code.rs:766` uses `openai` as a name outside the allow-list: change it to `vertex_ai`, or that test stops proving what it says.
 
 `backup::revoke_external_consent` turns off each revoked provider, deriving the setting name from the text before `/` through `register::info_for`:
 
@@ -576,11 +579,11 @@ Router: `ineligible` matches `consent::state`, `None` to `CONSENT`, `Suspended` 
 
 `ProviderArg` gains the seven names, with `#[value(name = "...")]` matching `PROVIDER_NAMES`. `name()` follows. `ConsentCommand::Give` gains `--attest`. Add `ConsentCommand::Show { provider, #[arg(long)] job: Option<String> }`, printing the `Sharing` in plain lines, and with `--job` the preview of `draft_resume`. `external_only` becomes `register::info(name)` being `Some`, so Ollama still says consent does not apply; its message drops "claude_code only". `ai status` text prints one line per external provider. `data::status` adds `"external"` to its JSON and a line per enabled provider.
 
-Give prints the data use and the attestation before it records. Update `PANEL` from the panel table. Rewrite the `consent_needed` message to name no one provider, and keep the example command that `consent_hint_names_the_whole_command` pins:
+Give prints the data use and the attestation before it records. Update `PANEL` from the panel table. Rewrite the `consent_needed` message here and in `reasons.ts` to name no one provider, and keep the example command that `consent_hint_names_the_whole_command` pins:
 
 "An AI provider is on, but your consent does not cover this task. See `jobpilot ai status`, then give consent in an ordinary terminal, for example `jobpilot ai consent give claude_code --categories job_text,profile_basic,resume_text`, or on the AI screen."
 
-`consent_suspended`: "The terms on file for this provider changed, so its consent is paused. Review it again on the AI screen, or with `jobpilot ai consent show`."
+`consent_suspended`, in `main.rs::message` and `reasons.ts`: "Your consent for this provider was given before the terms on file now, so it is paused and nothing is sent. Review it once on the AI screen, or with `jobpilot ai consent show`." The same words cover the upgrade from 0.3 and a changed register row.
 
 - [ ] **Step 6: Add the Tauri commands and the screen**
 
@@ -595,13 +598,13 @@ Move `ConsentDialog` to `components/ConsentDialog.tsx`, taking `provider: string
 
 Focus starts on Cancel. Tick `given` when reviewing a suspended or active record, nothing otherwise, as the wireframe says.
 
-`ProviderRow.tsx` renders one external provider: label, "Unavailable: {plain reason}", "Suspended: terms changed" in `role="alert"`, consent categories, `Use {label}`, `Review...`, `Revoke consent`. `AiView` maps `s.external` to rows in an "AI providers" section, with the heading "Register date {register_date}". Add the "Not available" list from wireframe 13, static read-only rows, minus Sign in with ChatGPT, plus "Vertex AI: not supported." and "Ollama cloud models: not supported." Each is text, with no control. The Claude section uses the same `ConsentDialog` and `suspended` state. `Provider` in `ipc.ts` widens to every name. `Generated.provider` widens to `ProviderId` in full. `backendEnabled` in `ResumesView` also counts any `external` row that is enabled, available, consented, and `runs_job_text`. `PROVIDERS` in `AiView` gains the labels. Add `consent_suspended` to `reasons.ts`.
+`ProviderRow.tsx` renders one external provider: label, "Unavailable: {plain reason}", "Suspended: this consent was given before the terms on file now. Review it once to turn it back on." in `role="alert"`, consent categories, `Use {label}`, `Review...`, `Revoke consent`. `AiView` maps `s.external` to rows in an "AI providers" section, with the heading "Register date {register_date}". Add the "Not available" list from wireframe 13, static read-only rows, minus Sign in with ChatGPT, plus "Vertex AI: not supported." and "Ollama cloud models: not supported." Each is text, with no control. The Claude section uses the same `ConsentDialog` and `suspended` state: while suspended it shows that same alert and one `Review consent...` button in place of today's "Off. Claude Code is used only after you consent below.", which would be false. `ai_status` gives `ClaudeStatus.consent: null` then, so the dialog takes `given` from `ai_sharing`. `Provider` in `ipc.ts` widens to every name. `Generated.provider` widens to `ProviderId` in full. `backendEnabled` in `ResumesView` also counts any `external` row that is enabled, available, consented, and `runs_job_text`. When a provider that is on is suspended, Claude Code included, and nothing else can draft, `ResumesView` shows the suspended line and a pointer to the AI screen instead of leaving Generate gone with no word. `PROVIDERS` in `AiView` gains the labels. Add `consent_suspended` to `reasons.ts`.
 
 - [ ] **Step 7: Seam check**
 
 - `cli.rs`: `consent_show_says_what_is_sent_for_each_provider`; `consent_give_needs_attest_for_google`; `panel_refuses_new_ai_commands`.
 - `commands.rs`: `consent_dialog_names_data_use_and_attestation` (the `asked` log holds the data use and the attestation), `a_left_out_provider_is_refused_at_ipc`.
-- `views02.test.tsx`: `consent_dialog_shows_tasks_destination_and_terms`, `consent_focus_starts_on_cancel`, `show_exactly_what_will_be_sent_is_inert_text` (a `<script>` in the posting appears as text), `a_suspended_row_says_so_and_offers_review`, `the_not_available_list_has_no_controls`, `resumes_view_counts_a_hosted_provider_as_a_backend`.
+- `views02.test.tsx`: `consent_dialog_shows_tasks_destination_and_terms`, `consent_focus_starts_on_cancel`, `show_exactly_what_will_be_sent_is_inert_text` (a `<script>` in the posting appears as text), `a_suspended_row_says_so_and_offers_review`, `claude_suspended_on_upgrade_says_why_and_review_starts_ticked`, `resumes_view_says_why_generate_is_gone_while_suspended`, `the_not_available_list_has_no_controls`, `resumes_view_counts_a_hosted_provider_as_a_backend`.
 
 Run: `cargo test --workspace && pnpm typecheck && pnpm test`
 Expected: PASS.
@@ -657,7 +660,8 @@ pub(crate) async fn read_api_key(provider: &str) -> Result<Option<Zeroizing<Stri
 // crates/core/tests/secrets_store.rs, ignored, JOBPILOT_SECRET_SERVICE=jobpilot-test
 #[ignore = "touches the OS keychain"] #[tokio::test]
 async fn provider_key_round_trips_and_appears_in_no_row_or_export() {
-    // Sentinel key. set_api_key, read_api_key. Then a full transfer::export and a scan of every
+    // Sentinel key. set_api_key, then secrets::get(&api_key_name("openai")), since read_api_key
+    // is pub(crate). Then a full transfer::export_all and a scan of every
     // table's text and every exported file: the sentinel appears in none, and the name does.
 }
 #[ignore = "touches the OS keychain"] #[tokio::test]
@@ -705,8 +709,8 @@ Add `tauri-plugin-clipboard-manager = "2.5.0"` and `.plugin(tauri_plugin_clipboa
 `views02.test.tsx`: `paste_key_sends_only_the_provider_name`, `a_key_field_does_not_exist` (no `input[type=password]` on the AI screen).
 
 Run: `cargo test --workspace && pnpm typecheck && pnpm test && scripts/ci-local.sh --fast`
-Then: `JOBPILOT_SECRET_SERVICE=jobpilot-test cargo test -p jobpilot-core --test secrets_store -- --ignored --test-threads=1`
 Expected: PASS.
+Then, only when the controller says: `JOBPILOT_SECRET_SERVICE=jobpilot-test cargo test -p jobpilot-core --test secrets_store -- --ignored --test-threads=1`
 
 - [ ] **Step 7: Commit**
 
@@ -719,7 +723,7 @@ git commit -m "feat: provider keys in the OS keychain, entered without passing t
 
 **Files:**
 - Create: `crates/core/src/ai/api.rs`, `crates/core/tests/api_chat.rs`
-- Modify: `crates/core/src/ai/{mod,router,ollama}.rs`, `crates/cli/src/{ai,main}.rs`, `crates/cli/tests/cli.rs`, `apps/desktop/src-tauri/src/commands.rs`, `apps/desktop/src/components/ProviderRow.tsx`, `apps/desktop/src/lib/ipc.ts`, `apps/desktop/src/views/views02.test.tsx`
+- Modify: `crates/core/src/ai/{mod,router,ollama}.rs`, `crates/cli/src/{ai,main}.rs`, `crates/cli/tests/cli.rs`, `apps/desktop/src-tauri/src/commands.rs`, `apps/desktop/src/components/ProviderRow.tsx`, `apps/desktop/src/lib/{ipc,reasons}.ts`, `apps/desktop/src/views/views02.test.tsx`
 
 **Interfaces:**
 - Consumes: `net::{hosted_client, loopback_client, read_capped, retry_after, MAX_REPLY_BYTES, MAX_ERROR_BODY}`, `secrets::read_api_key`, `register::info`, `ollama::name_is_local` (make `pub(crate)`), `Provider`.
@@ -805,6 +809,10 @@ pub(crate) fn classify_status(status: u16, retry_after: Option<Duration>, body: 
                 "http://localhost.example.com/v1", "https://127.0.0.1:1234/v1"] {
         assert_eq!(set_endpoint(&db, url).await.unwrap_err().to_string(), "refused: not_loopback");
     }
+    // A credential or query in the address would land in settings, and so in export.
+    for url in ["http://user:secret@127.0.0.1:1234/v1", "http://127.0.0.1:1234/v1?key=x"] {
+        assert_eq!(set_endpoint(&db, url).await.unwrap_err().code(), "validation");
+    }
     assert!(settings::get(&db, "ai.endpoint.url").await.unwrap().is_none());
 }
 #[tokio::test] async fn an_endpoint_still_needs_consent() {
@@ -837,9 +845,9 @@ Declaration {
 }
 ```
 
-`available()` opens no socket: `Unavailable("no_model")` maps to the new `no_api_model`, and `Unavailable("no_key")` to `no_key`, through `unavailable_reason`. The endpoint needs no key. `complete` reads the key on each attempt through `KeySource`, and `Keychain` with no entry is `Refused("no_key")`. It checks `CancellationToken` through the router's drop, as Ollama does. `embed` is `Refused("no_embeddings")`.
+`available()` opens no socket: `Unavailable("no_api_model")` and `Unavailable("no_key")` map to the reasons of those names through `unavailable_reason`. Do not reuse `no_model`: that word is Ollama's, and it maps to `no_model_set`. The endpoint needs no key. `complete` reads the key on each attempt through `KeySource`, and `Keychain` with no entry is `Refused("no_key")`. It checks `CancellationToken` through the router's drop, as Ollama does. `embed` is `Refused("no_embeddings")`.
 
-Reads go through `read_capped`: `MAX_REPLY_BYTES` on success, `MAX_ERROR_BODY` on failure. Parse JSON from bytes, and a parse failure is `bad_reply`. The returned text goes to the router's `validate`.
+`set_endpoint` stores the address with any trailing `/` removed, so `<url>/chat/completions` has one slash, and refuses a username, password, query, or fragment with `Validation`. Reads go through `read_capped`: `MAX_REPLY_BYTES` on success, `MAX_ERROR_BODY` on failure. Parse JSON from bytes, and a parse failure is `bad_reply`. The returned text goes to the router's `validate`.
 
 `Ollama::is_local` and its checks do not change.
 
@@ -856,7 +864,7 @@ Expected: PASS.
 
 - [ ] **Step 6: Add the GUI**
 
-`ai_set_api_model(provider, model)`, no native dialog, since the consent record is the gate and `check_model` holds the origin rules. `ai_set_endpoint(url)`, as `ai_set_ollama_url`: `loopback_client` refuses before anyone is asked, then `native::confirmed`. `ProviderRow` adds a `Model id` field with a Save button for API rows, and `Add endpoint...` with an address field for the endpoint row. Add `no_key`, `no_api_model`, `origin_refused` to `reasons.ts`.
+`ai_set_api_model(provider, model)`, no native dialog, since the consent record is the gate and `check_model` holds the origin rules. `ai_set_endpoint(url)`, as `ai_set_ollama_url`: `loopback_client` refuses before anyone is asked, then `native::confirmed`. `ProviderRow` adds a `Model id` field with a Save button for API rows, and `Add endpoint...` with an address field for the endpoint row. Add `no_key`, `no_api_model`, `origin_refused`, `no_endpoint` to `reasons.ts`.
 
 - [ ] **Step 7: Seam check**
 
@@ -877,7 +885,7 @@ git commit -m "feat: OpenAI, OpenRouter, and a loopback endpoint through the rou
 ### Task 5: Anthropic and Google wires
 
 **Files:**
-- Modify: `crates/core/src/ai/api.rs`, `crates/core/tests/api_vendors.rs` (new), `crates/cli/tests/cli.rs`, `apps/desktop/src/views/views02.test.tsx`
+- Modify: `crates/core/src/ai/{api,router}.rs`, `crates/core/tests/api_vendors.rs` (new), `crates/cli/tests/cli.rs`, `apps/desktop/src/components/ProviderRow.tsx`, `apps/desktop/src/views/views02.test.tsx`
 
 **Interfaces:**
 - Consumes: Task 4's `ApiProvider`, `classify_status`, `provider_schema`, `check_model`.
@@ -957,7 +965,7 @@ git commit -m "feat: Anthropic and Google paid-key providers"
 
 **Files:**
 - Create: `crates/core/src/ai/child.rs`, `crates/core/tests/child.rs`
-- Modify: `crates/core/src/ai/{mod,claude_code}.rs`, `crates/cli/src/ai.rs`, `crates/cli/src/main.rs`, `crates/cli/tests/cli.rs`, `apps/desktop/src-tauri/src/commands.rs`, `apps/desktop/src/components/ProviderRow.tsx`, `apps/desktop/src/lib/ipc.ts`
+- Modify: `crates/core/src/ai/{mod,claude_code}.rs`, `crates/cli/src/ai.rs`, `crates/cli/src/main.rs`, `crates/cli/tests/cli.rs`, `apps/desktop/src-tauri/src/commands.rs`, `apps/desktop/src/components/ProviderRow.tsx`, `apps/desktop/src/lib/{ipc,reasons}.ts`, `apps/desktop/src/views/views02.test.tsx`
 
 **Interfaces:**
 - Consumes: from `claude_code.rs`: `ALLOWED_ENV`, `KillTree`, `kill_tree`, `is_program`, `absolute_dirs`, `fallback_dirs`, `search`, `login_shell_lookup`, `find_binary`, `checked`, `has_claude_name`. Their `pub` names stay where they are as thin wrappers, because `crates/core/tests/claude_{code,env,locate}.rs` and `crates/cli/src/shell.rs` import them. Those tests stay unchanged and green: they prove the move changed nothing.
@@ -971,11 +979,19 @@ pub struct CliSpec {
     pub npm_entry: Option<(&'static str, &'static str)>, // ("@google/gemini-cli", "gemini.js")
     pub extra_env: &'static [&'static str],
 }
+/// Here, not in the adapters: `set_cli_path`, `find_cli`, and this task's tests need them first.
+/// Decision 17 gives `extra_env`. Codex: `"codex"`, `"JOBPILOT_CODEX_BIN"`, `"ai.codex_path"`,
+/// `Some(("@openai/codex", "codex.js"))`.
+pub const GEMINI: CliSpec;
+pub const CODEX: CliSpec;
+pub fn spec_for(name: &str) -> Option<&'static CliSpec>; // gemini_cli, codex_cli
+/// `env` is final: `run_piped` adds nothing to it, so `ClaudeCode` passes its own list unchanged.
 pub struct ChildRun<'a> { pub bin: &'a Path, pub args: Vec<OsString>, pub env: Vec<(String, String)>, pub cwd: &'a Path, pub stdin: &'a [u8], pub limit: u64 }
 pub struct ChildOutput { pub stdout: Vec<u8>, pub status: ExitStatus }
 #[doc(hidden)] pub async fn run_piped(run: ChildRun<'_>) -> Result<ChildOutput>; // tests/child.rs calls it
-/// `--version`. `None` for a spawn failure, a non-zero exit, or a hang past `VERSION_TIMEOUT`.
-pub(crate) async fn version_of(bin: &Path, env: Vec<(String, String)>) -> Option<String>;
+/// `--version`. `Err` is the word for `Availability::Unavailable`, as Claude's probe gives them:
+/// `not_installed`, `version_failed`, or `no_answer` past `VERSION_TIMEOUT`.
+pub(crate) async fn version_of(bin: &Path, env: Vec<(String, String)>) -> std::result::Result<String, &'static str>;
 pub fn child_env(spec_extra: &[&str]) -> Vec<(String, String)>;
 pub fn child_path(bin: &Path, spec: &CliSpec, inherited: &OsStr) -> OsString;
 pub fn bin_names(program: &str, windows: bool) -> Vec<String>; // windows: .exe then .cmd
@@ -1038,7 +1054,7 @@ Expected: FAIL, `child` not found.
 
 - [ ] **Step 3: Implement `child.rs` and move the code**
 
-Move, do not rewrite. `ClaudeCode::run` keeps its reply handling and calls `run_piped`. `claude_code::{absolute_dirs, fallback_dirs, search, login_shell_lookup}` become wrappers. `login_shell_lookup` takes the program name internally, with the same fixed-command rule. `find_cli` follows `find_binary`'s order, adding the nvm, Volta, and fnm folders before the login-shell lookup. `run_piped` sets `PATH` from `child_path`. `cfg!(windows)` picks the `windows` arguments, so the same logic is tested on macOS. An `InvalidInput` from spawning a `.cmd`, which is Rust refusing an argument it cannot escape, maps to `Failed("cli_error")`.
+Move, do not rewrite. `ClaudeCode::run` keeps its reply handling and calls `run_piped`. `claude_code::{absolute_dirs, fallback_dirs, search, login_shell_lookup}` become wrappers. `login_shell_lookup` takes the program name internally, with the same fixed-command rule. `find_cli` follows `find_binary`'s order, adding the nvm, Volta, and fnm folders before the login-shell lookup. `run_piped` leaves `PATH` as `ChildRun.env` gives it; Tasks 7 and 8 replace `PATH` in their env with `child_path`, and Claude's env does not change. Tests here also run on CI's Windows job, so `run_piped_caps_the_output` needs a child that exists on both. `cfg!(windows)` picks the `windows` arguments, so the same logic is tested on macOS. An `InvalidInput` from spawning a `.cmd`, which is Rust refusing an argument it cannot escape, maps to `Failed("cli_error")`.
 
 `VERSION_TIMEOUT` becomes 10 s for Node CLIs. `claude --version` keeps 5 s.
 
@@ -1049,7 +1065,7 @@ Expected: PASS, with `claude_*.rs` not edited.
 
 - [ ] **Step 5: Add the CLI and GUI path controls**
 
-`AiCommand::CliPath { provider, path }` accepts `gemini_cli` and `codex_cli`, and an empty path clears. `ai_set_cli_path(provider)` follows `ai_set_claude_path`, with the picker as the confirmation and `accepts_name` as the check. `ai_clear_cli_path(provider)` follows `ai_clear_claude_path`. `ProviderRow` for `kind: "cli"` shows the resolved path, `Choose gemini...` when unavailable, and `Use automatic`. Add the `PANEL` row.
+`AiCommand::CliPath { provider, path }` accepts `gemini_cli` and `codex_cli`, and an empty path clears. `ai_set_cli_path(provider)` follows `ai_set_claude_path`, with the picker as the confirmation and `accepts_name` as the check. `ai_clear_cli_path(provider)` follows `ai_clear_claude_path`. `ProviderRow` for `kind: "cli"` shows the resolved path, `Choose gemini...` when unavailable, and `Use automatic`. Add the `PANEL` row. `ai::status` and `ai::sharing` fill `path` for CLI rows through `find_cli` here, so decision 19's dialog line holds from this task on, and a row with no path reads reason `not_installed`.
 
 - [ ] **Step 6: Seam check**
 
@@ -1069,14 +1085,14 @@ git commit -m "refactor: shared child rules and CLI detection, including Windows
 
 **Files:**
 - Create: `crates/core/src/ai/gemini_cli.rs`, `crates/core/tests/gemini_cli.rs`, `crates/core/tests/mock-gemini/gemini`, `crates/core/tests/mock-gemini/gemini.cmd`
-- Modify: `crates/core/src/ai/{mod,router}.rs`, `crates/cli/tests/cli.rs`, `apps/desktop/src-tauri/src/commands.rs`, `apps/desktop/src/views/views02.test.tsx`, `apps/desktop/src/lib/reasons.ts`, `crates/cli/src/main.rs`, `.gitattributes`
+- Modify: `crates/core/src/ai/{mod,router}.rs`, `crates/cli/tests/cli.rs`, `apps/desktop/src-tauri/src/commands.rs`, `apps/desktop/src/components/ProviderRow.tsx`, `apps/desktop/src/views/views02.test.tsx`, `apps/desktop/src/lib/reasons.ts`, `crates/cli/src/main.rs`, `.gitattributes`, `scripts/ci-local.sh`, `.github/workflows/ci.yml`
 
 **Interfaces:**
-- Consumes: `child::{CliSpec, ChildRun, run_piped, version_of, child_env, find_cli}`, `register::info`, `MAX_OUTPUT_BYTES`.
+- Consumes: `child::{CliSpec, GEMINI, ChildRun, run_piped, version_of, child_env, child_path, find_cli}`, `register::info`, `MAX_OUTPUT_BYTES`.
 - Produces, in `ai::gemini_cli`:
 
 ```rust
-pub const SPEC: CliSpec;
+pub const SPEC: &CliSpec = &child::GEMINI;
 pub const MIN_VERSION: (u32, u32, u32) = (0, 40, 0);
 pub const DENY_ALL_POLICY: &str = "[[rule]]\ntoolName = \"*\"\ndecision = \"deny\"\npriority = 999\n";
 pub struct GeminiCli { /* bin */ }
@@ -1092,7 +1108,7 @@ pub(crate) fn read_stream(stdout: &[u8], status: ExitStatus) -> Result<String>;
 
 - [ ] **Step 1: Write the mock** `crates/core/tests/mock-gemini/gemini`, on the pattern of `mock-claude/claude`
 
-It answers `--version` with `$MOCK_GEMINI_VERSION`, default `0.40.0`. It records args, stdin, env, cwd, and the policy file through `MOCK_GEMINI_*` paths, and copies `$MOCK_GEMINI_SYSTEM_COPY` from `$GEMINI_SYSTEM_MD`. It prints `$MOCK_GEMINI_REPLY` or a default stream, exits `$MOCK_GEMINI_EXIT`, and honours `MOCK_GEMINI_SLEEP`. Default stream:
+The adapter clears the child's environment, so each test starts it through a wrapper script named `gemini` (`gemini.cmd` on Windows) that sets `MOCK_GEMINI_*`, as `MockCli` does in `claude_code.rs`. The mock answers `--version` with `$MOCK_GEMINI_VERSION`, default `0.40.0`. It records args, stdin, env, cwd, and the policy file through `MOCK_GEMINI_*` paths, and copies `$MOCK_GEMINI_SYSTEM_COPY` from `$GEMINI_SYSTEM_MD`. It prints the file `$MOCK_GEMINI_REPLY` names or a default stream, exits `$MOCK_GEMINI_EXIT`, and honours `MOCK_GEMINI_SLEEP`. Default stream:
 
 ```text
 {"type":"init","session_id":"s","model":"m"}
@@ -1109,9 +1125,11 @@ Add the `.cmd` twin with a `crates/core/tests/mock-gemini/gemini.cmd text eol=cr
 ```rust
 #[test] fn argv_is_exactly_the_documented_list() {
     let dir = Path::new("/d");
+    let policy = dir.join("deny-all.toml"); // a backslash on Windows, which CI runs
+    let policy = policy.to_str().unwrap();
     assert_eq!(GeminiCli::argv(dir), [
         "--output-format", "stream-json", "--approval-mode", "default",
-        "--policy", "/d/deny-all.toml", "--admin-policy", "/d/deny-all.toml",
+        "--policy", policy, "--admin-policy", policy,
         "--extensions", "none", "--allowed-mcp-server-names", "jobpilot-none", "--skip-trust",
     ].map(OsString::from));
 }
@@ -1143,6 +1161,8 @@ Add the `.cmd` twin with a `crates/core/tests/mock-gemini/gemini.cmd text eol=cr
 #[tokio::test] async fn no_consent_starts_no_child() {}
 #[tokio::test] #[ignore = "spends one real Gemini call; needs JOBPILOT_REAL_GEMINI_SMOKE=1"]
 async fn real_gemini_has_no_tools_smoke() {
+    // Returns with a `skipped` line unless JOBPILOT_REAL_GEMINI_SMOKE is set, as
+    // real_claude_has_no_tools_smoke does, because `--ignored` keychain runs reach this test.
     // Prompt tells the model to run `ls` and read a canary file in the cwd, with the canary
     // planted by the test. Assert no tool_use event in stdout and the canary text is absent.
 }
@@ -1155,15 +1175,15 @@ Expected: FAIL, `gemini_cli` not found.
 
 - [ ] **Step 4: Implement `gemini_cli.rs`**
 
-`SPEC.extra_env` is decision 17's list. Each attempt makes a `tempfile::tempdir` holding `deny-all.toml`, `system.md`, `settings.json`, and an empty `work/`, which is the cwd, so the model sees nothing even if a tool slipped through. `system.md` is `prompt.system`, then `\n\nReply with one JSON object and nothing else. It must match this JSON Schema:\n`, then the schema. `prompt.user` goes on stdin. Output limit is `4 * MAX_OUTPUT_BYTES`, because of the stream's framing.
+The child's env is `child_env(SPEC.extra_env)` with `PATH` replaced by `child_path`, plus the two variables under "No-tools evidence". Each attempt makes a `tempfile::tempdir` holding `deny-all.toml`, `system.md`, `settings.json`, and an empty `work/`, which is the cwd, so the model sees nothing even if a tool slipped through. `system.md` is `prompt.system`, then `\n\nReply with one JSON object and nothing else. It must match this JSON Schema:\n`, then the schema. `prompt.user` goes on stdin. Output limit is `4 * MAX_OUTPUT_BYTES`, because of the stream's framing.
 
 `declaration()`: capabilities from the table, `local: false`, `context_limit: 200_000`, `timeout: 180 s`, `sign_in: format!("gemini cli on its own sign-in ({})", path)`.
 
-`available()`: `version_of`, then parse `x.y.z`, and below the floor or unparsable is `cli_too_old`. No version is `not_installed`, or `version_failed` when it ran and failed. Sign-in is not probed, as for Claude.
+`available()`: `version_of`, whose `Err` word is the reason, then parse `x.y.z`, and below the floor or unparsable is `cli_too_old`. Sign-in is not probed, as for Claude.
 
 `read_stream`: split lines, parse each as JSON, skip what does not parse. `tool_use` or `tool_result` is `Refused("permission_denied")`. Join assistant `content`. Exit 41 is `Refused("not_logged_in")`. A `result` with `status` other than `success`, or any other non-zero exit, is `Failed("cli_error")`. No `result` is `Failed("bad_reply")`. Add a `ponytail:` comment: only a child-reported event can trip the guard, and the deny rule is what stops a tool.
 
-Router arm: `GEMINI_CLI` builds like `CLAUDE_CODE`, with an empty path when not found, so the run log shows it as unavailable. `unavailable_reason` maps `cli_too_old`. `ai::status` fills `available`, `reason`, `path`, and probes the CLIs together with `tokio::join!`, so `jobpilot status` waits for one timeout at most. `not_logged_in` copy says "Claude Code" today: make it name no vendor in `reasons.ts` and `main.rs`: "This CLI is not signed in. Run it once in your own terminal to sign in, then try again." Update `views02.test.tsx`'s row for it. `cli_too_old`: "The installed CLI is older than the version JobPilot checked. Update it, then try again."
+Router arm: `GEMINI_CLI` builds like `CLAUDE_CODE`, with an empty path when not found, so the run log shows it as unavailable. `unavailable_reason` maps `cli_too_old`. `ai::status` fills `available` and `reason` by decision 28, and probes enabled CLIs together with `tokio::join!`, so `jobpilot status` waits for one timeout at most. `not_logged_in` copy says "Claude Code" today: make it name no vendor in `reasons.ts` and `main.rs`: "This CLI is not signed in. Run it once in your own terminal to sign in, then try again." Update `views02.test.tsx`'s row for it. Add `--skip real_gemini` to `keychain_suites` in `scripts/ci-local.sh` and to both keychain steps in `ci.yml`, so no `--ignored` run reaches the real CLI. `cli_too_old`: "The installed CLI is older than the version JobPilot checked. Update it, then try again."
 
 - [ ] **Step 5: Run them to verify they pass**
 
@@ -1172,7 +1192,7 @@ Expected: PASS.
 
 - [ ] **Step 6: Seam check**
 
-- `cli.rs`: `gemini_cli_drafts_through_the_mock`: `JOBPILOT_GEMINI_BIN`, enable, `consent give gemini_cli --attest`, `resume generate`, provider `gemini_cli/cli_login`. `gemini_cli_absent_shows_unavailable`.
+- `cli.rs`: `gemini_cli_drafts_through_the_mock`: `JOBPILOT_GEMINI_BIN`, `ai disable ollama`, enable, `consent give gemini_cli --categories job_text,profile_basic,resume_text --attest`, `resume generate`, provider `gemini_cli/cli_login`. `gemini_cli_absent_shows_unavailable`.
 - `commands.rs`: `ai_status_lists_gemini_with_its_path`.
 - `views02.test.tsx`: `gemini_row_shows_it_runs_job_text_with_no_tools`.
 
@@ -1182,7 +1202,7 @@ Expected: PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates apps .gitattributes
+git add crates apps .gitattributes scripts .github
 git commit -m "feat: optional Gemini CLI adapter with every tool denied"
 ```
 
@@ -1190,14 +1210,14 @@ git commit -m "feat: optional Gemini CLI adapter with every tool denied"
 
 **Files:**
 - Create: `crates/core/src/ai/codex_cli.rs`, `crates/core/tests/codex_cli.rs`, `crates/core/tests/mock-codex/codex`, `crates/core/tests/mock-codex/codex.cmd`
-- Modify: `crates/core/src/ai/{mod,router}.rs`, `crates/cli/tests/cli.rs`, `apps/desktop/src-tauri/src/commands.rs`, `apps/desktop/src/views/views02.test.tsx`, `.gitattributes`
+- Modify: `crates/core/src/ai/{mod,router}.rs`, `crates/cli/tests/cli.rs`, `apps/desktop/src-tauri/src/commands.rs`, `apps/desktop/src/components/ProviderRow.tsx`, `apps/desktop/src/views/views02.test.tsx`, `.gitattributes`
 
 **Interfaces:**
-- Consumes: as Task 7, plus `Router::run_spec` and `TaskSpec` for a spec that needs no `NoTools`.
+- Consumes: as Task 7, with `child::CODEX`, plus `Router::run_spec` and `TaskSpec` for a spec that needs no `NoTools`.
 - Produces, in `ai::codex_cli`:
 
 ```rust
-pub const SPEC: CliSpec;
+pub const SPEC: &CliSpec = &child::CODEX;
 pub struct CodexCli { /* bin */ }
 impl CodexCli {
     pub fn with_binary(bin: PathBuf) -> CodexCli;
@@ -1207,12 +1227,12 @@ impl CodexCli {
 }
 ```
 
-- [ ] **Step 1: Write the mock**, on the pattern of Task 7, with `MOCK_CODEX_*`. It reads stdin, then writes `$MOCK_CODEX_REPLY` or `{"class":"normal"}` to the path after `--output-last-message`, and records args and env. Add the `.gitattributes` line for `codex.cmd`.
+- [ ] **Step 1: Write the mock**, on the pattern of Task 7, with `MOCK_CODEX_*`. Tests start it through a wrapper script named `codex`, for the same reason. It reads stdin, then copies the file `$MOCK_CODEX_REPLY` names, or writes `{"class":"normal"}`, to the path after `--output-last-message`, and records args and env. Add the `.gitattributes` line for `codex.cmd`.
 
 - [ ] **Step 2: Write the failing tests** in `crates/core/tests/codex_cli.rs`
 
 ```rust
-#[test] fn argv_is_exactly_the_documented_list() {} // the list under "No-tools evidence"
+#[test] fn argv_is_exactly_the_documented_list() {} // the list under "No-tools evidence", paths by Path::join
 #[test] fn it_does_not_claim_no_tools() {
     assert!(!codex.declaration().capabilities.contains(&Capability::NoTools));
 }
@@ -1241,7 +1261,7 @@ Expected: FAIL, `codex_cli` not found.
 
 - [ ] **Step 4: Implement `codex_cli.rs`**
 
-Each attempt: temp dir, `schema.json` from `provider_schema`, an empty `work/` cwd, stdin is `prompt.system`, a blank line, `prompt.user`. After a zero exit, read `reply.txt` under `MAX_OUTPUT_BYTES`, and a missing file is `bad_reply`. `sign_in: format!("codex cli on its own sign-in ({})", path)`. A `// ponytail:` comment quotes the gap: no documented way to remove `apply_patch`, so no `NoTools`. Add the router arm and fill `ai::status`.
+The child's env is built as in Task 7. Each attempt: temp dir, `schema.json` from `provider_schema`, an empty `work/` cwd, stdin is `prompt.system`, a blank line, `prompt.user`. After a zero exit, read `reply.txt` under `MAX_OUTPUT_BYTES`, and a missing file is `bad_reply`. `sign_in: format!("codex cli on its own sign-in ({})", path)`. A `// ponytail:` comment quotes the gap: no documented way to remove `apply_patch`, so no `NoTools`. Add the router arm and fill `ai::status`.
 
 - [ ] **Step 5: Run them to verify they pass**
 
@@ -1250,7 +1270,7 @@ Expected: PASS.
 
 - [ ] **Step 6: Seam check**
 
-- `cli.rs`: `codex_is_skipped_for_a_draft_and_says_why`: enabled with consent, `resume generate` ends `no_ai`, and `ai consent show codex_cli` says "Skipped". `codex_failing_its_version_shows_unavailable`.
+- `cli.rs`: `codex_is_skipped_for_a_draft_and_says_why`: Ollama disabled, Codex enabled with consent, `resume generate` ends `no_ai`, and `ai consent show codex_cli` says "Skipped". `codex_failing_its_version_shows_unavailable`, which enables Codex first, by decision 28.
 - `commands.rs`: `ai_status_says_codex_runs_no_job_text`.
 - `views02.test.tsx`: `codex_row_says_it_runs_no_task_today`: the row reads "No task can use this yet: it cannot prove it has no tools."
 
@@ -1268,7 +1288,7 @@ git commit -m "feat: optional Codex CLI adapter, skipped for untrusted text"
 
 **Files:**
 - Create: `crates/core/tests/injection_hosted.rs`, `crates/core/tests/injection/18_key_exfiltration.txt`, `crates/core/tests/injection/19_tool_call_reply.txt`
-- Modify: `crates/core/tests/injection.rs`, `crates/core/tests/injection/README.md`, `crates/core/src/memory/classify.rs`, `crates/core/src/ai/mod.rs`, `crates/cli/src/memory.rs`, `crates/cli/tests/cli.rs`, `apps/desktop/src/lib/{ipc,reasons}.ts`, `apps/desktop/src/test-utils.tsx`, `apps/desktop/src/views/{MemoryView,AiView}.tsx`, `apps/desktop/src/views/{views02,views03}.test.tsx`, `apps/desktop/src-tauri/src/commands.rs`
+- Modify: `crates/core/tests/{injection,agents}.rs`, `crates/core/tests/injection/README.md`, `crates/core/src/memory/classify.rs`, `crates/core/src/ai/mod.rs`, `crates/cli/src/memory.rs`, `crates/cli/tests/cli.rs`, `apps/desktop/src/lib/{ipc,reasons}.ts`, `apps/desktop/src/test-utils.tsx`, `apps/desktop/src/views/{MemoryView,AiView}.tsx`, `apps/desktop/src/views/{views02,views03}.test.tsx`, `apps/desktop/src-tauri/src/commands.rs`
 
 **Interfaces:**
 - Consumes: `generate::{resume, cover_letter, build_prompt}`, `drafts::list`, `knowledge::normalize`, `fake_http`, `ApiProvider::for_test`, `KeySource::Fixed`, `GeminiCli::with_binary`, the corpus and `MOCK_REPLY:` convention in `crates/core/tests/injection.rs`.
@@ -1309,7 +1329,7 @@ Expected: FAIL only where a gap exists. A case that passes at once still ships: 
 
 - [ ] **Step 4: Prove the app with no provider**
 
-Add `no_provider_works_end_to_end` to `crates/cli/tests/cli.rs`. A fresh home with `HTTP(S)_PROXY` pointed at a dead address, no CLIs on `PATH`, and every provider off: `status`, `doc add`, `doc search`, `profile set`, `kb add`, `job paste`, `resume generate` (ends `manual_required` with reason `no_ai`), `app add`, `app status`, `memory add-question`, `memory search`, `analytics report`, `backup create`, `data export`. Each exits as expected, and `audit` holds no `ai_external_call`.
+Add `no_provider_works_end_to_end` to `crates/cli/tests/cli.rs`. A fresh home with `HOME` on the temp root, `HTTP(S)_PROXY` pointed at a dead address, no CLIs on `PATH`, `SHELL` removed, and every provider off: `status`, `doc add`, `doc search`, `profile set`, `kb add`, `job paste`, `resume generate` (ends `manual_required` with reason `no_ai`), `app add`, `app status`, `memory add-question`, `memory search`, `analytics report`, `backup create`, `data export`. Each exits as expected. The CLI has no `audit` command, so the test reads `audit_log` through `sqlx` and finds no `ai_external_call`.
 
 Add `commands.rs::no_provider_screen_is_a_normal_state` and `views02.test.tsx::the_empty_state_reads_as_normal`: "JobPilot works without one. Tasks that need AI end with a manual path."
 
@@ -1340,53 +1360,49 @@ git commit -m "test: injection corpus on hosted backends, no-provider proof, pro
 ### Task 10: Release gates and docs
 
 **Files:**
-- Create: `docs/releases/0.4.0.md`, `scripts/windows-gate.ps1`
-- Modify: `docs/milestones.md`, `docs/ai-providers.md`, `docs/policy-register.md`, `docs/security/threat-model.md`, `docs/agents.md`, `docs/architecture.md`, `docs/database-schema.md`, `docs/development.md`, `docs/wireframes.md`, `docs/prd.md`, `README.md`, `CHANGELOG.md`, `Cargo.toml`, `Cargo.lock`, `apps/desktop/package.json`, `apps/desktop/src-tauri/tauri.conf.json`, `scripts/ci-local.sh`
+- Create: `docs/releases/0.4.0.md`
+- Modify: `docs/milestones.md`, `docs/ai-providers.md`, `docs/policy-register.md`, `docs/security/threat-model.md`, `docs/agents.md`, `docs/architecture.md`, `docs/database-schema.md`, `docs/development.md`, `docs/wireframes.md`, `docs/prd.md`, `README.md`, `CHANGELOG.md`, `Cargo.toml`, `Cargo.lock`, `apps/desktop/package.json`, `apps/desktop/src-tauri/tauri.conf.json`, `scripts/ci-local.sh`, `.github/workflows/ci.yml`, `crates/core/tests/net.rs`
 
 **Interfaces:**
 - Consumes: everything above. Produces no code interface.
 
-- [ ] **Step 1: Re-read the register rows this release depends on**
-
-Follow `docs/policy-register.md`, "Release re-check", for every row in Task 2's table and the Gemini and Codex rows. Re-read each URL, update the date read, and compare the quote. OpenAI's Usage Policies change on 2026-11-20: if this runs after that date, read the new text. A changed quote or verdict is recorded, and only then re-check that `cargo test --test register` passes. Owner decisions stand and are not re-opened.
-
-Also re-read the no-tools evidence against the CLI versions then installed, and update the plan's quotes in `docs/ai-providers.md` if they moved.
-
-- [ ] **Step 2: Update the docs**
+- [ ] **Step 1: Update the docs**
 
 | File | Change |
 |---|---|
-| `docs/ai-providers.md` | The status line, the backends table, and a new "As built in 0.4" section: wires, statuses, `Retry-After` per decision 11 (replacing the external retry rule in "Timeouts and retries"), Gemini's argv with its quotes, Codex's gap, the consent key table. Correct "Ollama is retried on network errors, 429, 5xx" to what the code does: network errors, 429, 503. |
-| `docs/security/threat-model.md` | Status block for 0.4 with a **Built 0.4** label. M-15, M-21 (redirect now tested, endpoint added), M-29, M-30, M-31, M-32 updated with test names. Section 7 table: `gemini` proven with its flags and residuals; `codex exec` updated with the `apply_patch` gap. Section 11: free-key attestation, `.env` selecting Vertex, the Gemini residuals, macOS TLS 1.2. M-14: `claude` is the only panel session. B1: keys enter through a Rust clipboard read. |
-| `docs/policy-register.md` | Dates from Step 1. FR-3.11's "interactive session" stays as vendor record. |
-| `docs/milestones.md` | Scope sentence, the 0.4 gate record, "0.1 to 0.4 are built", and the Windows row as it truly stands. |
+| `docs/ai-providers.md` | The status line, line 5's "must be re-read at each release" per the owner's waiver, the backends table, and a new "As built in 0.4" section: wires, statuses, `Retry-After` per decision 11 (replacing the external retry rule in "Timeouts and retries"), Gemini's argv with its quotes, Codex's gap, the consent key table. Correct "Ollama is retried on network errors, 429, 5xx" to what the code does: network errors, 429, 503. |
+| `docs/security/threat-model.md` | Status block for 0.4 with a **Built 0.4** label. M-15, M-21 (redirect now tested, endpoint added), M-29, M-30, M-31, M-32 updated with test names. Section 7 table: `gemini` proven with its flags and residuals; `codex exec` updated with the `apply_patch` gap. Section 11: free-key attestation, `.env` selecting Vertex, the Gemini residuals, macOS TLS 1.2; "Register drift" says the re-read is waived for AI rows. M-14: `claude` is the only panel session. B1: keys enter through a Rust clipboard read. |
+| `docs/policy-register.md` | Line 7 and "Release re-check": the owner waived the re-read for AI provider rows, and it stays for the site rows 0.5 and 0.6 rely on. Edit no table row and no date: decision 12 suspends consent on any row change, and the owner decision lines are part of that text. FR-3.11's "interactive session" stays as vendor record. |
+| `docs/milestones.md` | Scope sentence, the 0.4 gate record, "0.1 to 0.4 are built". Gate 4's row stays open for the CI run id, which Task 11 fills. |
 | `docs/agents.md` | 120 s per attempt for hosted, "Router policy" per decision 11. External backends widen in 0.4. |
 | `docs/architecture.md` | The new modules, the two clients, the keychain path. |
 | `docs/database-schema.md` | Section for `0012`, with the rule 7 note. |
-| `docs/development.md` | TLS backend, fakes, `real_gemini_has_no_tools_smoke`, `JOBPILOT_GEMINI_BIN`, `JOBPILOT_CODEX_BIN`, the Windows gate script. |
-| `docs/wireframes.md` | Section 13 as built: Rust clipboard flow, no key field, no ChatGPT row, so no Manage usage link. Section 14 heading. |
+| `docs/development.md` | TLS backend, fakes, `real_gemini_has_no_tools_smoke`, `JOBPILOT_GEMINI_BIN`, `JOBPILOT_CODEX_BIN`, and `--skip real_gemini --skip real_tls` on its two `--ignored` lines. |
+| `docs/wireframes.md` | Section 13 as built: Rust clipboard flow, no key field, no ChatGPT row, so no Manage usage link, no verdict on the list, and the suspended wording from Task 2. Section 14 heading. |
 | `docs/prd.md` | Open items line for FR-3.10 and FR-3.11 as they now stand. |
 | `README.md`, `CHANGELOG.md`, `docs/releases/0.4.0.md` | Built, tests, not exercised, risks, upgrading (one Claude re-consent). |
 
-- [ ] **Step 3: Write `scripts/windows-gate.ps1`**
+- [ ] **Step 2: Wire CI and the TLS check**
 
-It runs from a checkout on a Windows machine with Rust, pnpm, and optionally `npm i -g @google/gemini-cli @openai/codex`. It sets `$env:JOBPILOT_SECRET_SERVICE='jobpilot-test'`, then runs: `cargo test --workspace`, `cargo test --workspace -- --ignored --test-threads=1 --skip real_claude --skip real_gemini --skip make_fixtures`, `jobpilot ai status`, and a handshake check through `real_tls_handshake`. Add that test to `crates/core/tests/net.rs`, ignored, named `real_tls_handshake`, gated by `JOBPILOT_REAL_TLS=1`. It sends an unauthenticated `GET` with no body to each of the four vendor hosts and expects any HTTP status, which proves the handshake with no key and no cost. The script writes `windows-gate-<sha>.txt`. Add `--skip real_gemini --skip real_tls` to `keychain_suites` in `scripts/ci-local.sh`.
+Add `real_tls_handshake` to `crates/core/tests/net.rs`, ignored, gated by `JOBPILOT_REAL_TLS=1`, returning with a `skipped` line when that is unset, as `real_claude_has_no_tools_smoke` does. It uses `hosted_client` to send an unauthenticated `GET` with no body to each of the four vendor hosts and expects any HTTP status, which proves the handshake with no key and no cost. Task 11 Step 3 and CI call it. Do not run it here: implementers make no real network call.
 
-- [ ] **Step 4: Bump the version** to `0.4.0` in `Cargo.toml` (workspace), `apps/desktop/package.json`, `apps/desktop/src-tauri/tauri.conf.json`, and `Cargo.lock`.
+Add `--skip real_tls` to `keychain_suites` in `scripts/ci-local.sh` and to both keychain steps in `.github/workflows/ci.yml`. Add a `TLS handshake` step to `ci.yml` after them, on both systems: `cargo test -p jobpilot-core --test net -- --ignored real_tls_handshake`, with `JOBPILOT_REAL_TLS: 1` in its `env`. That step is the Schannel proof. Remove `ci.yml`'s "The repository is private" comment, and in the header of `ci-local.sh` replace "when minutes run out" and the ponytail with: this is the pre-commit gate, Windows is type-checked here, and CI's Windows job runs it.
 
-- [ ] **Step 5: Run the full gate**
+- [ ] **Step 3: Bump the version** to `0.4.0` in `Cargo.toml` (workspace), `apps/desktop/package.json`, `apps/desktop/src-tauri/tauri.conf.json`, and `Cargo.lock`.
 
-Run: `scripts/ci-local.sh`
+- [ ] **Step 4: Run the gate**
+
+Run: `scripts/ci-local.sh --fast`
 Then: `pnpm --filter desktop sidecar && pnpm tauri build --no-bundle`
-Expected: all steps `ok`, exit 0.
+Expected: all steps `ok`, exit 0. The controller runs the full `scripts/ci-local.sh`, which adds the keychain suites, after this task.
 
 Migration gate: `a_fresh_database_is_schema_12` and `a_0_3_database_upgrades_to_0_4` pass. Record the test counts.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add -A docs scripts crates apps README.md CHANGELOG.md Cargo.toml Cargo.lock
-git commit -m "docs: Release 0.4 gates, register re-check, threat model, and version 0.4.0"
+git add -A docs scripts .github crates apps README.md CHANGELOG.md Cargo.toml Cargo.lock
+git commit -m "docs: Release 0.4 gates, threat model, CI TLS check, and version 0.4.0"
 ```
 
 ### Task 11: Real end to end on a temporary root
@@ -1394,17 +1410,17 @@ git commit -m "docs: Release 0.4 gates, register re-check, threat model, and ver
 Driven by the controller, not an implementer subagent: it spends a little real usage. **At most one real completion per available provider.** Use only what is installed and signed in, and add no keys on the owner's behalf: if no key exists for a provider, that provider is recorded as not exercised. Never touch the owner's data root. No full-screen screenshots. If a step fails, stop, fix through a subagent with a failing test first, and rerun from the failed step, counting calls already spent against the limit.
 
 **Files:**
-- Modify: `docs/milestones.md` (0.4 gate record), `docs/releases/0.4.0.md`
+- Modify: `docs/milestones.md` (0.4 gate record), `docs/releases/0.4.0.md`, `docs/ai-providers.md` (no-tools quotes, if they moved)
 
 **Interfaces:**
-- Consumes: the release build of `jobpilot`, the app from `pnpm tauri build --no-bundle`.
+- Consumes: a debug build of `jobpilot` and the app from `pnpm tauri build --debug --no-bundle`. A release build ignores `JOBPILOT_SECRET_SERVICE` and would store keys and the data key under the owner's real service, where entries are keyed by name alone. Task 10 already proved the release build compiles.
 
 - [ ] **Step 1: Set up and take stock**
 
 ```bash
-cargo build --release -p jobpilot-cli
+cargo build -p jobpilot-cli
 E2E=$(mktemp -d); export JOBPILOT_HOME="$E2E/home" JOBPILOT_SECRET_SERVICE=jobpilot-e2e
-JP="$PWD/target/release/jobpilot"
+JP="$PWD/target/debug/jobpilot"
 $JP status; $JP ai status
 ```
 
@@ -1412,7 +1428,7 @@ Expected: schema 12, version 0.4.0, every external provider off, No-AI present. 
 
 - [ ] **Step 2: The no-provider path**
 
-With every provider off, build the candidate data as in 0.3's Task 11, and run `resume generate <job>`: expect `manual_required`, reason `no_ai`. `app add`, `analytics report`: expect both to work. Audit holds no `ai_external_call`.
+With every provider off, build the candidate data as in 0.3's Task 11, and run `resume generate <job>`: expect `manual_required`, reason `no_ai`. `app add`, `analytics report`: expect both to work. `sqlite3 "$JOBPILOT_HOME/jobpilot.db" "SELECT count(*) FROM audit_log WHERE action = 'ai_external_call'"` prints 0.
 
 - [ ] **Step 3: TLS against the real hosts, no key, no spend**
 
@@ -1421,16 +1437,18 @@ Expected: every host answers an HTTP status. This is decision 1's early warning 
 
 - [ ] **Step 4: Claude Code, one call**
 
-`ai enable claude_code`, `ai consent show claude_code --job <job>`, then give consent. `resume generate <job> --export pdf`. Expect a draft from `claude_code/cli_login`, and a PDF. This also proves the re-consent path, on a fresh root. Disable it.
+`ai enable claude_code`, `ai consent show claude_code --job <job>`, then give consent. `resume generate <job> --export pdf`. Expect a draft from `claude_code/cli_login`, and a PDF. A fresh root has no old record, so this proves consent and not the re-consent path: Steps 9 and 10 do that. Disable it.
 
 - [ ] **Step 5: Gemini CLI, one call, if it is installed and signed in**
+
+This is a security check, not a terms check, so it stays. Re-read the no-tools evidence above against the versions installed now: the flags in `gemini --help`, and the policy-engine and headless pages. Update the quotes in `docs/ai-providers.md` if they moved. A flag that is gone stops this step, as a failed smoke does.
 
 Run: `JOBPILOT_REAL_GEMINI_SMOKE=1 cargo test -p jobpilot-core --test gemini_cli -- --ignored real_gemini`
 That is the one call. Expect no `tool_use` event and no canary text. A login failure (`not_logged_in`) spends nothing useful: record the provider as not signed in, and the no-tools proof as unproven at run time. If the smoke sees a `tool_use`, remove `NoTools` from the table through a subagent, as decision 15 says.
 
 - [ ] **Step 6: Codex CLI, no call**
 
-`ai status`: expect Codex unavailable while its install is broken. With a working install, still no call: every task skips it. `ai consent show codex_cli` says why.
+`ai enable codex_cli`, `ai status`: expect Codex unavailable while its install is broken, then `ai disable codex_cli`. Re-read the `apply_patch` gap against the installed version's docs: if a documented switch now removes it, record that for a later release, with no change to the capability here. With a working install, still no call: every task skips it. `ai consent show codex_cli` says why.
 
 - [ ] **Step 7: API providers, one call each, only if the owner already has a key to hand**
 
@@ -1446,17 +1464,21 @@ If an Ollama model is installed, start it, and run one draft through Ollama, the
 sqlite3 "$JOBPILOT_HOME/jobpilot.db" "SELECT provider, outcome, reason, count(*) FROM task_runs GROUP BY 1,2,3;"
 ```
 
-Expected: one successful attempt per exercised provider. Scan the database, the exports, and `audit` for a distinctive word from the posting in logs, and for any key's last eight characters anywhere: expect none.
+Expected: one successful attempt per exercised provider. Scan the database, the exports, and `audit_log` for a distinctive word from the posting in logs, and for any key's last eight characters anywhere: expect none.
 
-Force a suspension by SQL on the temporary root, as the Task 2 test does: `ai status` shows suspended, a draft ends `consent_suspended`, and no call is made. Then `pause set` during a slow mock CLI: ends `paused`. Then `backup create`, `backup restore`: every provider off, consent revoked.
+Force a suspension by SQL on the temporary root, as the Task 2 test does: `ai status` shows suspended, a draft ends `consent_suspended`, and no call is made. Setting `register_row` to `''` is the 0.3 upgrade's exact state. Then `pause set` during a slow mock CLI: ends `paused`. Then `backup create`, `backup restore`: every provider off, consent revoked.
 
 - [ ] **Step 10: The GUI, once**
 
-Launch the release app with `JOBPILOT_HOME` on the same root. By keyboard: the AI screen lists every provider and the Not available list. Review opens the dialog with focus on Cancel, Show exactly what will be sent shows the prompt, and `Paste key from clipboard...` with a throwaway text refuses with no dialog. Drive any native dialog through System Events accessibility (`osascript`), and read the results from `ai status` and audit rows. If accessibility is not granted, record them as unproven. Capture only a window or element screenshot if evidence is needed.
+Build with `pnpm tauri build --debug --no-bundle` and launch that app with `JOBPILOT_HOME` and `JOBPILOT_SECRET_SERVICE` as in Step 1. By keyboard: the AI screen lists every provider and the Not available list. Review opens the dialog with focus on Cancel, Show exactly what will be sent shows the prompt, and `Paste key from clipboard...` with a throwaway text refuses with no dialog. Give Claude Code consent, set its `register_row` to `''` by SQL, and reload: the Claude section shows why it is suspended, `Review consent...` opens with the categories ticked, and `Allow selected` lifts it through the native confirmation. Drive any native dialog through System Events accessibility (`osascript`), and read the results from `ai status` and audit rows. If accessibility is not granted, record them as unproven. Capture only a window or element screenshot if evidence is needed.
 
-- [ ] **Step 11: Clean up and record**
+- [ ] **Step 11: Gate 4, the CI run**
 
-Run `data delete --confirm DELETE`, which removes the `jobpilot-e2e` keychain entries, before removing `$E2E`. Fill the gate record: what ran, real versions, calls spent per provider, and what is unproven: Windows unless the gate script ran, each provider with no key, and hosted replies only ever scripted against the corpus.
+Push the branch, then run `gh workflow run ci.yml --ref feat/v0.4-external-ai`: `ci.yml` starts on its own only for a pull request or `main`. Wait for it. The evidence is `windows-latest`'s test, keychain, and `TLS handshake` steps and `macos-latest`'s. A red job is fixed through a subagent with a failing test first, then this step reruns.
+
+- [ ] **Step 12: Clean up and record**
+
+Run `data delete --confirm DELETE` with the debug binary, which removes the `jobpilot-e2e` keychain entries, before removing `$E2E`. Fill the gate record: what ran, real versions, calls spent per provider, the CI run id and its Windows result for Gate 4, and what is unproven: real CLIs, native dialogs, and the GUI on Windows, each provider with no key, and hosted replies only ever scripted against the corpus.
 
 ```bash
 git add docs
