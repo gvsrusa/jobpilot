@@ -614,3 +614,107 @@ async fn a_short_retry_after_is_stored_before_the_sleep() {
         not_before - began
     );
 }
+
+// A parsed page is vetted once, in the fetcher, whatever connector produced it.
+
+const LEVER_PATH: &str = "/v0/postings/acme?mode=json&skip=0&limit=100";
+
+fn lever_row(id: &str, title: &str, url: &str) -> serde_json::Value {
+    json!({"id": id, "text": title, "hostedUrl": url, "categories": {"location": "Austin"}})
+}
+
+async fn lever_page(rows: serde_json::Value) -> Page {
+    let (_t, db) = open().await;
+    let fake = Fake::start(vec![(LEVER_PATH, Canned::json(200, &rows))]);
+    let fetcher = Fetcher::for_test(&fake.url).unwrap();
+    let lever = jobpilot_core::connectors::find("lever").unwrap();
+    fetcher
+        .page(
+            &db,
+            &*lever,
+            &target(),
+            0,
+            Operation::ListBoard,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_link_off_https_or_off_the_declared_hosts_skips_the_row() {
+    let good = "https://jobs.lever.co/acme/1";
+    let mut with_bad_apply = lever_row("9", "T", good);
+    with_bad_apply["applyUrl"] = json!("javascript:alert(1)");
+    let page = lever_page(json!([
+        lever_row("1", "Ok", good),
+        lever_row("2", "T", "javascript:alert(1)"),
+        lever_row("3", "T", "file:///etc/passwd"),
+        lever_row("4", "T", "https://evil.test/acme/4"),
+        lever_row("5", "T", "http://jobs.lever.co/acme/5"),
+        lever_row("6", "T", "https://jobs.lever.co@evil.test/acme/6"),
+        lever_row("7", "T", "https://jobs.lever.co:8443/acme/7"),
+        lever_row("8", "T", "https://jobs.eu.lever.co/acme/8"),
+        with_bad_apply,
+    ]))
+    .await;
+    let ids: Vec<_> = page
+        .postings
+        .iter()
+        .map(|p| p.external_id.as_str())
+        .collect();
+    assert_eq!(ids, ["1", "8"]);
+    assert_eq!(page.skipped, 7);
+}
+
+#[tokio::test]
+async fn a_repeated_id_keeps_the_first_and_counts_the_rest() {
+    let url = "https://jobs.lever.co/acme/1";
+    let page = lever_page(json!([
+        lever_row("1", "First", url),
+        lever_row("1", "Second", url),
+        lever_row("2", "Other", url),
+        lever_row("1", "Third", url),
+    ]))
+    .await;
+    let titles: Vec<_> = page.postings.iter().map(|p| p.title.as_str()).collect();
+    assert_eq!(titles, ["First", "Other"]);
+    assert_eq!(page.skipped, 2);
+}
+
+#[tokio::test]
+async fn negative_or_empty_pay_is_unknown() {
+    let url = "https://jobs.lever.co/acme/1";
+    let pay = |min: i64, max: i64| {
+        let mut row = lever_row("1", "T", url);
+        row["salaryRange"] =
+            json!({"currency": "USD", "interval": "per-year-salary", "min": min, "max": max});
+        row
+    };
+    for (min, max) in [(-5, 10), (5, -10), (0, 0), (-1, -1)] {
+        let page = lever_page(json!([pay(min, max)])).await;
+        assert!(page.postings[0].pay.is_none(), "{min} {max}");
+    }
+    let page = lever_page(json!([pay(0, 90000)])).await;
+    assert_eq!(page.postings[0].pay.as_ref().unwrap().max, Some(90000));
+}
+
+#[tokio::test]
+async fn long_fields_are_cut_and_a_long_title_skips_the_row() {
+    let url = "https://jobs.lever.co/acme/1";
+    let mut long = lever_row("1", "T", url);
+    long["categories"]["location"] = json!("é".repeat(250));
+    long["description"] = json!("é".repeat(150_000));
+    let exact = lever_row("2", &"t".repeat(300), url);
+    let over = lever_row("3", &"t".repeat(301), url);
+    let page = lever_page(json!([long, exact, over])).await;
+    assert_eq!(page.postings.len(), 2);
+    assert_eq!(page.skipped, 1);
+    assert_eq!(page.postings[0].location.chars().count(), 200);
+    assert!(page.postings[0].raw.len() <= 200 * 1024);
+    assert!(
+        page.postings[0].raw.len() > 200 * 1024 - 4,
+        "cut near the cap"
+    );
+    assert_eq!(page.postings[1].title.chars().count(), 300);
+}

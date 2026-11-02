@@ -138,6 +138,10 @@ impl Connector for WeWorkRemotely {
         &DECL
     }
 
+    fn link_hosts(&self) -> &'static [&'static str] {
+        &["weworkremotely.com"]
+    }
+
     fn request(&self, target: &Target, _: u32) -> Result<PageRequest> {
         let path = match target.name.as_str() {
             "" => "/remote-jobs.rss".to_string(),

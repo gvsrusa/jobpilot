@@ -9,7 +9,7 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE, RETRY_AFTER, USER_AGENT as UA};
 use reqwest::{Client, Url};
 
 use super::limit::{self, MAX_HOLD, MAX_WAIT, Slot};
-use super::{BodyKind, Connector, ConnectorDecl, Operation, Page, PageRequest, Target, gate};
+use super::{BodyKind, Connector, ConnectorDecl, Operation, Page, PageRequest, Target, gate, vet};
 use crate::ai::CancellationToken;
 use crate::ai::net::{hosted_client, loopback_client, net, read_capped, retry_after};
 use crate::db::Db;
@@ -178,7 +178,7 @@ impl Fetcher {
         }
         connector
             .parse_page(target, &reply.body, page)
-            .map(Step::Done)
+            .map(|parsed| Step::Done(vet(parsed, connector.link_hosts())))
     }
 
     /// One request, bounded by [`REQUEST_TIMEOUT`] and ended at once by the token.

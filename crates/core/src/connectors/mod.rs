@@ -149,6 +149,82 @@ pub trait Connector: Send + Sync {
     fn parse_page(&self, target: &Target, body: &[u8], _page: u32) -> Result<Page> {
         self.parse(target, body)
     }
+    /// Hosts a stored link may name, when the vendor serves its postings from known ones.
+    /// Empty means any host, over https.
+    fn link_hosts(&self) -> &'static [&'static str] {
+        &[]
+    }
+}
+
+// ponytail: field caps are fixed here for every connector: a title over 300 characters skips
+// the row; company and location are cut at 200 characters; description at 200 KB (204,800
+// bytes), always on a character boundary.
+const TITLE_MAX: usize = 300;
+const NAME_MAX: usize = 200;
+const RAW_MAX: usize = 200 * 1024;
+
+fn cut_chars(text: &mut String, max: usize) {
+    if let Some((at, _)) = text.char_indices().nth(max) {
+        text.truncate(at);
+    }
+}
+
+fn cut_bytes(text: &mut String, max: usize) {
+    if text.len() > max {
+        let mut at = max;
+        while !text.is_char_boundary(at) {
+            at -= 1;
+        }
+        text.truncate(at);
+    }
+}
+
+/// A stored link is https, names no user or port, and sits on one of `hosts` when any are given.
+fn link_ok(link: &str, hosts: &[&str]) -> bool {
+    let Ok(url) = reqwest::Url::parse(link) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+        && url
+            .host_str()
+            .is_some_and(|host| hosts.is_empty() || hosts.contains(&host))
+}
+
+/// The one check every parsed page passes through, in the fetcher. A row with a bad link or an
+/// over-long title is skipped and counted; a repeated `external_id` keeps its first; a pay
+/// range that is negative or empty becomes unknown; long fields are cut.
+pub fn vet(mut page: Page, link_hosts: &[&str]) -> Page {
+    let mut seen = std::collections::HashSet::new();
+    let rows = std::mem::take(&mut page.postings);
+    for mut posting in rows {
+        let links_ok = link_ok(&posting.url, link_hosts)
+            && posting
+                .apply_url
+                .as_deref()
+                .is_none_or(|link| link_ok(link, link_hosts));
+        if !links_ok
+            || posting.title.chars().count() > TITLE_MAX
+            || !seen.insert(posting.external_id.clone())
+        {
+            page.skipped += 1;
+            continue;
+        }
+        if let Some(pay) = &posting.pay {
+            let negative = pay.min.is_some_and(|n| n < 0) || pay.max.is_some_and(|n| n < 0);
+            let empty = pay.min.unwrap_or(0) == 0 && pay.max.unwrap_or(0) == 0;
+            if negative || empty {
+                posting.pay = None;
+            }
+        }
+        cut_chars(&mut posting.company, NAME_MAX);
+        cut_chars(&mut posting.location, NAME_MAX);
+        cut_bytes(&mut posting.raw, RAW_MAX);
+        page.postings.push(posting);
+    }
+    page
 }
 
 fn invalid(why: &str) -> Error {

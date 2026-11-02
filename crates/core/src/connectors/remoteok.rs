@@ -79,6 +79,10 @@ impl Connector for RemoteOk {
         &DECL
     }
 
+    fn link_hosts(&self) -> &'static [&'static str] {
+        &["remoteok.com"]
+    }
+
     fn request(&self, _: &Target, _: u32) -> Result<PageRequest> {
         Ok(PageRequest {
             host: "remoteok.com",

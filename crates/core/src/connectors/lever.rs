@@ -112,6 +112,10 @@ impl Connector for Lever {
         &DECL
     }
 
+    fn link_hosts(&self) -> &'static [&'static str] {
+        &["jobs.lever.co", "jobs.eu.lever.co"]
+    }
+
     fn request(&self, target: &Target, page: u32) -> Result<PageRequest> {
         let (eu, name) = site(target)?;
         Ok(PageRequest {
