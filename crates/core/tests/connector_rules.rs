@@ -73,6 +73,21 @@ fn every_src_file() -> Vec<(String, String)> {
         .collect()
 }
 
+/// The list above is kept by hand, so a connector file added to the folder must be added to it,
+/// or every test over the list would pass without reading the new file.
+#[test]
+fn the_connector_list_is_every_file_in_the_folder() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/connectors");
+    let mut on_disk: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    on_disk.sort();
+    let mut listed: Vec<&str> = CONNECTORS.iter().map(|(name, _)| *name).collect();
+    listed.sort();
+    assert_eq!(on_disk, listed);
+}
+
 #[test]
 fn only_fetch_rs_touches_the_network() {
     for (name, source) in CONNECTORS.iter().filter(|(name, _)| *name != "fetch.rs") {
@@ -88,6 +103,9 @@ fn only_fetch_rs_touches_the_network() {
             "ureq",
             "std::net",
             "tokio::net",
+            "hosted_client",
+            "loopback_client",
+            "net::",
         ] {
             assert!(!code.contains(banned), "{name} names {banned}");
         }
