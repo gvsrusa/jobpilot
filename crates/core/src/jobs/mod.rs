@@ -1013,6 +1013,18 @@ pub async fn apply_rules(db: &Db, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Runs the rules over each job they have not read. Only a job migrated from 0.4 waits here, and
+/// the rules move it to `rules`, so a later call finds nothing.
+pub(crate) async fn apply_rules_to_unread(db: &Db) -> Result<()> {
+    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM jobs WHERE fields_by = 'none'")
+        .fetch_all(&db.pool)
+        .await?;
+    for id in ids {
+        apply_rules(db, &id).await?;
+    }
+    Ok(())
+}
+
 /// What the profile says about work authorization for the job's country. It is only shown: no
 /// score, filter, or draft step reads it.
 #[derive(Debug, Clone, Serialize)]

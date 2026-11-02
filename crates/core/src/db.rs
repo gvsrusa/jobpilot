@@ -37,7 +37,13 @@ pub struct Db {
 
 impl Db {
     pub async fn open(paths: &AppPaths) -> Result<Db> {
-        Self::open_with(paths, &MIGRATOR).await
+        let db = Self::open_with(paths, &MIGRATOR).await?;
+        // A job the 0.5 migration carried over stays `none` until the rules have read it.
+        if let Err(error) = crate::jobs::apply_rules_to_unread(&db).await {
+            db.close().await;
+            return Err(error);
+        }
+        Ok(db)
     }
 
     /// `open` with a chosen migrator. Tests use this to supply a future or broken
