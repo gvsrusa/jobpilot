@@ -1,9 +1,9 @@
 name: CI
 
+# Manual only: GitHub Actions minutes ran out. scripts/ci-local.sh is the gate.
+# Put the pull_request and push triggers back when minutes are available.
 on:
-  pull_request:
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read

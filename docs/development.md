@@ -20,7 +20,7 @@ The installer bundles the `jobpilot` CLI as a Tauri sidecar (`externalBin: binar
 
 ## Checks
 
-CI runs these on macOS and Windows. Run them before pushing.
+`scripts/ci-local.sh` runs all of these on a Mac, and is the gate while GitHub Actions is manual only. It type-checks Windows but cannot link or run it. `--fast` skips the keychain suites and the Tauri build.
 
 ```bash
 pnpm typecheck
