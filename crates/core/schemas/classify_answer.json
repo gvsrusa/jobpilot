@@ -1,0 +1,6 @@
+{
+  "type": "object",
+  "required": ["class"],
+  "properties": { "class": { "type": "string", "enum": ["normal", "sensitive", "legal", "work_authorization"] } },
+  "additionalProperties": false
+}

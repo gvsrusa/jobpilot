@@ -224,6 +224,46 @@ export type ApplicationEvent = {
   note: string;
 };
 
+export type Agent = "resume" | "cover_letter" | "career_memory" | "tracking" | "analytics";
+
+export type RunState =
+  | "queued"
+  | "checking"
+  | "running"
+  | "checkpointed"
+  | "retrying"
+  | "waiting_for_human"
+  | "halted"
+  | "completed"
+  | "manual_required"
+  | "refused"
+  | "failed"
+  | "cancelled";
+
+export type RunSummary = {
+  id: string;
+  agent: Agent;
+  state: RunState;
+  step: number;
+  steps: number;
+  reason: string | null;
+  actor: string;
+  created_at: string;
+  finished_at: string | null;
+};
+
+export type LogRow = {
+  at: string;
+  step: string;
+  state: RunState;
+  duration_ms: number;
+  provider: string | null;
+  data_categories: DataCategory[];
+  outcome: string;
+};
+
+export type RunDetail = { run: RunSummary; log: LogRow[] };
+
 export type DraftKind = "resume" | "cover_letter";
 export type Template = "classic" | "compact";
 export type ExportFormat = "docx" | "pdf";
@@ -386,6 +426,12 @@ export const ipc = {
     invoke<Application>("app_set_status", { id, status, on, note }),
   appNote: (id: string, note: string) => invoke<void>("app_note", { id, note }),
   appHistory: (id: string) => invoke<ApplicationEvent[]>("app_history", { id }),
+
+  agentsList: (limit: number) => invoke<RunSummary[]>("agents_list", { limit }),
+  agentGet: (id: string) => invoke<RunDetail>("agent_get", { id }),
+  /** An active run stops at its next poll; a halted run ends now. */
+  agentCancel: (id: string) => invoke<void>("agent_cancel", { id }),
+  agentResume: (id: string) => invoke<RunDetail>("agent_resume", { id }),
   appRemove: (id: string) => invoke<void>("app_remove", { id }),
 
   memoryList: (cls: MemoryClass | null) => invoke<QuestionRow[]>("memory_list", { class: cls }),

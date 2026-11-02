@@ -1,5 +1,6 @@
 //! JobPilot CLI: a thin adapter over `jobpilot-core`. Parse, call core, print.
 
+mod agents;
 mod ai;
 mod apps;
 mod data;
@@ -65,6 +66,9 @@ pub enum Command {
     /// Questions and answers you reuse.
     #[command(subcommand)]
     Memory(memory::MemoryCommand),
+    /// Agent runs and their logs.
+    #[command(subcommand)]
+    Agents(agents::AgentsCommand),
     /// AI providers, models, and consent.
     #[command(subcommand)]
     Ai(ai::AiCommand),
@@ -261,6 +265,7 @@ async fn with_db(db: &Db, command: Command) -> Result<Output> {
         Command::Letter(command) => resume::letter(db, command).await,
         Command::App(command) => apps::app(db, command).await,
         Command::Memory(command) => memory::memory(db, command).await,
+        Command::Agents(command) => agents::agents(db, command).await,
         Command::Ai(command) => ai::ai(db, command).await,
         // `main` and the shell handle this before any command runs.
         Command::Shell => Err(Error::PanelRefused),
@@ -351,6 +356,12 @@ mod tests {
         ("memory search q", false),
         ("memory refresh", false),
         ("app answers i", false),
+        ("agents list", false),
+        ("agents list --limit 5", false),
+        ("agents show r", false),
+        ("agents log r", false),
+        ("agents cancel r", false),
+        ("agents resume r", false),
         ("ai status", false),
         ("ai models", false),
         ("ai pull m", true),

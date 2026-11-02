@@ -2,8 +2,9 @@
 
 use clap::{Args, Subcommand};
 use jobpilot_core::applications::{self, Application, ApplicationInput};
-use jobpilot_core::{Db, Result};
+use jobpilot_core::{Db, Result, agents};
 
+use crate::ai::with_ctrl_c;
 use crate::{ACTOR, Output, out};
 
 #[derive(Args)]
@@ -190,8 +191,10 @@ pub async fn app(db: &Db, command: AppCommand) -> Result<Output> {
             on,
             note,
         } => {
-            let saved =
-                applications::set_status(db, ACTOR, &id, &status, on.as_deref(), &note).await?;
+            let saved = with_ctrl_c(|cancel| {
+                agents::set_status(db, ACTOR, &id, &status, on.as_deref(), &note, cancel)
+            })
+            .await?;
             out(&saved, format!("{} is {}", saved.id, saved.status))
         }
         AppCommand::Note { id, text } => {

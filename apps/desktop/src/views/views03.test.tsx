@@ -9,11 +9,15 @@ import type {
   ApplicationInput,
   ApplicationStatus,
   Finding,
+  LogRow,
   KnowledgeItem,
   MemoryClass,
   MemoryHit,
   Question,
   QuestionRow,
+  RunDetail,
+  RunState,
+  RunSummary,
 } from "../lib/ipc";
 import { backend, count, renderApp } from "../test-utils";
 
@@ -893,5 +897,112 @@ describe("answers for an application", () => {
     expect(screen.getByText(/Needs sponsorship: No/)).toBeInTheDocument();
     expect(screen.getByText("<b>citizen</b>")).toBeInTheDocument();
     expect(container.querySelectorAll("main a, main b")).toHaveLength(0);
+  });
+});
+
+describe("agents", () => {
+  const run = (over: Partial<RunSummary> = {}): RunSummary => ({
+    id: "r1",
+    agent: "tracking",
+    state: "completed",
+    step: 1,
+    steps: 1,
+    reason: null,
+    actor: "gui",
+    created_at: "2026-11-01T10:00:00Z",
+    finished_at: "2026-11-01T10:00:01Z",
+    ...over,
+  });
+  const row = (state: RunState, over: Partial<LogRow> = {}): LogRow => ({
+    at: "2026-11-01T10:00:00Z",
+    step: "update",
+    state,
+    duration_ms: 12,
+    provider: null,
+    data_categories: [],
+    outcome: "ok",
+    ...over,
+  });
+  const agents = (runs: RunSummary[], log: LogRow[] = []) =>
+    backend({
+      agents_list: () => runs,
+      agent_get: ({ id }: Args): RunDetail => ({ run: runs.find((r) => r.id === id)!, log }),
+      agent_cancel: () => undefined,
+      agent_resume: ({ id }: Args): RunDetail => ({ run: runs.find((r) => r.id === id)!, log }),
+    });
+  const openAgents = async (user: ReturnType<typeof renderApp>["user"]) => {
+    await user.click(await screen.findByRole("button", { name: "Agents" }));
+    await screen.findByRole("heading", { level: 1, name: "Agents" });
+  };
+
+  it("ctrl_9_opens_agents", async () => {
+    backend({ agents_list: () => [] });
+    const { user } = renderApp();
+    await screen.findByRole("heading", { name: "Status" });
+    await user.keyboard("{Control>}9{/Control}");
+    expect(await screen.findByRole("heading", { level: 1, name: "Agents" })).toBeInTheDocument();
+    expect(await screen.findByText("No agent has run yet.")).toBeInTheDocument();
+  });
+
+  it("agents_view_lists_runs_and_shows_a_log", async () => {
+    agents(
+      [run({ id: "r1", state: "failed", step: 2, steps: 3, reason: "timeout", agent: "cover_letter" })],
+      [row("checking"), row("checkpointed", { provider: "ollama", data_categories: ["job_text", "resume_text"] })],
+    );
+    const { user } = renderApp();
+    await openAgents(user);
+
+    const cell = await screen.findByRole("button", { name: "Cover letter" });
+    const line = cell.closest("tr")!;
+    expect(line).toHaveTextContent("Failed");
+    expect(line).toHaveTextContent("2 of 3");
+    expect(line).toHaveTextContent("timeout");
+
+    await user.click(cell);
+    const log = await screen.findByRole("table", { name: "Run log" });
+    expect(within(log).getByText("Checkpointed")).toBeInTheDocument();
+    expect(within(log).getByText("ollama")).toBeInTheDocument();
+    expect(within(log).getByText("job_text, resume_text")).toBeInTheDocument();
+    expect(within(log).getAllByText("12 ms")).toHaveLength(2);
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Cancel run" })).toBeNull();
+  });
+
+  it("resume_is_offered_only_on_a_halted_run", async () => {
+    const api = agents([
+      run({ id: "r1", agent: "tracking", state: "halted", reason: "interrupted", step: 0 }),
+      run({ id: "r2", agent: "analytics", state: "running", step: 0 }),
+    ]);
+    const { user } = renderApp();
+    await openAgents(user);
+
+    await user.click(await screen.findByRole("button", { name: "Analytics" }));
+    expect(await screen.findByRole("button", { name: "Cancel run" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Cancel run" }));
+    await waitFor(() => expect(count(api, "agent_cancel")).toBe(1));
+    expect(api.calls.find((c) => c.cmd === "agent_cancel")!.args).toEqual({ id: "r2" });
+
+    await user.click(screen.getByRole("button", { name: "Tracking" }));
+    await user.click(await screen.findByRole("button", { name: "Resume" }));
+    await waitFor(() => expect(count(api, "agent_resume")).toBe(1));
+    expect(screen.getByRole("button", { name: "Cancel run" })).toBeInTheDocument();
+  });
+
+  it("a_refused_resume_shows_its_code", async () => {
+    backend({
+      agents_list: () => [run({ state: "halted", reason: "paused", step: 0 })],
+      agent_get: (): RunDetail => ({ run: run({ state: "halted", step: 0 }), log: [] }),
+      agent_resume: () => {
+        throw { code: "paused", message: "emergency pause is on" };
+      },
+    });
+    const { user } = renderApp();
+    await openAgents(user);
+    await user.click(await screen.findByRole("button", { name: "Tracking" }));
+    await user.click(await screen.findByRole("button", { name: "Resume" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("emergency pause is on");
+    expect(alert).toHaveTextContent("code: paused");
   });
 });

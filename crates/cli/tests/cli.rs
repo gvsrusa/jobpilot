@@ -1259,3 +1259,113 @@ async fn data_export_says_how_many_answers_it_left_out() {
     assert_eq!(report["withheld"], 1);
     assert_eq!(report["sensitive_plain"], false);
 }
+
+fn tracked_run(home: &Path) -> (String, String) {
+    let added = stdout_json(&run(
+        home,
+        &[
+            "app",
+            "add",
+            "--company",
+            "Acme",
+            "--role",
+            "Engineer",
+            "--json",
+        ],
+    ));
+    let app = added["id"].as_str().unwrap().to_owned();
+    assert!(
+        run(home, &["app", "status", &app, "applied", "--note", "sent"])
+            .status
+            .success()
+    );
+    let runs = stdout_json(&run(home, &["agents", "list", "--json"]));
+    (app, runs[0]["id"].as_str().unwrap().to_owned())
+}
+
+#[test]
+fn agents_list_shows_a_tracking_run_after_app_status() {
+    let (_dir, home) = fresh_home();
+    let (_, id) = tracked_run(&home);
+    let runs = stdout_json(&run(&home, &["agents", "list", "--limit", "5", "--json"]));
+    assert_eq!(runs.as_array().unwrap().len(), 1);
+    assert_eq!(runs[0]["agent"], "tracking");
+    assert_eq!(runs[0]["state"], "completed");
+    assert_eq!(runs[0]["actor"], "cli");
+    assert_eq!(runs[0]["step"], 1);
+
+    let text = run(&home, &["agents", "list"]);
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.contains(&id) && text.contains("tracking  completed  1 of 1"),
+        "{text}"
+    );
+    let shown = run(&home, &["agents", "show", &id]);
+    assert!(String::from_utf8_lossy(&shown.stdout).contains("completed"));
+}
+
+#[test]
+fn agents_log_prints_states() {
+    let (_dir, home) = fresh_home();
+    let (_, id) = tracked_run(&home);
+    let log = run(&home, &["agents", "log", &id]);
+    assert!(log.status.success());
+    let text = String::from_utf8_lossy(&log.stdout);
+    let states: Vec<&str> = text
+        .lines()
+        .map(|line| line.split("  ").nth(2).unwrap())
+        .collect();
+    assert_eq!(
+        states,
+        ["queued", "checking", "running", "checkpointed", "completed"],
+        "{text}"
+    );
+    assert!(
+        !text.contains("sent"),
+        "a note stays out of the log: {text}"
+    );
+    let json = stdout_json(&run(&home, &["agents", "log", &id, "--json"]));
+    assert_eq!(json.as_array().unwrap().len(), 5);
+}
+
+#[test]
+fn agents_cancel_and_resume_refuse_a_finished_run() {
+    let (_dir, home) = fresh_home();
+    let (_, id) = tracked_run(&home);
+    for verb in ["cancel", "resume"] {
+        let refused = run(&home, &["agents", verb, &id]);
+        assert!(!refused.status.success());
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(stderr.contains("error[validation]"), "{stderr}");
+    }
+    let missing = run(&home, &["agents", "show", "nope"]);
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("error[not_found]"));
+}
+
+#[tokio::test]
+async fn agents_cancel_and_resume_act_on_a_halted_run() {
+    let (_dir, home) = fresh_home();
+    let (app, id) = tracked_run(&home);
+    let halt = |run_id: String, home: std::path::PathBuf| async move {
+        let db = Db::open(&AppPaths::new(&home)).await.unwrap();
+        sqlx::query(
+            "UPDATE agent_runs SET state = 'halted', step = 0, finished_at = NULL WHERE id = ?",
+        )
+        .bind(run_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        db.close().await;
+    };
+    halt(id.clone(), home.clone()).await;
+    let resumed = stdout_json(&run(&home, &["agents", "resume", &id, "--json"]));
+    assert_eq!(resumed["state"], "completed");
+    assert_eq!(resumed["id"], id.as_str());
+
+    halt(id.clone(), home.clone()).await;
+    assert!(run(&home, &["agents", "cancel", &id]).status.success());
+    let shown = stdout_json(&run(&home, &["agents", "show", &id, "--json"]));
+    assert_eq!(shown["state"], "cancelled");
+    let app = stdout_json(&run(&home, &["app", "show", &app, "--json"]));
+    assert_eq!(app["status"], "applied");
+}

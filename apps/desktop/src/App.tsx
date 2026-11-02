@@ -6,6 +6,7 @@ import { useUiStore, type View } from "@/lib/store";
 import { useStatus } from "@/lib/status";
 import { cn } from "@/lib/utils";
 import { DataView } from "@/views/DataView";
+import { AgentsView } from "@/views/AgentsView";
 import { AiView } from "@/views/AiView";
 import { ApplicationsView } from "@/views/ApplicationsView";
 import { DocumentsView } from "@/views/DocumentsView";
@@ -24,6 +25,7 @@ const NAV: { view: View; label: string }[] = [
   { view: "ai", label: "AI" },
   { view: "applications", label: "Applications" },
   { view: "memory", label: "Memory" },
+  { view: "agents", label: "Agents" },
 ];
 
 function Shell({ version, root }: { version: string; root: string }) {
@@ -117,6 +119,7 @@ function Shell({ version, root }: { version: string; root: string }) {
           {view === "ai" && <AiView />}
           {view === "applications" && <ApplicationsView />}
           {view === "memory" && <MemoryView />}
+          {view === "agents" && <AgentsView />}
         </main>
       </div>
       <TerminalPanel open={terminal} onClose={() => setTerminal(false)} />

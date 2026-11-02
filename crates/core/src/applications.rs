@@ -287,6 +287,23 @@ pub async fn update(
     Ok(app)
 }
 
+/// What `set_status` refuses without touching a row, so a caller can ask before it starts.
+pub(crate) async fn check_change(
+    db: &Db,
+    status: &str,
+    on: Option<&str>,
+    note: &str,
+) -> Result<()> {
+    check_status(status)?;
+    if let Some(on) = on {
+        check_date(db, on).await?;
+    }
+    if too_long(note.trim(), NOTES_LIMIT) {
+        return Err(bad("a note is at most 20000 characters"));
+    }
+    Ok(())
+}
+
 /// The same status again writes nothing. The first move to `applied` stores `on`, or today's
 /// UTC date; a later one keeps the date already there.
 pub async fn set_status(
@@ -297,14 +314,8 @@ pub async fn set_status(
     on: Option<&str>,
     note: &str,
 ) -> Result<Application> {
-    check_status(status)?;
-    if let Some(on) = on {
-        check_date(db, on).await?;
-    }
+    check_change(db, status, on, note).await?;
     let note = note.trim();
-    if too_long(note, NOTES_LIMIT) {
-        return Err(bad("a note is at most 20000 characters"));
-    }
     let mut tx = db.pool.begin().await?;
     let current: Application = sqlx::query_as(concat!(
         "SELECT ",

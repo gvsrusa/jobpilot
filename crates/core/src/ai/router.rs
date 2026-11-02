@@ -429,7 +429,7 @@ fn carries_untrusted_text(spec: &TaskSpec) -> bool {
 }
 
 /// The sub-reason when it is on the allow-list, else the error code: never provider text.
-fn run_reason(error: &Error) -> &'static str {
+pub(crate) fn run_reason(error: &Error) -> &'static str {
     let (Error::Refused(why) | Error::Failed(why)) = error else {
         return error.code();
     };

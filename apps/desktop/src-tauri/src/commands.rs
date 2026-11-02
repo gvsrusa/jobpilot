@@ -13,7 +13,7 @@ use std::sync::Arc;
 use jobpilot_core::ai::claude_code::{self, TERMS_DATE};
 use jobpilot_core::ai::ollama::Ollama;
 use jobpilot_core::ai::router::{Router, ollama_from_settings};
-use jobpilot_core::ai::{self, AiStatus, DataCategory, ProviderId, consent};
+use jobpilot_core::ai::{self, AiStatus, CancellationToken, DataCategory, ProviderId, consent};
 use jobpilot_core::applications::{self, Application, ApplicationEvent, ApplicationInput};
 use jobpilot_core::audit::{self, AuditEntry};
 use jobpilot_core::backup::{self, BackupInfo};
@@ -31,7 +31,8 @@ use jobpilot_core::parse::{self, Imported};
 use jobpilot_core::profile::{self, Profile, ProfileBasic, WorkAuthorization};
 use jobpilot_core::recovery::{self, RecoveryReceipt};
 use jobpilot_core::render::{ResumeDoc, Template};
-use jobpilot_core::{Db, Error, Result, secrets, settings, transfer};
+use jobpilot_core::runner::{self, RunDetail, RunSummary};
+use jobpilot_core::{Db, Error, Result, agents, secrets, settings, transfer};
 use serde_json::{Value, json};
 use tauri::ipc::Invoke;
 use tauri::{AppHandle, Runtime, State};
@@ -96,6 +97,10 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         app_set_status,
         app_note,
         app_history,
+        agents_list,
+        agent_get,
+        agent_cancel,
+        agent_resume,
         app_remove,
         memory_list,
         memory_get,
@@ -559,13 +564,14 @@ pub async fn app_set_status(
     on: Option<String>,
     note: String,
 ) -> Result<Application> {
-    applications::set_status(
+    agents::set_status(
         &*state.work().await?,
         ACTOR,
         &id,
         &status,
         on.as_deref(),
         &note,
+        CancellationToken::new(),
     )
     .await
 }
@@ -1094,6 +1100,33 @@ pub async fn ai_index(state: State<'_, AppState>) -> Result<usize> {
 pub async fn ai_cancel(state: State<'_, AppState>) -> Result<()> {
     state.ai.cancel();
     Ok(())
+}
+
+#[tauri::command]
+pub async fn agents_list(state: State<'_, AppState>, limit: i64) -> Result<Vec<RunSummary>> {
+    runner::list(&*state.work().await?, limit).await
+}
+
+#[tauri::command]
+pub async fn agent_get(state: State<'_, AppState>, id: String) -> Result<RunDetail> {
+    runner::get(&*state.work().await?, &id).await
+}
+
+#[tauri::command]
+pub async fn agent_cancel(state: State<'_, AppState>, id: String) -> Result<()> {
+    agents::cancel_run(&*state.work().await?, ACTOR, &id).await
+}
+
+/// A run stopped short is the command's error, so the view shows its code.
+#[tauri::command]
+pub async fn agent_resume(state: State<'_, AppState>, id: String) -> Result<RunDetail> {
+    let running = state.ai.begin()?;
+    let db = state.work().await?;
+    let router = Router::from_settings(&db).await?;
+    agents::resume_run(&db, &router, ACTOR, &id, running.token.clone())
+        .await?
+        .into_result()?;
+    runner::get(&db, &id).await
 }
 
 /// `peek`: asks the store and never makes a key.
@@ -2316,6 +2349,10 @@ mod tests {
         "app_set_status",
         "app_note",
         "app_history",
+        "agents_list",
+        "agent_get",
+        "agent_cancel",
+        "agent_resume",
         "app_remove",
         "memory_list",
         "memory_get",
@@ -3334,6 +3371,70 @@ mod tests {
         assert_eq!(code_of(refused), "validation");
         h.ok("app_remove", json!({ "id": id }));
         assert_eq!(code_of(h.call("app_get", json!({ "id": id }))), "not_found");
+    }
+
+    #[test]
+    fn agents_commands_reach_core() {
+        let h = ready();
+        assert_eq!(
+            h.ok("agents_list", json!({ "limit": 10 })),
+            json!([]),
+            "no run yet"
+        );
+        let added = h.ok(
+            "app_add",
+            json!({ "input": { "company": "Acme", "role": "Engineer" } }),
+        );
+        let id = added["id"].as_str().unwrap().to_owned();
+        h.ok(
+            "app_set_status",
+            json!({ "id": id, "status": "applied", "on": null, "note": "sent" }),
+        );
+
+        let runs = h.ok("agents_list", json!({ "limit": 10 }));
+        assert_eq!(runs[0]["agent"], "tracking");
+        assert_eq!(runs[0]["state"], "completed");
+        assert_eq!(runs[0]["actor"], "gui");
+        let run = runs[0]["id"].as_str().unwrap().to_owned();
+        let detail = h.ok("agent_get", json!({ "id": run }));
+        assert_eq!(detail["run"]["id"], run.as_str());
+        assert_eq!(detail["log"].as_array().unwrap().len(), 5);
+
+        for command in ["agent_cancel", "agent_resume"] {
+            let refused = h.call(command, json!({ "id": run }));
+            assert_eq!(code_of(refused), "validation", "{command}");
+        }
+        assert_eq!(
+            code_of(h.call("agent_get", json!({ "id": "x" }))),
+            "not_found"
+        );
+
+        with_db(&h, |db| {
+            let run = run.clone();
+            async move {
+                sqlx::query("UPDATE agent_runs SET state = 'halted', step = 0 WHERE id = ?")
+                    .bind(run)
+                    .execute(&db.pool)
+                    .await
+                    .unwrap();
+            }
+        });
+        let resumed = h.ok("agent_resume", json!({ "id": run }));
+        assert_eq!(resumed["run"]["state"], "completed");
+
+        with_db(&h, |db| {
+            let run = run.clone();
+            async move {
+                sqlx::query("UPDATE agent_runs SET state = 'halted' WHERE id = ?")
+                    .bind(run)
+                    .execute(&db.pool)
+                    .await
+                    .unwrap();
+            }
+        });
+        h.ok("agent_cancel", json!({ "id": run }));
+        let detail = h.ok("agent_get", json!({ "id": run }));
+        assert_eq!(detail["run"]["state"], "cancelled");
     }
 
     /// A sealed row naming a key this keychain never held, under a question of `class`.

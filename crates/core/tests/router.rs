@@ -506,11 +506,29 @@ fn no_shipped_task_mixes_sensitive_with_untrusted_text() {
         TaskType::ParseJob,
         TaskType::DraftResume,
         TaskType::DraftCoverLetter,
+        TaskType::ClassifyAnswer,
         TaskType::Embed,
     ] {
         let categories = spec(task).categories;
         assert!(!categories.contains(&DataCategory::Sensitive), "{task:?}");
     }
+}
+
+#[test]
+fn classify_answer_makes_one_attempt_on_a_no_tools_provider() {
+    let task = spec(TaskType::ClassifyAnswer);
+    assert_eq!(task.attempts, 1);
+    assert!(task.required.contains(&Capability::NoTools));
+    assert_eq!(task.categories, [DataCategory::JobText]);
+    let schema: serde_json::Value = serde_json::from_str(task.schema).unwrap();
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(
+        schema["properties"]["class"]["enum"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
 }
 
 #[tokio::test]
