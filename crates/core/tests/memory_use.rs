@@ -542,3 +542,75 @@ async fn authorization_for_opens_only_the_named_country() {
     assert_eq!(answer.note, "a note");
     db.close().await;
 }
+
+#[tokio::test]
+async fn a_review_for_another_application_does_not_revive_a_stale_confirmation() {
+    let (_tmp, db) = open().await;
+    let answer = answer_of(&db, Class::Sensitive).await;
+    let a = application(&db, "Acme").await;
+    let b = application(&db, "Globex").await;
+    memory::confirm_use(&db, "cli", &answer, &b).await.unwrap();
+    // B was confirmed 300 days ago, and the answer was reviewed 181 days ago.
+    sqlx::query(
+        "UPDATE application_answers SET confirmed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now','-300 days')",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    reviewed_days_ago(&db, &answer, FRESH_DAYS + 1).await;
+    memory::confirm_use(&db, "cli", &answer, &a).await.unwrap();
+
+    // The answer is fresh again, through A only.
+    assert_eq!(
+        code(memory::use_answer(&db, "cli", &answer, &b).await),
+        "confirmation_required"
+    );
+    assert!(!memory::application_answers(&db, &b).await.unwrap()[0].current);
+    assert!(memory::application_answers(&db, &a).await.unwrap()[0].current);
+    // Confirming on B itself makes B current: the same-application path still works.
+    memory::confirm_use(&db, "cli", &answer, &b).await.unwrap();
+    assert!(memory::application_answers(&db, &b).await.unwrap()[0].current);
+    db.close().await;
+}
+
+#[tokio::test]
+async fn a_class_change_or_unapproval_voids_a_confirmation() {
+    let (_tmp, db) = open().await;
+    let answer = answer_of(&db, Class::Sensitive).await;
+    let application = application(&db, "Acme").await;
+    memory::confirm_use(&db, "cli", &answer, &application)
+        .await
+        .unwrap();
+    let current = || async {
+        memory::application_answers(&db, &application)
+            .await
+            .unwrap()[0]
+            .current
+    };
+    assert!(current().await);
+
+    sqlx::query("UPDATE memory_questions SET class = 'legal', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now','+1 seconds')")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        !current().await,
+        "a raise to legal voids it, though approved"
+    );
+    assert_eq!(
+        code(memory::use_answer(&db, "cli", &answer, &application).await),
+        "confirmation_required"
+    );
+
+    sqlx::query("UPDATE memory_questions SET updated_at = '0'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    memory::confirm_use(&db, "cli", &answer, &application)
+        .await
+        .unwrap();
+    assert!(current().await);
+    memory::approve(&db, "cli", &answer, false).await.unwrap();
+    assert!(!current().await, "an unapproved answer is not current");
+    db.close().await;
+}

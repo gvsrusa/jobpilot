@@ -35,6 +35,8 @@ const EMPTY: ApplicationInput = {
 };
 
 const CANCELLED = "confirmation_required";
+/** The user closed the confirmation dialog: their answer, not an error. */
+class Declined extends Error {}
 const STATED = { yes: "Yes", no: "No", not_stated: "Not stated by you" } as const;
 
 const label = (status: string) => status.charAt(0).toUpperCase() + status.slice(1);
@@ -77,7 +79,9 @@ type Choice = { value: string; text: string; question: Question; answer: Answer 
 function ApplicationAnswers({ application }: { application: Application }) {
   const client = useQueryClient();
   const [choice, setChoice] = useState("");
-  const [country, setCountry] = useState(application.country);
+  // The question's own country, never the application's: a Canadian question must not read
+  // the US row. With none, the user is asked which country.
+  const [country, setCountry] = useState("");
   const [text, setText] = useState<string | null>(null);
   const [stale, setStale] = useState(false);
   const [copy, setCopy] = useState<"copied" | "failed" | null>(null);
@@ -104,7 +108,13 @@ function ApplicationAnswers({ application }: { application: Application }) {
 
   const use = useMutation({
     mutationFn: async (answerId: string) => {
-      if (needsConfirm) await ipc.memoryConfirmUse(answerId, application.id);
+      if (needsConfirm) {
+        try {
+          await ipc.memoryConfirmUse(answerId, application.id);
+        } catch (error) {
+          throw toAppError(error).code === CANCELLED ? new Declined() : error;
+        }
+      }
       return ipc.memoryUse(answerId, application.id);
     },
     onMutate: () => {
@@ -127,13 +137,13 @@ function ApplicationAnswers({ application }: { application: Application }) {
 
   const pick = (value: string) => {
     setChoice(value);
+    setCountry(items.find((i) => i.value === value)?.question.country ?? "");
     setText(null);
     setCopy(null);
     use.reset();
     stated.reset();
   };
-  // A cancelled dialog is the user's own answer, not an error.
-  const useError = use.error && toAppError(use.error).code !== CANCELLED ? use.error : null;
+  const useError = use.error instanceof Declined ? null : use.error;
 
   return (
     <section className="grid gap-3" aria-labelledby="app-answers-heading">
@@ -147,6 +157,7 @@ function ApplicationAnswers({ application }: { application: Application }) {
           id="app-answer-pick"
           className={selectClass}
           value={choice}
+          disabled={use.isPending}
           onChange={(e) => pick(e.target.value)}
         >
           <option value="">Choose an answer</option>
@@ -192,7 +203,7 @@ function ApplicationAnswers({ application }: { application: Application }) {
             from another country.
           </p>
           <div className="grid gap-1.5">
-            <Label htmlFor="app-authz-country">Authorization country</Label>
+            <Label htmlFor="app-authz-country">Authorization country (two letters)</Label>
             <Input
               id="app-authz-country"
               className="max-w-24"
@@ -226,7 +237,9 @@ function ApplicationAnswers({ application }: { application: Application }) {
                 {stated.data.note && <li className="select-text">{stated.data.note}</li>}
               </ul>
             ) : (
-              <p className="text-sm">{STATED.not_stated}</p>
+              <p className="text-sm">
+                {stated.data.country}: {STATED.not_stated}
+              </p>
             ))}
         </div>
       )}

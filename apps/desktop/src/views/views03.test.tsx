@@ -571,7 +571,7 @@ describe("answers for an application", () => {
     resume_draft_id: null,
     letter_draft_id: null,
     link: "",
-    country: "CA",
+    country: "US",
     notes: "",
     status: "saved",
     applied_on: null,
@@ -591,7 +591,14 @@ describe("answers for an application", () => {
         question: questionOf("q2", "What is your salary?", { class: "sensitive" }),
         answers: [answerOf("a2", "q2", { approved: true, sealed: true }), answerOf("a3", "q2")],
       },
-      { question: questionOf("q3", "Are you authorized to work here?", { class: "work_authorization" }), answers: [] },
+      {
+        question: questionOf("q3", "Are you authorized to work here?", { class: "work_authorization", country: "CA" }),
+        answers: [],
+      },
+      {
+        question: questionOf("q4", "Do you need sponsorship?", { class: "work_authorization" }),
+        answers: [],
+      },
     ];
     const texts: Record<string, string> = { a1: "Because I like it", a2: SECRET };
     const api = backend({
@@ -729,7 +736,8 @@ describe("answers for an application", () => {
     const { user } = renderApp();
     await select(user, /authorized to work/);
 
-    expect(screen.getByLabelText("Authorization country")).toHaveValue("CA");
+    // The question says CA; the application's own country (US) is not used.
+    expect(screen.getByLabelText(/^Authorization country/)).toHaveValue("CA");
     expect(screen.queryByLabelText("Answer text")).toBeNull();
     expect(screen.queryByRole("button", { name: /copy/i })).toBeNull();
     // The only text box here is the country; no value can be typed for the answer.
@@ -739,9 +747,35 @@ describe("answers for an application", () => {
     expect(boxes).toHaveLength(1);
 
     await user.click(screen.getByRole("button", { name: "Show what I stated" }));
-    expect(await screen.findByText("Not stated by you")).toBeInTheDocument();
+    expect(await screen.findByText("CA: Not stated by you")).toBeInTheDocument();
     expect(api.calls.find((c) => c.cmd === "memory_authorization")!.args).toEqual({ country: "CA" });
     expect(screen.getByRole("button", { name: "Open Profile" })).toBeInTheDocument();
+  });
+
+  it("a_question_with_no_country_asks_for_one", async () => {
+    const api = answers();
+    const { user } = renderApp();
+    await select(user, /sponsorship/);
+
+    expect(screen.getByLabelText(/^Authorization country/)).toHaveValue("");
+    expect(screen.getByRole("button", { name: "Show what I stated" })).toBeDisabled();
+    await user.type(screen.getByLabelText(/^Authorization country/), "pt");
+    await user.click(screen.getByRole("button", { name: "Show what I stated" }));
+    await waitFor(() => expect(count(api, "memory_authorization")).toBe(1));
+    expect(api.calls.find((c) => c.cmd === "memory_authorization")!.args).toEqual({ country: "pt" });
+  });
+
+  it("a_refusal_from_the_use_step_shows_even_when_it_is_confirmation_required", async () => {
+    answers({
+      memory_use: () => {
+        throw { code: "confirmation_required", message: "this needs your confirmation" };
+      },
+    });
+    const { user } = renderApp();
+    vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+    await select(user, /salary/);
+    await user.click(screen.getByRole("button", { name: "Confirm and copy" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("code: confirmation_required");
   });
 
   it("a_stated_country_shows_its_values_as_text", async () => {

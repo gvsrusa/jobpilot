@@ -203,11 +203,11 @@ pub async fn memory(db: &Db, command: MemoryCommand) -> Result<Output> {
                         );
                     }
                 })?;
-            let text = if used.stale {
-                format!("{}\n(not reviewed for over 180 days)", used.text)
-            } else {
-                used.text.clone()
-            };
+            // On stderr, so what is piped from stdout is the answer and nothing else.
+            if used.stale {
+                eprintln!("note: this answer has not been reviewed for over 180 days");
+            }
+            let text = used.text.clone();
             out(&used, text)
         }
         MemoryCommand::Authorization { country } => {

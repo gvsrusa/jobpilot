@@ -93,18 +93,18 @@ pub async fn confirm_use(
     if reviewed == 0 {
         return Err(super::changed());
     }
-    sqlx::query(concat!(
+    sqlx::query(
         "INSERT INTO application_answers (application_id, answer_id, answer_version, \
-         confirmed_at, confirmed_by) VALUES (?, ?, ?, ",
-        now!(),
-        ", ?) ON CONFLICT(application_id, answer_id) DO UPDATE SET \
+         confirmed_at, confirmed_by) \
+         SELECT ?, id, ?, reviewed_at, ? FROM memory_answers WHERE id = ? \
+         ON CONFLICT(application_id, answer_id) DO UPDATE SET \
          answer_version = excluded.answer_version, confirmed_at = excluded.confirmed_at, \
-         confirmed_by = excluded.confirmed_by"
-    ))
+         confirmed_by = excluded.confirmed_by",
+    )
     .bind(application_id)
-    .bind(answer_id)
     .bind(row.version)
     .bind(actor)
+    .bind(answer_id)
     .execute(&mut *write)
     .await?;
     audit::record_to(
@@ -194,16 +194,31 @@ pub async fn use_answer(
     })
 }
 
+/// A confirmation counts while it matches the answer's version, the answer is approved and
+/// not stale, and nothing that voids it came after: a review of the answer (which is per
+/// answer, so one made for another application cannot revive this one) or a change of the
+/// question's class. Binds [`super::FRESH_DAYS`] as `?1`. Times are one fixed text format.
+macro_rules! current_sql {
+    () => {
+        "(x.confirmed_at IS NOT NULL AND x.answer_version = a.version AND a.approved = 1 \
+         AND x.confirmed_at >= a.reviewed_at AND x.confirmed_at >= q.updated_at \
+         AND coalesce(julianday('now') - julianday(a.reviewed_at) > ?1, 1) = 0)"
+    };
+}
+
 async fn confirmed_now(db: &Db, row: &StoredAnswer, application_id: &str) -> Result<bool> {
-    let found: Option<(Option<String>, i64)> = sqlx::query_as(
-        "SELECT confirmed_at, answer_version FROM application_answers \
-         WHERE application_id = ? AND answer_id = ?",
-    )
+    Ok(sqlx::query_scalar(concat!(
+        "SELECT coalesce(max(",
+        current_sql!(),
+        "), 0) FROM application_answers x JOIN memory_answers a ON a.id = x.answer_id \
+         JOIN memory_questions q ON q.id = a.question_id \
+         WHERE x.application_id = ?2 AND x.answer_id = ?3"
+    ))
+    .bind(super::FRESH_DAYS)
     .bind(application_id)
     .bind(&row.id)
-    .fetch_optional(&db.pool)
-    .await?;
-    Ok(matches!(found, Some((Some(_), version)) if version == row.version && !row.stale))
+    .fetch_one(&db.pool)
+    .await?)
 }
 
 /// What this application has used or confirmed, with no answer text, oldest first. Asks the
@@ -216,18 +231,17 @@ pub async fn application_answers(db: &Db, application_id: &str) -> Result<Vec<Ap
         class: String,
         confirmed_at: Option<String>,
         used_at: Option<String>,
-        answer_version: i64,
-        version: i64,
-        stale: bool,
+        current: bool,
     }
-    let stored: Vec<Stored> = sqlx::query_as(
+    let stored: Vec<Stored> = sqlx::query_as(concat!(
         "SELECT x.answer_id, q.text AS question, q.class, x.confirmed_at, x.used_at, \
-         x.answer_version, a.version, \
-         coalesce(julianday('now') - julianday(a.reviewed_at) > ?, 1) AS stale \
+         ",
+        current_sql!(),
+        " AS current \
          FROM application_answers x JOIN memory_answers a ON a.id = x.answer_id \
          JOIN memory_questions q ON q.id = a.question_id \
-         WHERE x.application_id = ? ORDER BY x.rowid",
-    )
+         WHERE x.application_id = ?2 ORDER BY x.rowid"
+    ))
     .bind(super::FRESH_DAYS)
     .bind(application_id)
     .fetch_all(&db.pool)
@@ -236,9 +250,7 @@ pub async fn application_answers(db: &Db, application_id: &str) -> Result<Vec<Ap
         .into_iter()
         .map(|row| {
             Ok(AppliedAnswer {
-                current: row.confirmed_at.is_some()
-                    && row.answer_version == row.version
-                    && !row.stale,
+                current: row.current,
                 class: row.class.parse()?,
                 answer_id: row.answer_id,
                 question: row.question,

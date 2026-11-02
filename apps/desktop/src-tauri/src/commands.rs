@@ -705,6 +705,9 @@ pub async fn memory_reveal<R: Runtime>(
 /// Confirming a use always asks a native yes, whatever the class, so script in the webview
 /// cannot make a sealed answer usable. The dialog names the class, the application, and the
 /// question, never the answer's value. Each `state.work()` here ends before the dialog.
+// ponytail: the version read before the dialog is not bound across it, so an edit that lands
+// while it is open is confirmed as the new version. Core still refuses an unapproved answer
+// then, and an edit unapproves, so the user must approve the new text before this counts.
 #[tauri::command]
 pub async fn memory_confirm_use<R: Runtime>(
     app: AppHandle<R>,
@@ -717,6 +720,13 @@ pub async fn memory_confirm_use<R: Runtime>(
         let (class, answer) = memory::find_answer(&db, &answer_id).await?;
         let question = memory::get(&db, &answer.question_id).await?.question;
         let application = applications::get(&db, &application_id).await?;
+        // The gates core would refuse on run first, so no one is asked for a doomed yes.
+        if class == Class::WorkAuthorization {
+            return Err(Error::Refused("use_profile_by_country".into()));
+        }
+        if !answer.approved {
+            return Err(Error::Refused("answer_not_approved".into()));
+        }
         let stale = match answer.stale {
             true => "\n\nThis answer has not been reviewed for over 180 days.",
             false => "",
@@ -3652,9 +3662,35 @@ mod tests {
     }
 
     #[test]
+    fn confirm_use_refuses_an_unapproved_answer_before_any_dialog() {
+        let h = ready();
+        let (id, app) = waiting_sensitive_answer(&h);
+        with_db(&h, |db| async move {
+            sqlx::query("UPDATE memory_answers SET approved = 0")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        });
+
+        let refused = h.call(
+            "memory_confirm_use",
+            json!({ "answerId": id, "applicationId": app }),
+        );
+
+        assert_eq!(code_of(refused), "refused");
+        assert!(h.asked().is_empty());
+    }
+
+    #[test]
     fn no_memory_dialog_holds_the_handle() {
         let h = ready();
         let question = seal_answer_without_a_key(&h, "sensitive", "s1");
+        with_db(&h, |db| async move {
+            sqlx::query("UPDATE memory_answers SET approved = 1")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        });
         let app = h.ok(
             "app_add",
             json!({ "input": {
