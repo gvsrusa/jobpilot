@@ -855,7 +855,9 @@ async fn a_marked_body_proves_a_key_that_has_no_row() {
             key_id: SEALED_UNDER.into()
         }
     );
+    // A list no longer opens bodies; the key the body proves still opens it on a reveal.
     let listed = knowledge::list(&db).await.unwrap();
-    assert_eq!(listed[0].body, "secret");
+    assert!(listed[0].sealed && listed[0].body.is_empty());
+    assert_eq!(knowledge::reveal(&db, "x").await.unwrap(), "secret");
     db.close().await;
 }
