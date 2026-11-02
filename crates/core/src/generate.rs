@@ -85,7 +85,8 @@ pub struct PromptPreview {
 }
 
 /// Turns a reply that passed the schema into the document and its claims.
-type Parts = fn(&serde_json::Value, &ProfileBasic) -> Result<(ResumeDoc, Vec<ClaimInput>)>;
+type Parts =
+    fn(&serde_json::Value, &ProfileBasic, &[String]) -> Result<(ResumeDoc, Vec<ClaimInput>)>;
 
 /// What a finished router run hands to the kind-specific half.
 struct Reply {
@@ -127,6 +128,7 @@ pub(crate) async fn resume_for(
 fn resume_parts(
     output: &serde_json::Value,
     basic: &ProfileBasic,
+    ids: &[String],
 ) -> Result<(ResumeDoc, Vec<ClaimInput>)> {
     let ResumeReply { summary, sections } = decode(output)?;
     let mut claims: Vec<ClaimInput> = Vec::new();
@@ -136,12 +138,19 @@ fn resume_parts(
         ..ResumeDoc::default()
     };
     let spoken = |line: &ClaimInput| !line.text.is_empty();
-    claims.extend(summary.into_iter().filter(spoken));
+    let stripped = |line: ClaimInput| ClaimInput {
+        text: strip_ids(&line.text, ids),
+        evidence_ids: line.evidence_ids,
+    };
+    claims.extend(summary.into_iter().map(stripped).filter(spoken));
     doc.summary = claims.iter().map(|claim| claim.text.clone()).collect();
     for section in sections {
         let mut entries = Vec::new();
         for entry in section.entries {
-            let fields = [&entry.title, &entry.subtitle, &entry.dates];
+            let title = strip_ids(&entry.title, ids);
+            let subtitle = strip_ids(&entry.subtitle, ids);
+            let dates = strip_ids(&entry.dates, ids);
+            let fields = [&title, &subtitle, &dates];
             for field in fields.into_iter().filter(|field| !field.is_empty()) {
                 claims.push(ClaimInput {
                     text: field.clone(),
@@ -149,12 +158,12 @@ fn resume_parts(
                 });
             }
             let first = claims.len();
-            claims.extend(entry.bullets.into_iter().filter(spoken));
+            claims.extend(entry.bullets.into_iter().map(stripped).filter(spoken));
             entries.push(Entry {
                 bullets: claims[first..].iter().map(|c| c.text.clone()).collect(),
-                title: entry.title,
-                subtitle: entry.subtitle,
-                dates: entry.dates,
+                title,
+                subtitle,
+                dates,
             });
         }
         doc.sections.push(Section {
@@ -193,11 +202,99 @@ pub(crate) async fn cover_letter_for(
 fn letter_parts(
     output: &serde_json::Value,
     basic: &ProfileBasic,
+    ids: &[String],
 ) -> Result<(ResumeDoc, Vec<ClaimInput>)> {
     let LetterReply { paragraphs } = decode(output)?;
+    let paragraphs: Vec<ClaimInput> = paragraphs
+        .into_iter()
+        .map(|paragraph| ClaimInput {
+            text: strip_ids(&paragraph.text, ids),
+            evidence_ids: paragraph.evidence_ids,
+        })
+        .filter(|paragraph| !paragraph.text.is_empty())
+        .collect();
     let texts: Vec<String> = paragraphs.iter().map(|p| p.text.clone()).collect();
     let doc = cover_letter_doc(&basic.name, &contact(basic), &texts);
     Ok((doc, paragraphs))
+}
+
+/// What the prompt cites by: an item's id, or anything shaped like one, as ids are 16 random
+/// bytes in lower-case hex.
+fn is_id(token: &str, known: &[String]) -> bool {
+    let shaped = token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit());
+    shaped || known.iter().any(|id| id == token)
+}
+
+/// A line with the ids a model wrote into its prose taken out, which gemma4 does in letters:
+/// bracketed tokens that are ids, and the known ids bare. Other bracketed text stays. This runs
+/// before every check, so a check reads what the page will say, and an id cannot split a word.
+/// It only ever cuts text: `evidence_ids` alone cites, so an id here vouches for nothing.
+fn strip_ids(text: &str, known: &[String]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find(']') else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        let tokens = after[..close]
+            .split([',', ';', ' '])
+            .filter(|token| !token.is_empty());
+        let kept: Vec<&str> = tokens.clone().filter(|t| !is_id(t, known)).collect();
+        if kept.len() == tokens.count() {
+            out.push('[');
+            rest = after;
+            continue;
+        }
+        rest = &after[close + 1..];
+        if kept.is_empty() {
+            rest = close_gap(&mut out, rest);
+        } else {
+            out.push('[');
+            out.push_str(&kept.join(", "));
+            out.push(']');
+        }
+    }
+    out.push_str(rest);
+    known
+        .iter()
+        .filter(|id| !id.is_empty())
+        .fold(out, |line, id| strip_bare(&line, id))
+}
+
+/// `id` taken out where it stands as a whole word.
+fn strip_bare(text: &str, id: &str) -> String {
+    let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(id) {
+        let after = &rest[at + id.len()..];
+        out.push_str(&rest[..at]);
+        if word(out.chars().next_back()) || word(after.chars().next()) {
+            out.push_str(id);
+            rest = after;
+        } else {
+            rest = close_gap(&mut out, after);
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The spaces around a cut, closed up: one stays between words, none before punctuation or at
+/// either end. With none there the two sides join, as they do on the page.
+fn close_gap<'a>(before: &mut String, after: &'a str) -> &'a str {
+    if !before.ends_with(' ') && !after.starts_with(' ') {
+        return after;
+    }
+    before.truncate(before.trim_end_matches(' ').len());
+    let after = after.trim_start_matches(' ');
+    let closes = |c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']');
+    if !before.is_empty() && after.chars().next().is_some_and(|c| !closes(c)) {
+        before.push(' ');
+    }
+    after
 }
 
 /// The fixed prompt for a drafting task. Takes [`ProfileBasic`], not `Profile`, so no
@@ -381,9 +478,10 @@ async fn ask(
 ) -> Result<Reply> {
     let (posting, basic, evidence) = gather(db, job_text_id).await?;
     let prompt = build_prompt(task, &basic, &evidence, &posting);
-    let owner = &basic;
+    let ids: Vec<String> = evidence.iter().map(|item| item.id.clone()).collect();
+    let (owner, known) = (&basic, ids.as_slice());
     let check = |output: serde_json::Value| async move {
-        let (doc, claims) = parts(&output, owner)?;
+        let (doc, claims) = parts(&output, owner, known)?;
         if claims.is_empty() {
             return Err(Error::Validation("the reply holds no text".into()));
         }
@@ -396,7 +494,7 @@ async fn ask(
         Outcome::Ok {
             provider, output, ..
         } => {
-            let (doc, claims) = parts(&output, &basic)?;
+            let (doc, claims) = parts(&output, &basic, &ids)?;
             Ok(Reply {
                 provider,
                 doc,

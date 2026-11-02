@@ -902,6 +902,181 @@ async fn an_uncited_line_anywhere_in_the_tree_is_flagged_and_blocks_export() {
     );
 }
 
+const SOME_ID: &str = "0123456789abcdef0123456789abcdef";
+
+fn holds_an_id(text: &str) -> bool {
+    let hex = |c: char| c.is_ascii_hexdigit();
+    text.split(|c: char| !hex(c)).any(|run| run.len() >= 32)
+}
+
+/// A real gemma4 letter. Its prose cites the ids of the run it was captured from, which this
+/// test's knowledge base does not hold, so this is the shape rule at work.
+#[tokio::test]
+async fn a_real_letter_comes_out_free_of_ids() {
+    let w = world().await;
+    let reply = real_reply("gemma4_letter_ids_in_prose.json", &w.item.id);
+    let cited = reply["paragraphs"].as_array().unwrap().clone();
+    assert!(
+        cited
+            .iter()
+            .any(|p| holds_an_id(p["text"].as_str().unwrap()))
+    );
+    let (router, _) = router(vec![reply]);
+
+    let made = generate::cover_letter(&w.db, &router, "gui", &w.job.id, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let claims = drafts::claims(&w.db, &made.draft.id).await.unwrap();
+    assert_eq!(claims.len(), cited.len());
+    for (claim, sent) in claims.iter().zip(&cited) {
+        assert!(!holds_an_id(&claim.text), "{}", claim.text);
+        assert!(!claim.text.contains(" .") && !claim.text.contains(" ,"));
+        assert!(!claim.text.contains("  ") && !claim.text.contains('['));
+        assert_eq!(json!(claim.evidence_ids), sent["evidence_ids"]);
+    }
+    assert!(
+        claims[0].text.ends_with("by 35 percent."),
+        "{}",
+        claims[0].text
+    );
+    assert!(!holds_an_id(
+        &serde_json::to_string(&made.draft.doc).unwrap()
+    ));
+    assert_eq!(made.blocked, 0);
+}
+
+#[tokio::test]
+async fn ids_are_stripped_from_every_field_of_a_resume() {
+    let w = world().await;
+    let id = w.item.id.as_str();
+    let tagged = |text: &str| format!("{text} [{id}]");
+    let reply = json!({
+        "summary": [
+            {"text": format!("Builds compilers [{id}, {SOME_ID}]; ships them."), "evidence_ids": [id]},
+            {"text": format!("[{SOME_ID}]"), "evidence_ids": [id]},
+        ],
+        "sections": [{"heading": "experience", "entries": [{
+            "title": tagged("Engineer"), "subtitle": tagged("Fabrikam"), "dates": tagged("2021"),
+            "evidence_ids": [id],
+            "bullets": [
+                {"text": format!("Shipped [{id}] the compiler, {id} twice"), "evidence_ids": [id]},
+            ],
+        }]}],
+    });
+    let (router, _) = router(vec![reply]);
+
+    let made = generate::resume(&w.db, &router, "gui", &w.job.id, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(made.draft.doc.summary, ["Builds compilers; ships them."]);
+    let entry = &made.draft.doc.sections[0].entries[0];
+    assert_eq!(
+        (&*entry.title, &*entry.subtitle, &*entry.dates),
+        ("Engineer", "Fabrikam", "2021")
+    );
+    assert_eq!(entry.bullets, ["Shipped the compiler, twice"]);
+    let claims = drafts::claims(&w.db, &made.draft.id).await.unwrap();
+    let texts: Vec<String> = claims.iter().map(|c| c.text.clone()).collect();
+    assert_eq!(texts, lines(&made.draft.doc));
+    assert_eq!(made.blocked, 0);
+}
+
+#[tokio::test]
+async fn ordinary_brackets_stay() {
+    let w = world().await;
+    let id = w.item.id.as_str();
+    let text = format!("Wrote [Python] in [2021] and [v2, beta] [{id}, Rust].");
+    let want = "Wrote [Python] in [2021] and [v2, beta] [Rust].";
+    let resume = reply_citing(&[(text.as_str(), &[id])]);
+    let letter = json!({"paragraphs": [paragraph(&text, &[id])]});
+    let (router, _) = router(vec![resume, letter]);
+
+    let made = generate::resume(&w.db, &router, "gui", &w.job.id, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(made.draft.doc.sections[0].entries[0].bullets, [want]);
+
+    let made = generate::cover_letter(&w.db, &router, "gui", &w.job.id, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(made.draft.doc.summary, [want]);
+}
+
+/// Stripping is for the page. The id in the prose never stood for `evidence_ids`.
+#[tokio::test]
+async fn an_id_in_prose_is_not_a_citation() {
+    let w = world().await;
+    let text = format!("Shipped the Rust compiler [{}].", w.item.id);
+    let resume = reply_citing(&[(text.as_str(), &[])]);
+    let letter = json!({"paragraphs": [paragraph(&text, &[])]});
+    let (router, _) = router(vec![resume, letter]);
+
+    let resume = generate::resume(&w.db, &router, "gui", &w.job.id, CancellationToken::new())
+        .await
+        .unwrap();
+    let letter = generate::cover_letter(&w.db, &router, "gui", &w.job.id, CancellationToken::new())
+        .await
+        .unwrap();
+
+    for made in [resume, letter] {
+        let claims = drafts::claims(&w.db, &made.draft.id).await.unwrap();
+        assert_eq!(claims[0].text, "Shipped the Rust compiler.");
+        assert_eq!(claims[0].status, "no_evidence");
+        assert!(claims[0].evidence_ids.is_empty());
+        assert_eq!(made.blocked, 1);
+    }
+}
+
+/// The checks read the stripped line: an id cannot split a word they look for.
+#[tokio::test]
+async fn an_id_cannot_hide_a_statement_from_the_checks() {
+    let w = world().await;
+    let id = w.item.id.as_str();
+    let (split, spaced) = (
+        format!("Holds a vi[{id}]sa"),
+        format!("Has a work [{id}] permit"),
+    );
+    let (router, _) = router(vec![reply_citing(&[
+        (split.as_str(), &[id]),
+        (spaced.as_str(), &[id]),
+    ])]);
+
+    let made = generate::resume(&w.db, &router, "gui", &w.job.id, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let claims = drafts::claims(&w.db, &made.draft.id).await.unwrap();
+    let got: Vec<(&str, &str)> = claims
+        .iter()
+        .map(|c| (c.text.as_str(), c.status.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("Holds a visa", "authorization_statement"),
+            ("Has a work permit", "authorization_statement"),
+        ]
+    );
+}
+
+/// An adapter that only reads the schema as text can write a stock heading as a person would.
+#[tokio::test]
+async fn a_stock_heading_in_any_case_passes_with_no_retry() {
+    let w = world().await;
+    let mut reply = reply_citing(&[(BULLET, &[&w.item.id])]);
+    reply["sections"][0]["heading"] = json!("Work EXPERIENCE");
+    let (router, seen) = router(vec![reply]);
+
+    let made = generate::resume(&w.db, &router, "gui", &w.job.id, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(seen.prompts.lock().unwrap().len(), 1);
+    assert_eq!(made.draft.doc.sections[0].heading, "Work Experience");
+}
+
 /// The reply that showed the bug: `doc` and `claims` written apart, so they disagreed. Asking
 /// again cannot help, so the run ends with a reason, and the disagreement is never stored.
 #[tokio::test]

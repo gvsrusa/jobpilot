@@ -1287,10 +1287,20 @@ fn draft_schemas_refuse_extras_at_every_level() {
         .unwrap()
         .remove("evidence_ids");
     assert!(validate(resume, &uncited.to_string()).is_err());
-    // A hostile or wandering model cannot name a section.
-    let mut invented = valid.clone();
-    invented["sections"][0]["heading"] = json!("Work Authorization");
-    assert!(validate(resume, &invented.to_string()).is_err());
+    // A hostile or wandering model cannot name a section, in any case.
+    for heading in ["Work Authorization", "work authorization", "Experience:"] {
+        let mut invented = valid.clone();
+        invented["sections"][0]["heading"] = json!(heading);
+        assert!(
+            validate(resume, &invented.to_string()).is_err(),
+            "{heading}"
+        );
+    }
+    // A stock heading is one, however it is cased.
+    let mut cased = valid.clone();
+    cased["sections"][0]["heading"] = json!("SKILLS");
+    let checked = validate(resume, &cased.to_string()).unwrap();
+    assert_eq!(checked["sections"][0]["heading"], json!("skills"));
 
     let letter = spec(TaskType::DraftCoverLetter).schema;
     let valid = json!({"paragraphs": [{"text": "T", "evidence_ids": []}]});

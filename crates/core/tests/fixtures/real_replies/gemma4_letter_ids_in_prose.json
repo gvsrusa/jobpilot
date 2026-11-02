@@ -1,0 +1,25 @@
+{
+ "paragraphs": [
+  {
+   "evidence_ids": [
+    "$EVIDENCE_ID",
+    "$EVIDENCE_ID"
+   ],
+   "text": "Jordan Rivera has experience building low-latency services, including a Rust order-routing service at Northwind Logistics that handled 40,000 requests per minute and reduced p99 latency by 35 percent [e4d720f6005a23d7c8bd5c82f909e618, 5df7c26e92cdd33ba9ece04c63b3ffaf]."
+  },
+  {
+   "evidence_ids": [
+    "$EVIDENCE_ID",
+    "$EVIDENCE_ID"
+   ],
+   "text": "His technical skills include Rust, PostgreSQL, and AWS, and he has experience with gRPC [5df7c26e92cdd33ba9ece04c63b3ffaf]. Furthermore, he has experience leading a team of four engineers and migrating PostgreSQL from version 12 to 15 without downtime [e4d720f6005a23d7c8bd5c82f909e618]."
+  },
+  {
+   "evidence_ids": [
+    "$EVIDENCE_ID",
+    "$EVIDENCE_ID"
+   ],
+   "text": "Jordan Rivera possesses over five years of backend experience, having worked as a Software Engineer from January 2018 to February 2021 [8c9ba4e303a4d637e249b3b04c35a63c] and as a Senior Backend Engineer from March 2021 to June 2024 [e4d720f6005a23d7c8bd5c82f909e618], totaling more than five years of experience."
+  }
+ ]
+}
