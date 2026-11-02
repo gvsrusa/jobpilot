@@ -308,6 +308,8 @@ export type Draft = {
   origin: string;
   title: string;
   job_text_id: string | null;
+  /** The current text of this draft's job, or `job_text_id` when no job holds it. */
+  current_text_id: string | null;
   provider: string | null;
   doc: ResumeDoc;
   created_at: string;

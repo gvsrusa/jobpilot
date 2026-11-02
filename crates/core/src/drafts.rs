@@ -48,6 +48,8 @@ pub struct Draft {
     pub origin: String,
     pub title: String,
     pub job_text_id: Option<String>,
+    /// The current text of this draft's job, or `job_text_id` when no job holds it.
+    pub current_text_id: Option<String>,
     pub provider: Option<String>,
     pub doc: ResumeDoc,
     pub created_at: String,
@@ -242,6 +244,9 @@ struct DraftRow {
     origin: String,
     title: String,
     job_text_id: Option<String>,
+    /// Only [`list`] selects it.
+    #[sqlx(default)]
+    current_text_id: Option<String>,
     provider: Option<String>,
     body: String,
     created_at: String,
@@ -257,6 +262,7 @@ impl DraftRow {
             version: self.version,
             origin: self.origin,
             title: self.title,
+            current_text_id: self.current_text_id.or_else(|| self.job_text_id.clone()),
             job_text_id: self.job_text_id,
             provider: self.provider,
             created_at: self.created_at,
@@ -867,7 +873,9 @@ pub async fn list(db: &Db, kind: Option<&str>) -> Result<Vec<Draft>> {
     let rows: Vec<DraftRow> = sqlx::query_as(concat!(
         "SELECT ",
         columns!(),
-        " FROM drafts WHERE ?1 IS NULL OR kind = ?1 ORDER BY created_at DESC, version DESC, id DESC"
+        ", COALESCE((SELECT j.job_text_id FROM job_texts t JOIN jobs j ON j.id = t.version_of \
+                     WHERE t.id = d.job_text_id), d.job_text_id) AS current_text_id \
+         FROM drafts d WHERE ?1 IS NULL OR kind = ?1 ORDER BY created_at DESC, version DESC, id DESC"
     ))
     .bind(kind)
     .fetch_all(&db.pool)

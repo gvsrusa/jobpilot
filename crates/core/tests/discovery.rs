@@ -327,6 +327,25 @@ async fn a_changed_posting_gets_a_new_text_and_loses_its_score() {
     jobpilot_core::knowledge::get_job_text(&db, &job.job_text_id)
         .await
         .expect("a draft citing the old text still resolves");
+    sqlx::query(
+        "INSERT INTO drafts (id, kind, lineage_id, version, origin, title, job_text_id, body, \
+         created_at) VALUES ('dr1', 'resume', 'l1', 1, 'generated', 'Draft', ?, \
+         '{\"name\":\"A\",\"contact\":[],\"summary\":[],\"sections\":[]}', 't')",
+    )
+    .bind(&job.job_text_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let draft = jobpilot_core::drafts::list(&db, None)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(draft.job_text_id.as_ref(), Some(&job.job_text_id));
+    assert_eq!(
+        draft.current_text_id.as_ref(),
+        Some(&now.job_text_id),
+        "a draft on an old text names its job's current text"
+    );
     let found = list(
         &db,
         &JobFilter {
@@ -338,6 +357,15 @@ async fn a_changed_posting_gets_a_new_text_and_loses_its_score() {
     .await
     .unwrap();
     assert_eq!(found.len(), 1, "search reads the new text");
+    // With its job gone the draft keeps its own text and belongs to no job.
+    jobpilot_core::jobs::remove(&db, "cli", &job.id)
+        .await
+        .unwrap();
+    let draft = jobpilot_core::drafts::list(&db, None)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(draft.current_text_id.as_ref(), Some(&job.job_text_id));
 }
 
 #[tokio::test]

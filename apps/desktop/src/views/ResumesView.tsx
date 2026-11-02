@@ -50,7 +50,7 @@ function lineages(drafts: Draft[]): Draft[][] {
   return [...groups.values()].map((g) => g.sort((a, b) => a.version - b.version));
 }
 
-const tied = (group: Draft[], jobId: string | null) => group.some((d) => d.job_text_id === jobId);
+const tied = (group: Draft[], jobId: string | null) => group.some((d) => d.current_text_id === jobId);
 const latest = (group: Draft[]) => group[group.length - 1];
 
 function PostingForm({ onSaved, onClose }: { onSaved(job: JobText): void; onClose(): void }) {
@@ -190,10 +190,8 @@ export function ResumesView() {
   const job = jobs.data?.find((j) => j.id === jobChoice) ?? jobs.data?.[0] ?? null;
   const groups = lineages(drafts.data ?? []);
   const forJob = groups.filter((g) => tied(g, job?.id ?? null));
-  // A draft on an older version of a posting: the picker lists only the current one.
-  const onOlder = groups.find((g) => jobs.isSuccess && g[0].job_text_id && !jobs.data.some((j) => j.id === g[0].job_text_id));
   const group =
-    groups.find((g) => g[0].lineage_id === lineageChoice) ?? (lineageChoice === null ? (forJob[0] ?? onOlder) : undefined);
+    groups.find((g) => g[0].lineage_id === lineageChoice) ?? (lineageChoice === null ? forJob[0] : undefined);
   const current = group ? (group.find((d) => d.id === draftChoice) ?? latest(group)) : null;
   const earlier = group && current ? group.filter((d) => d.version < current.version) : [];
   const postingId = current?.job_text_id ?? null;
