@@ -6,3 +6,4 @@
 crates/core/tests/mock-claude/claude.cmd text eol=crlf
 crates/core/tests/mock-gemini/gemini.cmd text eol=crlf
 crates/core/tests/mock-codex/codex.cmd text eol=crlf
+crates/core/tests/mock-mcp/server.mjs text eol=lf
