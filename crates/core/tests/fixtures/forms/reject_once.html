@@ -1,0 +1,34 @@
+<!doctype html>
+<!-- A synthetic fixture for the apply browser tests: invented names, no brand asset. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Apply - Thistledown</title>
+</head>
+<body>
+<main>
+<h1>Release Engineer</h1>
+<p>Thistledown.</p>
+<p id="problem" role="alert" hidden>Please check the form and try again.</p>
+<form id="application" action="/form" method="post" enctype="multipart/form-data">
+<p><label for="name">Full name</label><br><input id="name" name="name" type="text" autocomplete="off"></p>
+<p><label for="email">Email</label><br><input id="email" name="email" type="email" autocomplete="off"></p>
+<p><label for="why">Why this role?</label><br><textarea id="why" name="why" rows="3"></textarea></p>
+<p><label for="resume">Resume</label><br><input id="resume" name="resume" type="file"></p>
+<p><label for="letter">Cover letter</label><br><input id="letter" name="letter" type="file"></p>
+<p><button type="submit">Submit app</button></p>
+</form>
+</main>
+<script>
+// Refuses the first send, as a form that finds a missing field does.
+let refused = false;
+document.getElementById("application").addEventListener("submit", (event) => {
+  if (!refused) {
+    refused = true;
+    event.preventDefault();
+    document.getElementById("problem").hidden = false;
+  }
+});
+</script>
+</body>
+</html>

@@ -35,18 +35,35 @@ pnpm tauri build --no-bundle
 Tests that touch the real OS keychain are `#[ignore]`d. Nothing else does: `Db::open` never reaches the keychain, so `cargo test --workspace` writes no entries. Run them against a throwaway service name, never the app's own, and never with `--release`, and not while another agent or process is running them (parallel runs hang and can raise macOS dialogs):
 
 ```bash
-JOBPILOT_SECRET_SERVICE=jobpilot-test cargo test --workspace -- --ignored --skip real_claude --skip real_gemini --skip real_tls --skip make_fixtures
+JOBPILOT_SECRET_SERVICE=jobpilot-test cargo test --workspace -- --ignored --skip real_claude --skip real_gemini --skip real_tls --skip make_fixtures --skip browser_e2e --skip serve_fixtures
 ```
 
 The ignored tests live in `crates/core/tests/` (`crypto`, `recovery`, `profile`, `knowledge`, `memory`, `memory_use`, `drafts`, `backup`, `transfer`, `secrets_store`, `secrets_locked`, `embed`, `parse`, `injection`, `claude_code`, `gemini_cli`, `net`), in `crates/cli/tests/cli.rs`, and in `apps/desktop/src-tauri/src/commands.rs`. Run them one process at a time, with `--test-threads=1`, on a Mac with the login keychain unlocked, because a second process, or a locked keychain, can hang or show a system dialog:
 
 ```bash
-JOBPILOT_SECRET_SERVICE=jobpilot-test cargo test --workspace -- --ignored --test-threads=1 --skip real_claude --skip real_gemini --skip real_tls --skip make_fixtures
+JOBPILOT_SECRET_SERVICE=jobpilot-test cargo test --workspace -- --ignored --test-threads=1 --skip real_claude --skip real_gemini --skip real_tls --skip make_fixtures --skip browser_e2e --skip serve_fixtures
 ```
 
 Release 0.3 adds sealed answers (`memory_answers.body_enc`), so `memory`, `memory_use`, and `crypto` hold the tests that touch the keychain for them. Read paths never ask it: `plain_work_makes_no_keychain_call` in `crypto.rs` is the one test that may read the call count.
 
-`real_claude_has_no_tools_smoke`, `real_gemini_has_no_tools_smoke`, `real_tls_handshake`, and `make_fixtures` are also ignored, and are skipped by name (`real_claude`, `real_gemini`, `real_tls`, `make_fixtures`), so CI never calls the real `claude` or `gemini` or rewrites the committed resume fixtures, and the keychain steps never open the TLS check. `locked_keychain_is_unavailable_not_missing` swaps the default macOS keychain for a throwaway one, so it runs only with `JOBPILOT_ALLOW_KEYCHAIN_SWAP=1` and is not run in CI.
+`real_claude_has_no_tools_smoke`, `real_gemini_has_no_tools_smoke`, `real_tls_handshake`, and `make_fixtures` are also ignored, and are skipped by name (`real_claude`, `real_gemini`, `real_tls`, `make_fixtures`), so CI never calls the real `claude` or `gemini` or rewrites the committed resume fixtures, and the keychain steps never open the TLS check. The `browser_e2e_*` tests and `serve_fixtures` are skipped by name too: they have their own step, below. `locked_keychain_is_unavailable_not_missing` swaps the default macOS keychain for a throwaway one, so it runs only with `JOBPILOT_ALLOW_KEYCHAIN_SWAP=1` and is not run in CI.
+
+### Apply mode in a real browser (release 0.6)
+
+`crates/core/tests/apply_browser.rs` runs apply mode end to end: the scripted fake `claude` in `crates/core/tests/mock-claude-apply` drives the real `jobpilot apply-mcp`, the pinned Playwright server, and a real, visible Chromium. Every test is `#[ignore]`d, named `browser_e2e_*`, and needs `JOBPILOT_E2E_RUNTIME`: the `browser-runtime` folder of a temporary root that `jobpilot browser setup` filled. Each test links its own root's `browser-runtime` to it, so the download happens once. Never point it at your own data folder.
+
+```bash
+cargo build -p jobpilot-cli
+export JOBPILOT_HOME=$(mktemp -d) JOBPILOT_SECRET_SERVICE=jobpilot-test
+./target/debug/jobpilot browser setup
+JOBPILOT_E2E_RUNTIME=$JOBPILOT_HOME/browser-runtime cargo test -p jobpilot-core --test apply_browser -- --ignored --test-threads=1 --skip serve_fixtures
+```
+
+CI runs this as its `Browser end to end` step on macOS and Windows, and `scripts/ci-local.sh` runs it in full mode. A Chromium window opens for each test; leave it alone. `serve_fixtures` needs no runtime: it serves the forms on `127.0.0.1` until killed and prints the port, for the real `claude` check of Task 14 (`--nocapture` shows the port).
+
+**Fixtures.** `crates/core/tests/fixtures/forms/*.html` are the forms: one page in the shape of each site apply mode meets (`greenhouse`, `lever`, `ashby`, `workday`, `indeed`, `linkedin`, `company`, `two_pages`), one per mandatory stop (`captcha`, `mfa`, `identity`, `legal`, `login`), and `injection`, `fake_success`, and `reject_once`. They hold synthetic text: invented company names, no logo, no brand asset, and no capture of a real page. A page in the shape of a site imitates its layout only. Every form's button reads `Submit app`, so a run records exactly one submit click, and each form posts to `/form`, which `fake_http` answers with a redirect to its own `/done` page.
+
+**No test reaches a site.** `fake_http` serves the fixtures on `127.0.0.1`, the scripts navigate only there, and the hostile page's addresses (`file:`, a non-loopback `http`) are refused before any request. A test never starts the real `claude`.
 
 ### Job connectors (release 0.5)
 

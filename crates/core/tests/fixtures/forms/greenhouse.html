@@ -1,0 +1,36 @@
+<!doctype html>
+<!-- A synthetic fixture for the apply browser tests: invented names, no brand asset. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Platform Engineer - Quillfeather Systems</title>
+</head>
+<body>
+<header><p>Quillfeather Systems job board</p></header>
+<main>
+<section id="landing">
+<h1>Platform Engineer</h1>
+<p>Quillfeather Systems. Remote, full time.</p>
+<p>You will build the services our small teams depend on.</p>
+<button type="button" id="apply">Apply now</button>
+</section>
+<section id="application" hidden>
+<h2>Apply for Platform Engineer</h2>
+<form action="/form" method="post" enctype="multipart/form-data">
+<p><label for="name">Full name</label><br><input id="name" name="name" type="text" autocomplete="off"></p>
+<p><label for="email">Email</label><br><input id="email" name="email" type="email" autocomplete="off"></p>
+<p><label for="why">Why this role?</label><br><textarea id="why" name="why" rows="3"></textarea></p>
+<p><label for="resume">Resume</label><br><input id="resume" name="resume" type="file"></p>
+<p><label for="letter">Cover letter</label><br><input id="letter" name="letter" type="file"></p>
+<p><button type="submit">Submit app</button></p>
+</form>
+</section>
+</main>
+<script>
+document.getElementById("apply").addEventListener("click", () => {
+  document.getElementById("landing").hidden = true;
+  document.getElementById("application").hidden = false;
+});
+</script>
+</body>
+</html>

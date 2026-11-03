@@ -11,6 +11,11 @@
 //                    {"exit"}. A tool step with "nowait": true is sent and not awaited. Each reply is appended to JOBPILOT_FAKE_REPLIES. After the last
 //                    step it idles, as an interactive session does, until it is killed. SIGTERM
 //                    and SIGHUP are ignored.
+//                    In a step's args, the string "@ref:<name>" is the ref of the element named
+//                    exactly <name> among the controls on a browser_snapshot taken just before the step (its reply
+//                    is recorded with "auto": true), and
+//                    "@brief:<a.b.0>" is that field of the last apply_next reply. Real pages
+//                    give refs only at run time; a name that matches nothing stays as written.
 "use strict";
 const fs = require("node:fs");
 const { spawn } = require("node:child_process");
@@ -83,6 +88,62 @@ function scenario() {
   return JSON.parse(text.trim().startsWith("[") ? text : fs.readFileSync(text, "utf8"));
 }
 
+function textOf(reply) {
+  const content = reply && reply.result && reply.result.content;
+  return (content && content[0] && content[0].text) || "";
+}
+
+let snapshot = "";
+let brief = null;
+
+// Only a control is a target, as a model would choose: a table cell can carry its label's name.
+const CONTROLS = ["textbox", "searchbox", "combobox", "button", "link", "checkbox", "radio", "option", "switch", "tab", "spinbutton", "slider"];
+
+function refOf(name) {
+  for (const line of snapshot.split("\n")) {
+    const found = line.match(/^\s*- ([\w-]+) "((?:[^"\\]|\\.)*)".*\[ref=([^\]]+)\]/);
+    if (!found || !CONTROLS.includes(found[1])) continue;
+    let seen;
+    try {
+      seen = JSON.parse('"' + found[2] + '"');
+    } catch {
+      continue;
+    }
+    if (seen === name) return found[3];
+  }
+  return undefined;
+}
+
+function briefAt(path) {
+  let at = brief;
+  for (const key of path.split(".")) at = at == null ? undefined : at[key];
+  return typeof at === "string" ? at : undefined;
+}
+
+function resolve(value) {
+  if (typeof value === "string" && value.startsWith("@ref:")) return refOf(value.slice(5)) ?? value;
+  if (typeof value === "string" && value.startsWith("@brief:")) return briefAt(value.slice(7)) ?? value;
+  if (Array.isArray(value)) return value.map(resolve);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, v]) => [key, resolve(v)]));
+  }
+  return value;
+}
+
+async function tool(name, args, auto = false) {
+  const reply = await call("tools/call", { name, arguments: args });
+  if (name === "browser_snapshot") snapshot = textOf(reply);
+  if (name === "apply_next") {
+    try {
+      brief = JSON.parse(textOf(reply));
+    } catch {
+      brief = null;
+    }
+  }
+  append(env.JOBPILOT_FAKE_REPLIES, { tool: name, args, reply, auto });
+  return reply;
+}
+
 (async () => {
   await call("initialize", {
     protocolVersion: "2025-06-18",
@@ -99,10 +160,10 @@ function scenario() {
       process.exit(step.exit);
     } else if (step.tool !== undefined && step.nowait) {
       // Sent, and not waited for: the next step runs while the server still holds it.
-      call("tools/call", { name: step.tool, arguments: step.args || {} });
+      call("tools/call", { name: step.tool, arguments: resolve(step.args || {}) });
     } else if (step.tool !== undefined) {
-      const reply = await call("tools/call", { name: step.tool, arguments: step.args || {} });
-      append(env.JOBPILOT_FAKE_REPLIES, { tool: step.tool, reply });
+      if (JSON.stringify(step.args || {}).includes('"@ref:')) await tool("browser_snapshot", {}, true);
+      await tool(step.tool, resolve(step.args || {}));
     }
   }
 })();
