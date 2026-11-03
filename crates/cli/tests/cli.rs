@@ -3591,6 +3591,10 @@ fn fake_apply_claude(dir: &Path, steps: &str) -> (PathBuf, PathBuf, PathBuf) {
     let vars = [
         ("JOBPILOT_FAKE_SCENARIO", scenario.display().to_string()),
         ("JOBPILOT_FAKE_RECORD", record.display().to_string()),
+        (
+            "JOBPILOT_FAKE_REPLIES",
+            dir.join("replies.jsonl").display().to_string(),
+        ),
         ("JOBPILOT_PLAYWRIGHT_CLI", playwright.display().to_string()),
         ("JOBPILOT_NODE_BIN", node_bin().display().to_string()),
         ("JOBPILOT_SECRET_SERVICE", "jobpilot-test".to_string()),
@@ -3735,4 +3739,70 @@ fn apply_start_session_and_mcp_are_refused_in_the_panel() {
     }
     let allowed = run_env(&home, &["apply", "status"], &panel);
     assert!(allowed.status.success(), "{}", stderr_text(&allowed));
+}
+
+/// A closed terminal or a quitting app sends the host SIGHUP. It winds up as a Ctrl-C does:
+/// the run ends, its folder goes, and so does every process the session started.
+#[cfg(unix)]
+#[tokio::test]
+async fn apply_start_winds_up_on_sighup() {
+    use std::time::{Duration, Instant};
+    let (dir, home) = fresh_home();
+    let app = apply_ready_home(&home).await;
+    let steps = r#"[{"tool": "apply_next"}, {"tool": "browser_snapshot"}]"#;
+    let (bin, record, playwright) = fake_apply_claude(dir.path(), steps);
+    let mut host = Command::new(env!("CARGO_BIN_EXE_jobpilot"))
+        .args(["apply", "start", &app])
+        .env("JOBPILOT_HOME", &home)
+        .env("JOBPILOT_SECRET_SERVICE", "jobpilot-test")
+        .env("JOBPILOT_CLAUDE_BIN", &bin)
+        .env("JOBPILOT_PLAYWRIGHT_CLI", &playwright)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let replies = dir.path().join("replies.jsonl");
+    let begun = Instant::now();
+    while !std::fs::read_to_string(&replies)
+        .unwrap_or_default()
+        .contains("\"browser_snapshot\"")
+    {
+        assert!(begun.elapsed() < Duration::from_secs(60), "a snapshot");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let session: serde_json::Value = std::fs::read_to_string(&record)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|entry| {
+            entry["argv"]
+                .as_array()
+                .is_some_and(|a| a.contains(&"--mcp-config".into()))
+        })
+        .unwrap();
+    let claude = session["pid"].as_u64().unwrap().to_string();
+
+    // Only the host this test started is signalled.
+    let sent = Command::new("kill")
+        .args(["-HUP", &host.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(sent.success());
+    let begun = Instant::now();
+    while host.try_wait().unwrap().is_none() {
+        assert!(begun.elapsed() < Duration::from_secs(30), "the host ends");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let status = stdout_json(&run(&home, &["apply", "status", "--json"]));
+    assert_eq!(status["state"], "ended", "{status}");
+    assert_eq!(status["items"][0]["state"], "skipped", "{status}");
+    let left: Vec<String> = std::fs::read_dir(home.join("apply"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, ["session"], "only the session folder stays");
+    let probe = Command::new("kill").args(["-0", &claude]).status().unwrap();
+    assert!(!probe.success(), "claude is gone");
 }

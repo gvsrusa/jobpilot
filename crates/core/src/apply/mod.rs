@@ -611,7 +611,7 @@ pub async fn resolve_pause(
     Ok(())
 }
 
-/// A person's act. A `ready` run has no agent run: it ends here, through `finish_items`. Any
+/// A person's act. A `ready` run with no live host ends here, through `finish_items`. Any
 /// other goes to `agents::cancel_run`, and its host ends it. The sweep then ends it here when
 /// its host is gone.
 pub async fn cancel(db: &Db, actor: &str, id: &str) -> Result<()> {
@@ -625,9 +625,26 @@ pub async fn cancel(db: &Db, actor: &str, id: &str) -> Result<()> {
     if state == "ended" {
         return Err(ended());
     }
-    if let Some(agent_run) = agent_run {
+    // A host that died in `prepare` left its claim on a `ready` run: that run ends here too.
+    let host_alive = match &agent_run {
+        Some(agent_run) => {
+            runner::reap_stale(db).await?;
+            let alive: Option<bool> = sqlx::query_scalar(
+                "SELECT state NOT IN ('completed', 'manual_required', 'refused', 'failed', \
+                 'cancelled', 'halted') FROM agent_runs WHERE id = ?",
+            )
+            .bind(agent_run)
+            .fetch_optional(&db.pool)
+            .await?;
+            alive.unwrap_or(false)
+        }
+        None => false,
+    };
+    if let Some(agent_run) = agent_run.filter(|_| state != "ready" || host_alive) {
         let cancelled = agents::cancel_run(db, actor, &agent_run).await;
-        session::sweep_orphans(db).await?;
+        // The cancel stands whatever the sweep meets; the next sweep finishes what this one
+        // could not.
+        let _ = session::sweep_orphans(db).await;
         return cancelled;
     }
     let skipped: i64 = sqlx::query_scalar(
@@ -637,7 +654,7 @@ pub async fn cancel(db: &Db, actor: &str, id: &str) -> Result<()> {
     .bind(id)
     .fetch_one(&db.pool)
     .await?;
-    if !finish(db, id).await? {
+    if !finish(db, id, None).await? {
         return Err(ended());
     }
     let detail = json!({ "skipped": skipped });
@@ -649,11 +666,21 @@ pub async fn cancel(db: &Db, actor: &str, id: &str) -> Result<()> {
 /// left mid-way is `uncertain` if a submit was clicked, else skipped; a queued one is skipped;
 /// a pause still open is stopped. Running it again changes nothing.
 pub async fn finish_items(db: &Db, apply_id: &str) -> Result<()> {
-    finish(db, apply_id).await.map(|_| ())
+    finish(db, apply_id, None).await.map(|_| ())
+}
+
+/// `finish_items`, with `because` as the reason on every item it ends, in place of
+/// `session_ended` and `run_ended`.
+pub(crate) async fn finish_items_because(
+    db: &Db,
+    apply_id: &str,
+    because: Option<&str>,
+) -> Result<()> {
+    finish(db, apply_id, because).await.map(|_| ())
 }
 
 /// True when this call moved the run row to `ended`.
-async fn finish(db: &Db, apply_id: &str) -> Result<bool> {
+async fn finish(db: &Db, apply_id: &str, because: Option<&str>) -> Result<bool> {
     let mut tx = db.pool.begin().await?;
     let found: Option<String> = sqlx::query_scalar("SELECT state FROM apply_runs WHERE id = ?")
         .bind(apply_id)
@@ -663,17 +690,19 @@ async fn finish(db: &Db, apply_id: &str) -> Result<bool> {
         return Err(Error::NotFound);
     };
     sqlx::query(
-        "UPDATE apply_items SET reason = 'session_ended', \
+        "UPDATE apply_items SET reason = coalesce(?, 'session_ended'), \
          state = CASE WHEN submit_clicks > 0 THEN 'uncertain' ELSE 'skipped' END \
          WHERE apply_run_id = ? AND state IN ('active', 'filled')",
     )
+    .bind(because)
     .bind(apply_id)
     .execute(&mut *tx)
     .await?;
     sqlx::query(
-        "UPDATE apply_items SET state = 'skipped', reason = 'run_ended' \
+        "UPDATE apply_items SET state = 'skipped', reason = coalesce(?, 'run_ended') \
          WHERE apply_run_id = ? AND state = 'queued'",
     )
+    .bind(because)
     .bind(apply_id)
     .execute(&mut *tx)
     .await?;
@@ -736,40 +765,51 @@ pub async fn settle(db: &Db, actor: &str, apply_id: &str) -> Result<usize> {
         let Some(application) = item.application_id.as_deref() else {
             continue;
         };
-        if item.status_written {
+        if item.status_written || !matches!(item.state.as_str(), "submitted" | "uncertain") {
             continue;
         }
-        let written = match item.state.as_str() {
-            "submitted" => {
-                let said: String = item
-                    .confirmation_text
-                    .as_deref()
-                    .unwrap_or("")
-                    .chars()
-                    .take(EXCERPT)
-                    .collect();
-                let note = format!("Applied by Claude Code run {apply_id}. The page said: {said}");
-                let cancel = CancellationToken::new();
-                agents::set_status(db, actor, application, "applied", None, &note, cancel)
-                    .await
-                    .map(|_| ())
-            }
-            "uncertain" => {
-                pause::ensure_off(db).await?;
-                applications::add_note(db, actor, application, UNCERTAIN_NOTE).await
-            }
-            _ => continue,
-        };
-        match written {
-            Ok(()) => {}
-            error @ Err(Error::Paused | Error::Db(_)) => return error.map(|()| settled),
-            // This one stays unwritten for a later settle; the rest go on.
-            Err(_) => continue,
+        // Claimed first, so two settles at once write each item once.
+        let claimed = sqlx::query(
+            "UPDATE apply_items SET status_written = 1 WHERE id = ? AND status_written = 0",
+        )
+        .bind(&item.id)
+        .execute(&db.pool)
+        .await?
+        .rows_affected();
+        if claimed == 0 {
+            continue;
         }
-        sqlx::query("UPDATE apply_items SET status_written = 1 WHERE id = ?")
-            .bind(&item.id)
-            .execute(&db.pool)
-            .await?;
+        let written = if item.state == "submitted" {
+            let said: String = item
+                .confirmation_text
+                .as_deref()
+                .unwrap_or("")
+                .chars()
+                .take(EXCERPT)
+                .collect();
+            let note = format!("Applied by Claude Code run {apply_id}. The page said: {said}");
+            let cancel = CancellationToken::new();
+            agents::set_status(db, actor, application, "applied", None, &note, cancel)
+                .await
+                .map(|_| ())
+        } else {
+            match pause::ensure_off(db).await {
+                Ok(()) => applications::add_note(db, actor, application, UNCERTAIN_NOTE).await,
+                Err(error) => Err(error),
+            }
+        };
+        if let Err(error) = written {
+            // Not written: the claim goes back, for a later settle.
+            sqlx::query("UPDATE apply_items SET status_written = 0 WHERE id = ?")
+                .bind(&item.id)
+                .execute(&db.pool)
+                .await?;
+            match error {
+                Error::Paused | Error::Db(_) => return Err(error),
+                // This one stays unwritten; the rest go on.
+                _ => continue,
+            }
+        }
         settled += 1;
     }
     Ok(settled)

@@ -1,14 +1,15 @@
 //! Claude Code apply runs. `start` and `session` host a tool-enabled session in this terminal,
 //! so the panel refuses them, as it does `apply-mcp`. The rest read, stop, or finish.
 
+use std::io::Write;
 use std::path::Path;
 
 use clap::{Subcommand, ValueEnum};
+use jobpilot_core::ai::CancellationToken;
 use jobpilot_core::apply::{self, Preflight, Resolution, RunView};
 use jobpilot_core::{Db, Result, agents};
 use serde_json::json;
 
-use crate::ai::with_interrupts;
 use crate::{ACTOR, Output, out, text};
 
 #[derive(Subcommand)]
@@ -112,9 +113,27 @@ pub async fn apply(db: &Db, command: ApplyCommand) -> Result<Output> {
     }
 }
 
-/// Runs the session on this terminal, then prints one line per item, however it ended.
+/// Runs the session on this terminal, then prints one line per item, however it ended. Ctrl-C,
+/// a closed terminal or window (SIGHUP, a close event), and a quitting app or system (SIGTERM,
+/// a shutdown event) all cancel the run and wait while it winds up: the items settle and the
+/// session's processes and folder go. Only a second Ctrl-C gives up waiting. The emergency
+/// pause reaches the run through the runner's own watch.
 async fn host(db: &Db, id: &str) -> Result<Output> {
-    let hosted = with_interrupts(db, |cancel| agents::claude_apply(db, ACTOR, id, cancel)).await;
+    // Before the session starts, so a signal in its first moments is not the default kill.
+    let mut stops = Stops::new()?;
+    let token = CancellationToken::new();
+    let task = agents::claude_apply(db, ACTOR, id, token.clone());
+    tokio::pin!(task);
+    let hosted = tokio::select! {
+        done = &mut task => done,
+        () = stops.next() => {
+            token.cancel();
+            tokio::select! {
+                done = &mut task => done,
+                () = second_ctrl_c() => std::process::exit(130),
+            }
+        }
+    };
     match hosted {
         Ok(run) => {
             let text = summary(&run);
@@ -122,9 +141,74 @@ async fn host(db: &Db, id: &str) -> Result<Output> {
         }
         Err(error) => {
             if let Ok(run) = apply::view(db, id).await {
-                println!("{}", text::sanitize(&summary(&run)));
+                // The terminal may be gone: a failed write is not an error here.
+                let _ = writeln!(
+                    std::io::stdout().lock(),
+                    "{}",
+                    text::sanitize(&summary(&run))
+                );
             }
             Err(error)
+        }
+    }
+}
+
+async fn second_ctrl_c() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// The signals that end a hosted session.
+struct Stops {
+    #[cfg(unix)]
+    hangup: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    close: tokio::signal::windows::CtrlClose,
+    #[cfg(windows)]
+    shutdown: tokio::signal::windows::CtrlShutdown,
+    #[cfg(windows)]
+    ctrl_break: tokio::signal::windows::CtrlBreak,
+}
+
+impl Stops {
+    #[cfg(unix)]
+    fn new() -> Result<Stops> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Stops {
+            hangup: signal(SignalKind::hangup())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    #[cfg(windows)]
+    fn new() -> Result<Stops> {
+        use tokio::signal::windows;
+        Ok(Stops {
+            close: windows::ctrl_close()?,
+            shutdown: windows::ctrl_shutdown()?,
+            ctrl_break: windows::ctrl_break()?,
+        })
+    }
+
+    #[cfg(unix)]
+    async fn next(&mut self) {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = self.hangup.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+    }
+
+    #[cfg(windows)]
+    async fn next(&mut self) {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = self.close.recv() => {}
+            _ = self.shutdown.recv() => {}
+            _ = self.ctrl_break.recv() => {}
         }
     }
 }

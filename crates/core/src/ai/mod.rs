@@ -79,6 +79,7 @@ pub const RUN_REASONS: &[&str] = &[
     "session_ended",
     "no_browser_runtime",
     "claude_not_found",
+    "claude_exited",
 ];
 
 /// Absent capabilities are false: a declaration lists only what the provider proves.

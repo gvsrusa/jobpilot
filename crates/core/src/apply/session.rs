@@ -40,6 +40,8 @@ const LAST_WORD: Duration = Duration::from_secs(10);
 /// A run folder that will not go, on Windows a file still held, is tried again for this long.
 const REMOVE_RETRY: Duration = Duration::from_secs(2);
 const PURGE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The run reason, and the items' reason, when `claude` exits with a failure.
+pub const CLAUDE_EXITED: &str = "claude_exited";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionEnd {
@@ -49,8 +51,8 @@ pub enum SessionEnd {
     ClaudeExited,
 }
 
-/// Test settings. A release build ignores both: the sidecar is this program, and the runtime
-/// reads no debug variable.
+/// Test settings. A release build ignores them all: the sidecar is this program, the runtime
+/// reads no debug variable, and the run has the agent's own deadline.
 #[doc(hidden)]
 #[derive(Debug, Clone, Default)]
 pub struct HostKnobs {
@@ -58,12 +60,15 @@ pub struct HostKnobs {
     pub sidecar: Option<PathBuf>,
     /// Read as `JOBPILOT_PLAYWRIGHT_CLI`, so a test needs no process-wide variable.
     pub playwright_cli: Option<PathBuf>,
+    /// A shorter deadline than the agent's eight hours.
+    pub run_timeout: Option<Duration>,
 }
 
 impl HostKnobs {
     pub(crate) const NONE: HostKnobs = HostKnobs {
         sidecar: None,
         playwright_cli: None,
+        run_timeout: None,
     };
 
     pub(crate) fn sidecar(&self) -> Result<PathBuf> {
@@ -71,6 +76,10 @@ impl HostKnobs {
             Some(sidecar) => Ok(sidecar),
             None => Ok(std::env::current_exe()?),
         }
+    }
+
+    pub(crate) fn run_timeout(&self) -> Option<Duration> {
+        self.run_timeout.filter(|_| cfg!(debug_assertions))
     }
 
     pub(crate) fn playwright_cli(&self) -> Option<OsString> {
@@ -213,19 +222,23 @@ pub(crate) fn prepare_folders(db: &Db, apply_id: &str, sidecar: &Path) -> Result
     Ok(())
 }
 
-/// Runs `claude` on the inherited terminal until it exits, the run ends, or `cancel` fires.
-/// No process group of its own: it needs the terminal's foreground group. A cancel sweeps the
-/// run folder at once, so `claude`, `apply-mcp`, the Playwright server, and the browser go
-/// together, and returns `Err(Cancelled)` for the runner to map.
+/// Runs `claude` on the inherited terminal, with the `mcp.json` `prepare` wrote in `dir`, until
+/// it exits, the run ends, or `cancel` fires. No process group of its own: it needs the
+/// terminal's foreground group. A cancel sweeps the run folder at once, so `claude`,
+/// `apply-mcp`, the Playwright server, and the browser go together, and returns
+/// `Err(Cancelled)` for the runner to map. A `claude` that exits with a failure before the run
+/// ended is `Err(Failed("claude_exited"))`: signed out, or a flag it no longer takes.
 pub async fn run_claude(
     bin: &Path,
     dir: &Path,
-    sidecar: &Path,
     db: &Db,
     apply_id: &str,
     cancel: CancellationToken,
 ) -> Result<SessionEnd> {
-    let config = write_mcp_config(db.paths(), dir, sidecar)?;
+    let config = dir.join("mcp.json");
+    if !config.is_file() {
+        return Err(Error::Validation("the run folder has no mcp.json".into()));
+    }
     let cwd = session_cwd(db.paths());
     std::fs::create_dir_all(&cwd)?;
     let mut child = Command::new(bin)
@@ -246,11 +259,13 @@ pub async fn run_claude(
             stop(&mut child, dir).await;
             return Err(Error::Cancelled);
         }
-        if tokio::time::timeout(TICK, child.wait()).await.is_ok() {
-            return Ok(match run_ended(db, apply_id).await {
-                true => SessionEnd::Finished,
-                false => SessionEnd::ClaudeExited,
-            });
+        if let Ok(waited) = tokio::time::timeout(TICK, child.wait()).await {
+            let clean = waited.is_ok_and(|status| status.success());
+            return match (run_ended(db, apply_id).await, clean) {
+                (true, _) => Ok(SessionEnd::Finished),
+                (false, true) => Ok(SessionEnd::ClaudeExited),
+                (false, false) => Err(Error::Failed(CLAUDE_EXITED.into())),
+            };
         }
         if polled.elapsed() < ENDED_POLL {
             continue;
@@ -284,16 +299,28 @@ async fn run_ended(db: &Db, apply_id: &str) -> bool {
 }
 
 async fn stop(child: &mut Child, dir: &Path) {
-    kill_marked(dir);
+    sweep_folder(dir).await;
     let _ = child.start_kill();
     let _ = child.wait().await;
+}
+
+/// `kill_marked` reads every process on the machine: off the async runtime, so the runner's
+/// watch and heartbeat keep going meanwhile.
+async fn sweep_folder(dir: &Path) {
+    let dir = dir.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || kill_marked(&dir)).await;
 }
 
 /// What every ending gets, whoever ends it: the items settled, their statuses written when the
 /// pause allows, and the run's processes and folder gone. A status left unwritten waits for
 /// `apply settle`.
-pub(crate) async fn wind_up(db: &Db, apply_id: &str, bin: Option<&Path>) -> Result<()> {
-    let finished = super::finish_items(db, apply_id).await;
+pub(crate) async fn wind_up(
+    db: &Db,
+    apply_id: &str,
+    bin: Option<&Path>,
+    because: Option<&str>,
+) -> Result<()> {
+    let finished = super::finish_items_because(db, apply_id, because).await;
     let actor: Option<String> = sqlx::query_scalar("SELECT actor FROM apply_runs WHERE id = ?")
         .bind(apply_id)
         .fetch_optional(&db.pool)
@@ -316,7 +343,7 @@ pub(crate) async fn wind_up(db: &Db, apply_id: &str, bin: Option<&Path>) -> Resu
 /// and the next sweep tries the folder again. Nothing here prints a value.
 pub async fn cleanup(db: &Db, apply_id: &str, bin: Option<&Path>) -> Result<()> {
     let dir = super::run_dir(db, checked_id(apply_id)?);
-    kill_marked(&dir);
+    sweep_folder(&dir).await;
     if !remove(&dir).await {
         let detail = json!({ "folder": dir.display().to_string() });
         audit::record(db, "system", "cleanup_failed", Some(apply_id), detail).await?;
@@ -360,8 +387,9 @@ async fn purge(bin: &Path, session: &Path) -> bool {
 }
 
 /// Ends what a dead host left: first `runner::reap_stale`, so its agent run reads `halted`.
-/// A run is active while its host lives (`running`, with an agent run neither terminal nor
-/// halted) or while it is `ready` and younger than `READY_STALE`. Every other run not yet
+/// A run is active while its host lives (an agent run neither terminal nor halted), or while
+/// it is `ready`, unclaimed, and younger than `READY_STALE`. A host that died in `prepare`
+/// left its claim on a `ready` run, so the claim's agent run decides. Every other run not yet
 /// ended gets what a host does at its end. Then a folder under `<root>/apply/` whose run is
 /// gone or ended is cleaned. The session folder stays. Returns how many runs it ended.
 pub async fn sweep_orphans(db: &Db) -> Result<usize> {
@@ -369,9 +397,9 @@ pub async fn sweep_orphans(db: &Db) -> Result<usize> {
     let orphans: Vec<String> = sqlx::query_scalar(
         "SELECT r.id FROM apply_runs r LEFT JOIN agent_runs a ON a.id = r.agent_run_id \
          WHERE r.state <> 'ended' AND NOT ( \
-           (r.state = 'running' AND a.state IS NOT NULL AND a.state NOT IN \
+           (a.state IS NOT NULL AND a.state NOT IN \
              ('completed', 'manual_required', 'refused', 'failed', 'cancelled', 'halted')) \
-           OR (r.state = 'ready' AND \
+           OR (r.state = 'ready' AND r.agent_run_id IS NULL AND \
              (julianday('now') - julianday(r.created_at)) * 86400.0 < ?)) \
          ORDER BY r.seq",
     )
@@ -408,7 +436,7 @@ pub async fn sweep_orphans(db: &Db) -> Result<usize> {
         false => None,
     };
     for id in &orphans {
-        wind_up(db, id, bin.as_deref()).await?;
+        wind_up(db, id, bin.as_deref(), None).await?;
     }
     for id in &leftovers {
         cleanup(db, id, bin.as_deref()).await?;

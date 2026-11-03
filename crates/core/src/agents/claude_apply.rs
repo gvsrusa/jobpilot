@@ -2,6 +2,8 @@
 //! lays out its folder, `session` runs `claude` until it ends. Whatever the ending, the host
 //! then settles every item and cleans up, so a pause, a cancel, and an early exit end alike.
 
+use std::sync::{Mutex, PoisonError};
+
 use crate::ai::claude_code;
 use crate::ai::{BoxFuture, CancellationToken, ProviderId};
 use crate::apply::session::{self, HostKnobs};
@@ -15,10 +17,12 @@ pub struct ClaudeApply {
     pub apply_id: String,
 }
 
-/// `ClaudeApply` with test settings.
+/// `ClaudeApply` as a host runs it: with test settings, and the agent run whose `prepare`
+/// claimed the apply run, so the host knows the run is its own whatever the runner returns.
 struct Hosted<'k> {
     apply_id: String,
     knobs: &'k HostKnobs,
+    claimed: Mutex<Option<String>>,
 }
 
 static STEPS: &[StepDef] = &[
@@ -47,13 +51,14 @@ static STEPS: &[StepDef] = &[
 fn step<'a>(
     apply_id: &'a str,
     knobs: &'a HostKnobs,
+    claimed: Option<&'a Mutex<Option<String>>>,
     ctx: &'a Ctx<'a>,
     index: usize,
 ) -> BoxFuture<'a, Result<StepOutput>> {
     Box::pin(async move {
         match index {
-            0 => prepare(ctx, apply_id, knobs).await,
-            _ => run_session(ctx, apply_id, knobs).await,
+            0 => prepare(ctx, apply_id, knobs, claimed).await,
+            _ => run_session(ctx, apply_id).await,
         }
     })
 }
@@ -74,7 +79,7 @@ impl Workflow for ClaudeApply {
     }
 
     fn step<'a>(&'a self, ctx: &'a Ctx<'a>, index: usize) -> BoxFuture<'a, Result<StepOutput>> {
-        step(&self.apply_id, &HostKnobs::NONE, ctx, index)
+        step(&self.apply_id, &HostKnobs::NONE, None, ctx, index)
     }
 }
 
@@ -94,15 +99,20 @@ impl Workflow for Hosted<'_> {
     }
 
     fn step<'a>(&'a self, ctx: &'a Ctx<'a>, index: usize) -> BoxFuture<'a, Result<StepOutput>> {
-        step(&self.apply_id, self.knobs, ctx, index)
+        step(&self.apply_id, self.knobs, Some(&self.claimed), ctx, index)
     }
 }
 
 /// The run is this host's from here, so a second host for it stops at this line. Then the
 /// browser runtime and `claude` must be there, and the folders are laid out.
-async fn prepare(ctx: &Ctx<'_>, apply_id: &str, knobs: &HostKnobs) -> Result<StepOutput> {
+async fn prepare(
+    ctx: &Ctx<'_>,
+    apply_id: &str,
+    knobs: &HostKnobs,
+    claimed: Option<&Mutex<Option<String>>>,
+) -> Result<StepOutput> {
     let db = ctx.db;
-    let claimed = sqlx::query(
+    let claimed_rows = sqlx::query(
         "UPDATE apply_runs SET agent_run_id = ? \
          WHERE id = ? AND state = 'ready' AND (agent_run_id IS NULL OR agent_run_id = ?)",
     )
@@ -112,8 +122,11 @@ async fn prepare(ctx: &Ctx<'_>, apply_id: &str, knobs: &HostKnobs) -> Result<Ste
     .execute(&db.pool)
     .await?
     .rows_affected();
-    if claimed == 0 {
+    if claimed_rows == 0 {
         return Err(Error::Refused("apply_run_not_ready".into()));
+    }
+    if let Some(claimed) = claimed {
+        *claimed.lock().unwrap_or_else(PoisonError::into_inner) = Some(ctx.run_id().to_owned());
     }
     let cli = knobs.playwright_cli();
     let get = |name: &str| match (name, &cli) {
@@ -142,14 +155,13 @@ async fn prepare(ctx: &Ctx<'_>, apply_id: &str, knobs: &HostKnobs) -> Result<Ste
     Ok(StepOutput::default())
 }
 
-async fn run_session(ctx: &Ctx<'_>, apply_id: &str, knobs: &HostKnobs) -> Result<StepOutput> {
+async fn run_session(ctx: &Ctx<'_>, apply_id: &str) -> Result<StepOutput> {
     let db = ctx.db;
     let bin = claude_code::find_binary(Some(db))
         .await
         .map_err(|_| Error::ManualRequired("claude_not_found".into()))?;
     let dir = apply::run_dir(db, apply_id);
-    let sidecar = knobs.sidecar()?;
-    session::run_claude(&bin, &dir, &sidecar, db, apply_id, ctx.cancel.clone()).await?;
+    session::run_claude(&bin, &dir, db, apply_id, ctx.cancel.clone()).await?;
     Ok(StepOutput {
         provider: Some(ProviderId::ClaudeCode),
         categories: &apply::CATEGORIES,
@@ -204,24 +216,43 @@ async fn host(
     let workflow = Hosted {
         apply_id: apply_id.to_owned(),
         knobs,
+        claimed: Mutex::new(None),
     };
-    let started = runner::start(db, actor, &workflow, cancel).await;
+    let started = match knobs.run_timeout() {
+        Some(timeout) => {
+            let limits = runner::Limits::for_test(timeout);
+            runner::start_with(db, actor, &workflow, cancel, limits).await
+        }
+        None => runner::start(db, actor, &workflow, cancel).await,
+    };
 
     // Only the host that holds the run ends it: a second host refused in `prepare` must not.
+    // The claim is read from `prepare` itself, so a runner error does not hide it.
     let holder: Option<String> =
         sqlx::query_scalar("SELECT agent_run_id FROM apply_runs WHERE id = ?")
             .bind(apply_id)
             .fetch_optional(&db.pool)
             .await?
             .flatten();
-    let ours = match (&started, &holder) {
-        (_, None) => true,
-        (Ok(finished), Some(holder)) => *holder == finished.run_id,
-        (Err(_), Some(_)) => false,
+    let claimed = workflow
+        .claimed
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let ours = match &holder {
+        None => true,
+        Some(holder) => claimed.as_ref() == Some(holder),
     };
     if ours {
+        // A `claude` that failed leaves its reason on every item it did not finish.
+        let because = match &started {
+            Ok(finished) if finished.reason.as_deref() == Some(session::CLAUDE_EXITED) => {
+                Some(session::CLAUDE_EXITED)
+            }
+            _ => None,
+        };
         let bin = claude_code::find_binary(Some(db)).await.ok();
-        session::wind_up(db, apply_id, bin.as_deref()).await?;
+        session::wind_up(db, apply_id, bin.as_deref(), because).await?;
     }
     started?.into_result()?;
     apply::view(db, apply_id).await
