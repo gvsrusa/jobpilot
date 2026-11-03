@@ -224,17 +224,17 @@ Details and the full lists are in [release 0.6.0](releases/0.6.0.md). Rows marke
 
 | Gate | Result |
 |---|---|
-| 1. Build | `scripts/ci-local.sh --fast` passed at the Task 13 commit (figures in the [release note](releases/0.6.0.md#tests)). `pnpm tauri build --no-bundle` and the launched debug app: `PLACEHOLDER_TASK_14_BUILD`. |
-| 2. Tests | Local macOS: see [release 0.6.0](releases/0.6.0.md#tests). The `browser_e2e_*` suite in real Chromium: `PLACEHOLDER_TASK_14_E2E`. Keychain suites: `PLACEHOLDER_TASK_14_KEYCHAIN`. |
-| 3. Migrations | `a_fresh_database_is_schema_17` and `a_0_5_database_upgrades_to_0_6` (figures in the release note). An upgrade of a database made by the real 0.5 binary: `PLACEHOLDER_TASK_14_UPGRADE`. |
+| 1. Build | `scripts/ci-local.sh --fast` passed at the Task 13 commit (figures in the [release note](releases/0.6.0.md#tests)). `pnpm tauri build --no-bundle` and the launched debug app: passed at d30e69d (`pnpm --filter desktop sidecar`, then `tauri build --debug --no-bundle`; a 111 MB debug binary). The window was not launched. |
+| 2. Tests | Local macOS: see [release 0.6.0](releases/0.6.0.md#tests). The `browser_e2e_*` suite in real Chromium: `PLACEHOLDER_TASK_14_E2E`. Keychain suites: 91 passed, 0 failed, run one thread at a time as `ci-local.sh` does, at d30e69d. |
+| 3. Migrations | `a_fresh_database_is_schema_17` and `a_0_5_database_upgrades_to_0_6` (figures in the release note). An upgrade of a database made by the real 0.5 binary: passed: a home made by the 0.5.0 CLI (802df62, schema 15) opened at schema 17 under the 0.6 CLI, with its application and question unchanged. |
 | 4. Windows and macOS | `PLACEHOLDER_TASK_14_CI`. The CI `Browser end to end` step is the first run of headed Chromium, the sweep, and the `.cmd` shims on Windows. ConPTY with a real `claude`, and a person on Windows, are not run by anyone. |
 | 5. Docs and risks | Updated: policy register (prose and site-row consequences only; no AI provider row, no owner decision table row, no verdict), agents, architecture, database schema, AI providers, threat model, wireframes (screens 11, 12, and 19), development guide, PRD, README, changelog, and the release note. Risks are in the release note. |
 
 Exit tests not proven end to end:
-- Every apply mode exit test above ran against a scripted fake `claude` and fixture forms. A real `claude` session: `PLACEHOLDER_TASK_14_REAL_CLAUDE`. `--tools ""` left the MCP tools unreachable in an interactive session on Claude Code 2.1.317, which defers them behind `ToolSearch`; the session now keeps that one built-in, which loads tool schemas and nothing else. Whether the trust dialog shows is read off that run.
-- Emergency pause from the native menu and from `jobpilot pause set` in a second terminal, with a real session: `PLACEHOLDER_TASK_14_PAUSE`.
-- A crash of the desktop mid-run, then a relaunch: `PLACEHOLDER_TASK_14_CRASH`.
-- Manual and Copilot once each in the real window: `PLACEHOLDER_TASK_14_MODES`.
+- Every apply mode exit test above ran against a scripted fake `claude` and fixture forms. A real `claude` session: passed on the `greenhouse` fixture after two fixes this step found (`tools/list` answered at once; `--tools ToolSearch`); no trust dialog, `CLAUDE.md` kept out, nothing left running, no transcript left. See the release note. `--tools ""` left the MCP tools unreachable in an interactive session on Claude Code 2.1.317, which defers them behind `ToolSearch`; the session now keeps that one built-in, which loads tool schemas and nothing else. Whether the trust dialog shows is read off that run.
+- Emergency pause from the native menu and from `jobpilot pause set` in a second terminal, with a real session: the CLI path passed (10 run processes gone in 0.21 s, run `halted`); the native menu was not pressed and is an owner hand check.
+- A crash of the desktop mid-run, then a relaunch: run on the CLI host, not the desktop: every run process died with the host, but the run read `running` until `apply cancel`; the desktop crash and relaunch are an owner hand check.
+- Manual and Copilot once each in the real window: Manual and Copilot passed from the CLI on fixtures; the review screen in the real window is an owner hand check.
 - No real site was opened, in any form. Applying on a real site is the owner's act, after release. Pause detection on real CAPTCHA, MFA, and legal pages is unproven.
 - "The permissions engine allows Autonomous submission only for connectors with verified permission and explicit user authorization" is proven with a test-only verified list; no site is verified, so no Autonomous run has submitted anywhere but a fake server.
 
