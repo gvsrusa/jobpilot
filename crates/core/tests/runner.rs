@@ -772,8 +772,9 @@ async fn a_cancel_requested_elsewhere_stops_the_run() {
     let done = done.unwrap();
     assert_eq!(done.state, RunState::Cancelled);
     assert!(cancel.is_cancelled(), "the token fires for the step");
+    // ponytail: 2 s, not 1: a Windows CI runner measured 1.03 s (the watch polls every 250 ms).
     assert!(
-        clock.elapsed() < Duration::from_secs(1),
+        clock.elapsed() < Duration::from_secs(2),
         "{:?}",
         clock.elapsed()
     );
