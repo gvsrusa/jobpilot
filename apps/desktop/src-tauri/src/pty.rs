@@ -459,11 +459,22 @@ fn open_session<R: Runtime>(
         let code = child.wait().ok().map(|status| status.exit_code());
         // `None`: `close` took it, so nobody is waiting for an exit.
         if let Some(session) = window.state::<PtyState>().take(id) {
+            let hosted = session.apply.as_ref().map(|hosted| hosted.id.clone());
+            let host_pid = session.pid;
             // Windows only ends the reader when the pseudoconsole closes.
             drop(session);
             let _ = drained.recv_timeout(DRAIN);
             ended.silence();
             let _ = window.emit_to(target(&window), "pty:exit", code);
+            // A host that exits with nobody closing the panel is gone all the same: its run is
+            // ended as on a close, so nothing it started outlives it.
+            if let (Some(apply_id), Some(app)) = (hosted, window.try_state::<AppState>()) {
+                tauri::async_runtime::block_on(async {
+                    if let Ok(db) = app.work().await {
+                        end_closed_run(&db, &apply_id, host_pid).await;
+                    }
+                });
+            }
         }
         window.unlisten(acks);
     });
@@ -954,6 +965,74 @@ mod tests {
         assert!(state.pid().is_none());
         session.assert_gone();
         gone_within_two_seconds(&mut browser);
+    }
+
+    /// The host of a run exits with nobody closing the panel (here: killed outright). The app
+    /// reacts as to a close: the agent run it held is halted and the run is wound up.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_that_exits_on_its_own_ends_its_run() {
+        let session = Stubborn::start();
+        let state = session.app.state::<PtyState>();
+        let paths = AppPaths::new(session._tmp.path().join("data"));
+        let (id, agent_run) = ("0123abcd", "feedface");
+        let host_pid = state.pid().unwrap();
+        let db = tauri::async_runtime::block_on(async {
+            session
+                .app
+                .state::<AppState>()
+                .db
+                .read()
+                .await
+                .clone()
+                .unwrap()
+        });
+        tauri::async_runtime::block_on(async {
+            sqlx::query(
+                "INSERT INTO agent_runs (id, agent, state, actor, input, steps, heartbeat_at, \
+                 created_at) VALUES (?, 'claude_apply', 'running', 'gui', '{}', 2, \
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            )
+            .bind(agent_run)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO apply_runs (id, agent_run_id, mode, actor, state, created_at) \
+                 VALUES (?, ?, 'claude_code', 'gui', 'running', \
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            )
+            .bind(id)
+            .bind(agent_run)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        });
+        let dir = paths.apply().join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        apply::record_host(&dir, host_pid, agent_run).unwrap();
+        state.mark_apply(&paths, id);
+
+        // SAFETY: `kill` takes plain integers; the pid is the session's own child.
+        unsafe { libc::kill(host_pid as libc::pid_t, libc::SIGKILL) };
+
+        let run_state = || {
+            tauri::async_runtime::block_on(
+                sqlx::query_scalar::<_, String>("SELECT state FROM apply_runs WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&db.pool),
+            )
+            .unwrap()
+        };
+        let until = Instant::now() + Duration::from_secs(20);
+        while run_state() != "ended" && Instant::now() < until {
+            thread::sleep(Duration::from_millis(50));
+        }
+        // SAFETY: as above; the stand-in `claude` ignores the hangup, so it goes first.
+        unsafe { libc::kill(session.pid, libc::SIGKILL) };
+        session.assert_gone();
+        assert_eq!(run_state(), "ended");
+        assert!(!dir.exists());
     }
 
     #[cfg(unix)]
