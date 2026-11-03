@@ -11,7 +11,8 @@ use jobpilot_core::apply::{self, Material};
 use jobpilot_core::crypto::{self, KeyState};
 use jobpilot_core::memory::{self, Class};
 use jobpilot_core::profile::{self, Stated, WorkAuthorization};
-use jobpilot_core::{AppPaths, Db, Error};
+use jobpilot_core::render::{Entry, ResumeDoc, Section};
+use jobpilot_core::{AppPaths, Db, Error, audit, drafts};
 use tempfile::TempDir;
 
 const BLOCKED: &str = "The site's terms forbid this. JobPilot will not do it, even if you ask.";
@@ -111,6 +112,7 @@ async fn manual_makes_no_request_and_records_the_outcome() {
     .unwrap();
     let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
     assert_eq!(detail["mode"], "manual");
+    assert_eq!(detail["agent"], "manual");
 
     // No run of any browser mode, and the only agent that ran is tracking.
     assert_eq!(count(&db, "SELECT count(*) FROM apply_runs").await, 0);
@@ -310,4 +312,234 @@ async fn each_mode_note_is_the_fixed_copy_for_each_site() {
         apply::CLAUDE_CODE_NOTE,
         "Fills and submits with Claude Code in a visible browser. Add it to a run from Applications."
     );
+}
+
+async fn submissions(db: &Db, app: &str) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT json_extract(detail, '$.mode') FROM audit_log \
+         WHERE action = 'application_submitted' AND target = ? ORDER BY rowid",
+    )
+    .bind(app)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap()
+}
+
+async fn record(db: &Db, app: &str, outcome: &str) -> Result<String, Error> {
+    apply::record_outcome(db, "cli", app, outcome, None, "", CancellationToken::new())
+        .await
+        .map(|saved| saved.status)
+}
+
+#[tokio::test]
+async fn a_submission_is_audited_once_per_application() {
+    let (_tmp, db) = world().await;
+    let app = add_app(&db, "https://jobs.lever.co/acme/1", "PT").await;
+    record(&db, &app, "applied").await.unwrap();
+    record(&db, &app, "applied").await.unwrap();
+    record(&db, &app, "interviewing").await.unwrap();
+    // A move back to applied writes the status and claims no new submission.
+    assert_eq!(record(&db, &app, "applied").await.unwrap(), "applied");
+    assert_eq!(submissions(&db, &app).await, ["manual"]);
+
+    // A Claude Code run already recorded this one: recording it by hand adds nothing.
+    let run = add_app(&db, "https://jobs.lever.co/acme/2", "PT").await;
+    audit::record(
+        &db,
+        "cli",
+        "application_submitted",
+        Some(&run),
+        serde_json::json!({ "mode": "claude_code" }),
+    )
+    .await
+    .unwrap();
+    record(&db, &run, "applied").await.unwrap();
+    assert_eq!(submissions(&db, &run).await, ["claude_code"]);
+}
+
+#[tokio::test]
+async fn recording_refuses_an_application_in_a_run_that_has_not_ended() {
+    let (_tmp, db) = world().await;
+    let app = add_app(&db, "https://jobs.lever.co/acme/1", "PT").await;
+    for statement in [
+        "INSERT INTO apply_runs (id, mode, actor, state, created_at) \
+         VALUES ('run1', 'claude_code', 'cli', 'running', '2026-11-02T10:00:00.000Z')",
+        "INSERT INTO apply_items (id, apply_run_id, application_id, position, host) \
+         SELECT 'item1', 'run1', id, 0, 'jobs.lever.co' FROM applications",
+    ] {
+        sqlx::query(statement).execute(&db.pool).await.unwrap();
+    }
+    match record(&db, &app, "applied").await {
+        Err(Error::Refused(reason)) if reason == "in_active_run" => {}
+        other => panic!("expected in_active_run, got {other:?}"),
+    }
+    let status: String = sqlx::query_scalar("SELECT status FROM applications")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "saved");
+
+    sqlx::query("UPDATE apply_runs SET state = 'ended', ended_at = created_at")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(record(&db, &app, "applied").await.unwrap(), "applied");
+}
+
+#[tokio::test]
+async fn the_status_and_the_submission_row_land_together() {
+    let (_tmp, db) = world().await;
+    let app = add_app(&db, "https://jobs.lever.co/acme/1", "PT").await;
+    sqlx::query(
+        "CREATE TRIGGER no_submission BEFORE INSERT ON audit_log \
+         WHEN NEW.action = 'application_submitted' BEGIN SELECT RAISE(ABORT, 'refused'); END",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert!(record(&db, &app, "applied").await.is_err());
+    let status: String = sqlx::query_scalar("SELECT status FROM applications")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "saved", "no status without its submission row");
+}
+
+async fn uploaded(db: &Db, kind: &str, bullet: &str) -> drafts::Draft {
+    let doc = ResumeDoc {
+        name: "Ada Lovelace".into(),
+        contact: vec!["ada@example.com".into()],
+        summary: Vec::new(),
+        sections: vec![Section {
+            heading: "Experience".into(),
+            entries: vec![Entry {
+                bullets: vec![bullet.into()],
+                ..Entry::default()
+            }],
+        }],
+    };
+    drafts::create_version(
+        db,
+        kind,
+        None,
+        "uploaded",
+        "Acme",
+        None,
+        None,
+        doc,
+        Vec::new(),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn material_renders_a_document_only_when_it_is_missing_or_its_version_changed() {
+    let (_tmp, db) = world().await;
+    let resume = uploaded(&db, "resume", "Built things").await;
+    let input = ApplicationInput {
+        company: "Acme".into(),
+        role: "Engineer".into(),
+        link: "https://jobs.lever.co/acme/1".into(),
+        resume_draft_id: Some(resume.id.clone()),
+        ..ApplicationInput::default()
+    };
+    let app = applications::add(&db, "cli", input.clone())
+        .await
+        .unwrap()
+        .id;
+    let exports = || {
+        count(
+            &db,
+            "SELECT count(*) FROM audit_log WHERE action = 'export'",
+        )
+    };
+
+    let first = apply::material(&db, &app).await.unwrap().resume.unwrap();
+    assert!(first.is_file());
+    assert_eq!(exports().await, 1);
+    let again = apply::material(&db, &app).await.unwrap().resume.unwrap();
+    assert_eq!(again, first);
+    assert_eq!(exports().await, 1, "a second read renders nothing");
+
+    // A removed file is rendered again.
+    std::fs::remove_file(&first).unwrap();
+    apply::material(&db, &app).await.unwrap();
+    assert!(first.is_file());
+    assert_eq!(exports().await, 2);
+
+    // Another document is rendered once, even where its file name is the same.
+    let newer = uploaded(&db, "resume", "Built more").await;
+    let input = ApplicationInput {
+        resume_draft_id: Some(newer.id),
+        ..input
+    };
+    applications::update(&db, "cli", &app, input).await.unwrap();
+    let second = apply::material(&db, &app).await.unwrap().resume.unwrap();
+    assert!(second.is_file());
+    assert_eq!(exports().await, 3);
+    apply::material(&db, &app).await.unwrap();
+    assert_eq!(exports().await, 3);
+}
+
+/// Run by [`the_review_screen_starts_no_child_process`] in a child of this binary with a
+/// clean environment. On its own it does nothing.
+#[tokio::test]
+#[ignore]
+async fn no_child_process_probe() {
+    if std::env::var_os("JOBPILOT_PROBE_MARKER").is_none() {
+        return;
+    }
+    let (_tmp, db) = world().await;
+    let app = add_app(&db, "https://jobs.lever.co/acme/1", "PT").await;
+    apply::material(&db, &app).await.unwrap();
+    record(&db, &app, "applied").await.unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn the_review_screen_starts_no_child_process() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let marker = tmp.path().join("spawned");
+    // Any login shell, node, or claude lookup that runs a program runs this, which leaves a mark.
+    let program = tmp.path().join("probe");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\necho \"$0 $*\" >> '{}'\necho v99.0.0\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let empty = tmp.path().join("bin");
+    std::fs::create_dir(&empty).unwrap();
+
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "no_child_process_probe",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("JOBPILOT_PROBE_MARKER", &marker)
+        .env("SHELL", &program)
+        .env("JOBPILOT_NODE_BIN", &program)
+        .env("PATH", &empty)
+        .env("HOME", tmp.path())
+        .env_remove("JOBPILOT_CLAUDE_BIN")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "the probe did not run"
+    );
+    let spawned = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert!(spawned.is_empty(), "started: {spawned}");
 }

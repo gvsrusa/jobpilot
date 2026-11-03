@@ -152,7 +152,14 @@ pub async fn apply(db: &Db, command: ApplyCommand) -> Result<Output> {
         ApplyCommand::Material { application } => {
             let material = apply::material(db, &application).await?;
             let text = material_text(&material);
-            out(material, text)
+            // The panel may run this, so the stated work-authorization values stay out of the
+            // JSON as they do of the text: only whether the country has a stated row.
+            let mut shown = serde_json::to_value(&material).map_err(std::io::Error::other)?;
+            shown["authorization"] = json!({
+                "country": material.authorization.country,
+                "stated": material.authorization.stated,
+            });
+            out(shown, text)
         }
         ApplyCommand::Record {
             application,

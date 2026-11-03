@@ -3826,6 +3826,11 @@ async fn apply_material_and_record_are_manual_mode_from_the_cli() {
     let json = stdout_json(&run(&home, &["apply", "material", &app, "--json"]));
     assert_eq!(json["modes"].as_array().unwrap().len(), 4);
     assert!(json["resume"].as_str().unwrap().ends_with(".pdf"));
+    // The panel may run this: the stated work-authorization values stay out.
+    let authorization = json["authorization"].as_object().unwrap();
+    let mut keys: Vec<&str> = authorization.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["country", "stated"], "{json}");
 
     let saved = stdout_json(&run(
         &home,

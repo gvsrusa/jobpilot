@@ -1192,6 +1192,17 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
 /// the draft cannot then be shown free of it. Neither writes a file. The file is
 /// `<title-slug>-v<version>.<docx|pdf>` under `out_dir`, replacing one of that name.
 // ponytail: two lineages with one title share a file name, and the later export wins.
+/// The name [`export`] gives a draft's file. A draft never changes once stored, so one name
+/// is one content.
+pub fn export_file_name(draft: &Draft, format: ExportFormat) -> String {
+    format!(
+        "{}-v{}.{}",
+        slug(&draft.title),
+        draft.version,
+        format.extension()
+    )
+}
+
 pub async fn export(
     db: &Db,
     draft_id: &str,
@@ -1226,13 +1237,7 @@ pub async fn export_signalling(
             return Err(Error::Refused("claims_blocked".into()));
         }
     }
-    let name = format!(
-        "{}-v{}.{}",
-        slug(&draft.title),
-        draft.version,
-        format.extension()
-    );
-    let path = out_dir.join(name);
+    let path = out_dir.join(export_file_name(&draft, format));
     // Rendering and the file write run off the async threads: a runner step shares its
     // overseer's task, and a stretch that never yields would stall its timeout and heartbeat.
     // The audit row is written by a task of its own, so a cancel that drops this future past

@@ -50,6 +50,22 @@ pub async fn set_status(
     note: &str,
     cancel: CancellationToken,
 ) -> Result<Application> {
+    set_status_with(db, actor, application_id, status, on, note, None, cancel).await
+}
+
+/// [`set_status`], also writing an `application_submitted` row with `submission` as its
+/// detail in the status write's own transaction, when no such row exists for the application.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn set_status_with(
+    db: &Db,
+    actor: &str,
+    application_id: &str,
+    status: &str,
+    on: Option<&str>,
+    note: &str,
+    submission: Option<serde_json::Value>,
+    cancel: CancellationToken,
+) -> Result<Application> {
     applications::get(db, application_id).await?;
     applications::check_change(db, status, on, note).await?;
     let workflow = Tracking {
@@ -57,6 +73,7 @@ pub async fn set_status(
         status: status.to_owned(),
         on: on.map(str::to_owned),
         note: note.to_owned(),
+        submission,
     };
     runner::start(db, actor, &workflow, cancel)
         .await?
@@ -136,6 +153,9 @@ async fn resume_from(
                 status,
                 on,
                 note: String::new(),
+                // ponytail: a run's stored input holds no submission, so a resumed Manual
+                // record writes the status alone. The halted record is the trace.
+                submission: None,
             };
             runner::resume(db, actor, run_id, &workflow, cancel).await
         }

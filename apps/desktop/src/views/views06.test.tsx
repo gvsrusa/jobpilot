@@ -424,6 +424,22 @@ describe("application review", () => {
     expect(count(api, "memory_confirm_use")).toBe(1);
   });
 
+  it("a copy reloads no material and updates only the stale flag", async () => {
+    const answers: Material["answers"] = [
+      { answer_id: "n1", question: "Notice period", class: "normal", stale: false, needs_confirmation: false },
+    ];
+    const { api, user } = await openReview(application({}), {
+      apply_material: () => material({ answers }),
+      apply_copy: () => ({ stale: true }),
+    });
+    const list = await screen.findByRole("list", { name: "Answers you approved for this form" });
+    expect(list).toHaveTextContent("approved, fresh");
+    await user.click(within(list).getByRole("button", { name: "Copy: Notice period" }));
+    await waitFor(() => expect(list).toHaveTextContent("approved, not reviewed for over 180 days"));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(count(api, "apply_material")).toBe(1);
+  });
+
   it("work authorization not stated reads so and offers Enter it yourself", async () => {
     const { user } = await openReview(application({}), { apply_material: () => material() });
     expect(await screen.findByText("Work authorization (US): not stated by you")).toBeInTheDocument();

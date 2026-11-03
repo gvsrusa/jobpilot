@@ -1976,7 +1976,7 @@ pub async fn apply_open<R: Runtime>(
     };
     let url = url.trim();
     if !permissions::link_allowed(url) {
-        return Err(Error::Refused("link_not_https".into()));
+        return Err(Error::Refused(link_refusal(url).into()));
     }
     let grant = permissions::Grant {
         owner_started: true,
@@ -1993,6 +1993,35 @@ pub async fn apply_open<R: Runtime>(
     }
     native::open_url(&app, url).await
 }
+
+/// Why `permissions::link_allowed` refused a link, for the person to fix it.
+// ponytail: reads only the authority's shape, as a reason for a refusal already made. An
+// IPv6 host in brackets reads its colons as no port.
+fn link_refusal(url: &str) -> &'static str {
+    if url.is_empty() {
+        return "link_empty";
+    }
+    let Some((_, rest)) = url.split_once("://") else {
+        return "link_not_https";
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = match authority.rsplit_once('@') {
+        Some(_) => return "link_userinfo",
+        None => authority,
+    };
+    let host = host.rsplit_once(']').map_or(host, |(_, after)| after);
+    if host.contains(':') {
+        "link_port"
+    } else {
+        "link_not_https"
+    }
+}
+
+/// How long a copied answer stays on the clipboard before Rust clears it.
+#[cfg(not(test))]
+const CLIPBOARD_CLEAR: std::time::Duration = std::time::Duration::from_secs(60);
+#[cfg(test)]
+const CLIPBOARD_CLEAR: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// What a person did after applying by hand, through the tracking agent.
 #[tauri::command]
@@ -2028,7 +2057,15 @@ pub async fn apply_copy<R: Runtime>(
     let used =
         memory::use_answer(&*state.work().await?, ACTOR, &answer_id, &application_id).await?;
     let stale = used.stale;
-    native::write_clipboard(&app, Zeroizing::new(used.text)).await?;
+    let text = Zeroizing::new(used.text);
+    native::write_clipboard(&app, text.clone()).await?;
+    // Cleared only while it still holds this answer: what the person copied since is theirs.
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(CLIPBOARD_CLEAR).await;
+        if native::clear_clipboard(&app, &text).await.is_err() {
+            eprintln!("apply_copy: the clipboard could not be cleared");
+        }
+    });
     Ok(Copied { stale })
 }
 
@@ -6808,10 +6845,16 @@ mod tests {
         let h = ready();
         let app = apply_ready(&h);
         let hook = h.app.state::<NativeHook>();
-        for bad in [
-            "http://boards.greenhouse.io/acme/jobs/1",
-            "https://user@boards.greenhouse.io/acme/jobs/1",
-            "",
+        for (bad, code) in [
+            ("http://boards.greenhouse.io/acme/jobs/1", "link_not_https"),
+            ("ftp://boards.greenhouse.io/acme/jobs/1", "link_not_https"),
+            (
+                "https://user@boards.greenhouse.io/acme/jobs/1",
+                "link_userinfo",
+            ),
+            ("https://boards.greenhouse.io:8443/acme/jobs/1", "link_port"),
+            ("  ", "link_empty"),
+            ("", "link_empty"),
         ] {
             let link = bad.to_owned();
             let id = app.clone();
@@ -6826,7 +6869,7 @@ mod tests {
             let refused = h.call("apply_open", json!({ "applicationId": app }));
             assert_eq!(
                 refused.unwrap_err()["message"],
-                "refused: link_not_https",
+                format!("refused: {code}"),
                 "{bad}"
             );
         }
@@ -6907,6 +6950,19 @@ mod tests {
             hook.clipboard.lock().unwrap().as_deref(),
             Some("ZXQ-CANARY")
         );
+
+        // It is cleared once the time is up, while it still holds the answer.
+        std::thread::sleep(super::CLIPBOARD_CLEAR * 4);
+        assert!(hook.clipboard.lock().unwrap().is_none());
+
+        // Something the person copied since is theirs, and stays.
+        h.ok(
+            "apply_copy",
+            json!({ "applicationId": app, "answerId": answer }),
+        );
+        *hook.clipboard.lock().unwrap() = Some("mine".into());
+        std::thread::sleep(super::CLIPBOARD_CLEAR * 4);
+        assert_eq!(hook.clipboard.lock().unwrap().as_deref(), Some("mine"));
     }
 
     // ---- Copilot ----

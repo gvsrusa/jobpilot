@@ -2775,6 +2775,7 @@ dependencies = [
 name = "jobpilot-desktop"
 version = "0.5.0"
 dependencies = [
+ "arboard",
  "jobpilot-core",
  "libc",
  "portable-pty",

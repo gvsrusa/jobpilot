@@ -162,6 +162,18 @@ pub async fn state_by(db: &Db, get: Env<'_>) -> Result<RuntimeState> {
     Ok(RuntimeState::Ready(runtime))
 }
 
+/// Whether the pinned server and its browser are on disk, from files alone: no Node lookup
+/// and no process. [`state`] is the full check, which a run's preflight makes.
+pub fn installed(db: &Db) -> bool {
+    let runtime = runtime_of(db, PathBuf::new());
+    let manifest = runtime.cli.with_file_name("package.json");
+    let version = std::fs::read_to_string(manifest)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|manifest| manifest["version"].as_str().map(str::to_owned));
+    version.as_deref() == Some(PLAYWRIGHT_MCP) && runtime.cli.is_file() && runtime.browsers.is_dir()
+}
+
 /// The same bytes for every run. No environment variable changes any of it.
 pub fn playwright_config(spec: &BrowserSpec) -> Value {
     json!({

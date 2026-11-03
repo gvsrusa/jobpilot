@@ -1271,8 +1271,12 @@ pub async fn material(db: &Db, application_id: &str) -> Result<Material> {
         Decision::Refuse("policy_blocked") => (false, BLOCKED_NOTE),
         Decision::Refuse(_) => (false, NO_AUTONOMOUS_NOTE),
     };
-    let set_up = matches!(runtime::state(db).await?, RuntimeState::Ready(_))
-        && claude_code::find_binary(Some(db)).await.is_ok();
+    // Files and settings only: this screen starts no process. The preflight checks Node.
+    let set_up = runtime::installed(db)
+        && matches!(
+            claude_code::find_binary_quietly(Some(db)).await,
+            Ok(Some(_))
+        );
     let claude = match set_up {
         true => (true, CLAUDE_CODE_NOTE),
         false => (false, CLAUDE_CODE_SETUP_NOTE),
@@ -1289,17 +1293,8 @@ pub async fn material(db: &Db, application_id: &str) -> Result<Material> {
         choice("claude_code", claude),
     ];
 
-    // As the preflight renders them, so every claim guard holds. A blocked document is none.
-    let (_, resume) =
-        export_doc(db, "system", &app, app.resume_draft_id.as_deref(), "resume").await?;
-    let (_, letter) = export_doc(
-        db,
-        "system",
-        &app,
-        app.letter_draft_id.as_deref(),
-        "cover_letter",
-    )
-    .await?;
+    let resume = rendered(db, &app, app.resume_draft_id.as_deref(), "resume").await?;
+    let letter = rendered(db, &app, app.letter_draft_id.as_deref(), "cover_letter").await?;
 
     let confirmed: HashSet<String> = usage::application_answers(db, &app.id)
         .await?
@@ -1353,15 +1348,49 @@ pub async fn record_outcome(
 ) -> Result<Application> {
     runner::person(actor)?;
     let app = applications::get(db, application_id).await?;
-    let saved = agents::set_status(db, actor, &app.id, outcome, on, note, cancel).await?;
-    if outcome == "applied" {
-        let detail = json!({
-            "agent": "browser_application",
+    // A run's own proxy writes this status: a second writer would race it.
+    if in_a_run(db, &app.id).await? {
+        return Err(Error::Refused("in_active_run".into()));
+    }
+    let submission = (outcome == "applied").then(|| {
+        json!({
+            "agent": "manual",
             "mode": "manual",
             "application": app.id,
             "host": host_of(&app.link),
-        });
-        audit::record(db, actor, "application_submitted", Some(&app.id), detail).await?;
+        })
+    });
+    agents::set_status_with(db, actor, &app.id, outcome, on, note, submission, cancel).await
+}
+
+/// The file Rust rendered for this application's draft, rendered again only when it is gone
+/// or the application now names another draft. A draft never changes once stored, and the
+/// marker beside the file names the draft it came from.
+async fn rendered(
+    db: &Db,
+    app: &Application,
+    draft_id: Option<&str>,
+    kind: &str,
+) -> Result<Option<PathBuf>> {
+    const MARKER: &str = "draft-id";
+    let Some(draft_id) = draft_id else {
+        return Ok(None);
+    };
+    let draft = match drafts::get(db, draft_id).await {
+        Ok(draft) => draft,
+        Err(Error::NotFound) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let dir = db.paths().exports().join("apply").join(&app.id).join(kind);
+    let path = dir.join(drafts::export_file_name(&draft, ExportFormat::Pdf));
+    let marker = dir.join(MARKER);
+    if path.is_file() && std::fs::read_to_string(&marker).ok().as_deref() == Some(&draft.id) {
+        return Ok(Some(path));
     }
-    Ok(saved)
+    // As the preflight renders them, so every claim guard holds. A blocked document is none.
+    let (_, path) = export_doc(db, "system", app, Some(draft_id), kind).await?;
+    if path.is_some() {
+        std::fs::write(&marker, &draft.id)?;
+    }
+    Ok(path)
 }

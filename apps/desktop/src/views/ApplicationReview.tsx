@@ -13,6 +13,7 @@ import {
   toAppError,
   type Application,
   type ApplicationStatus,
+  type Material,
   type MaterialRow,
   type ModeChoice,
 } from "@/lib/ipc";
@@ -81,8 +82,17 @@ export function ApplicationReview({ application, onClose }: { application: Appli
       return ipc.applyCopy(application.id, row.answer_id);
     },
     onMutate: () => setCopied(null),
-    onSuccess: (done, row) => setCopied({ id: row.answer_id, stale: done.stale }),
-    onSettled: () => client.invalidateQueries({ queryKey: key }),
+    // No reload: reading the material renders files. Only the row's stale flag can have moved,
+    // and a sealed row asks again on every copy whatever it says.
+    onSuccess: (done, row) => {
+      setCopied({ id: row.answer_id, stale: done.stale });
+      client.setQueryData<Material>(key, (old) =>
+        old && {
+          ...old,
+          answers: old.answers.map((a) => (a.answer_id === row.answer_id ? { ...a, stale: done.stale } : a)),
+        },
+      );
+    },
   });
   const open = useMutation({ mutationFn: () => ipc.applyOpen(application.id) });
   const record = useMutation({

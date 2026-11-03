@@ -72,20 +72,44 @@ pub async fn clipboard_text<R: Runtime>(app: &AppHandle<R>) -> Result<Option<Str
 }
 
 /// Puts text on the system clipboard, so an answer goes there from Rust and never through
-/// the webview.
-// ponytail: nothing clears it later. The person copied it to paste it, as a copy by hand would.
+/// the webview. It is marked to stay out of clipboard history: on Windows out of Win+V
+/// history and cloud sync, and on macOS as concealed, which history tools that follow
+/// nspasteboard.org skip. The caller clears it after a while.
+// ponytail: a history tool that ignores the concealed type on macOS still keeps it.
 #[cfg(not(test))]
 pub async fn write_clipboard<R: Runtime>(
     app: &AppHandle<R>,
     text: Zeroizing<String>,
 ) -> Result<()> {
-    use tauri_plugin_clipboard_manager::ClipboardExt;
-
     let app = app.clone();
-    off_the_main_thread(move || app.clipboard().write_text(text.as_str()).is_ok())
+    off_the_main_thread(move || write_unrecorded(&app, &text))
         .await?
         .then_some(())
         .ok_or_else(|| Error::Failed("the clipboard could not be written".into()))
+}
+
+#[cfg(all(not(test), any(windows, target_os = "macos")))]
+fn write_unrecorded<R: Runtime>(_app: &AppHandle<R>, text: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    use arboard::SetExtApple;
+    #[cfg(windows)]
+    use arboard::SetExtWindows;
+
+    let Ok(mut clipboard) = arboard::Clipboard::new() else {
+        return false;
+    };
+    let set = clipboard.set().exclude_from_history();
+    #[cfg(windows)]
+    let set = set.exclude_from_cloud();
+    set.text(text).is_ok()
+}
+
+/// Other systems are not targets: the plugin's plain write.
+#[cfg(all(not(test), not(any(windows, target_os = "macos"))))]
+fn write_unrecorded<R: Runtime>(app: &AppHandle<R>, text: &str) -> bool {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+
+    app.clipboard().write_text(text).is_ok()
 }
 
 /// The dialog promised a clear, and the key may still be on the clipboard.

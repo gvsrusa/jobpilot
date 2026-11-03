@@ -316,6 +316,7 @@ fn wrapped(app: &Application, agent: Agent, fire: bool) -> Wrapped {
             status: "applied".into(),
             on: None,
             note: String::new(),
+            submission: None,
         },
         agent,
         fire,

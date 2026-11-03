@@ -20,6 +20,9 @@ pub struct Tracking {
     pub on: Option<String>,
     /// Only for the update. A run's row never holds it.
     pub note: String,
+    /// Manual mode's `application_submitted` detail, written with the status. A run's row
+    /// never holds it.
+    pub submission: Option<serde_json::Value>,
 }
 
 impl Workflow for Tracking {
@@ -45,13 +48,14 @@ impl Workflow for Tracking {
                 ctx.check(permission)?;
             }
             ctx.stop_point()?;
-            applications::set_status(
+            applications::set_status_with(
                 ctx.db,
                 ctx.actor,
                 &self.application_id,
                 &self.status,
                 self.on.as_deref(),
                 &self.note,
+                self.submission.as_ref(),
             )
             .await?;
             Ok(StepOutput::default())
