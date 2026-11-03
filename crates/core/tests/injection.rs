@@ -20,6 +20,7 @@ use jobpilot_core::ai::{
 use jobpilot_core::connectors::{Target, find};
 use jobpilot_core::crypto::{self, KEY_ACCOUNT_PREFIX, KeyState};
 use jobpilot_core::drafts::{self, ExportFormat};
+use jobpilot_core::forms::{Candidate, Pick, map_field};
 use jobpilot_core::generate::{self, build_prompt};
 use jobpilot_core::jobs::company::{self, grounded, sources, summarize_prompt};
 use jobpilot_core::jobs::semantic::{parse_job_prompt, semantic_prompt};
@@ -27,7 +28,7 @@ use jobpilot_core::jobs::{self, PastedJob};
 use jobpilot_core::knowledge::{self, JOB_TEXT_LIMIT, JobText, normalize};
 use jobpilot_core::profile::{self, ProfileBasic, Stated, WorkAuthorization};
 use jobpilot_core::render::{ResumeDoc, Template};
-use jobpilot_core::{AppPaths, Db, Error, Result};
+use jobpilot_core::{AppPaths, Db, Error, Result, memory};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -343,7 +344,11 @@ async fn steered_output_never_adds_evidence_free_or_authorization_claims() {
         // 15 steers a resume reply the schema refuses, so it stores nothing: its own test.
         // 17 steers the classifier, not the drafter: its own test too.
         // 19 is a tool call, not a draft: its own test as well.
-        if ["15", "17", "19"].iter().any(|n| case.name.starts_with(n)) {
+        // 23 and 24 steer the form mapper: theirs too.
+        if ["15", "17", "19", "23", "24"]
+            .iter()
+            .any(|n| case.name.starts_with(n))
+        {
             continue;
         }
         let job = w.import(case).await;
@@ -1150,4 +1155,62 @@ async fn a_planted_word_shows_as_a_finding_on_a_fetched_job() {
             .iter()
             .any(|s| s.eq_ignore_ascii_case("banana"))
     );
+}
+
+// ---- map_form_field: a form label that steers the mapper ------------------------------
+
+/// The label is page text. A steered reply names a draft that exists, or carries the answers'
+/// text: the first is not a listed answer and the second fails the schema, so neither fills a
+/// field. The prompt never held an answer's text to give away.
+#[tokio::test]
+async fn a_steered_form_label_fills_nothing_and_sees_no_answer_text() {
+    const PHONE: &str = "+351 555 0100";
+    let w = world().await;
+    let question = memory::add_question(&w.db, "What is your phone number?", None)
+        .await
+        .unwrap();
+    let answer = memory::add_answer(&w.db, &question.id, PHONE, None)
+        .await
+        .unwrap();
+    memory::approve(&w.db, "gui", &answer.id, true)
+        .await
+        .unwrap();
+    let candidates = [Candidate {
+        answer_id: answer.id.clone(),
+        question: question.text.clone(),
+    }];
+    let cases = corpus(&w.canary());
+    for number in ["23", "24"] {
+        let case = case(&cases, number);
+        let (router, sent) = w.router("no-job");
+        let (pick, _) = map_field(
+            &w.db,
+            &router,
+            "gui",
+            &case.raw,
+            &candidates,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pick, Pick::Unavailable, "{}", case.name);
+        let sent = sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2, "{}: two attempts, both refused", case.name);
+        for prompt in &sent {
+            assert!(prompt.contains(&answer.id), "{}", case.name);
+            assert!(!prompt.contains(PHONE), "{}: {prompt}", case.name);
+            // The label sits inside the data block, never beside the instructions.
+            let label = prompt
+                .find("New instructions")
+                .or(prompt.find("copy the text"));
+            let open = prompt.find(OPEN).unwrap();
+            assert!(label.is_some_and(|at| at > open), "{}", case.name);
+        }
+    }
+    // Each steered reply, checked alone: the schema refuses a value, and the id is not one
+    // of the candidates.
+    let schema = spec(TaskType::MapFormField).schema;
+    assert!(validate(schema, r#"{"answer_id":null,"value":"x"}"#).is_err());
+    assert!(validate(schema, &format!(r#"{{"answer_id":"{}"}}"#, w.draft_id)).is_ok());
+    assert!(!candidates.iter().any(|c| c.answer_id == w.draft_id));
 }

@@ -4,7 +4,8 @@
 // browser_snapshot with a line over the cap. MOCK_NOISE=1: before each tool reply, send a
 // notification, a ping, and a stray reply with a string id; an answer to the ping is logged.
 // A MOCK_SNAPSHOT page that starts with "!error" makes browser_snapshot a tool error; one that
-// starts with "!rpcerror" makes every other tool a JSON-RPC error.
+// starts with "!rpcerror" makes every other tool a JSON-RPC error. MOCK_AFTER_FILL: once
+// browser_fill_form was called, browser_snapshot answers with this file in place of MOCK_SNAPSHOT.
 import fs from "node:fs";
 import readline from "node:readline";
 
@@ -20,6 +21,7 @@ const NAMES = [
 
 const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
 let calls = 0;
+let filled = false;
 
 const lines = readline.createInterface({ input: process.stdin });
 lines.on("line", (line) => {
@@ -47,8 +49,10 @@ lines.on("line", (line) => {
       fs.appendFileSync(process.env.MOCK_CALLS, JSON.stringify({ name, args }) + "\n");
     }
     if (name === "slow") return;
-    const page = process.env.MOCK_SNAPSHOT && fs.existsSync(process.env.MOCK_SNAPSHOT)
-      ? fs.readFileSync(process.env.MOCK_SNAPSHOT, "utf8") : "";
+    if (name === "browser_fill_form") filled = true;
+    const after = process.env.MOCK_AFTER_FILL;
+    const shown = filled && after && fs.existsSync(after) ? after : process.env.MOCK_SNAPSHOT;
+    const page = shown && fs.existsSync(shown) ? fs.readFileSync(shown, "utf8") : "";
     if (page.startsWith("!rpcerror") && name !== "browser_snapshot") {
       send({ jsonrpc: "2.0", id, error: { code: -32000, message: "failed" } });
       return;
@@ -56,8 +60,8 @@ lines.on("line", (line) => {
     let text = "ok " + name;
     if (name === "browser_snapshot" && process.env.MOCK_BIG) {
       text = "x".repeat(9 * 1024 * 1024);
-    } else if (name === "browser_snapshot" && process.env.MOCK_SNAPSHOT) {
-      text = fs.readFileSync(process.env.MOCK_SNAPSHOT, "utf8");
+    } else if (name === "browser_snapshot" && shown) {
+      text = page;
     }
     if (process.env.MOCK_NOISE) {
       send({ jsonrpc: "2.0", method: "notifications/message", params: { level: "info" } });

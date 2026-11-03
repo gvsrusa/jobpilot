@@ -85,7 +85,7 @@ async fn manual_makes_no_request_and_records_the_outcome() {
     let app = add_app(&db, "https://jobs.lever.co/acme/1", "PT").await;
 
     let material = apply::material(&db, &app).await.unwrap();
-    assert_eq!(note(&material, "manual").0, true);
+    assert!(note(&material, "manual").0);
     assert!(material.resume.is_none() && material.letter.is_none());
 
     let saved = apply::record_outcome(

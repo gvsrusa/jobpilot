@@ -145,7 +145,6 @@ static CLAUDE_APPLY: AgentSpec = AgentSpec {
     run_timeout: Duration::from_secs(8 * 60 * 60),
 };
 
-// ponytail: Task 11 adds Model(TaskType::MapFormField) once that task type exists.
 static BROWSER_APPLICATION: AgentSpec = AgentSpec {
     agent: Agent::BrowserApplication,
     permissions: &[
@@ -162,6 +161,7 @@ static BROWSER_APPLICATION: AgentSpec = AgentSpec {
         BrowserSubmit,
         ApplyOpenLink,
         ApplySupply,
+        Model(TaskType::MapFormField),
     ],
     run_timeout: Duration::from_secs(2 * 60 * 60),
 };

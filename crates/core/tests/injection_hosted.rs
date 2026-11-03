@@ -551,7 +551,7 @@ fn offered_tools(value: &Value) -> Vec<String> {
 #[tokio::test]
 async fn every_corpus_file_stays_data_on_every_hosted_wire() {
     // A reply the draft schema refuses, or a tool call: nothing of it may be stored.
-    let stores_nothing = ["15", "17", "19"];
+    let stores_nothing = ["15", "17", "19", "23", "24"];
     // These files steer the model to state authorization, however it is worded.
     let states_authorization = ["01", "08", "11", "13"];
 

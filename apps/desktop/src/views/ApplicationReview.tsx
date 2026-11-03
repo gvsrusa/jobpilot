@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useUiStore } from "@/lib/store";
+import { CopilotRun } from "@/views/CopilotRun";
 import {
   ipc,
   STATUSES,
@@ -148,9 +149,7 @@ export function ApplicationReview({ application, onClose }: { application: Appli
                 );
               })}
             </div>
-            {mode === "copilot" && (
-              <p className="text-sm">Copilot runs are not built yet. Manual stays available below.</p>
-            )}
+            {mode === "copilot" && <CopilotRun applicationId={application.id} />}
             {mode === "claude_code" && (
               <p className="text-sm">Select this application on Applications, then press Apply with Claude Code...</p>
             )}

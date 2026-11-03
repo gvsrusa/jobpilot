@@ -892,7 +892,11 @@ pub async fn settle(db: &Db, actor: &str, apply_id: &str) -> Result<usize> {
                 .chars()
                 .take(EXCERPT)
                 .collect();
-            let note = format!("Applied by Claude Code run {apply_id}. The page said: {said}");
+            let by = match run.mode.as_str() {
+                "copilot" => "Copilot",
+                _ => "Claude Code",
+            };
+            let note = format!("Applied by {by} run {apply_id}. The page said: {said}");
             let cancel = CancellationToken::new();
             agents::set_status(db, actor, application, "applied", None, &note, cancel)
                 .await
@@ -922,6 +926,136 @@ pub async fn settle(db: &Db, actor: &str, apply_id: &str) -> Result<usize> {
 
 const EXCERPT: usize = 300;
 const HOLD_POLL: Duration = Duration::from_millis(250);
+/// The most of a confirmation page an item keeps: its end, where the result is.
+const CONFIRMATION: usize = 2000;
+
+/// The `Page URL` line Playwright puts on a snapshot, when it holds a web address.
+pub(crate) fn page_url(snapshot: &str) -> Option<String> {
+    snapshot.lines().find_map(|line| {
+        let (_, url) = line.split_once("Page URL:")?;
+        let url = url.trim();
+        let parsed = reqwest::Url::parse(url).ok()?;
+        matches!(parsed.scheme(), "http" | "https").then(|| url.to_owned())
+    })
+}
+
+/// Who reported a submission, for its audit row.
+pub(crate) struct Submitter<'a> {
+    pub agent: &'a str,
+    pub mode: &'a str,
+}
+
+/// An item a submit was made for: the page is kept as the page's claim (M-39), and the
+/// submission is audited. `capture` is the snapshot taken after it, if one could be. The
+/// status is written later, by `settle`.
+pub(crate) async fn record_submitted(
+    db: &Db,
+    actor: &str,
+    run_id: &str,
+    item: &Item,
+    capture: Option<&str>,
+    by: Submitter<'_>,
+) -> Result<()> {
+    let page = capture.unwrap_or("");
+    let (text, _) = crate::knowledge::normalize(page);
+    let count = text.chars().count();
+    let tail: String = text
+        .chars()
+        .skip(count.saturating_sub(CONFIRMATION))
+        .collect();
+    sqlx::query(concat!(
+        "UPDATE apply_items SET state = 'submitted', reason = NULL, confirmation_text = ?, \
+         confirmation_url = ?, captured_at = CASE WHEN ? THEN ",
+        now!(),
+        " END WHERE id = ? AND state IN ('active', 'filled')"
+    ))
+    .bind(capture.is_some().then_some(&tail))
+    .bind(page_url(page))
+    .bind(capture.is_some())
+    .bind(&item.id)
+    .execute(&db.pool)
+    .await?;
+    let mut detail = json!({
+        "agent": by.agent,
+        "mode": by.mode,
+        "run": run_id,
+        "application": item.application_id,
+        "host": item.host,
+    });
+    if by.mode == "copilot" {
+        detail["policy_note"] = json!(item.policy_note);
+    }
+    audit::record(
+        db,
+        actor,
+        "application_submitted",
+        item.application_id.as_deref(),
+        detail,
+    )
+    .await
+}
+
+/// A Copilot run of one application, held by `agent_run` from the start, with the files the
+/// preflight renders. Refused with the first block the preflight finds, or when another run
+/// is active. The audit row carries `policy_note`: what the register said about this mode.
+pub(crate) async fn open_assisted(
+    db: &Db,
+    actor: &str,
+    apply_id: &str,
+    application_id: &str,
+    agent_run: &str,
+    policy_note: Option<&str>,
+) -> Result<Item> {
+    runner::person(actor)?;
+    let approved = usage::approved_for(db).await?;
+    let item = check_item(db, actor, application_id, &approved).await?;
+    if let Some(block) = item.check.blocks.first() {
+        return Err(Error::Refused((*block).into()));
+    }
+    let mut tx = db.pool.begin().await?;
+    let inserted = sqlx::query(concat!(
+        "INSERT INTO apply_runs (id, agent_run_id, mode, actor, state, created_at) \
+         SELECT ?, ?, 'copilot', ?, 'running', ",
+        now!(),
+        " WHERE NOT EXISTS (SELECT 1 FROM apply_runs WHERE state IN ('ready', 'running'))"
+    ))
+    .bind(apply_id)
+    .bind(agent_run)
+    .bind(actor)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if inserted == 0 {
+        return Err(Error::Refused("apply_run_active".into()));
+    }
+    sqlx::query(
+        "INSERT INTO apply_items (id, apply_run_id, application_id, position, host, state, \
+         resume_path, letter_path, policy_note) \
+         VALUES (lower(hex(randomblob(16))), ?, ?, 0, ?, 'active', ?, ?, ?)",
+    )
+    .bind(apply_id)
+    .bind(&item.check.application_id)
+    .bind(&item.check.host)
+    .bind(path_text(item.resume_path.as_deref())?)
+    .bind(path_text(item.letter_path.as_deref())?)
+    .bind(policy_note)
+    .execute(&mut *tx)
+    .await?;
+    let detail = json!({
+        "mode": "copilot",
+        "items": 1,
+        "hosts": [item.check.host],
+        "policy_note": policy_note,
+    });
+    audit::record_to(&mut *tx, actor, "apply_run_created", Some(apply_id), detail).await?;
+    tx.commit().await?;
+    view(db, apply_id)
+        .await?
+        .items
+        .into_iter()
+        .next()
+        .ok_or(Error::NotFound)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Held {

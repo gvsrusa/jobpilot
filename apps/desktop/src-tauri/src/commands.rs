@@ -208,6 +208,7 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         apply_open,
         apply_record,
         apply_copy,
+        copilot_start,
         crate::pty::pty_open,
         crate::pty::pty_open_apply,
         crate::pty::pty_write,
@@ -2036,6 +2037,18 @@ pub struct Copied {
     pub stale: bool,
 }
 
+/// Copilot on one application: the webview names it, and Rust reads its link, decides, starts
+/// the browser, and fills. The run holds in the AI slot until the person ends its review stop
+/// on the pause panel, so Cancel, the emergency pause, and app exit all reach it. It never
+/// clicks submit.
+#[tauri::command]
+pub async fn copilot_start(state: State<'_, AppState>, application_id: String) -> Result<RunView> {
+    let running = state.ai.begin()?;
+    let db = state.work().await?;
+    let router = Router::from_settings(&db).await?;
+    agents::copilot(&db, &router, ACTOR, &application_id, running.token.clone()).await
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -3313,6 +3326,7 @@ mod tests {
         "apply_open",
         "apply_record",
         "apply_copy",
+        "copilot_start",
         "pty_open",
         "pty_open_apply",
         "pty_write",
@@ -6893,5 +6907,41 @@ mod tests {
             hook.clipboard.lock().unwrap().as_deref(),
             Some("ZXQ-CANARY")
         );
+    }
+
+    // ---- Copilot ----
+
+    #[test]
+    fn copilot_start_takes_only_an_id_and_starts_nothing_on_a_blocked_site() {
+        // One line as formatted, so read by its commas.
+        let source = include_str!("commands.rs");
+        let (_, rest) = source.split_once("pub async fn copilot_start(").unwrap();
+        let (arguments, _) = rest.split_once(") -> ").unwrap();
+        let names: Vec<&str> = arguments
+            .split(", ")
+            .filter_map(|argument| argument.split_once(':'))
+            .map(|(name, _)| name.trim())
+            .collect();
+        assert_eq!(names, ["state", "application_id"]);
+        let h = ready();
+        let app = apply_ready(&h);
+        let id = app.clone();
+        with_db(&h, |db| async move {
+            sqlx::query("UPDATE applications SET link = ? WHERE id = ?")
+                .bind("https://www.indeed.com/viewjob?jk=1")
+                .bind(id)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        });
+        let refused = h.call("copilot_start", json!({ "applicationId": app }));
+        assert_eq!(refused.unwrap_err()["message"], "refused: policy_blocked");
+        let started = with_db(&h, |db| async move {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM apply_runs")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap()
+        });
+        assert_eq!(started, 0);
     }
 }

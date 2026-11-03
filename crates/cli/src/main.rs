@@ -138,7 +138,11 @@ impl Command {
                 )
                 | Command::Pause(PauseCommand::Clear)
                 | Command::Browser(BrowserCommand::Setup)
-                | Command::Apply(ApplyCommand::Start { .. } | ApplyCommand::Session { .. })
+                | Command::Apply(
+                    ApplyCommand::Start { .. }
+                        | ApplyCommand::Session { .. }
+                        | ApplyCommand::Copilot { .. }
+                )
                 | Command::ApplyMcp { .. }
                 | Command::Kb(KbCommand::Reveal { .. })
                 | Command::Memory(
@@ -644,6 +648,7 @@ mod tests {
         ("apply settle r", false),
         ("apply cancel r", false),
         ("apply material a", false),
+        ("apply copilot a", true),
         ("apply record a --outcome applied", false),
         (
             "apply record a --outcome applied --on 2026-11-02 --note n",

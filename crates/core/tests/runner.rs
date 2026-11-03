@@ -500,6 +500,7 @@ fn permission_sets_match_the_spec_table() {
                 BrowserSubmit,
                 ApplyOpenLink,
                 ApplySupply,
+                Model(TaskType::MapFormField),
             ],
             Duration::from_secs(2 * 60 * 60),
         ),
@@ -534,6 +535,7 @@ fn no_permission_names_a_forbidden_power() {
         Model(TaskType::Embed),
         Model(TaskType::SemanticMatch),
         Model(TaskType::SummarizeCompany),
+        Model(TaskType::MapFormField),
         EmbedLocal,
         ReadMatches,
         WriteJobs,
@@ -563,12 +565,16 @@ fn no_permission_names_a_forbidden_power() {
             assert!(!name.contains(word), "{name}");
         }
     }
-    for agent in [Agent::ClaudeApply, Agent::BrowserApplication] {
+    // Copilot may ask `map_form_field` to name an answer by its id, and no other task. The
+    // Claude Code session asks the router nothing.
+    for (agent, model) in [
+        (Agent::ClaudeApply, None),
+        (Agent::BrowserApplication, Some(TaskType::MapFormField)),
+    ] {
         let held = spec_of(agent).permissions;
         assert!(
-            !held
-                .iter()
-                .any(|p| matches!(p, Model(_) | NetConnector | EmbedLocal)),
+            !held.iter().any(|p| matches!(p, NetConnector | EmbedLocal)
+                || matches!(p, Model(task) if Some(*task) != model)),
             "{agent:?}"
         );
         assert!(

@@ -408,7 +408,8 @@ export type TaskSharing = {
     | "draft_cover_letter"
     | "classify_answer"
     | "semantic_match"
-    | "summarize_company";
+    | "summarize_company"
+    | "map_form_field";
   categories: DataCategory[];
   runs: boolean;
   skipped_because: string | null;
@@ -932,6 +933,8 @@ export const ipc = {
   /** Rust puts the answer on the clipboard. The text never comes here. */
   applyCopy: (applicationId: string, answerId: string) =>
     invoke<{ stale: boolean }>("apply_copy", { applicationId, answerId }),
+  /** Copilot on one application. Resolves when the run ends: after the person's review. */
+  copilotStart: (applicationId: string) => invoke<ApplyRunView>("copilot_start", { applicationId }),
 };
 
 export function ptyOpen(cols: number, rows: number): Promise<void> {

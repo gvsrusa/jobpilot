@@ -15,6 +15,7 @@ pub mod documents;
 pub mod drafts;
 pub mod embed;
 pub mod error;
+pub mod forms;
 pub mod generate;
 pub mod hardware;
 pub mod jobs;

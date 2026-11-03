@@ -144,7 +144,7 @@ fn clean(text: &str) -> String {
 
 /// The role, the name that follows it at once, and the inline text after `:`. A key Playwright
 /// wrapped in quotes (`- 'role "name: x"':`) is read as the plain form.
-fn split_line(line: &str) -> (String, String, String) {
+pub(crate) fn split_line(line: &str) -> (String, String, String) {
     let body = line.trim_start().trim_start_matches("- ");
     let body = match body.chars().next() {
         Some('\'') => body[1..].replace("''", "'"),
@@ -280,7 +280,7 @@ fn page_lines(text: &str, typed: &Typed) -> Vec<String> {
 }
 
 /// The ref a line names: the last `[ref=…]` outside quotes.
-fn ref_of(line: &str) -> Option<String> {
+pub(crate) fn ref_of(line: &str) -> Option<String> {
     let (at, _) = line
         .match_indices("[ref=")
         .filter(|(at, _)| outside_quotes(line, *at))

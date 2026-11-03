@@ -1,11 +1,13 @@
 //! Claude Code apply runs. `start` and `session` host a tool-enabled session in this terminal,
-//! so the panel refuses them, as it does `apply-mcp`. The rest read, stop, or finish.
+//! so the panel refuses them, as it does `apply-mcp`, and `copilot`, which starts a browser.
+//! The rest read, stop, or finish.
 
 use std::io::Write;
 use std::path::Path;
 
 use clap::{Subcommand, ValueEnum};
 use jobpilot_core::ai::CancellationToken;
+use jobpilot_core::ai::router::Router;
 use jobpilot_core::apply::{self, Material, Preflight, Resolution, RunView};
 use jobpilot_core::{Db, Result, agents};
 use serde_json::json;
@@ -54,6 +56,11 @@ pub enum ApplyCommand {
     /// Manual mode: the files, approved answers, and mode notes for one application. No
     /// answer text is shown; take one with `memory use`.
     Material {
+        application: String,
+    },
+    /// Copilot: fill one application's form in a visible browser and stop for you to review
+    /// and submit it. It never clicks submit. End its stops with `apply resolve`.
+    Copilot {
         application: String,
     },
     /// Manual mode: record what happened after you applied by hand.
@@ -127,6 +134,20 @@ pub async fn apply(db: &Db, command: ApplyCommand) -> Result<Output> {
         ApplyCommand::Cancel { id } => {
             apply::cancel(db, ACTOR, &id).await?;
             out(json!({"id": id}), format!("cancel asked for run {id}"))
+        }
+        ApplyCommand::Copilot { application } => {
+            let router = Router::from_settings(db).await?;
+            eprintln!(
+                "Copilot is filling the form in a browser window. It stops for you there: \
+                 `jobpilot apply status` shows the stop, and `jobpilot apply resolve <pause> \
+                 continue` (after you submitted) or `take-over` ends it."
+            );
+            let run = with_interrupts(db, |cancel| {
+                agents::copilot(db, &router, ACTOR, &application, cancel)
+            })
+            .await?;
+            let text = summary(&run);
+            out(run, text)
         }
         ApplyCommand::Material { application } => {
             let material = apply::material(db, &application).await?;

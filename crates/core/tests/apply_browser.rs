@@ -19,8 +19,9 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use fake_http::Fake as Site;
-use jobpilot_core::agents::claude_apply_with;
+use jobpilot_core::agents::{claude_apply_with, copilot};
 use jobpilot_core::ai::claude_code::{PATH_SETTING, PROVIDER};
+use jobpilot_core::ai::router::Router;
 use jobpilot_core::ai::{CancellationToken, DataCategory, consent};
 use jobpilot_core::applications::{self, ApplicationInput};
 use jobpilot_core::apply::session::HostKnobs;
@@ -1090,6 +1091,105 @@ async fn browser_e2e_browser_is_visible_and_the_profile_is_the_runs() {
 
 /// For Task 14 only: serves the fixture forms on 127.0.0.1 until killed, printing the port.
 /// It needs no runtime.
+/// Copilot drives the same real server and browser with no `claude` at all. It fills and
+/// uploads, then holds for the person. The test plays the person: it cannot click in a browser
+/// it does not drive, so it sends the form as the browser's submit would, then presses
+/// Continue, and the run captures the page and records the application.
+#[tokio::test]
+#[ignore]
+async fn browser_e2e_copilot_on_the_greenhouse_lever_and_ashby_fixtures() {
+    const REVIEW: &str = "Review the form in the browser and click submit yourself.";
+    let w = world().await;
+    for (posted, page) in ["greenhouse", "lever", "ashby"].into_iter().enumerate() {
+        let app = add_app(&w, page).await;
+        let db = w.db.clone();
+        let id = app.clone();
+        let task = tokio::spawn(async move {
+            let router = Router::with_providers(Vec::new());
+            copilot(&db, &router, "cli", &id, CancellationToken::new()).await
+        });
+        let begun = Instant::now();
+        let pause = loop {
+            let run = apply::latest(&w.db).await.unwrap();
+            if let Some(pause) = run.and_then(|run| run.active_pause) {
+                break pause;
+            }
+            assert!(
+                !task.is_finished(),
+                "{page}: the run ended before its review"
+            );
+            assert!(begun.elapsed() < WAIT, "{page}: no review stop");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        // The review stop and nothing left over: every field filled, and each file went up
+        // through its own chooser (a refused click or upload would be listed here).
+        assert_eq!(
+            pause.excerpt, REVIEW,
+            "{page}: a {} stop from {}",
+            pause.kind, pause.origin
+        );
+        let run = apply::latest(&w.db).await.unwrap().unwrap();
+        let dir = apply::run_dir(&w.db, &run.id);
+        assert_eq!(run.items[0].state, "filled", "{page}");
+        assert_eq!(run.items[0].submit_clicks, 0, "{page}");
+        let uploaded: Vec<String> = sqlx::query_scalar(
+            "SELECT json_extract(detail, '$.kind') FROM audit_log \
+             WHERE action = 'apply_file_uploaded' AND target = ? ORDER BY id",
+        )
+        .bind(&run.items[0].id)
+        .fetch_all(&w.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(uploaded, ["resume", "letter"], "{page}");
+        // Nothing was sent: Copilot never clicks submit.
+        assert_eq!(w.site.bodies("/form").len(), posted, "{page}");
+        // The browser stays open through the hold.
+        assert!(!browsers(&dir).is_empty(), "{page}");
+
+        // The person submits, then says so.
+        let sent = reqwest::Client::new()
+            .post(format!("{}/form", w.site.url))
+            .body("submitted by the person")
+            .send()
+            .await
+            .unwrap();
+        assert!(sent.status().is_success() || sent.status().is_redirection());
+        resume(&w, &pause).await;
+        let view = tokio::time::timeout(WAIT, task)
+            .await
+            .expect("the run ends")
+            .unwrap()
+            .unwrap();
+        let done = &view.items[0];
+        assert_eq!(view.state, "ended", "{page}");
+        assert_eq!(done.state, "submitted", "{page}");
+        assert!(done.status_written, "{page}");
+        // The capture is the page the person left: the real browser holds what Copilot typed.
+        let seen = done.confirmation_text.clone().unwrap_or_default();
+        let typed = match page {
+            "greenhouse" => vec!["Ada", "Lovelace", EMAIL, WHY],
+            _ => vec![NAME, EMAIL, WHY],
+        };
+        for value in typed {
+            assert!(seen.contains(value), "{page}: {value} not in {seen}");
+        }
+        assert_eq!(
+            done.confirmation_url.as_deref(),
+            Some(format!("{}/{page}", w.site.url).as_str()),
+            "{page}"
+        );
+        assert_eq!(
+            applications::get(&w.db, &app).await.unwrap().status,
+            "applied",
+            "{page}"
+        );
+        assert!(!dir.exists(), "{page}: {}", cleanup_note(&w.db).await);
+        assert!(browsers(&dir).is_empty(), "{page}");
+    }
+    // The person's posts are the only ones sent.
+    assert_eq!(w.site.bodies("/form").len(), 3);
+}
+
 #[tokio::test]
 #[ignore]
 async fn serve_fixtures() {

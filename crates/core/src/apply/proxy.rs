@@ -24,8 +24,8 @@ use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::generate::{CLOSE, OPEN, neutralise};
 use crate::memory::{self, Class};
+use crate::pause;
 use crate::permissions::{self, Action, Decision, Grant, Mode};
-use crate::{audit, knowledge, pause};
 
 const HANDLED: &str = "A person handled this field. Take a snapshot and go on.";
 const STOPPED: &str = "Stopped for a person. Call apply_next.";
@@ -33,7 +33,6 @@ const VALUE_REFUSED: &str = "not an approved answer or profile fact; call apply_
 const UNLABELED: &str = "unlabeled_field: this field has no label, so it cannot be checked. \
     Call apply_pause for a person, or apply_result with outcome skipped and reason no_form.";
 const SECOND_SUBMIT: &str = "A second submit click on this application.";
-const CONFIRMATION: usize = 2000;
 const PAUSE_KINDS: [&str; 7] = [
     "login",
     "captcha",
@@ -332,16 +331,6 @@ fn fold(text: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
-}
-
-/// The `Page URL` line Playwright puts on a snapshot, when it holds a web address.
-fn page_url(snapshot: &str) -> Option<String> {
-    snapshot.lines().find_map(|line| {
-        let (_, url) = line.split_once("Page URL:")?;
-        let url = url.trim();
-        let parsed = reqwest::Url::parse(url).ok()?;
-        matches!(parsed.scheme(), "http" | "https").then(|| url.to_owned())
-    })
 }
 
 /// The reasons `apply_result` keeps. Anything else is stored as `other`, so no page text lands
@@ -958,38 +947,17 @@ impl Session<'_> {
             true => None,
             false => self.snapshot().await?,
         };
-        let page = capture.as_deref().unwrap_or("");
-        let (text, _) = knowledge::normalize(page);
-        let count = text.chars().count();
-        let tail: String = text
-            .chars()
-            .skip(count.saturating_sub(CONFIRMATION))
-            .collect();
-        sqlx::query(concat!(
-            "UPDATE apply_items SET state = 'submitted', reason = NULL, confirmation_text = ?, \
-             confirmation_url = ?, captured_at = CASE WHEN ? THEN ",
-            now!(),
-            " END WHERE id = ? AND state = 'active'"
-        ))
-        .bind(capture.is_some().then_some(&tail))
-        .bind(page_url(page))
-        .bind(capture.is_some())
-        .bind(&item.id)
-        .execute(&self.db.pool)
-        .await?;
-        let detail = json!({
-            "agent": "claude_apply",
-            "mode": "claude_code",
-            "run": self.run_id,
-            "application": item.application_id,
-            "host": item.host,
-        });
-        audit::record(
+        let by = super::Submitter {
+            agent: "claude_apply",
+            mode: "claude_code",
+        };
+        super::record_submitted(
             self.db,
             &self.actor,
-            "application_submitted",
-            item.application_id.as_deref(),
-            detail,
+            &self.run_id,
+            &item,
+            capture.as_deref(),
+            by,
         )
         .await?;
         if paused {

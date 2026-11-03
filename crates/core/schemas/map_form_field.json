@@ -1,0 +1,6 @@
+{
+  "type": "object",
+  "required": ["answer_id"],
+  "properties": { "answer_id": { "type": ["string", "null"] } },
+  "additionalProperties": false
+}
