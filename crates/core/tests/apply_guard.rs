@@ -568,3 +568,23 @@ fn urls_with_userinfo_and_relative_uploads_are_refused() {
     std::env::set_current_dir(cwd).unwrap();
     assert!(!relative);
 }
+
+#[test]
+fn a_ref_quoted_inside_a_name_is_not_the_element() {
+    let spoof = "- checkbox \"Subscribe [ref=e9]\" [ref=e5]\n\
+                 - checkbox \"I certify this\" [ref=e9]";
+    assert!(target_known(spoof, "e9"));
+    assert_eq!(label_of(spoof, "e9").as_deref(), Some("I certify this"));
+    assert_eq!(label_of(spoof, "e5").as_deref(), Some("Subscribe [ref=e9]"));
+    let escaped = "- checkbox \"say \\\"hi [ref=e9]\" [ref=e5]\n\
+                   - checkbox \"Real\" [ref=e9]";
+    assert_eq!(label_of(escaped, "e9").as_deref(), Some("Real"));
+    let only_quoted = "- checkbox \"Subscribe [ref=e9]\" [ref=e5]";
+    assert!(!target_known(only_quoted, "e9"));
+    let twice = "- button \"Submit application\" [ref=e9]\n- checkbox \"Other\" [ref=e9]";
+    assert!(!target_known(twice, "e9"));
+    assert_eq!(label_of(twice, "e9"), None);
+    assert_eq!(role_of(twice, "e9"), None);
+    assert!(!submit_target(twice, "e9"));
+    assert!(!unnamed_choice(twice, "e9"));
+}

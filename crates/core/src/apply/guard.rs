@@ -434,12 +434,34 @@ pub fn fields_in(tool: &str, args: &Value) -> Vec<(String, String)> {
 }
 
 /// The snapshot line that holds `[ref=<target>]`. A target is a plain ref or nothing.
+/// A marker inside a quoted name is not a ref, and a ref held twice is no element.
 fn line_of<'a>(snapshot: &'a str, target: &str) -> Option<&'a str> {
     if target.is_empty() || !target.bytes().all(|b| b.is_ascii_alphanumeric()) {
         return None;
     }
     let marker = format!("[ref={target}]");
-    snapshot.lines().find(|line| line.contains(&marker))
+    let mut found = snapshot.lines().filter(|line| {
+        line.match_indices(&marker)
+            .any(|(at, _)| outside_quotes(line, at))
+    });
+    let line = found.next()?;
+    found.next().is_none().then_some(line)
+}
+
+/// True when byte `at` follows an even number of unescaped double quotes.
+fn outside_quotes(line: &str, at: usize) -> bool {
+    let mut quotes = 0;
+    let mut chars = line[..at].chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '"' => quotes += 1,
+            _ => {}
+        }
+    }
+    quotes % 2 == 0
 }
 
 /// True only when the snapshot holds this exact ref. A selector is never known.
