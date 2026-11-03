@@ -159,8 +159,15 @@ fn no_source_holds_a_bypass() {
         for word in banned {
             // `.no_proxy()` is the opposite of `proxy(`: it is the rule being kept.
             let hit = code.replace("no_proxy(", "").contains(word);
-            // The apply guard names the CAPTCHA page as a stop for a person. Only that word.
-            let stop_word = word == "captcha" && path.ends_with("crates/core/src/apply/guard.rs");
+            // The apply guard and the proxy's `apply_pause` kinds name the CAPTCHA page as a stop
+            // for a person. Only that word.
+            let stop_word = word == "captcha"
+                && [
+                    "crates/core/src/apply/guard.rs",
+                    "crates/core/src/apply/proxy.rs",
+                ]
+                .iter()
+                .any(|file| path.ends_with(file));
             if hit && !stop_word {
                 hits.push(format!("{path}: {word}"));
             }

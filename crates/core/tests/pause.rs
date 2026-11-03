@@ -748,8 +748,12 @@ fn every_route_to_a_status_write_passes_the_gate() {
         ["crypto.rs", "tracking.rs"],
         "crypto.rs is a unit test"
     );
-    // The agent, whose `start` is a gate: the CLI's `app status` and the desktop command.
-    assert_eq!(reaching("agents::set_status("), ["apps.rs", "commands.rs"]);
+    // The agent, whose `start` is a gate: the CLI's `app status`, the desktop command, and
+    // `apply::settle` (apply/mod.rs), which records an apply run's submissions.
+    assert_eq!(
+        reaching("agents::set_status("),
+        ["apps.rs", "commands.rs", "mod.rs"]
+    );
 }
 
 /// The scan reads statements the way the guard needs, whatever the case or the spelling.

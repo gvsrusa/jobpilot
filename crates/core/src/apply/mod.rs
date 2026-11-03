@@ -4,6 +4,7 @@
 
 pub mod brief;
 pub mod guard;
+pub mod proxy;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -12,9 +13,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::ai::DataCategory;
+use self::guard::PauseKind;
 use crate::ai::claude_code::{self, PROVIDER};
 use crate::ai::consent;
+use crate::ai::{CancellationToken, DataCategory};
 use crate::applications::{self, Application};
 use crate::browser::runtime::{self, RuntimeState};
 use crate::db::Db;
@@ -606,8 +608,8 @@ pub async fn resolve_pause(
     Ok(())
 }
 
-/// A person's act. A `ready` run has no agent run: it ends here. Any other goes to
-/// `agents::cancel_run`.
+/// A person's act. A `ready` run has no agent run: it ends here, through `finish_items`. Any
+/// other goes to `agents::cancel_run`, and its host ends it.
 pub async fn cancel(db: &Db, actor: &str, id: &str) -> Result<()> {
     runner::person(actor)?;
     let (state, agent_run): (String, Option<String>) =
@@ -622,31 +624,245 @@ pub async fn cancel(db: &Db, actor: &str, id: &str) -> Result<()> {
     if let Some(agent_run) = agent_run {
         return agents::cancel_run(db, actor, &agent_run).await;
     }
-    let mut tx = db.pool.begin().await?;
-    let moved = sqlx::query(concat!(
-        "UPDATE apply_runs SET state = 'ended', ended_at = ",
-        now!(),
-        " WHERE id = ? AND state <> 'ended' AND agent_run_id IS NULL"
-    ))
-    .bind(id)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    if moved == 0 {
-        return Err(ended());
-    }
-    let skipped = sqlx::query(
-        "UPDATE apply_items SET state = 'skipped', reason = 'run_ended' \
-         WHERE apply_run_id = ? AND state IN ('queued', 'active')",
+    let skipped: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM apply_items \
+         WHERE apply_run_id = ? AND state IN ('queued', 'active', 'filled')",
     )
     .bind(id)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
+    .fetch_one(&db.pool)
+    .await?;
+    if !finish(db, id).await? {
+        return Err(ended());
+    }
     let detail = json!({ "skipped": skipped });
-    audit::record_to(&mut *tx, actor, "apply_run_cancelled", Some(id), detail).await?;
-    tx.commit().await?;
+    audit::record(db, actor, "apply_run_cancelled", Some(id), detail).await?;
     Ok(())
+}
+
+/// Every end of a run comes through here, so `apply_run_active` never outlives one. An item
+/// left mid-way is `uncertain` if a submit was clicked, else skipped; a queued one is skipped;
+/// a pause still open is stopped. Running it again changes nothing.
+pub async fn finish_items(db: &Db, apply_id: &str) -> Result<()> {
+    finish(db, apply_id).await.map(|_| ())
+}
+
+/// True when this call moved the run row to `ended`.
+async fn finish(db: &Db, apply_id: &str) -> Result<bool> {
+    let mut tx = db.pool.begin().await?;
+    let found: Option<String> = sqlx::query_scalar("SELECT state FROM apply_runs WHERE id = ?")
+        .bind(apply_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(state) = found else {
+        return Err(Error::NotFound);
+    };
+    sqlx::query(
+        "UPDATE apply_items SET reason = 'session_ended', \
+         state = CASE WHEN submit_clicks > 0 THEN 'uncertain' ELSE 'skipped' END \
+         WHERE apply_run_id = ? AND state IN ('active', 'filled')",
+    )
+    .bind(apply_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE apply_items SET state = 'skipped', reason = 'run_ended' \
+         WHERE apply_run_id = ? AND state = 'queued'",
+    )
+    .bind(apply_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(concat!(
+        "UPDATE apply_pauses SET resolved_by = 'system', resolution = 'stopped', resolved_at = ",
+        now!(),
+        " WHERE resolved_at IS NULL AND item_id IN \
+         (SELECT id FROM apply_items WHERE apply_run_id = ?)"
+    ))
+    .bind(apply_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(concat!(
+        "UPDATE apply_runs SET state = 'ended', ended_at = coalesce(ended_at, ",
+        now!(),
+        ") WHERE id = ? AND state <> 'ended'"
+    ))
+    .bind(apply_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(state != "ended")
+}
+
+const UNCERTAIN_NOTE: &str = "Check the site. JobPilot will not try again.";
+
+/// Writes what the run's results mean for each application, once: a `submitted` item moves
+/// the application to `applied` through the tracking agent, and an `uncertain` one gets a
+/// note. `status_written` marks either as done. Returns how many it wrote. While the
+/// emergency pause is on it stops at the first status write with `Err(Paused)`, and a later
+/// call finishes the rest.
+pub async fn settle(db: &Db, actor: &str, apply_id: &str) -> Result<usize> {
+    let run = view(db, apply_id).await?;
+    let mut settled = 0;
+    for item in run.items {
+        let Some(application) = item.application_id.as_deref() else {
+            continue;
+        };
+        if item.status_written {
+            continue;
+        }
+        match item.state.as_str() {
+            "submitted" => {
+                let said: String = item
+                    .confirmation_text
+                    .as_deref()
+                    .unwrap_or("")
+                    .chars()
+                    .take(EXCERPT)
+                    .collect();
+                let note = format!("Applied by Claude Code run {apply_id}. The page said: {said}");
+                let cancel = CancellationToken::new();
+                agents::set_status(db, actor, application, "applied", None, &note, cancel).await?;
+            }
+            "uncertain" => applications::add_note(db, actor, application, UNCERTAIN_NOTE).await?,
+            _ => continue,
+        }
+        sqlx::query("UPDATE apply_items SET status_written = 1 WHERE id = ?")
+            .bind(&item.id)
+            .execute(&db.pool)
+            .await?;
+        settled += 1;
+    }
+    Ok(settled)
+}
+
+const EXCERPT: usize = 300;
+const HOLD_POLL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Held {
+    Continue,
+    TakenOver,
+    TimedOut,
+}
+
+/// Opens a pause on the item and waits for a person, up to `limit` (`PAUSE_HOLD` outside
+/// tests). `Err(Paused)` or `Err(Cancelled)` when the flag or a cancel ends the hold; the pause
+/// is then `stopped`. The host's agent run reads `waiting_for_human` meanwhile.
+pub(crate) async fn hold(
+    db: &Db,
+    item: &Item,
+    kind: PauseKind,
+    origin: &str,
+    excerpt: &str,
+    cancel: &CancellationToken,
+    limit: Duration,
+) -> Result<Held> {
+    let excerpt: String = excerpt.chars().take(EXCERPT).collect();
+    let kind = json!(kind);
+    let id: String = sqlx::query_scalar(concat!(
+        "INSERT INTO apply_pauses (id, item_id, kind, origin, excerpt, created_at) \
+         VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ",
+        now!(),
+        ") RETURNING id"
+    ))
+    .bind(&item.id)
+    .bind(kind.as_str().unwrap_or("other"))
+    .bind(origin)
+    .bind(&excerpt)
+    .fetch_one(&db.pool)
+    .await?;
+    let agent_run: Option<String> =
+        sqlx::query_scalar("SELECT agent_run_id FROM apply_runs WHERE id = ?")
+            .bind(&item.run_id)
+            .fetch_optional(&db.pool)
+            .await?
+            .flatten();
+    if let Some(run) = &agent_run {
+        runner::store::set_waiting(db, run, true).await?;
+    }
+    let held = wait(db, &id, &item.run_id, cancel, limit).await;
+    let back = match &agent_run {
+        Some(run) => runner::store::set_waiting(db, run, false).await,
+        None => Ok(()),
+    };
+    let held = held?;
+    back?;
+    Ok(held)
+}
+
+async fn wait(
+    db: &Db,
+    pause_id: &str,
+    run_id: &str,
+    cancel: &CancellationToken,
+    limit: Duration,
+) -> Result<Held> {
+    let begun = tokio::time::Instant::now();
+    loop {
+        let resolution: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT resolution FROM apply_pauses WHERE id = ? AND resolved_at IS NOT NULL",
+        )
+        .bind(pause_id)
+        .fetch_optional(&db.pool)
+        .await?;
+        match resolution.flatten().as_deref() {
+            Some("continue") => return Ok(Held::Continue),
+            Some("take_over") => return Ok(Held::TakenOver),
+            Some("timeout") => return Ok(Held::TimedOut),
+            // Stopped by `finish_items` from another process.
+            Some(_) => return Err(Error::Cancelled),
+            None => {}
+        }
+        if pause::is_set(db).await? {
+            stop(db, pause_id).await?;
+            return Err(Error::Paused);
+        }
+        if cancel.is_cancelled() || run_cancelled(db, run_id).await? {
+            stop(db, pause_id).await?;
+            return Err(Error::Cancelled);
+        }
+        if begun.elapsed() >= limit {
+            let timed_out = sqlx::query(concat!(
+                "UPDATE apply_pauses SET resolved_by = 'system', resolution = 'timeout', \
+                 resolved_at = ",
+                now!(),
+                " WHERE id = ? AND resolved_at IS NULL"
+            ))
+            .bind(pause_id)
+            .execute(&db.pool)
+            .await?
+            .rows_affected();
+            if timed_out == 1 {
+                return Ok(Held::TimedOut);
+            }
+            // A person got there first: read what they chose.
+            continue;
+        }
+        tokio::time::sleep(HOLD_POLL).await;
+    }
+}
+
+async fn stop(db: &Db, pause_id: &str) -> Result<()> {
+    sqlx::query(concat!(
+        "UPDATE apply_pauses SET resolved_by = 'system', resolution = 'stopped', resolved_at = ",
+        now!(),
+        " WHERE id = ? AND resolved_at IS NULL"
+    ))
+    .bind(pause_id)
+    .execute(&db.pool)
+    .await?;
+    Ok(())
+}
+
+/// The run has ended, or a person asked its agent run to stop.
+pub(crate) async fn run_cancelled(db: &Db, run_id: &str) -> Result<bool> {
+    let stopped: Option<bool> = sqlx::query_scalar(
+        "SELECT r.state = 'ended' OR coalesce(a.cancel_requested, 0) = 1 \
+         FROM apply_runs r LEFT JOIN agent_runs a ON a.id = r.agent_run_id WHERE r.id = ?",
+    )
+    .bind(run_id)
+    .fetch_optional(&db.pool)
+    .await?;
+    Ok(stopped.unwrap_or(true))
 }
 
 fn ended() -> Error {

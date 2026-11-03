@@ -75,6 +75,10 @@ pub const RUN_REASONS: &[&str] = &[
     "network",
     "no_sources",
     "company_gone",
+    "browser_gone",
+    "session_ended",
+    "no_browser_runtime",
+    "claude_not_found",
 ];
 
 /// Absent capabilities are false: a declaration lists only what the provider proves.
