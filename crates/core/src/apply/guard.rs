@@ -85,23 +85,47 @@ const LEGAL: [&str; 18] = [
     "i consent",
     "i authorize",
 ];
-const KEYS: [&str; 13] = [
-    "Tab",
-    "Shift+Tab",
-    "Escape",
-    "ArrowUp",
-    "ArrowDown",
-    "ArrowLeft",
-    "ArrowRight",
-    "Backspace",
-    "Delete",
-    "Home",
-    "End",
-    "PageUp",
-    "PageDown",
-];
+const KEYS: [&str; 3] = ["Tab", "Shift+Tab", "Escape"];
 /// An authorization word beside `sponsor` makes the question's polarity unclear.
 const POLARITY: [&str; 4] = ["authoriz", "eligib", "legally", "permitted"];
+/// Whole words that turn a work authorization question around.
+const NEGATING: [&str; 4] = ["visa", "not", "never", "without"];
+/// The state flags Playwright prints on a line. They change as the page is used.
+const FLAGS: [&str; 8] = [
+    "checked", "selected", "expanded", "pressed", "disabled", "active", "focused", "cursor",
+];
+/// Other names for a country, beside the table's own.
+const ALIASES: [(&str, &[&str]); 6] = [
+    (
+        "US",
+        &[
+            "united states",
+            "united states of america",
+            "usa",
+            "u.s.",
+            "u.s.a.",
+            "america",
+        ],
+    ),
+    (
+        "GB",
+        &[
+            "united kingdom",
+            "uk",
+            "u.k.",
+            "britain",
+            "great britain",
+            "england",
+            "scotland",
+            "wales",
+            "northern ireland",
+        ],
+    ),
+    ("CA", &["canada"]),
+    ("IN", &["india"]),
+    ("DE", &["germany"]),
+    ("AU", &["australia"]),
+];
 const DIALOG_ROLES: [&str; 2] = ["dialog", "alertdialog"];
 const SUBMIT_WORDS: [&str; 3] = ["submit", "send application", "finish application"];
 const EXCERPT: usize = 300;
@@ -159,8 +183,10 @@ fn parts(line: &str) -> (String, String) {
         .unwrap_or("")
         .to_owned();
     let mut name = String::new();
-    if let Some(open) = body.find('"') {
-        let mut chars = body[open + 1..].chars();
+    // A name follows the role at once. Text after `:` or a flag is inline content.
+    let after = body[role.len()..].trim_start();
+    if let Some(rest) = after.strip_prefix('"') {
+        let mut chars = rest.chars();
         while let Some(c) = chars.next() {
             match c {
                 '\\' => name.extend(chars.next()),
@@ -215,7 +241,7 @@ pub fn scan(snapshot: &str, acknowledged: &HashSet<String>) -> Option<Hit> {
                 continue;
             };
             let line: String = folded[at..].chars().take(EXCERPT).collect();
-            let key = format!("{}:{folded}", kind_name(kind));
+            let key = format!("{}:{}", kind_name(kind), without_flags(folded));
             let hit = Hit { kind, line, key };
             if !acknowledged.contains(&hit.key) {
                 return Some(hit);
@@ -223,6 +249,27 @@ pub fn scan(snapshot: &str, acknowledged: &HashSet<String>) -> Option<Hit> {
         }
     }
     None
+}
+
+/// The line without its state flags, so a ticked box keeps the key it had.
+fn without_flags(line: &str) -> String {
+    let mut out = String::new();
+    let mut rest = line;
+    while let Some(at) = rest.find('[') {
+        let (before, tail) = rest.split_at(at);
+        out.push_str(before);
+        let end = tail.find(']').map_or(tail.len(), |e| e + 1);
+        let flag = tail[1..end.saturating_sub(1).max(1)]
+            .split('=')
+            .next()
+            .unwrap_or("");
+        if !FLAGS.contains(&flag) {
+            out.push_str(&tail[..end]);
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 pub fn hit_key(hit: &Hit) -> String {
@@ -257,6 +304,12 @@ pub fn refused_args(tool: &str, args: &Value, debug: bool) -> Option<&'static st
     }
     if has_key(args, "isolatedContext") || has_key(args, "isolated_context") {
         return Some("isolated_context_refused");
+    }
+    if tool == "browser_type" && args.get("slowly").and_then(Value::as_bool) == Some(true) {
+        return Some("slowly_refused");
+    }
+    if tool == "browser_snapshot" && (args.get("target").is_some() || args.get("depth").is_some()) {
+        return Some("snapshot_scope_refused");
     }
     if tool == "browser_press_key" {
         let allowed = args
@@ -433,19 +486,39 @@ pub fn fields_in(tool: &str, args: &Value) -> Vec<(String, String)> {
     }
 }
 
-/// The snapshot line that holds `[ref=<target>]`. A target is a plain ref or nothing.
-/// A marker inside a quoted name is not a ref, and a ref held twice is no element.
-fn line_of<'a>(snapshot: &'a str, target: &str) -> Option<&'a str> {
-    if target.is_empty() || !target.bytes().all(|b| b.is_ascii_alphanumeric()) {
+/// A ref as Playwright prints it: `e12`, or `f1e12` inside a frame. Anything else is a selector.
+fn is_ref(target: &str) -> bool {
+    let rest = match target.strip_prefix('f') {
+        Some(frame) => {
+            let after = frame.trim_start_matches(|c: char| c.is_ascii_digit());
+            if after.len() == frame.len() {
+                return false;
+            }
+            after
+        }
+        None => target,
+    };
+    rest.strip_prefix('e')
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The index of the one snapshot line that holds `[ref=<target>]`. A marker inside a quoted
+/// name is not a ref, and a ref held twice is no element.
+fn index_of(snapshot: &str, target: &str) -> Option<usize> {
+    if !is_ref(target) {
         return None;
     }
     let marker = format!("[ref={target}]");
-    let mut found = snapshot.lines().filter(|line| {
+    let mut found = snapshot.lines().enumerate().filter(|(_, line)| {
         line.match_indices(&marker)
             .any(|(at, _)| outside_quotes(line, at))
     });
-    let line = found.next()?;
-    found.next().is_none().then_some(line)
+    let (index, _) = found.next()?;
+    found.next().is_none().then_some(index)
+}
+
+fn line_of<'a>(snapshot: &'a str, target: &str) -> Option<&'a str> {
+    snapshot.lines().nth(index_of(snapshot, target)?)
 }
 
 /// True when byte `at` follows an even number of unescaped double quotes.
@@ -533,31 +606,38 @@ fn label_words(label: &str) -> Vec<String> {
         .collect()
 }
 
-/// A country other than the fact's that the label names, by name or by uppercase code.
-fn names_other_country(label: &str, own: &str) -> bool {
+/// True when the label names the country by a table name, an alias, or its code in capitals.
+fn names_country(label: &str, own: &str) -> bool {
     let padded = format!(" {} ", label_words(label).join(" "));
-    let raw: Vec<&str> = label
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .collect();
-    geo::countries().iter().any(|country| {
-        if country.code.eq_ignore_ascii_case(own) {
-            return false;
-        }
-        let name = label_words(country.name).join(" ");
-        padded.contains(&format!(" {name} ")) || raw.contains(&country.code)
-    })
+    let has = |phrase: &str| padded.contains(&format!(" {} ", label_words(phrase).join(" ")));
+    let raw = label.split(|c: char| !c.is_alphanumeric());
+    if raw.clone().any(|word| word == own) {
+        return true;
+    }
+    let table = geo::countries()
+        .iter()
+        .filter(|country| country.code == own)
+        .map(|country| country.name.trim_end_matches(" (country)"));
+    let aliases = ALIASES
+        .iter()
+        .filter(|(code, _)| *code == own)
+        .flat_map(|(_, names)| names.iter().copied());
+    table.chain(aliases).any(has)
 }
 
 /// The stated yes or no for the label, compared to the value. Nothing is inferred. A label
-/// with unclear polarity, or one that names another country, has no answer here.
+/// that does not name the fact's country, or whose polarity is unclear, has no answer here.
 pub fn authorization_ok(label: &str, value: &str, fact: &AuthorizationFact) -> bool {
     let folded = clean(label);
     let sponsor = folded.contains("sponsor");
-    if sponsor && POLARITY.iter().any(|word| folded.contains(word)) {
+    let words = label_words(label);
+    let negated = words.iter().any(|w| NEGATING.contains(&w.as_str()))
+        || folded.contains("n't")
+        || folded.contains("n\u{2019}t");
+    if negated || (sponsor && POLARITY.iter().any(|word| folded.contains(word))) {
         return false;
     }
-    if names_other_country(label, &fact.country) {
+    if !names_country(label, &fact.country) {
         return false;
     }
     let stated = if sponsor {
@@ -566,6 +646,15 @@ pub fn authorization_ok(label: &str, value: &str, fact: &AuthorizationFact) -> b
         &fact.authorized
     };
     (stated == "yes" || stated == "no") && fold(value) == *stated
+}
+
+/// One text is the other, or a run of its whole words.
+fn same_question(a: &str, b: &str) -> bool {
+    let (a, b) = (label_words(a), label_words(b));
+    let within = |small: &[String], big: &[String]| {
+        !small.is_empty() && big.windows(small.len()).any(|run| run == small)
+    };
+    within(&a, &b) || within(&b, &a)
 }
 
 /// A field that needs a person returns the kind of pause to open. This is never a refusal.
@@ -581,13 +670,9 @@ pub fn field_guard(label: &str, value: &str, brief: &Brief) -> Result<(), PauseK
             _ => Err(PauseKind::Sensitive),
         },
         Class::Sensitive => {
-            let label = fold(label);
             let value = fold(value);
             let answered = brief.answers.iter().any(|answer| {
-                let question = fold(&answer.question);
-                !question.is_empty()
-                    && (label.contains(&question) || question.contains(&label))
-                    && fold(&answer.answer) == value
+                same_question(label, &answer.question) && fold(&answer.answer) == value
             });
             if answered {
                 Ok(())
@@ -596,5 +681,51 @@ pub fn field_guard(label: &str, value: &str, brief: &Brief) -> Result<(), PauseK
             }
         }
         Class::Normal | Class::Legal => Ok(()),
+    }
+}
+
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// A checkbox or radio is judged by the question above it: the nearest ancestor line with a
+/// name, found by indentation. The option's own name is the value. An unnamed choice, or one
+/// with no named ancestor and no clear label, is a `Legal` pause. Other roles pass here.
+pub fn choice_guard(snapshot: &str, target: &str, brief: &Brief) -> Result<(), PauseKind> {
+    let Some(index) = index_of(snapshot, target) else {
+        return Err(PauseKind::Legal);
+    };
+    let lines: Vec<&str> = snapshot.lines().collect();
+    let (role, name) = parts(lines[index]);
+    if !matches!(role.to_lowercase().as_str(), "checkbox" | "radio") {
+        return Ok(());
+    }
+    let option: String = name.chars().filter(|c| !hidden(*c)).collect();
+    if !option.is_empty() && field_guard(&option, "", brief) == Err(PauseKind::Legal) {
+        return Err(PauseKind::Legal);
+    }
+    let mut limit = indent_of(lines[index]);
+    let mut question = None;
+    for line in lines[..index].iter().rev() {
+        if line.trim().is_empty() || indent_of(line) >= limit {
+            continue;
+        }
+        limit = indent_of(line);
+        let (_, ancestor) = parts(line);
+        if !ancestor.is_empty() {
+            question = Some(ancestor);
+            break;
+        }
+    }
+    match question {
+        Some(question) => {
+            field_guard(&question, &option, brief)?;
+            if option.is_empty() {
+                return Err(PauseKind::Legal);
+            }
+            Ok(())
+        }
+        None if option.is_empty() => Err(PauseKind::Legal),
+        None => field_guard(&option, "", brief),
     }
 }

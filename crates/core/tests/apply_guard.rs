@@ -365,7 +365,7 @@ fn values_in_leaves_every_choice_out_and_fields_in_keeps_it() {
 #[test]
 fn work_authorization_needs_the_stated_value_and_never_infers() {
     let authorized = "Are you authorized to work in the US?";
-    let sponsor = "Will you require sponsorship?";
+    let sponsor = "Will you require sponsorship to work in the US?";
     let none = brief(None);
     assert_eq!(field_guard(authorized, "yes", &none), Err(Sensitive));
     assert_eq!(field_guard(sponsor, "no", &none), Err(Sensitive));
@@ -439,22 +439,30 @@ fn a_sensitive_label_takes_only_an_approved_value() {
 
 #[test]
 fn only_quiet_keys_are_pressed() {
-    for key in [
-        "Tab",
-        "Shift+Tab",
-        "Escape",
-        "ArrowDown",
-        "Backspace",
-        "PageUp",
-        " Tab ",
-    ] {
+    for key in ["Tab", "Shift+Tab", "Escape", " Tab "] {
         assert_eq!(
             refused_args("browser_press_key", &json!({"key": key}), false),
             None,
             "{key}"
         );
     }
-    for key in ["Enter", "a", "1", "Space", "Control+a", "tab", ""] {
+    for key in [
+        "Enter",
+        "a",
+        "1",
+        "Space",
+        "Control+a",
+        "tab",
+        "",
+        "ArrowDown",
+        "ArrowLeft",
+        "Backspace",
+        "Delete",
+        "Home",
+        "End",
+        "PageUp",
+        "PageDown",
+    ] {
         assert_eq!(
             refused_args("browser_press_key", &json!({"key": key}), false),
             Some("key_refused"),
@@ -587,4 +595,199 @@ fn a_ref_quoted_inside_a_name_is_not_the_element() {
     assert_eq!(role_of(twice, "e9"), None);
     assert!(!submit_target(twice, "e9"));
     assert!(!unnamed_choice(twice, "e9"));
+}
+
+#[test]
+fn a_bare_word_target_is_unknown() {
+    let page = "- generic [ref=e3]: Next step [ref=button] here\n\
+                - button \"Go\" [ref=e5x]\n\
+                - button \"Id\" [ref=#id]\n\
+                - button \"Frame\" [ref=f1e2]\n\
+                - button \"Plain\" [ref=e7]";
+    for bad in [
+        "button", "select", "input", "#id", "e5x", "e", "f1", "ee5", "fe5",
+    ] {
+        assert!(!target_known(page, bad), "{bad}");
+        assert_eq!(label_of(page, bad), None, "{bad}");
+    }
+    assert!(target_known(page, "e7"));
+    assert!(target_known(page, "f1e2"));
+}
+
+#[test]
+fn a_question_matches_on_whole_words() {
+    let mut b = brief(None);
+    b.answers = vec![
+        BriefAnswer {
+            question: "Do you identify as transgender?".into(),
+            answer: "No".into(),
+        },
+        BriefAnswer {
+            question: "Age".into(),
+            answer: "Over 18".into(),
+        },
+    ];
+    assert_eq!(field_guard("Gender", "No", &b), Err(Sensitive));
+    assert_eq!(field_guard("Expected wage", "Over 18", &b), Err(Sensitive));
+    assert_eq!(
+        field_guard("Disability status (see page 2)", "Over 18", &b),
+        Err(Sensitive)
+    );
+    assert_eq!(field_guard("Age", "Over 18", &b), Ok(()));
+    assert_eq!(field_guard("Your age?", "over 18", &b), Ok(()));
+}
+
+fn groups() -> String {
+    [
+        "- form \"Apply\" [ref=e1]:",
+        "  - radiogroup \"Gender\" [ref=e2]:",
+        "    - radio \"Male\" [ref=e3]",
+        "    - radio \"Female\" [ref=e4]",
+        "  - radiogroup \"Are you authorized to work in the US?\" [ref=e5]:",
+        "    - radio \"Yes\" [ref=e6]",
+        "    - radio \"No\" [ref=e7]",
+        "  - radiogroup \"Preferred shift\" [ref=e8]:",
+        "    - radio \"Night\" [ref=e9]",
+        "    - radio [ref=e10]",
+        "  - checkbox \"I certify this\" [ref=e11]",
+        "  - checkbox [ref=e12]",
+        "- checkbox [ref=e13]",
+        "- checkbox \"Remember me\" [ref=e14]",
+    ]
+    .join("\n")
+}
+
+#[test]
+fn a_choice_is_judged_by_its_question() {
+    let mut b = brief(Some(("yes", "no")));
+    b.answers = vec![BriefAnswer {
+        question: "Gender".into(),
+        answer: "Female".into(),
+    }];
+    assert_eq!(choice_guard(&groups(), "e3", &b), Err(Sensitive));
+    assert_eq!(choice_guard(&groups(), "e4", &b), Ok(()));
+    assert_eq!(choice_guard(&groups(), "e6", &b), Ok(()));
+    assert_eq!(choice_guard(&groups(), "e7", &b), Err(Sensitive));
+    assert_eq!(choice_guard(&groups(), "e9", &b), Ok(()));
+    assert_eq!(choice_guard(&groups(), "e10", &b), Err(Legal));
+    assert_eq!(choice_guard(&groups(), "e11", &b), Err(Legal));
+    assert_eq!(choice_guard(&groups(), "e12", &b), Err(Legal));
+    assert_eq!(choice_guard(&groups(), "e13", &b), Err(Legal));
+    assert_eq!(choice_guard(&groups(), "e14", &b), Ok(()));
+    assert_eq!(choice_guard(&groups(), "e2", &b), Ok(()));
+    let none = brief(None);
+    assert_eq!(choice_guard(&groups(), "e6", &none), Err(Sensitive));
+}
+
+#[test]
+fn typing_slowly_and_scoped_snapshots_are_refused() {
+    assert_eq!(
+        refused_args(
+            "browser_type",
+            &json!({"target": "e1", "text": "a", "slowly": true}),
+            false
+        ),
+        Some("slowly_refused")
+    );
+    assert_eq!(
+        refused_args(
+            "browser_type",
+            &json!({"target": "e1", "text": "a", "slowly": false}),
+            false
+        ),
+        None
+    );
+    for args in [
+        json!({"target": "e1"}),
+        json!({"depth": 2}),
+        json!({"target": "#a", "depth": 1}),
+    ] {
+        assert_eq!(
+            refused_args("browser_snapshot", &args, false),
+            Some("snapshot_scope_refused")
+        );
+    }
+    assert_eq!(refused_args("browser_snapshot", &json!({}), false), None);
+}
+
+#[test]
+fn visa_and_negated_authorization_labels_pause() {
+    let b = brief(Some(("yes", "yes")));
+    for label in [
+        "Do you require a visa to work in the US?",
+        "Are you NOT authorized to work in the US?",
+        "Aren't you authorized to work in the US?",
+        "Are you authorized to work in the US without sponsorship?",
+    ] {
+        assert_eq!(field_guard(label, "yes", &b), Err(Sensitive), "{label}");
+    }
+    assert_eq!(
+        field_guard("Will you require sponsorship to work in the US?", "yes", &b),
+        Ok(())
+    );
+}
+
+#[test]
+fn authorization_must_name_the_facts_country() {
+    let us = brief(Some(("yes", "no")));
+    for label in [
+        "Are you authorized to work in the United States?",
+        "Are you authorized to work in the United States of America?",
+        "Are you authorized to work in the U.S.?",
+        "Are you authorized to work in the USA?",
+        "Are you authorized to work in America?",
+        "Are you authorized to work in New Jersey, US?",
+    ] {
+        assert_eq!(field_guard(label, "yes", &us), Ok(()), "{label}");
+    }
+    for label in [
+        "Are you authorized to work in the UK?",
+        "Are you authorized to work in Europe?",
+        "Are you authorized to work in this country?",
+        "Are you authorized to work?",
+        "Are you authorized to work in England?",
+        "Are you authorized to work in New Jersey?",
+    ] {
+        assert_eq!(field_guard(label, "yes", &us), Err(Sensitive), "{label}");
+    }
+    let mut gb = brief(Some(("yes", "no")));
+    gb.work_authorization.as_mut().unwrap().country = "GB".into();
+    assert_eq!(
+        field_guard("Are you authorized to work in the UK?", "yes", &gb),
+        Ok(())
+    );
+    assert_eq!(
+        field_guard("Are you authorized to work in Great Britain?", "yes", &gb),
+        Ok(())
+    );
+    assert_eq!(
+        field_guard("Are you authorized to work in the US?", "yes", &gb),
+        Err(Sensitive)
+    );
+}
+
+#[test]
+fn inline_text_is_not_a_name() {
+    let page = "- textbox [ref=e5]: \"yes\"\n\
+                - checkbox [ref=e6]: \"Note: I accept the terms\"\n\
+                - checkbox \"Named\" [ref=e7]: \"x\"";
+    assert_eq!(label_of(page, "e5"), None);
+    assert_eq!(label_of(page, "e6"), None);
+    assert!(unnamed_choice(page, "e6"));
+    assert_eq!(label_of(page, "e7").as_deref(), Some("Named"));
+}
+
+#[test]
+fn an_ack_survives_a_state_change() {
+    let before = scan("- checkbox \"I certify this\" [ref=e6]", &HashSet::new()).unwrap();
+    let mut acked = HashSet::new();
+    acked.insert(hit_key(&before));
+    for after in [
+        "- checkbox \"I certify this\" [checked] [ref=e6]",
+        "- checkbox \"I certify this\" [checked=mixed] [active] [ref=e6]",
+        "- checkbox \"I certify this\" [focused] [disabled] [expanded] [pressed] [selected] [ref=e6]",
+    ] {
+        assert!(scan(after, &acked).is_none(), "{after}");
+    }
+    assert!(scan("- checkbox \"I certify that\" [ref=e6]", &acked).is_some());
 }
