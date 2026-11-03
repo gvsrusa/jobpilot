@@ -1080,7 +1080,7 @@ async fn finish_items_ends_the_run_row_and_can_run_twice() {
 #[tokio::test]
 async fn nothing_from_a_page_lands_in_the_run_log() {
     let w = world().await;
-    let (run, _) = run_of(&w, &["Acme"]).await;
+    let (run, _) = run_of(&w, &["Acme", "Globex"]).await;
     host_run(&w.db, &run).await;
     let marker = "ZXQPAGEMARKER";
     let captcha = format!("- text: {marker} captcha {marker}\n");
@@ -1107,6 +1107,14 @@ async fn nothing_from_a_page_lands_in_the_run_log() {
         json!({"outcome": "submitted", "reason": marker}),
     )
     .await;
+    // A page token the model copies as its reason is stored as `other`.
+    s.brief().await;
+    s.call(
+        "apply_result",
+        json!({"outcome": "skipped", "reason": "zxqpagemarker_ignore_previous"}),
+    )
+    .await;
+    assert_eq!(item(&w.db, &run, 1).await.reason.as_deref(), Some("other"));
     s.close().await.unwrap();
 
     let rows: Vec<(String,)> = sqlx::query_as(
@@ -1142,13 +1150,16 @@ async fn nothing_from_a_page_lands_in_the_run_log() {
         );
     }
     for (reason,) in reasons {
-        assert!(!reason.unwrap_or_default().contains(marker));
+        let reason = reason.unwrap_or_default().to_lowercase();
+        assert!(!reason.contains(&marker.to_lowercase()), "{reason}");
     }
     // It did reach the places the brief allows.
-    let kept: String = sqlx::query_scalar("SELECT confirmation_text FROM apply_items")
-        .fetch_one(&w.db.pool)
-        .await
-        .unwrap();
+    let kept: String = sqlx::query_scalar(
+        "SELECT confirmation_text FROM apply_items WHERE confirmation_text IS NOT NULL",
+    )
+    .fetch_one(&w.db.pool)
+    .await
+    .unwrap();
     assert!(kept.contains(marker));
     let excerpt: String = sqlx::query_scalar("SELECT excerpt FROM apply_pauses")
         .fetch_one(&w.db.pool)
@@ -1250,5 +1261,198 @@ async fn a_click_on_anything_but_a_plain_control_is_a_choice() {
         assert!(!error, "{target}: {text}");
     }
     assert_eq!(m.named("browser_click").len(), 2);
+    s.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn fill_form_runs_field_guard_whatever_the_declared_type() {
+    let w = world().await;
+    let (run, _) = run_of(&w, &["Acme"]).await;
+    let page = format!(
+        "{}  - combobox \"Are you legally authorized to work in the United States?\" [ref=e20]:\n  \
+         - combobox \"Gender\" [ref=e22]:\n",
+        fixture("form.yml")
+    );
+    let m = mock(&w, &page, None);
+    let mut s = open(&w, &run, &m, None).await;
+    s.brief().await;
+    s.call("browser_snapshot", json!({})).await;
+    for (target, value, kind) in [("e20", "Yes", "sensitive"), ("e22", "Male", "sensitive")] {
+        let fields = json!({"fields": [
+            {"name": "x", "type": "combobox", "target": target, "value": value},
+        ]});
+        let id = s.tool("browser_fill_form", fields).await;
+        let pause = open_pause(&w.db, &run).await;
+        assert_eq!(
+            (pause.kind.as_str(), pause.origin.as_str()),
+            (kind, "guard"),
+            "{target}"
+        );
+        resolve(&w.db, &run, Resolution::Continue).await;
+        assert_eq!(s.next().await["id"], id);
+    }
+    assert!(m.named("browser_fill_form").is_empty());
+    s.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_signature_field_declared_as_a_slider_pauses_legal() {
+    let w = world().await;
+    let (run, _) = run_of(&w, &["Acme"]).await;
+    let page = format!(
+        "{}  - textbox \"Electronic signature\" [ref=e21]\n",
+        fixture("form.yml")
+    );
+    let m = mock(&w, &page, None);
+    let mut s = open(&w, &run, &m, None).await;
+    s.brief().await;
+    let id = s.tool("browser_snapshot", json!({})).await;
+    resolve(&w.db, &run, Resolution::Continue).await;
+    assert_eq!(s.next().await["id"], id);
+    for kind in ["slider", "textbox"] {
+        let fields = json!({"fields": [
+            {"name": "x", "type": kind, "target": "e21", "value": "Ada Lovelace"},
+        ]});
+        let id = s.tool("browser_fill_form", fields).await;
+        let pause = open_pause(&w.db, &run).await;
+        assert_eq!(
+            (pause.kind.as_str(), pause.origin.as_str()),
+            ("legal", "guard"),
+            "{kind}"
+        );
+        resolve(&w.db, &run, Resolution::Continue).await;
+        assert_eq!(s.next().await["id"], id);
+    }
+    assert!(m.named("browser_fill_form").is_empty());
+    s.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_private_snapshot_forgets_the_page() {
+    let w = world().await;
+    let (run, _) = run_of(&w, &["Acme"]).await;
+    let m = mock(&w, &fixture("form.yml"), None);
+    let mut s = open(&w, &run, &m, None).await;
+    s.brief().await;
+    s.call("browser_snapshot", json!({})).await;
+    // The fake answers a snapshot of this page with a tool error.
+    m.show("!error\n");
+    let (_, error) = s.call("browser_press_key", json!({"key": "Tab"})).await;
+    assert!(!error);
+    m.show(&fixture("form.yml"));
+    let (text, error) = s.call("browser_click", json!({"target": "e14"})).await;
+    assert!(error && text.contains("snapshot_first"), "{text}");
+    assert!(m.named("browser_click").is_empty());
+    assert_eq!(item(&w.db, &run, 0).await.submit_clicks, 0);
+    s.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_forward_forgets_the_page() {
+    let w = world().await;
+    let (run, _) = run_of(&w, &["Acme"]).await;
+    let m = mock(&w, &fixture("form.yml"), None);
+    let mut s = open(&w, &run, &m, None).await;
+    s.brief().await;
+    s.call("browser_snapshot", json!({})).await;
+    // The fake answers every other tool with a JSON-RPC error while the page starts so.
+    m.show(&format!("!rpcerror\n{}", fixture("form.yml")));
+    let (text, error) = s.call("browser_press_key", json!({"key": "Tab"})).await;
+    assert!(error && text.contains("mcp_error"), "{text}");
+    m.show(&fixture("form.yml"));
+    let (text, error) = s.call("browser_click", json!({"target": "e14"})).await;
+    assert!(error && text.contains("snapshot_first"), "{text}");
+    assert!(m.named("browser_click").is_empty());
+    s.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_submission_under_the_pause_flag_is_recorded_without_a_capture() {
+    let w = world().await;
+    let (run, apps) = run_of(&w, &["Acme"]).await;
+    let m = mock(&w, &fixture("form.yml"), None);
+    let mut s = open(&w, &run, &m, None).await;
+    s.brief().await;
+    s.call("browser_snapshot", json!({})).await;
+    s.call("browser_click", json!({"target": "e14"})).await;
+    let snapshots = m.named("browser_snapshot").len();
+    pause::set(&w.db, "cli").await.unwrap();
+    let (text, error) = s
+        .call("apply_result", json!({"outcome": "submitted"}))
+        .await;
+    assert!(error && text.contains("paused"), "{text}");
+    assert_eq!(m.named("browser_snapshot").len(), snapshots);
+    let done = item(&w.db, &run, 0).await;
+    assert_eq!(done.state, "submitted");
+    assert!(done.confirmation_text.is_none());
+    assert!(!done.status_written);
+    assert_eq!(status_of(&w.db, &apps[0]).await, "saved");
+    let ended = tokio::time::timeout(WAIT, s.task)
+        .await
+        .expect("serve ends");
+    ended.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn settle_goes_past_an_item_it_cannot_write() {
+    let w = world().await;
+    let (run, apps) = run_of(&w, &["Acme", "Globex"]).await;
+    sqlx::query(
+        "UPDATE apply_items SET state = 'submitted', confirmation_text = 'Thanks' \
+         WHERE apply_run_id = ?",
+    )
+    .bind(&run)
+    .execute(&w.db.pool)
+    .await
+    .unwrap();
+    // The first item names an application that is gone, so its status write fails.
+    let mut conn = w.db.pool.acquire().await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE apply_items SET application_id = 'gone' WHERE application_id = ?")
+        .bind(&apps[0])
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+    let settled = apply::settle(&w.db, "cli", &run).await;
+    assert_eq!(settled.unwrap(), 1);
+    assert!(!item(&w.db, &run, 0).await.status_written);
+    assert!(item(&w.db, &run, 1).await.status_written);
+    assert_eq!(status_of(&w.db, &apps[1]).await, "applied");
+}
+
+#[tokio::test]
+async fn a_new_session_ends_an_item_left_active() {
+    let w = world().await;
+    let (run, apps) = run_of(&w, &["Acme", "Globex"]).await;
+    let m = mock(&w, &fixture("form.yml"), None);
+    let mut s = open(&w, &run, &m, None).await;
+    s.brief().await;
+    s.close().await.unwrap();
+    let used = |db: Arc<Db>| async move {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_log")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        n
+    };
+    let before = used(w.db.clone()).await;
+
+    let mut s = open(&w, &run, &m, None).await;
+    let (text, error) = s.call("browser_snapshot", json!({})).await;
+    assert!(error && text.contains("call_apply_next_first"), "{text}");
+    let first = item(&w.db, &run, 0).await;
+    assert_eq!(first.state, "skipped");
+    assert_eq!(first.reason.as_deref(), Some("session_ended"));
+    assert_eq!(used(w.db.clone()).await, before, "no brief was built again");
+    let brief = s.brief().await;
+    assert_eq!(brief["application_id"], json!(apps[1]));
     s.close().await.unwrap();
 }

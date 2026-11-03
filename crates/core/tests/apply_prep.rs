@@ -442,6 +442,20 @@ async fn work_authorization_is_the_exact_country_or_nothing() {
     w.db.close().await;
 }
 
+/// A process whose working folder is `dir`, as the browser server's is.
+fn holding(dir: &Path) -> std::process::Child {
+    let mut command = if cfg!(windows) {
+        let mut c = std::process::Command::new("powershell");
+        c.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"]);
+        c
+    } else {
+        let mut c = std::process::Command::new("sleep");
+        c.arg("60");
+        c
+    };
+    command.current_dir(dir).spawn().unwrap()
+}
+
 #[tokio::test]
 async fn stage_files_replaces_the_last_applications_files() {
     let w = world().await;
@@ -485,6 +499,38 @@ async fn stage_files_replaces_the_last_applications_files() {
         assert_eq!(path, std::fs::canonicalize(path).unwrap());
     }
     assert!(staged.iter().any(|file| file.kind == "resume"));
+
+    // The folder stays: it is the browser's working folder while it runs.
+    let mut child = holding(&files);
+    #[cfg(unix)]
+    let inode = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&files).unwrap().ino()
+    };
+    brief::stage_files(&item_a, &files).unwrap();
+    brief::stage_files(&item_b, &files).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(std::fs::metadata(&files).unwrap().ino(), inode);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(files.join("resume.pdf").is_file());
+
+    #[cfg(unix)]
+    {
+        let outside = w.tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep.txt"), "mine").unwrap();
+        std::os::unix::fs::symlink(&outside, files.join("away")).unwrap();
+        brief::stage_files(&item_b, &files).unwrap();
+        assert!(
+            outside.join("keep.txt").is_file(),
+            "a link is removed, not followed"
+        );
+        assert!(!files.join("away").exists());
+    }
 
     #[cfg(unix)]
     {

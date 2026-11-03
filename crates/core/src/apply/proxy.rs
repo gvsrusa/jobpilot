@@ -189,12 +189,12 @@ fn apply_tools() -> Vec<Value> {
         }),
         json!({
             "name": "apply_result",
-            "description": "End the current application. reason is a short snake_case code.",
+            "description": "End the current application, with one of the listed reason codes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "outcome": {"type": "string", "enum": ["submitted", "skipped", "failed"]},
-                    "reason": {"type": "string"},
+                    "reason": {"type": "string", "enum": REASONS},
                 },
                 "required": ["outcome"],
                 "additionalProperties": false,
@@ -212,20 +212,6 @@ fn target_of(args: &Value) -> String {
         .to_owned()
 }
 
-/// The `browser_fill_form` fields judged by `guard::choice_guard`: all but textboxes.
-fn choice_fields(tool: &str, args: &Value) -> HashSet<String> {
-    if tool != "browser_fill_form" {
-        return HashSet::new();
-    }
-    args.get("fields")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|field| field.get("type").and_then(Value::as_str) != Some("textbox"))
-        .map(target_of)
-        .collect()
-}
-
 /// The `Page URL` line Playwright puts on a snapshot, when it holds a web address.
 fn page_url(snapshot: &str) -> Option<String> {
     snapshot.lines().find_map(|line| {
@@ -236,15 +222,27 @@ fn page_url(snapshot: &str) -> Option<String> {
     })
 }
 
-/// A model's reason is kept only as a short code, so no page text lands on the row.
-fn reason_code(args: &Value) -> Option<String> {
+/// The reasons `apply_result` keeps. Anything else is stored as `other`, so no page text lands
+/// on the row.
+const REASONS: [&str; 8] = [
+    "form_error",
+    "site_down",
+    "not_eligible",
+    "duplicate",
+    "no_form",
+    "login_required",
+    "closed",
+    "other",
+];
+
+fn reason_code(args: &Value) -> Option<&'static str> {
     let reason = args.get("reason").and_then(Value::as_str)?.trim();
-    let code = !reason.is_empty()
-        && reason.len() <= 64
-        && reason
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
-    code.then(|| reason.to_owned())
+    Some(
+        REASONS
+            .into_iter()
+            .find(|code| *code == reason)
+            .unwrap_or("other"),
+    )
 }
 
 impl Session<'_> {
@@ -378,17 +376,10 @@ impl Session<'_> {
         Ok(())
     }
 
-    async fn item(&self, id: &str) -> Result<Item> {
-        super::view(self.db, &self.run_id)
-            .await?
-            .items
-            .into_iter()
-            .find(|item| item.id == id)
-            .ok_or(Error::NotFound)
-    }
-
     /// Whether an item is active, read from the row each time, so an item another process
-    /// ended is not acted on. A session that starts with one active builds its brief again.
+    /// ended is not acted on. An item a session finds active when it starts was left by an
+    /// earlier session: it ends `session_ended`, as `finish_items` ends it. Its brief is not
+    /// built again, which would stage its files and use its answers a second time.
     async fn current(&mut self) -> Result<bool> {
         let active: Option<String> = sqlx::query_scalar(
             "SELECT id FROM apply_items WHERE apply_run_id = ? AND state = 'active' \
@@ -404,16 +395,9 @@ impl Session<'_> {
         if self.current.as_ref().is_some_and(|c| c.item.id == id) {
             return Ok(true);
         }
-        let item = self.item(&id).await?;
-        let brief = brief::build(self.db, &self.actor, &item, &self.files()).await?;
-        self.current = Some(Current {
-            allowed: brief::allowed_values(&brief),
-            item,
-            brief,
-            last: String::new(),
-            acks: HashSet::new(),
-        });
-        Ok(true)
+        super::end_left(self.db, &id).await?;
+        self.current = None;
+        Ok(false)
     }
 
     async fn set_item(&mut self, state: &str, reason: Option<&str>) -> Result<()> {
@@ -517,13 +501,19 @@ impl Session<'_> {
         {
             return Ok(refusal(VALUE_REFUSED));
         }
-        let choices = choice_fields(name, &args);
+        // The page's role decides, never the type the session declares: every field passes
+        // `field_guard`, and a choice also passes `choice_guard`.
         for (target, value) in guard::fields_in(name, &args) {
             let label = guard::label_of(&last, &target);
-            let checked = match (&label, choices.contains(&target)) {
-                (_, true) => guard::choice_guard(&last, &target, &brief),
-                (Some(label), false) => guard::field_guard(label, &value, &brief),
-                (None, false) => return Ok(refusal("snapshot_first")),
+            let choice = guard::is_choice(&last, &target);
+            let checked = match &label {
+                Some(label) => guard::field_guard(label, &value, &brief),
+                None if choice => Ok(()),
+                None => return Ok(refusal("snapshot_first")),
+            };
+            let checked = match (checked, choice) {
+                (Ok(()), true) => guard::choice_guard(&last, &target, &brief),
+                (checked, _) => checked,
             };
             if let Err(kind) = checked {
                 return self.by_person(kind, &label.unwrap_or_default()).await;
@@ -559,7 +549,14 @@ impl Session<'_> {
             }
         }
 
-        let forwarded = self.forward(name, args).await?;
+        let forwarded = match self.forward(name, args).await {
+            Ok(forwarded) => forwarded,
+            Err(error) => {
+                // The page may have changed: refs from the old one must not be trusted.
+                self.forget_page();
+                return Err(error);
+            }
+        };
         sqlx::query("UPDATE apply_items SET tool_calls = tool_calls + 1 WHERE id = ?")
             .bind(&item_id)
             .execute(&self.db.pool)
@@ -576,6 +573,13 @@ impl Session<'_> {
             _ => forwarded.text,
         };
         Ok(tool_text(&wrap(&text), forwarded.is_error))
+    }
+
+    /// The next targeted call needs a fresh snapshot.
+    fn forget_page(&mut self) {
+        if let Some(current) = self.current.as_mut() {
+            current.last.clear();
+        }
     }
 
     async fn forward(&mut self, name: &str, args: Value) -> Result<ToolReply> {
@@ -631,7 +635,10 @@ impl Session<'_> {
                     page = next;
                     is_snapshot = true;
                 }
-                None => return Ok(Step::Go),
+                None => {
+                    self.forget_page();
+                    return Ok(Step::Go);
+                }
             }
         }
     }
@@ -795,7 +802,7 @@ impl Session<'_> {
             }
             _ => {
                 let state = if clicks > 0 { "uncertain" } else { outcome };
-                self.set_item(state, reason_code(args).as_deref()).await?;
+                self.set_item(state, reason_code(args)).await?;
                 state
             }
         };
@@ -809,7 +816,12 @@ impl Session<'_> {
         let Some(item) = self.current.as_ref().map(|current| current.item.clone()) else {
             return Ok(refusal("call_apply_next_first"));
         };
-        let capture = self.snapshot().await?;
+        // Under the emergency pause no browser call goes out: the click stands as recorded.
+        let paused = pause::ensure_off(self.db).await.is_err();
+        let capture = match paused {
+            true => None,
+            false => self.snapshot().await?,
+        };
         let page = capture.as_deref().unwrap_or("");
         let (text, _) = knowledge::normalize(page);
         let count = text.chars().count();
@@ -819,12 +831,13 @@ impl Session<'_> {
             .collect();
         sqlx::query(concat!(
             "UPDATE apply_items SET state = 'submitted', reason = NULL, confirmation_text = ?, \
-             confirmation_url = ?, captured_at = ",
+             confirmation_url = ?, captured_at = CASE WHEN ? THEN ",
             now!(),
-            " WHERE id = ? AND state = 'active'"
+            " END WHERE id = ? AND state = 'active'"
         ))
-        .bind(&tail)
+        .bind(capture.is_some().then_some(&tail))
         .bind(page_url(page))
+        .bind(capture.is_some())
         .bind(&item.id)
         .execute(&self.db.pool)
         .await?;
@@ -843,6 +856,10 @@ impl Session<'_> {
             detail,
         )
         .await?;
+        if paused {
+            self.current = None;
+            return Err(Error::Paused);
+        }
         let settled = self.settle().await;
         let step = match capture {
             Some(page) => self.watch(page, true, false).await.map(|_| ()),

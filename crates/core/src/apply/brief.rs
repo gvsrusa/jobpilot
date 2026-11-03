@@ -178,11 +178,27 @@ pub fn allowed_values(brief: &Brief) -> Vec<String> {
     values
 }
 
-/// Empties `files`, then copies in this item's resume and letter. A source that is not a
-/// plain file, a link included, is refused. Returns the canonical paths.
+/// Empties `files` and keeps the folder, which is the browser server's working folder, then
+/// copies in this item's resume and letter. An entry that is a link is removed, never followed.
+/// A source that is not a plain file, a link included, is refused. Returns the canonical paths.
 pub fn stage_files(item: &Item, files: &Path) -> Result<Vec<BriefFile>> {
     match std::fs::symlink_metadata(files) {
-        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(files)?,
+        Ok(meta) if meta.is_dir() => {
+            for entry in std::fs::read_dir(files)? {
+                let path = entry?.path();
+                // `symlink_metadata` reads the entry itself: a link to a folder is a link.
+                let kind = std::fs::symlink_metadata(&path)?.file_type();
+                if kind.is_dir() {
+                    std::fs::remove_dir_all(&path)?;
+                } else if let Err(error) = std::fs::remove_file(&path) {
+                    // Windows removes a link to a folder as a folder, which leaves its target.
+                    if !(cfg!(windows) && kind.is_symlink()) {
+                        return Err(error.into());
+                    }
+                    std::fs::remove_dir(&path)?;
+                }
+            }
+        }
         Ok(_) => std::fs::remove_file(files)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),

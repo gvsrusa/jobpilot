@@ -3,6 +3,8 @@
 // appended to. MOCK_EXIT_AFTER=n: exit after the nth reply to a tool call. MOCK_BIG=1: answer
 // browser_snapshot with a line over the cap. MOCK_NOISE=1: before each tool reply, send a
 // notification, a ping, and a stray reply with a string id; an answer to the ping is logged.
+// A MOCK_SNAPSHOT page that starts with "!error" makes browser_snapshot a tool error; one that
+// starts with "!rpcerror" makes every other tool a JSON-RPC error.
 import fs from "node:fs";
 import readline from "node:readline";
 
@@ -45,6 +47,12 @@ lines.on("line", (line) => {
       fs.appendFileSync(process.env.MOCK_CALLS, JSON.stringify({ name, args }) + "\n");
     }
     if (name === "slow") return;
+    const page = process.env.MOCK_SNAPSHOT && fs.existsSync(process.env.MOCK_SNAPSHOT)
+      ? fs.readFileSync(process.env.MOCK_SNAPSHOT, "utf8") : "";
+    if (page.startsWith("!rpcerror") && name !== "browser_snapshot") {
+      send({ jsonrpc: "2.0", id, error: { code: -32000, message: "failed" } });
+      return;
+    }
     let text = "ok " + name;
     if (name === "browser_snapshot" && process.env.MOCK_BIG) {
       text = "x".repeat(9 * 1024 * 1024);
@@ -56,7 +64,7 @@ lines.on("line", (line) => {
       send({ jsonrpc: "2.0", id: "p-1", method: "ping" });
       send({ jsonrpc: "2.0", id: String(id), result: { content: [{ type: "text", text: "stray" }] } });
     }
-    send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text }], isError: name === "fail" } });
+    send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text }], isError: name === "fail" || text.startsWith("!error") } });
     calls += 1;
     if (process.env.MOCK_EXIT_AFTER && calls >= Number(process.env.MOCK_EXIT_AFTER)) {
       process.stdout.write("", () => process.exit(0));

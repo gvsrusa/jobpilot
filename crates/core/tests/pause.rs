@@ -737,7 +737,14 @@ fn every_route_to_a_status_write_passes_the_gate() {
         let mut found: Vec<String> = files
             .iter()
             .filter(|(_, text)| flat(text).contains(needle))
-            .map(|(path, _)| path.file_name().unwrap().to_string_lossy().into_owned())
+            .map(|(path, _)| {
+                // A `mod.rs` is named with its folder, so a move to another module shows.
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                match path.parent().and_then(|p| p.file_name()) {
+                    Some(dir) if name == "mod.rs" => format!("{}/mod.rs", dir.to_string_lossy()),
+                    _ => name,
+                }
+            })
             .collect();
         found.sort();
         found
@@ -752,7 +759,7 @@ fn every_route_to_a_status_write_passes_the_gate() {
     // `apply::settle` (apply/mod.rs), which records an apply run's submissions.
     assert_eq!(
         reaching("agents::set_status("),
-        ["apps.rs", "commands.rs", "mod.rs"]
+        ["apply/mod.rs", "apps.rs", "commands.rs"]
     );
 }
 

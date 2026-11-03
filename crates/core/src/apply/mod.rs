@@ -698,13 +698,37 @@ async fn finish(db: &Db, apply_id: &str) -> Result<bool> {
     Ok(state != "ended")
 }
 
+/// An item an earlier session left `active` ends as `finish_items` would end it, and a pause
+/// still open on it is stopped.
+pub(crate) async fn end_left(db: &Db, item_id: &str) -> Result<()> {
+    let mut tx = db.pool.begin().await?;
+    sqlx::query(
+        "UPDATE apply_items SET reason = 'session_ended', \
+         state = CASE WHEN submit_clicks > 0 THEN 'uncertain' ELSE 'skipped' END \
+         WHERE id = ? AND state IN ('active', 'filled')",
+    )
+    .bind(item_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(concat!(
+        "UPDATE apply_pauses SET resolved_by = 'system', resolution = 'stopped', resolved_at = ",
+        now!(),
+        " WHERE resolved_at IS NULL AND item_id = ?"
+    ))
+    .bind(item_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 const UNCERTAIN_NOTE: &str = "Check the site. JobPilot will not try again.";
 
 /// Writes what the run's results mean for each application, once: a `submitted` item moves
 /// the application to `applied` through the tracking agent, and an `uncertain` one gets a
-/// note. `status_written` marks either as done. Returns how many it wrote. While the
-/// emergency pause is on it stops at the first status write with `Err(Paused)`, and a later
-/// call finishes the rest.
+/// note. `status_written` marks either as done. Returns how many it wrote. It stops only on
+/// the emergency pause (`Err(Paused)`) or a database error; an item that fails otherwise stays
+/// unwritten and the rest go on. A later call finishes what is left.
 pub async fn settle(db: &Db, actor: &str, apply_id: &str) -> Result<usize> {
     let run = view(db, apply_id).await?;
     let mut settled = 0;
@@ -715,7 +739,7 @@ pub async fn settle(db: &Db, actor: &str, apply_id: &str) -> Result<usize> {
         if item.status_written {
             continue;
         }
-        match item.state.as_str() {
+        let written = match item.state.as_str() {
             "submitted" => {
                 let said: String = item
                     .confirmation_text
@@ -726,13 +750,21 @@ pub async fn settle(db: &Db, actor: &str, apply_id: &str) -> Result<usize> {
                     .collect();
                 let note = format!("Applied by Claude Code run {apply_id}. The page said: {said}");
                 let cancel = CancellationToken::new();
-                agents::set_status(db, actor, application, "applied", None, &note, cancel).await?;
+                agents::set_status(db, actor, application, "applied", None, &note, cancel)
+                    .await
+                    .map(|_| ())
             }
             "uncertain" => {
                 pause::ensure_off(db).await?;
-                applications::add_note(db, actor, application, UNCERTAIN_NOTE).await?
+                applications::add_note(db, actor, application, UNCERTAIN_NOTE).await
             }
             _ => continue,
+        };
+        match written {
+            Ok(()) => {}
+            error @ Err(Error::Paused | Error::Db(_)) => return error.map(|()| settled),
+            // This one stays unwritten for a later settle; the rest go on.
+            Err(_) => continue,
         }
         sqlx::query("UPDATE apply_items SET status_written = 1 WHERE id = ?")
             .bind(&item.id)
