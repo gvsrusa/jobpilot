@@ -90,7 +90,17 @@ const KEYS: [&str; 3] = ["Tab", "Shift+Tab", "Escape"];
 const FLAGS: [&str; 8] = [
     "checked", "selected", "expanded", "pressed", "disabled", "active", "focused", "cursor",
 ];
-const DIALOG_ROLES: [&str; 2] = ["dialog", "alertdialog"];
+/// A form control inside a `dialog` makes it a form, such as a quick-apply modal, and not a stop.
+const FORM_CONTROLS: [&str; 8] = [
+    "textbox",
+    "combobox",
+    "listbox",
+    "checkbox",
+    "radio",
+    "spinbutton",
+    "slider",
+    "searchbox",
+];
 const SUBMIT_WORDS: [&str; 3] = ["submit", "send application", "finish application"];
 const EXCERPT: usize = 300;
 const LONG_VALUE: usize = 2000;
@@ -192,8 +202,8 @@ fn matched(kind: PauseKind, folded: &str) -> Option<usize> {
             }
         }
         PauseKind::Legal => first_of(folded, &LEGAL),
-        PauseKind::Other => DIALOG_ROLES.contains(&role.as_str()).then_some(0),
-        PauseKind::Sensitive => None,
+        // Read by `dialog_stop`, which sees the dialog's subtree.
+        PauseKind::Other | PauseKind::Sensitive => None,
     }
 }
 
@@ -211,8 +221,12 @@ const SCAN_ORDER: [PauseKind; 6] = [
 pub fn scan(snapshot: &str, acknowledged: &HashSet<String>) -> Option<Hit> {
     let lines: Vec<String> = snapshot.lines().map(clean).collect();
     for kind in SCAN_ORDER {
-        for folded in &lines {
-            let Some(at) = matched(kind, folded) else {
+        for (index, folded) in lines.iter().enumerate() {
+            let found = match kind {
+                PauseKind::Other => dialog_stop(&lines, index),
+                _ => matched(kind, folded),
+            };
+            let Some(at) = found else {
                 continue;
             };
             let line: String = folded[at..].chars().take(EXCERPT).collect();
@@ -224,6 +238,27 @@ pub fn scan(snapshot: &str, acknowledged: &HashSet<String>) -> Option<Hit> {
         }
     }
     None
+}
+
+/// An `alertdialog` always stops. A `dialog` stops unless its subtree holds a form control:
+/// a quick-apply modal is the form the owner's run fills. Every other stop is still found on
+/// its own line inside it.
+// ponytail: a page can wrap any text in a dialog with one textbox to skip this stop; the
+// other scans still run on every line inside it (Task 13 threat model).
+fn dialog_stop(lines: &[String], index: usize) -> Option<usize> {
+    let (role, _) = parts(&lines[index]);
+    match role.as_str() {
+        "alertdialog" => Some(0),
+        "dialog" => {
+            let depth = indent_of(&lines[index]);
+            let holds_form = lines[index + 1..]
+                .iter()
+                .take_while(|line| line.trim().is_empty() || indent_of(line) > depth)
+                .any(|line| FORM_CONTROLS.contains(&parts(line).0.as_str()));
+            (!holds_form).then_some(0)
+        }
+        _ => None,
+    }
 }
 
 /// The line without its state flags, so a ticked box keeps the key it had.

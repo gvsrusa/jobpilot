@@ -50,9 +50,19 @@ jobs:
 
       # Apply mode against the real pinned Playwright server and a visible Chromium, on the
       # local fixture forms served on 127.0.0.1. The runtime goes under a temporary root.
+      # Chromium, kept between runs. Setup still runs `npm ci`; the install skips a browser
+      # already in place.
+      - name: Browser cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/jobpilot-e2e/browser-runtime/browsers
+          key: pw-${{ runner.os }}-${{ hashFiles('crates/core/assets/browser-runtime/package-lock.json') }}
+
       - name: Browser end to end
         timeout-minutes: 15
         shell: bash
+        env:
+          JOBPILOT_SECRET_SERVICE: jobpilot-test
         run: |
           home="$RUNNER_TEMP/jobpilot-e2e"
           mkdir -p "$home"

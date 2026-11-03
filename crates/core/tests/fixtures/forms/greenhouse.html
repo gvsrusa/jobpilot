@@ -17,16 +17,29 @@
 <section id="application" hidden>
 <h2>Apply for Platform Engineer</h2>
 <form action="/form" method="post" enctype="multipart/form-data">
-<p><label for="name">Full name</label><br><input id="name" name="name" type="text" autocomplete="off"></p>
-<p><label for="email">Email</label><br><input id="email" name="email" type="email" autocomplete="off"></p>
+<p><label for="first">First name *</label><br><input id="first" name="first_name" type="text" autocomplete="off"></p>
+<p><label for="last">Last name *</label><br><input id="last" name="last_name" type="text" autocomplete="off"></p>
+<p><label for="email">Email *</label><br><input id="email" name="email" type="email" autocomplete="off"></p>
 <p><label for="why">Why this role?</label><br><textarea id="why" name="why" rows="3"></textarea></p>
-<p><label for="resume">Resume</label><br><input id="resume" name="resume" type="file"></p>
-<p><label for="letter">Cover letter</label><br><input id="letter" name="letter" type="file"></p>
-<p><button type="submit">Submit app</button></p>
+<div role="group" aria-labelledby="resume-label">
+<p id="resume-label">Resume/CV *</p>
+<button type="button" data-for="resume">Attach</button>
+<input id="resume" name="resume" type="file" hidden>
+</div>
+<div role="group" aria-labelledby="letter-label">
+<p id="letter-label">Cover letter</p>
+<button type="button" data-for="letter">Attach</button>
+<input id="letter" name="letter" type="file" hidden>
+</div>
+<p><button type="submit">Submit application</button></p>
 </form>
 </section>
 </main>
 <script>
+// Each Attach button opens the hidden file input it stands for.
+for (const button of document.querySelectorAll("button[data-for]")) {
+  button.addEventListener("click", () => document.getElementById(button.dataset.for).click());
+}
 document.getElementById("apply").addEventListener("click", () => {
   document.getElementById("landing").hidden = true;
   document.getElementById("application").hidden = false;

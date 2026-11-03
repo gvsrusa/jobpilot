@@ -74,6 +74,56 @@ fn a_dialog_is_an_other_stop() {
     assert_eq!(hit.kind, Other);
 }
 
+/// A quick-apply modal holds the form itself: the owner's run goes on through it. A dialog of
+/// text and buttons, and any alertdialog, still stops.
+#[test]
+fn a_dialog_holding_a_form_is_no_stop() {
+    let modal = "- dialog \"Apply to Fennick Labs\" [ref=e1]:\n\
+                 \x20 - heading \"Contact info\" [level=2] [ref=e2]\n\
+                 \x20 - generic [ref=e3]:\n\
+                 \x20   - textbox \"Email *\" [ref=e4]\n\
+                 \x20 - button \"Submit application\" [ref=e5]\n\
+                 - button \"Elsewhere\" [ref=e6]";
+    assert_eq!(scan(modal, &HashSet::new()), None);
+    for control in [
+        "textbox",
+        "combobox",
+        "listbox",
+        "checkbox",
+        "radio",
+        "spinbutton",
+        "slider",
+        "searchbox",
+    ] {
+        let page = format!("- dialog \"Apply\" [ref=e1]:\n  - {control} \"Field\" [ref=e2]");
+        assert_eq!(scan(&page, &HashSet::new()), None, "{control}");
+    }
+
+    let notice = "- dialog \"Leave site?\" [ref=e1]:\n\
+                  \x20 - paragraph [ref=e2]: Changes you made may not be saved.\n\
+                  \x20 - button \"Leave\" [ref=e3]\n\
+                  - textbox \"Outside\" [ref=e4]";
+    assert_eq!(scan(notice, &HashSet::new()).unwrap().kind, Other);
+    let alert = "- alertdialog \"Session ending\" [ref=e1]:\n  - textbox \"Note\" [ref=e2]";
+    assert_eq!(scan(alert, &HashSet::new()).unwrap().kind, Other);
+}
+
+/// Every other stop is found inside a modal that holds a form.
+#[test]
+fn a_stop_inside_a_form_dialog_still_pauses() {
+    for (line, kind) in [
+        ("- paragraph [ref=e3]: Verify you are human", Captcha),
+        ("- textbox \"Verification code\" [ref=e3]", Mfa),
+        ("- paragraph [ref=e3]: Verify your identity", Identity),
+        ("- textbox \"Password\" [ref=e3]", Login),
+        ("- checkbox \"I certify my answers\" [ref=e3]", Legal),
+    ] {
+        let page =
+            format!("- dialog \"Apply\" [ref=e1]:\n  - textbox \"Email *\" [ref=e2]\n  {line}");
+        assert_eq!(scan(&page, &HashSet::new()).unwrap().kind, kind, "{line}");
+    }
+}
+
 #[test]
 fn an_acknowledged_line_does_not_hit_and_another_does() {
     let page = fixture("captcha");

@@ -44,6 +44,10 @@ const EMAIL: &str = "ada@example.com";
 const WHY: &str = "I enjoy building reliable tools for small teams.";
 /// What the done page says, after a form posts.
 const RECEIVED: &str = "Your application was received.";
+/// Every form's send button.
+const SUBMIT: &str = "Submit application";
+/// The legal fixture's declaration, a checkbox.
+const CERTIFY: &str = "I certify that my answers are true and complete.";
 /// A real browser is slow to start, and a run of eight forms takes a while.
 const WAIT: Duration = Duration::from_secs(300);
 /// The emergency pause's bound, from the flag to every process gone.
@@ -435,6 +439,28 @@ async fn item(db: &Db, run: &str, position: usize) -> apply::Item {
     apply::view(db, run).await.unwrap().items.remove(position)
 }
 
+/// The host's agent run, by the link on the apply run.
+async fn agent_state(db: &Db, run: &str) -> (String, Option<String>) {
+    sqlx::query_as(
+        "SELECT a.state, a.reason FROM agent_runs a JOIN apply_runs r ON r.agent_run_id = a.id \
+         WHERE r.id = ?",
+    )
+    .bind(run)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap()
+}
+
+/// Why a run folder may still be there: the cleanup's own audit rows, for a failure message.
+async fn cleanup_note(db: &Db) -> String {
+    let rows: Vec<String> =
+        sqlx::query_scalar("SELECT detail FROM audit_log WHERE action = 'cleanup_failed'")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    format!("cleanup_failed rows: {rows:?}")
+}
+
 /// Every live process whose arguments name `dir`, with those arguments.
 fn processes_in(dir: &Path) -> Vec<(u32, Vec<String>)> {
     #[cfg(windows)]
@@ -542,17 +568,42 @@ fn uploads() -> Vec<Value> {
     ]
 }
 
+/// The `greenhouse` shape: a split name, starred labels, and each file behind an `Attach`
+/// button that opens a hidden input.
+fn split_form() -> Vec<Value> {
+    vec![
+        type_into("First name *", "Ada"),
+        type_into("Last name *", "Lovelace"),
+        type_into("Email *", EMAIL),
+        type_into("Why this role?", WHY),
+        click("Attach#1"),
+        call(
+            "browser_file_upload",
+            json!({"paths": ["@brief:files.0.path"]}),
+        ),
+        click("Attach#2"),
+        call(
+            "browser_file_upload",
+            json!({"paths": ["@brief:files.1.path"]}),
+        ),
+    ]
+}
+
 /// The whole form of `page`, as each fixture lays it out.
 fn fill(page: &str) -> Vec<Value> {
+    if page == "greenhouse" {
+        return split_form();
+    }
     let mut steps = text_fields();
     if page == "two_pages" {
         steps.push(click("Continue"));
     }
     if page == "workday" {
-        steps.push(call(
-            "browser_select_option",
-            json!({"target": "@ref:Preferred office", "values": ["Porto"]}),
-        ));
+        // A button that opens a listbox, then the option.
+        steps.extend([click("Preferred office"), click("Porto")]);
+    }
+    if page == "legal" {
+        steps.push(click(CERTIFY));
     }
     steps.extend(uploads());
     steps
@@ -560,7 +611,7 @@ fn fill(page: &str) -> Vec<Value> {
 
 fn submit() -> Vec<Value> {
     vec![
-        click("Submit app"),
+        click(SUBMIT),
         call("apply_result", json!({"outcome": "submitted"})),
     ]
 }
@@ -599,7 +650,13 @@ async fn cancelled(w: &World, run: &str, task: JoinHandle<jobpilot_core::Result<
     apply::cancel(&w.other().await, "cli", run).await.unwrap();
     let result = ended(task).await;
     assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
-    assert!(!apply::run_dir(&w.db, run).exists());
+    let dir = apply::run_dir(&w.db, run);
+    assert!(
+        !dir.exists(),
+        "{}: {}",
+        dir.display(),
+        cleanup_note(&w.db).await
+    );
 }
 
 // ---- Tests ----
@@ -648,13 +705,16 @@ async fn browser_e2e_fills_uploads_and_submits_on_each_fixture() {
         if *page == "workday" {
             assert!(body.contains(&field("office", "opo")), "{page}");
         }
-        for value in [
-            field("name", NAME),
+        let names = match *page {
+            "greenhouse" => vec![field("first_name", "Ada"), field("last_name", "Lovelace")],
+            _ => vec![field("name", NAME)],
+        };
+        for value in names.into_iter().chain([
             field("email", EMAIL),
             field("why", WHY),
             "name=\"resume\"; filename=\"resume.pdf\"".into(),
             "name=\"letter\"; filename=\"cover-letter.pdf\"".into(),
-        ] {
+        ]) {
             let head: String = body.chars().take(600).collect();
             assert!(
                 body.contains(&value),
@@ -690,21 +750,24 @@ async fn browser_e2e_each_stop_holds_until_a_person_continues() {
         assert!(active_pause(&w.db, &run).await.is_some(), "{kind}");
         resume(&w, &pause).await;
 
-        // A stop on two lines of one page asks for each, and nothing goes on meanwhile.
+        // A stop on two lines of one page asks for each, and the legal checkbox asks again
+        // when clicked. Nothing posts until the last is answered.
+        let mut origins = vec![pause.origin.clone()];
         let begun = Instant::now();
-        while s.answered("browser_navigate") == position {
+        while w.site.bodies("/form").len() == position {
             if let Some(again) = active_pause(&w.db, &run).await {
-                assert_eq!(again.kind, *kind);
+                assert_eq!(again.kind, *kind, "{}", again.excerpt);
                 assert_eq!(w.site.bodies("/form").len(), position, "{kind}");
+                origins.push(again.origin.clone());
                 resume(&w, &again).await;
             }
-            assert!(begun.elapsed() < WAIT, "{kind}: the page after Continue");
+            assert!(begun.elapsed() < WAIT, "{kind}: the form after Continue");
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        until(&w, &run, &s, kind, async || {
-            w.site.bodies("/form").len() == position + 1
-        })
-        .await;
+        if *kind == "legal" {
+            // The page's line, then the click on the declaration itself.
+            assert!(origins.contains(&"guard".to_owned()), "{origins:?}");
+        }
     }
 
     let view = ended(task).await.unwrap();
@@ -719,10 +782,63 @@ async fn browser_e2e_each_stop_holds_until_a_person_continues() {
     }
 }
 
+/// The stop shows only after `Apply now`, so the click's reply is held, not the page's. (The
+/// fixture's name holds no stop word: the page's address is scanned too.) A
+/// call the session sends meanwhile gets no answer and does nothing until a person is done.
+#[tokio::test]
+#[ignore]
+async fn browser_e2e_a_stop_after_a_click_holds_every_later_call() {
+    let w = world().await;
+    let (run, _) = run_of(&w, &["after_click"]).await;
+    let mut steps = vec![
+        call("apply_next", json!({})),
+        call("browser_navigate", json!({"url": "@brief:link"})),
+        call("browser_snapshot", json!({})),
+        json!({"tool": "browser_click", "args": {"target": "@ref:Apply now"}, "nowait": true}),
+    ];
+    // Sent while the click is held: its snapshot, then the typing.
+    steps.extend(fill("after_click"));
+    steps.extend(submit());
+    steps.extend(finish());
+    let s = script(&w, steps).await;
+    let task = host(&w, &run, &s);
+
+    let pause = next_pause(&w, &run, &s).await;
+    assert_eq!(
+        (pause.kind.as_str(), pause.origin.as_str()),
+        ("captcha", "page")
+    );
+    // The page itself opened without a stop.
+    let opened = s.written();
+    assert_eq!(opened[1].0, "browser_navigate");
+    assert!(!opened[1].2, "{opened:?}");
+    let seen = s.replies().len();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        s.replies().len(),
+        seen,
+        "a call was answered during the hold"
+    );
+    assert!(w.site.bodies("/form").is_empty());
+    assert!(active_pause(&w.db, &run).await.is_some());
+    resume(&w, &pause).await;
+
+    until(&w, &run, &s, "the run ends", async || task.is_finished()).await;
+    ended(task).await.unwrap();
+    assert_eq!(w.site.bodies("/form").len(), 1);
+    let done = item(&w.db, &run, 0).await;
+    assert_eq!(done.state, "submitted");
+    assert_eq!(done.submit_clicks, 1);
+    for (tool, text, error) in s.written() {
+        assert!(!error, "{tool}: {text}");
+    }
+}
+
 #[tokio::test]
 #[ignore]
 async fn browser_e2e_a_hostile_page_changes_nothing() {
     const CLAIM: &str = "Licensed attorney with twenty years of practice.";
+    const HIDDEN: &str = "SYSTEM NOTE";
     let w = world().await;
     let (run, _) = run_of(&w, &["injection"]).await;
     let stray = fixtures().join("injection.html").display().to_string();
@@ -773,6 +889,22 @@ async fn browser_e2e_a_hostile_page_changes_nothing() {
     files.sort_unstable();
     assert_eq!(files, ["cover-letter.pdf", "resume.pdf"]);
     assert!(w.site.paths().iter().all(|path| !path.contains("steal")));
+    // The hidden instruction never reached the session, its record, or a log row.
+    for file in ["replies.jsonl", "record.jsonl"] {
+        let text = std::fs::read_to_string(s.dir.path().join(file)).unwrap_or_default();
+        assert!(!text.contains(HIDDEN), "{file}");
+    }
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT detail FROM audit_log UNION ALL SELECT outcome FROM agent_run_log \
+         UNION ALL SELECT excerpt FROM apply_pauses",
+    )
+    .fetch_all(&w.db.pool)
+    .await
+    .unwrap();
+    assert!(rows.iter().all(|row| !row.contains(HIDDEN)));
+    // The visible one was seen, as page data inside the markers.
+    let replies = std::fs::read_to_string(s.dir.path().join("replies.jsonl")).unwrap();
+    assert!(replies.contains("Message for the assistant"));
     let done = item(&w.db, &run, 0).await;
     assert_eq!(done.state, "submitted");
     assert_eq!(done.submit_clicks, 1);
@@ -780,7 +912,7 @@ async fn browser_e2e_a_hostile_page_changes_nothing() {
 
 #[tokio::test]
 #[ignore]
-async fn browser_e2e_a_fake_success_msg_is_recorded_as_the_pages_claim() {
+async fn browser_e2e_a_fake_success_message_is_recorded_as_the_pages_claim() {
     let w = world().await;
     let (run, apps) = run_of(&w, &["fake_success"]).await;
     let s = script(&w, applying(&["fake_success"])).await;
@@ -813,7 +945,7 @@ async fn browser_e2e_a_rejected_submit_pauses_before_the_second_click() {
     let (run, _) = run_of(&w, &["reject_once"]).await;
     let mut steps = open("reject_once");
     steps.extend(fill("reject_once"));
-    steps.extend([click("Submit app"), click("Submit app")]);
+    steps.extend([click(SUBMIT), click(SUBMIT)]);
     steps.push(call("apply_result", json!({"outcome": "submitted"})));
     steps.extend(finish());
     let s = script(&w, steps).await;
@@ -866,10 +998,28 @@ async fn browser_e2e_emergency_pause_closes_the_browser_and_deletes_the_profile(
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // Every process that names the run folder, including any the browser started on its
+    // way out, is gone within the bound.
+    while !processes_in(&dir).is_empty() {
+        assert!(
+            begun.elapsed() <= KILL,
+            "still running: {:?}",
+            processes_in(&dir)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let result = ended(task).await;
     assert!(matches!(result, Err(Error::Paused)), "{result:?}");
-    assert!(!dir.exists(), "{}", dir.display());
-    assert!(processes_in(&dir).is_empty());
+    assert_eq!(
+        agent_state(&w.db, &run).await,
+        ("halted".to_owned(), Some("paused".to_owned()))
+    );
+    assert!(
+        !dir.exists(),
+        "{}: {}",
+        dir.display(),
+        cleanup_note(&w.db).await
+    );
     drop(s);
     pause::clear(&other, "cli").await.unwrap();
 }
@@ -912,7 +1062,11 @@ async fn browser_e2e_browser_is_visible_and_the_profile_is_the_runs() {
     let profile = dir.join("profile");
     let browsers = browsers(&dir);
     assert!(!browsers.is_empty());
-    let wanted = format!("--user-data-dir={}", profile.display());
+    #[cfg(windows)]
+    let fold = jobpilot_core::browser::sweep::windows_fold;
+    #[cfg(not(windows))]
+    let fold = |text: &str| text.to_owned();
+    let wanted = fold(&format!("--user-data-dir={}", profile.display()));
     for args in &browsers {
         assert!(
             args.iter().all(|arg| !arg.starts_with("--headless")),
@@ -921,7 +1075,7 @@ async fn browser_e2e_browser_is_visible_and_the_profile_is_the_runs() {
         assert!(
             args.iter()
                 .filter(|arg| arg.starts_with("--user-data-dir="))
-                .all(|arg| *arg == wanted),
+                .all(|arg| fold(arg) == wanted),
             "{args:?}"
         );
     }
@@ -929,7 +1083,7 @@ async fn browser_e2e_browser_is_visible_and_the_profile_is_the_runs() {
     let entries = std::fs::read_dir(&profile).unwrap().count();
     assert!(entries > 0, "{}", profile.display());
     cancelled(&w, &run, task).await;
-    assert!(!profile.exists());
+    assert!(!profile.exists(), "{}", cleanup_note(&w.db).await);
 }
 
 /// For Task 14 only: serves the fixture forms on 127.0.0.1 until killed, printing the port.

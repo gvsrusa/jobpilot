@@ -12,7 +12,7 @@
 //                    step it idles, as an interactive session does, until it is killed. SIGTERM
 //                    and SIGHUP are ignored.
 //                    In a step's args, the string "@ref:<name>" is the ref of the element named
-//                    exactly <name> among the controls on a browser_snapshot taken just before the step (its reply
+//                    exactly <name> (or "<name>#<n>", the n-th) among the controls on a browser_snapshot taken just before the step (its reply
 //                    is recorded with "auto": true), and
 //                    "@brief:<a.b.0>" is that field of the last apply_next reply. Real pages
 //                    give refs only at run time; a name that matches nothing stays as written.
@@ -99,7 +99,11 @@ let brief = null;
 // Only a control is a target, as a model would choose: a table cell can carry its label's name.
 const CONTROLS = ["textbox", "searchbox", "combobox", "button", "link", "checkbox", "radio", "option", "switch", "tab", "spinbutton", "slider"];
 
-function refOf(name) {
+// "<name>#<n>" is the n-th control of that name, counted from 1.
+function refOf(wanted) {
+  const nth = wanted.match(/^(.*)#(\d+)$/);
+  const name = nth ? nth[1] : wanted;
+  let skip = nth ? Number(nth[2]) - 1 : 0;
   for (const line of snapshot.split("\n")) {
     const found = line.match(/^\s*- ([\w-]+) "((?:[^"\\]|\\.)*)".*\[ref=([^\]]+)\]/);
     if (!found || !CONTROLS.includes(found[1])) continue;
@@ -109,7 +113,7 @@ function refOf(name) {
     } catch {
       continue;
     }
-    if (seen === name) return found[3];
+    if (seen === name && skip-- === 0) return found[3];
   }
   return undefined;
 }

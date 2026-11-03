@@ -238,6 +238,81 @@ fn sweep_kills_a_process_that_ignores_sigterm() {
     let _ = other.wait();
 }
 
+/// Chromium can start a helper on its way out, after a sweep has read the process table: the
+/// sweep looks again until a pass finds nothing new. Here an unmarked watcher stands in for
+/// Chromium: it starts a marked process when its marked child dies. The marker reaches it
+/// through the environment, so the watcher itself is not swept.
+#[test]
+fn sweep_kills_a_process_started_by_one_it_killed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run = tmp.path().join("run-sweep-late-c7d8e9");
+    let marker = run.display().to_string();
+    let script = r#"
+        const { spawn } = require("node:child_process");
+        const marker = process.env.SWEEP_MARKER;
+        const keep = "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);";
+        const first = spawn(process.execPath, ["-e", keep, marker], { stdio: "ignore" });
+        first.on("spawn", () => console.log("ready"));
+        first.on("exit", () => {
+          const late = spawn(process.execPath, ["-e", keep, marker], {
+            stdio: "ignore",
+            detached: true,
+          });
+          late.unref();
+          console.log("late " + late.pid);
+        });
+    "#;
+    let mut watcher = Command::new(node())
+        .arg("-e")
+        .arg(script)
+        .env("SWEEP_MARKER", &marker)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(watcher.stdout.take().unwrap()).lines();
+    assert_eq!(lines.next().unwrap().unwrap(), "ready");
+    // The child's command line is in place once node has started it.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let killed = kill_marked(&run);
+    let late: u32 = lines
+        .next()
+        .unwrap()
+        .unwrap()
+        .strip_prefix("late ")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let begun = Instant::now();
+    let mut alive = still_running(late);
+    while alive && begun.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(50));
+        alive = still_running(late);
+    }
+    if alive {
+        // Only the process this test started.
+        let mut system = sysinfo::System::new().unwrap();
+        let pid = sysinfo::Pid::from_u32(late);
+        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+        if let Some(process) = system.process(pid) {
+            process.kill();
+        }
+    }
+    let _ = watcher.wait();
+    assert!(!alive, "the late process outlived the sweep");
+    assert_eq!(killed, 2);
+}
+
+fn still_running(pid: u32) -> bool {
+    use sysinfo::{Pid, ProcessStatus, ProcessesToUpdate, System};
+    let mut system = System::new().unwrap();
+    let pid = Pid::from_u32(pid);
+    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+    system
+        .process(pid)
+        .is_some_and(|process| process.status() != ProcessStatus::Zombie)
+}
+
 #[test]
 fn sweep_never_kills_its_caller() {
     let tmp = tempfile::tempdir().unwrap();

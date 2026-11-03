@@ -254,7 +254,14 @@ pub async fn setup_by(
     let env = env_with_browsers(&runtime.browsers, Some(&node_dir));
     let install = ["ci", "--ignore-scripts"].map(OsString::from);
     run(&npm, &install, &env, &dir, &cancel, "npm_ci_failed").await?;
-    let chromium = ["node_modules/playwright/cli.js", "install", "chromium"].map(OsString::from);
+    // The browser runs headed, so the headless shell is never needed.
+    let chromium = [
+        "node_modules/playwright/cli.js",
+        "install",
+        "--no-shell",
+        "chromium",
+    ]
+    .map(OsString::from);
     run(&node, &chromium, &env, &dir, &cancel, "chromium_failed").await?;
 
     audit::record(

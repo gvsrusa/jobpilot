@@ -1,5 +1,5 @@
 //! The pinned Playwright MCP runtime. No test downloads a browser or starts a server: the
-//! node lookup reads a fake environment, and `setup` is only called where it refuses.
+//! node lookup reads a fake environment, and `setup` runs only a fake node and npm.
 
 use std::ffi::OsString;
 use std::fs;
@@ -41,6 +41,47 @@ fn fake_node(dir: &std::path::Path, version: &str) -> PathBuf {
 fn fake_node(dir: &std::path::Path, version: &str) -> PathBuf {
     let node = dir.join("node.cmd");
     fs::write(&node, format!("@echo off\r\necho {version}\r\n")).unwrap();
+    node
+}
+
+/// A node that answers `--version` and records any other call, with an npm beside it that
+/// does nothing, so `setup` runs through without a download.
+#[cfg(unix)]
+fn recording_node(dir: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let node = dir.join("node");
+    let calls = dir.join("calls.txt");
+    fs::write(
+        &node,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo v24.1.0; exit 0; fi\n\
+             echo \"$*\" >> '{}'\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    let npm = dir.join("npm");
+    fs::write(&npm, "#!/bin/sh\nexit 0\n").unwrap();
+    for program in [&node, &npm] {
+        fs::set_permissions(program, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    node
+}
+
+#[cfg(windows)]
+fn recording_node(dir: &std::path::Path) -> PathBuf {
+    let node = dir.join("node.cmd");
+    let calls = dir.join("calls.txt");
+    fs::write(
+        &node,
+        format!(
+            "@echo off\r\nif \"%1\"==\"--version\" (echo v24.1.0& exit /b 0)\r\n\
+             echo %*>> \"{}\"\r\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    fs::write(dir.join("npm.cmd"), "@echo off\r\nexit /b 0\r\n").unwrap();
     node
 }
 
@@ -228,6 +269,23 @@ async fn the_debug_cli_reads_ready_with_no_install() {
         state_by(&db, &none).await.unwrap(),
         RuntimeState::NoNode
     ));
+    db.close().await;
+}
+
+/// The run is headed, so the headless shell Playwright would add is never fetched.
+#[tokio::test]
+async fn setup_installs_chromium_without_the_headless_shell() {
+    let (tmp, _paths, db) = open().await;
+    let node = recording_node(tmp.path());
+    let env = env_of(vec![("JOBPILOT_NODE_BIN", node.into())]);
+    setup_by(&db, "cli", CancellationToken::new(), &env)
+        .await
+        .unwrap();
+    let calls = fs::read_to_string(tmp.path().join("calls.txt")).unwrap();
+    assert_eq!(
+        calls.trim(),
+        "node_modules/playwright/cli.js install --no-shell chromium"
+    );
     db.close().await;
 }
 
