@@ -1,0 +1,4 @@
+- generic [ref=e1]:
+  - heading "Almost done" [level=1] [ref=e2]
+  - paragraph [ref=e3]: We need to verify your identity before we continue.
+  - button "Upload photo ID" [ref=e4]

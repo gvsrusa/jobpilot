@@ -159,14 +159,19 @@ fn no_source_holds_a_bypass() {
         for word in banned {
             // `.no_proxy()` is the opposite of `proxy(`: it is the rule being kept.
             let hit = code.replace("no_proxy(", "").contains(word);
-            // The app has a CAPTCHA pause state in 0.6 only as a stop for a person: a word in
-            // an identifier or a string that says "stop" is still a name for it.
-            if hit {
+            // The apply guard names the CAPTCHA page as a stop for a person. Only that word.
+            let stop_word = word == "captcha" && path.ends_with("crates/core/src/apply/guard.rs");
+            if hit && !stop_word {
                 hits.push(format!("{path}: {word}"));
             }
         }
     }
     assert!(hits.is_empty(), "{hits:#?}");
+    let guard = every_src_file()
+        .into_iter()
+        .find(|(path, _)| path.ends_with("crates/core/src/apply/guard.rs"))
+        .expect("guard.rs exists");
+    assert!(!code(&guard.1).to_lowercase().contains("solver"));
 }
 
 /// The text between `hosts: &[` and the closing `]` of each declaration.

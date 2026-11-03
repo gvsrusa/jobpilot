@@ -3,6 +3,7 @@
 //! No row written here holds an answer's text.
 
 pub mod brief;
+pub mod guard;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

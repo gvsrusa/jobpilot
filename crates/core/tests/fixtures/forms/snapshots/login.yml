@@ -1,0 +1,5 @@
+- generic [ref=e1]:
+  - heading "Welcome back" [level=1] [ref=e2]
+  - textbox "Email" [ref=e3]
+  - textbox "Password" [ref=e4]
+  - button "Log in" [ref=e5]
