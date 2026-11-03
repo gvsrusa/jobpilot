@@ -1105,6 +1105,46 @@ async fn the_pause_flag_stops_the_next_call_and_ends_serve() {
     ended.unwrap().unwrap();
 }
 
+/// A session whose host is gone: its agent run is changed by `change` (bound to its id), from another handle,
+/// mid-item. The next browser call is refused as cancelled and `serve` ends.
+async fn a_gone_host_stops_the_next_call(change: &'static str) {
+    let w = world().await;
+    let (run, _) = run_of(&w, &["Acme"]).await;
+    let agent_run = host_run(&w.db, &run).await;
+    let m = mock(&w, &fixture("form.yml"), None);
+    let mut s = open(&w, &run, &m, None).await;
+    s.brief().await;
+    sqlx::query(change)
+        .bind(&agent_run)
+        .execute(&w.db.pool)
+        .await
+        .unwrap();
+    let (text, error) = s.call("browser_snapshot", json!({})).await;
+    assert!(error && text.contains("cancelled"), "{text}");
+    assert!(m.calls().is_empty());
+    let ended = tokio::time::timeout(WAIT, s.task)
+        .await
+        .expect("serve ends");
+    ended.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_halted_host_stops_the_next_call_and_ends_serve() {
+    a_gone_host_stops_the_next_call(
+        "UPDATE agent_runs SET state = 'halted', reason = 'interrupted' WHERE id = ?",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_stale_host_heartbeat_stops_the_next_call_and_ends_serve() {
+    a_gone_host_stops_the_next_call(
+        "UPDATE agent_runs SET heartbeat_at = \
+         strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-60 seconds') WHERE id = ?",
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn finish_items_ends_the_run_row_and_can_run_twice() {
     let w = world().await;

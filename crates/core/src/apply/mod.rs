@@ -1215,12 +1215,19 @@ async fn stop(db: &Db, pause_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// The run has ended, or a person asked its agent run to stop.
+/// The run has ended, a person asked its agent run to stop, or its host is gone: the agent
+/// run is no longer active (halted or ended), or its heartbeat is older than the runner's
+/// `STALE`. A session that outlives its host so refuses its next call and ends.
 pub(crate) async fn run_cancelled(db: &Db, run_id: &str) -> Result<bool> {
+    let stale = format!("-{:.3} seconds", runner::STALE.as_secs_f64());
     let stopped: Option<bool> = sqlx::query_scalar(
         "SELECT r.state = 'ended' OR coalesce(a.cancel_requested, 0) = 1 \
+           OR (a.id IS NOT NULL AND (a.state NOT IN \
+             ('queued','checking','running','checkpointed','retrying','waiting_for_human') \
+             OR a.heartbeat_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?))) \
          FROM apply_runs r LEFT JOIN agent_runs a ON a.id = r.agent_run_id WHERE r.id = ?",
     )
+    .bind(&stale)
     .bind(run_id)
     .fetch_optional(&db.pool)
     .await?;
