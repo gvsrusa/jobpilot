@@ -10,6 +10,7 @@ use crate::error::{Error, Result};
 use crate::runner::{self, Finished, RunInput, RunState, Workflow, store};
 
 pub mod analytics;
+pub mod claude_apply;
 pub mod discovery;
 pub mod draft;
 pub mod matching;
@@ -19,6 +20,9 @@ pub mod tracking;
 
 use crate::analytics::Report;
 use analytics::Analytics;
+#[doc(hidden)]
+pub use claude_apply::claude_apply_with;
+pub use claude_apply::{ClaudeApply, claude_apply};
 use discovery::DiscoveryWorkflow;
 pub use discovery::{DiscoveryReport, SourceResult, discover, discover_with};
 use draft::DraftWorkflow;

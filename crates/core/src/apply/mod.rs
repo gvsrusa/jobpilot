@@ -5,6 +5,7 @@
 pub mod brief;
 pub mod guard;
 pub mod proxy;
+pub mod session;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -33,7 +34,7 @@ pub const PAUSE_HOLD: Duration = Duration::from_secs(30 * 60);
 /// Recorded on every item: this mode rests on the owner's decision, not a register row.
 pub const POLICY_NOTE: &str = "owner decision 2026-11-01";
 /// What a run sends to the session, besides `Sensitive` when sealed values are released.
-const CATEGORIES: [DataCategory; 3] = [
+pub(crate) const CATEGORIES: [DataCategory; 3] = [
     DataCategory::JobText,
     DataCategory::ProfileBasic,
     DataCategory::CareerMemory,
@@ -364,6 +365,8 @@ pub async fn start(
     if application_ids.iter().collect::<HashSet<_>>().len() != application_ids.len() {
         return Err(Error::Validation("an application is listed twice".into()));
     }
+    // A dead host's run must not block this one.
+    session::sweep_orphans(db).await?;
     if run_active(db).await? {
         return Err(Error::Refused("apply_run_active".into()));
     }
@@ -609,7 +612,8 @@ pub async fn resolve_pause(
 }
 
 /// A person's act. A `ready` run has no agent run: it ends here, through `finish_items`. Any
-/// other goes to `agents::cancel_run`, and its host ends it.
+/// other goes to `agents::cancel_run`, and its host ends it. The sweep then ends it here when
+/// its host is gone.
 pub async fn cancel(db: &Db, actor: &str, id: &str) -> Result<()> {
     runner::person(actor)?;
     let (state, agent_run): (String, Option<String>) =
@@ -622,7 +626,9 @@ pub async fn cancel(db: &Db, actor: &str, id: &str) -> Result<()> {
         return Err(ended());
     }
     if let Some(agent_run) = agent_run {
-        return agents::cancel_run(db, actor, &agent_run).await;
+        let cancelled = agents::cancel_run(db, actor, &agent_run).await;
+        session::sweep_orphans(db).await?;
+        return cancelled;
     }
     let skipped: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM apply_items \
@@ -722,7 +728,10 @@ pub async fn settle(db: &Db, actor: &str, apply_id: &str) -> Result<usize> {
                 let cancel = CancellationToken::new();
                 agents::set_status(db, actor, application, "applied", None, &note, cancel).await?;
             }
-            "uncertain" => applications::add_note(db, actor, application, UNCERTAIN_NOTE).await?,
+            "uncertain" => {
+                pause::ensure_off(db).await?;
+                applications::add_note(db, actor, application, UNCERTAIN_NOTE).await?
+            }
             _ => continue,
         }
         sqlx::query("UPDATE apply_items SET status_written = 1 WHERE id = ?")

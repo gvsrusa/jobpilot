@@ -3,6 +3,7 @@
 mod agents;
 mod ai;
 mod analytics;
+mod apply;
 mod apps;
 mod browser_cmd;
 mod data;
@@ -85,6 +86,15 @@ pub enum Command {
     /// Stop all automation.
     #[command(subcommand)]
     Pause(pause::PauseCommand),
+    /// Claude Code apply runs.
+    #[command(subcommand)]
+    Apply(apply::ApplyCommand),
+    /// The MCP server an apply session talks to. Started by the session, not by hand.
+    #[command(hide = true)]
+    ApplyMcp {
+        #[arg(long)]
+        dir: std::path::PathBuf,
+    },
     /// Restricted prompt used by the app's terminal panel.
     Shell,
 }
@@ -97,6 +107,7 @@ impl Command {
     /// ever takes something away.
     pub fn refused_in_panel(&self) -> bool {
         use ai::{AiCommand, ConsentCommand};
+        use apply::ApplyCommand;
         use browser_cmd::BrowserCommand;
         use data::{BackupCommand, DataCommand};
         use jobs::JobCommand;
@@ -127,6 +138,8 @@ impl Command {
                 )
                 | Command::Pause(PauseCommand::Clear)
                 | Command::Browser(BrowserCommand::Setup)
+                | Command::Apply(ApplyCommand::Start { .. } | ApplyCommand::Session { .. })
+                | Command::ApplyMcp { .. }
                 | Command::Kb(KbCommand::Reveal { .. })
                 | Command::Memory(
                     MemoryCommand::Approve { .. }
@@ -490,6 +503,11 @@ async fn with_db(db: &Db, command: Command) -> Result<Output> {
         Command::Ai(command) => ai::ai(db, command).await,
         Command::Browser(command) => browser_cmd::browser(db, command).await,
         Command::Pause(command) => pause::pause(db, command).await,
+        Command::Apply(command) => apply::apply(db, command).await,
+        Command::ApplyMcp { dir } => {
+            apply::mcp(db, &dir).await?;
+            out(serde_json::json!(null), String::new())
+        }
         // `main` and the shell handle this before any command runs.
         Command::Shell => Err(Error::PanelRefused),
     }
@@ -614,6 +632,17 @@ mod tests {
         ("analytics show", false),
         ("browser status", false),
         ("browser setup", true),
+        ("apply preflight i", false),
+        ("apply start i --release-sealed", true),
+        ("apply start i", true),
+        ("apply session i", true),
+        ("apply-mcp --dir d", true),
+        ("apply status", false),
+        ("apply show r", false),
+        ("apply resolve p continue", false),
+        ("apply resolve p take-over", false),
+        ("apply settle r", false),
+        ("apply cancel r", false),
         ("pause set", false),
         ("pause status", false),
         ("pause clear", true),
