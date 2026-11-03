@@ -78,7 +78,7 @@ function PreflightScreen({ ids, onClose }: { ids: string[]; onClose(): void }) {
     mutationFn: ipc.browserSetup,
     onSuccess: () => client.invalidateQueries({ queryKey: key }),
   });
-  const start = useMutation({ mutationFn: () => ipc.applyStart(ids), onSuccess: (id) => setApplyRun(id) });
+  const start = useMutation({ mutationFn: () => ipc.applyStart(ids), onSuccess: (id) => setApplyRun(id, true) });
 
   const data = checked.data;
   const needsSetup = data !== undefined && (data.runtime !== "ready" || data.claude === null);

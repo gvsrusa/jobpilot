@@ -84,7 +84,7 @@ pub struct Session {
     killer: Box<dyn ChildKiller + Send + Sync>,
     input: SyncSender<Vec<u8>>,
     output: Arc<Output>,
-    #[cfg(any(unix, test))]
+    /// The child's pid: the apply host matches its own claim by it.
     pid: Option<u32>,
 }
 
@@ -230,16 +230,17 @@ impl PtyState {
 
     /// For the main thread: stops the output now and leaves the grace period to a thread.
     /// For an apply session, the run's id and word of when the end is done.
-    fn close_soon(&self) -> Option<(String, mpsc::Receiver<()>)> {
+    fn close_soon(&self) -> Option<(String, Option<u32>, mpsc::Receiver<()>)> {
         let session = self.slot().take()?;
         session.output.silence();
+        let host_pid = session.pid;
         let hosted = session.apply.as_ref().map(|hosted| hosted.id.clone());
         let (done, ended) = mpsc::channel();
         self.ending().push(thread::spawn(move || {
             session.end();
             let _ = done.send(());
         }));
-        hosted.map(|id| (id, ended))
+        hosted.map(|id| (id, host_pid, ended))
     }
 
     fn ending(&self) -> MutexGuard<'_, Vec<JoinHandle<()>>> {
@@ -444,7 +445,6 @@ fn open_session<R: Runtime>(
     let output = Arc::new(Output::default());
     let id = state.next_id.fetch_add(1, Ordering::Relaxed);
     let killer = child.clone_killer();
-    #[cfg(any(unix, test))]
     let pid = child.process_id();
 
     thread::spawn(move || write_input(queue, writer));
@@ -479,7 +479,6 @@ fn open_session<R: Runtime>(
         killer,
         input,
         output,
-        #[cfg(any(unix, test))]
         pid,
     });
     Ok(())
@@ -559,13 +558,13 @@ pub fn pty_resize(state: State<'_, PtyState>, cols: u16, rows: u16) -> Result<()
 /// waits for a heartbeat to go stale.
 #[tauri::command]
 pub fn pty_close<R: Runtime>(app: AppHandle<R>, state: State<'_, PtyState>) -> Result<()> {
-    if let Some((apply_id, ended)) = state.close_soon() {
+    if let Some((apply_id, host_pid, ended)) = state.close_soon() {
         tauri::async_runtime::spawn(async move {
             let _ =
                 tauri::async_runtime::spawn_blocking(move || ended.recv_timeout(END_WAIT)).await;
             let state = app.state::<AppState>();
             if let Ok(db) = state.work().await {
-                end_closed_run(&db, &apply_id).await;
+                end_closed_run(&db, &apply_id, host_pid).await;
             }
         });
     }
@@ -575,9 +574,11 @@ pub fn pty_close<R: Runtime>(app: AppHandle<R>, state: State<'_, PtyState>) -> R
 /// How long a closed session's end may take before its run is ended anyway.
 const END_WAIT: Duration = Duration::from_secs(5);
 
-/// The host is gone: its agent run is halted, then the person's close cancels what is left.
-async fn end_closed_run(db: &jobpilot_core::Db, apply_id: &str) {
-    if let Ok(false) = apply::host_gone(db, apply_id, "closed").await {
+/// The host is gone: the agent run it held is halted, then the person's close cancels a run
+/// no host ever claimed. A claim another host holds is left to it.
+async fn end_closed_run(db: &jobpilot_core::Db, apply_id: &str, host_pid: Option<u32>) {
+    if let Ok(apply::HostGone::Unclaimed) = apply::host_gone(db, apply_id, "closed", host_pid).await
+    {
         let _ = apply::cancel(db, "gui", apply_id).await;
     }
 }

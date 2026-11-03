@@ -41,7 +41,7 @@ function panel(onClose = vi.fn()) {
 }
 
 describe("TerminalPanel", () => {
-  beforeEach(() => useUiStore.setState({ applyRun: null }));
+  beforeEach(() => useUiStore.setState({ applyRun: null, applyHost: false }));
 
   it("renders_header_footer_and_empty_hint", async () => {
     const { of } = backend();
@@ -210,7 +210,7 @@ describe("TerminalPanel", () => {
 
   it("the panel opens the apply session only with a run id", async () => {
     const { of } = backend();
-    useUiStore.setState({ applyRun: "run1" });
+    useUiStore.setState({ applyRun: "run1", applyHost: true });
     panel();
     await waitFor(() => expect(of("pty_open_apply")).toHaveLength(1));
     expect(Object.keys(of("pty_open_apply")[0].args).sort()).toEqual(["applyId", "cols", "rows"]);
@@ -225,7 +225,7 @@ describe("TerminalPanel", () => {
     const { user } = panel();
     await waitFor(() => expect(of("pty_open")).toHaveLength(1));
 
-    act(() => useUiStore.getState().setApplyRun("run1"));
+    act(() => useUiStore.getState().setApplyRun("run1", true));
 
     const dialog = await screen.findByRole("dialog");
     expect(dialog).toHaveTextContent("This ends the terminal session.");
@@ -242,7 +242,7 @@ describe("TerminalPanel", () => {
     const { user } = panel();
     await waitFor(() => expect(of("pty_open")).toHaveLength(1));
 
-    act(() => useUiStore.getState().setApplyRun("run1"));
+    act(() => useUiStore.getState().setApplyRun("run1", true));
     const dialog = await screen.findByRole("dialog");
     await user.click(within(dialog).getByRole("button", { name: "End session" }));
 
@@ -257,7 +257,7 @@ describe("TerminalPanel", () => {
         throw { code: "refused", message: "refused: apply_run_not_ready" };
       },
     });
-    useUiStore.setState({ applyRun: "run1" });
+    useUiStore.setState({ applyRun: "run1", applyHost: true });
     panel();
     expect(await screen.findByRole("alert")).toHaveTextContent("code: refused");
     await waitFor(() => expect(of("apply_cancel")).toHaveLength(1));
@@ -266,7 +266,7 @@ describe("TerminalPanel", () => {
 
   it("a hosted run is not opened again when the panel reopens", async () => {
     const { of } = backend();
-    useUiStore.setState({ applyRun: "run1" });
+    useUiStore.setState({ applyRun: "run1", applyHost: true });
     const user = userEvent.setup();
     const onClose = vi.fn();
     const ui = (open: boolean) => <TerminalPanel open={open} onClose={onClose} />;
@@ -287,7 +287,7 @@ describe("TerminalPanel", () => {
 
   it("reopening the panel during a run neither re-hosts nor cancels it", async () => {
     const { of } = backend();
-    useUiStore.setState({ applyRun: "run1" });
+    useUiStore.setState({ applyRun: "run1", applyHost: true });
     const user = userEvent.setup();
     const ui = (open: boolean) => <TerminalPanel open={open} onClose={vi.fn()} />;
     const { rerender } = render(ui(true));
@@ -301,5 +301,17 @@ describe("TerminalPanel", () => {
     expect(of("pty_open_apply")).toHaveLength(1);
     expect(of("apply_cancel")).toHaveLength(0);
     expect(useUiStore.getState().applyRun).toBe("run1");
+  });
+
+  it("a view-only run is never hosted or cancelled", async () => {
+    const { of } = backend();
+    panel();
+    await waitFor(() => expect(of("pty_open")).toHaveLength(1));
+    act(() => useUiStore.getState().setApplyRun("run7"));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(of("pty_open_apply")).toHaveLength(0);
+    expect(of("apply_cancel")).toHaveLength(0);
+    expect(useUiStore.getState().applyRun).toBe("run7");
   });
 });

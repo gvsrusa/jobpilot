@@ -19,7 +19,8 @@ export const TERMINAL_OPTIONS = {
 /** A run left `ready` with no session would block the next one: end it. */
 function dropRun(id: string) {
   void ipc.applyCancel(id).catch(() => undefined);
-  if (useUiStore.getState().applyRun === id) useUiStore.getState().setApplyRun(null);
+  const { applyRun, applyHost, setApplyRun } = useUiStore.getState();
+  if (applyHost && applyRun === id) setApplyRun(null);
 }
 
 /**
@@ -44,7 +45,8 @@ export function TerminalPanel({ open, onClose }: { open: boolean; onClose(): voi
   const [writeError, setWriteError] = useState<unknown>(null);
   const [ended, setEnded] = useState(false);
   const [typed, setTyped] = useState(false);
-  const applyRun = useUiStore((s) => s.applyRun);
+  // Only a run marked for hosting reaches the panel: a view-only one is not its business.
+  const applyRun = useUiStore((s) => (s.applyHost ? s.applyRun : null));
   // The run the next open hosts, read once: a reopen after it is a shell.
   const launch = useRef<string | null>(null);
   // The run the current session hosts, for the header.

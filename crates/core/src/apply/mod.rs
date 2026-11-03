@@ -694,18 +694,65 @@ pub async fn cancel(db: &Db, actor: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Where a host that claimed a run writes who it is: its pid and its agent run.
+const HOST_FILE: &str = "host.json";
+
+/// Written by the host once it holds the claim, so whoever kills it by pid can tell its run
+/// from one another host holds. Ids and a pid only.
+pub fn record_host(dir: &Path, pid: u32, agent_run: &str) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let record = json!({ "pid": pid, "agent_run": agent_run });
+    std::fs::write(dir.join(HOST_FILE), record.to_string())?;
+    Ok(())
+}
+
+/// The pid and agent run a host recorded in the run folder `dir`, if any.
+pub fn recorded_host(dir: &Path) -> Option<(u32, String)> {
+    let text = std::fs::read_to_string(dir.join(HOST_FILE)).ok()?;
+    let record: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let pid = u32::try_from(record["pid"].as_u64()?).ok()?;
+    Some((pid, record["agent_run"].as_str()?.to_owned()))
+}
+
+/// What `host_gone` found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostGone {
+    /// The run has ended.
+    Ended,
+    /// No host ever claimed it: a person's close may cancel it.
+    Unclaimed,
+    /// Another host holds the claim: the run is left to it.
+    Elsewhere,
+    /// Halted, and the sweep has not ended it yet: the next sweep will.
+    Pending,
+}
+
 /// The process hosting `apply_id` is known to be gone: the app closed its terminal, or the
 /// emergency pause killed it. Its agent run, if still active, is halted with `reason`, so no
-/// one waits for a heartbeat to go stale, and the sweep then winds the run up. Returns true
-/// when the run has ended.
-pub async fn host_gone(db: &Db, apply_id: &str, reason: &str) -> Result<bool> {
+/// one waits for a heartbeat to go stale, and the sweep then winds the run up. With
+/// `host_pid`, the halt applies only when the claim belongs to the host that recorded that
+/// pid: a run another host won stays its own.
+pub async fn host_gone(
+    db: &Db,
+    apply_id: &str,
+    reason: &str,
+    host_pid: Option<u32>,
+) -> Result<HostGone> {
     let agent_run: Option<String> =
         sqlx::query_scalar("SELECT agent_run_id FROM apply_runs WHERE id = ?")
             .bind(apply_id)
             .fetch_optional(&db.pool)
             .await?
             .ok_or(Error::NotFound)?;
+    let claimed = agent_run.is_some();
     if let Some(agent_run) = agent_run {
+        let ours = match host_pid {
+            None => true,
+            Some(pid) => recorded_host(&run_dir(db, apply_id)) == Some((pid, agent_run.clone())),
+        };
+        if !ours {
+            return Ok(HostGone::Elsewhere);
+        }
         runner::store::halt(db, &agent_run, reason).await?;
     }
     session::sweep_orphans(db).await?;
@@ -713,7 +760,11 @@ pub async fn host_gone(db: &Db, apply_id: &str, reason: &str) -> Result<bool> {
         .bind(apply_id)
         .fetch_one(&db.pool)
         .await?;
-    Ok(state == "ended")
+    Ok(match (state == "ended", claimed) {
+        (true, _) => HostGone::Ended,
+        (false, false) => HostGone::Unclaimed,
+        (false, true) => HostGone::Pending,
+    })
 }
 
 /// Every end of a run comes through here, so `apply_run_active` never outlives one. An item

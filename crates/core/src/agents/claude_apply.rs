@@ -140,6 +140,12 @@ async fn prepare(
         .await
         .map_err(|_| Error::ManualRequired("claude_not_found".into()))?;
     session::prepare_folders(db, apply_id, &knobs.sidecar()?)?;
+    // Who holds the claim, for whoever kills this process by pid (the app's panel).
+    apply::record_host(
+        &apply::run_dir(db, apply_id),
+        std::process::id(),
+        ctx.run_id(),
+    )?;
     let running = sqlx::query(
         "UPDATE apply_runs SET state = 'running' \
          WHERE id = ? AND state = 'ready' AND agent_run_id = ?",

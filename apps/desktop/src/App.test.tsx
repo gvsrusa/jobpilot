@@ -37,7 +37,7 @@ describe("terminal panel", () => {
     await screen.findByRole("heading", { name: "Status" });
     expect(panel()).not.toBeVisible();
 
-    act(() => useUiStore.getState().setApplyRun("run1"));
+    act(() => useUiStore.getState().setApplyRun("run1", true));
 
     expect(await screen.findByText("Claude Code apply run")).toBeVisible();
     await waitFor(() => expect(count(api, "pty_open_apply")).toBe(1));

@@ -309,4 +309,31 @@ describe("apply run", () => {
     expect(useUiStore.getState().applyRun).toBe("run7");
     expect(await screen.findByRole("button", { name: "Record status" })).toBeInTheDocument();
   });
+
+  it("the last run opens view-only: never hosted, never cancelled", async () => {
+    const last = run({
+      id: "run7",
+      state: "ended",
+      ended_at: "2026-11-02T11:00:00.000Z",
+      items: [item({ run_id: "run7", state: "submitted", status_written: false })],
+    });
+    const api = backend({
+      app_list: () => APPS,
+      resume_list: () => [],
+      apply_latest: () => last,
+      apply_view: () => last,
+      // As the real backend: an ended run is not ready.
+      pty_open_apply: () => Promise.reject({ code: "refused", message: "refused: apply_run_not_ready" }),
+    });
+    const { user } = renderApp();
+    await screen.findByRole("heading", { name: "Status" });
+    await user.click(screen.getByRole("button", { name: "Applications" }));
+    await user.click(await screen.findByRole("button", { name: "Show last run" }));
+    expect(await screen.findByRole("button", { name: "Record status" })).toBeInTheDocument();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(count(api, "pty_open_apply")).toBe(0);
+    expect(count(api, "apply_cancel")).toBe(0);
+    expect(useUiStore.getState().applyRun).toBe("run7");
+    expect(screen.getByRole("button", { name: "Record status" })).toBeInTheDocument();
+  });
 });

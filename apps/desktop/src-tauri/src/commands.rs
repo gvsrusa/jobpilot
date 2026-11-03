@@ -1614,7 +1614,7 @@ pub async fn pause_now(state: &AppState, pty: &PtyState) -> Result<PauseState> {
 /// `paused`, and the run is wound up. Spawned, as a purge can wait.
 fn halt_hosted(db: Arc<Db>, apply_id: String) {
     tauri::async_runtime::spawn(async move {
-        let _ = apply::host_gone(&db, &apply_id, "paused").await;
+        let _ = apply::host_gone(&db, &apply_id, "paused", None).await;
     });
 }
 
@@ -6212,6 +6212,81 @@ mod tests {
         wait_until(|| h.ok("apply_view", json!({ "id": run }))["state"] == "ended");
     }
 
+    /// Run `run` as `running`, claimed by an active agent run whose host recorded `pid`.
+    fn claimed_by(h: &Harness, run: &str, pid: u32) -> String {
+        let run = run.to_owned();
+        let dir = h.paths.apply().join(&run);
+        with_db(h, |db| async move {
+            let agent: String = sqlx::query_scalar(
+                "INSERT INTO agent_runs (id, agent, state, actor, input, steps, heartbeat_at, \
+                 created_at) VALUES (lower(hex(randomblob(16))), 'claude_apply', 'running', \
+                 'cli', '{}', 2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) RETURNING id",
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            sqlx::query("UPDATE apply_runs SET state = 'running', agent_run_id = ? WHERE id = ?")
+                .bind(&agent)
+                .bind(&run)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            jobpilot_core::apply::record_host(&dir, pid, &agent).unwrap();
+            agent
+        })
+    }
+
+    fn agent_state(h: &Harness, agent: &str) -> (String, Option<String>) {
+        let agent = agent.to_owned();
+        with_db(h, |db| async move {
+            sqlx::query_as("SELECT state, reason FROM agent_runs WHERE id = ?")
+                .bind(&agent)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap()
+        })
+    }
+
+    /// Another terminal's host won the claim: closing the panel's session leaves its run be.
+    #[test]
+    fn closing_the_panel_leaves_a_run_another_host_holds() {
+        let h = ready();
+        let run = ready_run(&h);
+        let panel = Panel::open(&h);
+        let pty = h.app.state::<PtyState>();
+        let pid = pty.pid().unwrap();
+        pty.mark_apply(&h.paths, &run);
+        let agent = claimed_by(&h, &run, pid + 1);
+
+        panel.close();
+        wait_gone(pid);
+        std::thread::sleep(Duration::from_millis(1500));
+
+        assert_eq!(agent_state(&h, &agent).0, "running");
+        assert_eq!(h.ok("apply_view", json!({ "id": run }))["state"], "running");
+    }
+
+    /// The claim is the closed session's own: its agent run is halted and the run ends.
+    #[test]
+    fn closing_the_panel_halts_the_run_its_own_host_held() {
+        let h = ready();
+        let run = ready_run(&h);
+        let panel = Panel::open(&h);
+        let pty = h.app.state::<PtyState>();
+        let pid = pty.pid().unwrap();
+        pty.mark_apply(&h.paths, &run);
+        let agent = claimed_by(&h, &run, pid);
+
+        panel.close();
+
+        wait_until(|| h.ok("apply_view", json!({ "id": run }))["state"] == "ended");
+        assert_eq!(
+            agent_state(&h, &agent),
+            ("halted".to_owned(), Some("closed".to_owned()))
+        );
+    }
+
     /// The real host under the panel, with the fake `claude` and a fake browser runtime: the
     /// pause kills it, and the run reads halted and ended without waiting for a stale heartbeat.
     #[cfg(unix)]
@@ -6237,6 +6312,11 @@ mod tests {
             assert!(Instant::now() < until, "never active: {}", panel.text());
             std::thread::sleep(Duration::from_millis(50));
         }
+
+        // The host recorded itself under the pid the panel knows it by.
+        let pid = h.app.state::<PtyState>().pid().unwrap();
+        let recorded = jobpilot_core::apply::recorded_host(&h.paths.apply().join(&run));
+        assert_eq!(recorded.map(|(found, _)| found), Some(pid));
 
         h.ok("pause_set", json!({}));
 
