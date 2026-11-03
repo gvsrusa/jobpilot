@@ -280,6 +280,8 @@ async fn erase(
 fn remove_files(paths: &AppPaths, include_backups: bool) -> io::Result<()> {
     remove_dir_if_present(&paths.documents())?;
     remove_dir_if_present(&paths.exports())?;
+    remove_dir_if_present(&paths.apply())?;
+    remove_dir_if_present(&paths.browser_runtime())?;
     if include_backups {
         remove_dir_if_present(&paths.backups())?;
     }

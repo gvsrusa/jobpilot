@@ -302,7 +302,12 @@ fn message(error: &Error) -> String {
                           `jobpilot pause clear` in an ordinary terminal, or from the title bar."
             .into(),
         Error::ManualRequired(reason) if reason == "no_node" => {
-            "Install Node 18 or later (nodejs.org), then run `jobpilot browser setup`.".into()
+            "Install Node 20 or later (nodejs.org), then run `jobpilot browser setup`.".into()
+        }
+        Error::ManualRequired(reason) if reason == "node_too_old" => {
+            "The Node on this computer is older than 20. Install Node 20 or later, then run \
+             `jobpilot browser setup`. `jobpilot browser status` shows the version found."
+                .into()
         }
         Error::ManualRequired(reason) if reason == "no_evidence" => {
             "There is no approved knowledge to work from. Add an item with `jobpilot kb add \

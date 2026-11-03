@@ -12,7 +12,7 @@ use crate::{ACTOR, Output, out};
 pub enum BrowserCommand {
     /// Whether the browser runtime is installed.
     Status,
-    /// Install the pinned Playwright MCP server and download Chromium. Needs Node 18 or later.
+    /// Install the pinned Playwright MCP server and download Chromium. Needs Node 20 or later.
     Setup,
 }
 
@@ -22,7 +22,14 @@ pub async fn browser(db: &Db, command: BrowserCommand) -> Result<Output> {
             let (state, text) = match runtime::state(db).await? {
                 RuntimeState::NoNode => (
                     "no_node",
-                    "Node is not installed. Install Node 18 or later.".to_owned(),
+                    "Node is not installed. Install Node 20 or later.".to_owned(),
+                ),
+                RuntimeState::NodeTooOld(found) => (
+                    "node_too_old",
+                    format!(
+                        "Node {found} is too old. Install Node {} or later.",
+                        runtime::NODE_MIN
+                    ),
                 ),
                 RuntimeState::NotInstalled => (
                     "not_installed",

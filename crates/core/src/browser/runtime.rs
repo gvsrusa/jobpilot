@@ -20,6 +20,9 @@ use crate::{audit, pause};
 pub const PLAYWRIGHT_MCP: &str = "0.0.84";
 pub const PLAYWRIGHT: &str = "1.65.0-alpha-2026-10-30";
 
+/// The strictest `engines.node` in the lock (`playwright`, `playwright-core`). A test pins it.
+pub const NODE_MIN: u64 = 20;
+
 const PACKAGE: &str = include_str!("../../assets/browser-runtime/package.json");
 const LOCK: &str = include_str!("../../assets/browser-runtime/package-lock.json");
 
@@ -34,6 +37,8 @@ pub struct Runtime {
 #[derive(Debug)]
 pub enum RuntimeState {
     NoNode,
+    /// The Node found, as it reported itself, is older than `NODE_MIN`.
+    NodeTooOld(String),
     NotInstalled,
     WrongVersion(String),
     Ready(Runtime),
@@ -86,6 +91,31 @@ async fn find_node(get: Env<'_>) -> Option<PathBuf> {
     None
 }
 
+/// What `node --version` prints, and whether its major version is new enough. A node that
+/// does not answer reads as too old, with `unknown` for its version.
+async fn node_check(node: &Path) -> std::result::Result<(), String> {
+    let mut probe = command(node, &child_env(&[]), Path::new("."));
+    probe.arg("--version").stdout(std::process::Stdio::piped());
+    let answer = async {
+        let output = probe.spawn().ok()?.wait_with_output().await.ok()?;
+        String::from_utf8(output.stdout).ok()
+    };
+    let text = tokio::time::timeout(Duration::from_secs(10), answer)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let text = text.trim();
+    let major = text
+        .strip_prefix('v')
+        .and_then(|v| v.split('.').next()?.parse::<u64>().ok());
+    match major {
+        Some(major) if major >= NODE_MIN => Ok(()),
+        _ if text.is_empty() => Err("unknown".into()),
+        _ => Err(text.to_owned()),
+    }
+}
+
 fn runtime_of(db: &Db, node: PathBuf) -> Runtime {
     let dir = db.paths().browser_runtime();
     Runtime {
@@ -105,6 +135,9 @@ pub async fn state_by(db: &Db, get: Env<'_>) -> Result<RuntimeState> {
     let Some(node) = find_node(get).await else {
         return Ok(RuntimeState::NoNode);
     };
+    if let Err(found) = node_check(&node).await {
+        return Ok(RuntimeState::NodeTooOld(found));
+    }
     let mut runtime = runtime_of(db, node);
     // Tasks 6 and 7 point this at a fake server on a root with no install.
     if let Some(cli) = debug_var(get, "JOBPILOT_PLAYWRIGHT_CLI") {
@@ -192,10 +225,23 @@ fn env_with_browsers(browsers: &Path, node_dir: Option<&Path>) -> Vec<(String, S
 /// Installs the pinned server and its Chromium. The download is the owner's to start, and
 /// running it again finishes a stopped one.
 pub async fn setup(db: &Db, actor: &str, cancel: CancellationToken) -> Result<Runtime> {
+    setup_by(db, actor, cancel, &real_env).await
+}
+
+#[doc(hidden)]
+pub async fn setup_by(
+    db: &Db,
+    actor: &str,
+    cancel: CancellationToken,
+    get: Env<'_>,
+) -> Result<Runtime> {
     pause::ensure_off(db).await?;
-    let node = find_node(&real_env)
+    let node = find_node(get)
         .await
         .ok_or_else(|| Error::ManualRequired("no_node".into()))?;
+    if node_check(&node).await.is_err() {
+        return Err(Error::ManualRequired("node_too_old".into()));
+    }
     let node_dir = node.parent().unwrap_or(Path::new("")).to_path_buf();
     let npm = search([node_dir.clone()], &bin_names("npm", cfg!(windows)))
         .ok_or_else(|| Error::ManualRequired("no_node".into()))?;

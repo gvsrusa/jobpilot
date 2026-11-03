@@ -7,7 +7,8 @@ use std::path::PathBuf;
 
 use jobpilot_core::ai::CancellationToken;
 use jobpilot_core::browser::runtime::{
-    BrowserSpec, PLAYWRIGHT, PLAYWRIGHT_MCP, RuntimeState, playwright_config, setup, state_by,
+    BrowserSpec, NODE_MIN, PLAYWRIGHT, PLAYWRIGHT_MCP, RuntimeState, playwright_config, setup,
+    setup_by, state_by,
 };
 use jobpilot_core::{AppPaths, Db, Error, backup, pause, transfer};
 use serde_json::Value;
@@ -26,15 +27,20 @@ async fn open() -> (tempfile::TempDir, AppPaths, Db) {
     (tmp, paths, db)
 }
 
-/// A file that is a program, so the node lookup accepts it.
-fn fake_node(dir: &std::path::Path) -> PathBuf {
-    let node = dir.join(if cfg!(windows) { "node.exe" } else { "node" });
-    fs::write(&node, "").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&node, fs::Permissions::from_mode(0o755)).unwrap();
-    }
+/// A program that prints `version` for `--version`, so the node check accepts or refuses it.
+#[cfg(unix)]
+fn fake_node(dir: &std::path::Path, version: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let node = dir.join("node");
+    fs::write(&node, format!("#!/bin/sh\necho {version}\n")).unwrap();
+    fs::set_permissions(&node, fs::Permissions::from_mode(0o755)).unwrap();
+    node
+}
+
+#[cfg(windows)]
+fn fake_node(dir: &std::path::Path, version: &str) -> PathBuf {
+    let node = dir.join("node.cmd");
+    fs::write(&node, format!("@echo off\r\necho {version}\r\n")).unwrap();
     node
 }
 
@@ -92,17 +98,31 @@ fn the_browser_is_visible_and_page_tools_are_off() {
 }
 
 #[test]
-fn no_environment_variable_reaches_the_config() {
-    let before = playwright_config(&spec());
-    // The names the runtime reads, and ones a user might hope would change the browser.
-    let env = env_of(vec![
-        ("JOBPILOT_PLAYWRIGHT_CLI", "/x/cli.js".into()),
-        ("JOBPILOT_NODE_BIN", "/x/node".into()),
-        ("PLAYWRIGHT_MCP_USER_AGENT", "other".into()),
-        ("HTTPS_PROXY", "http://proxy".into()),
-    ]);
-    assert!(env("HTTPS_PROXY").is_some());
-    assert_eq!(playwright_config(&spec()), before);
+fn the_config_is_exactly_the_brief() {
+    assert_eq!(
+        playwright_config(&spec()),
+        serde_json::json!({
+            "browser": {
+                "browserName": "chromium",
+                "userDataDir": "/p/profile",
+                "launchOptions": {
+                    "headless": false,
+                    "args": ["--disable-blink-features=JobPilotNone"]
+                },
+                "contextOptions": {"acceptDownloads": false}
+            },
+            "capabilities": ["core"],
+            "webmcp": false,
+            "saveSession": false,
+            "ignoreRoots": true,
+            "allowUnrestrictedFileAccess": false,
+            "imageResponses": "omit",
+            "codegen": "none",
+            "outputDir": "/p/output",
+            "console": {"level": "error"},
+            "timeouts": {"action": 10000, "navigation": 60000}
+        })
+    );
 }
 
 #[tokio::test]
@@ -119,7 +139,7 @@ async fn no_node_reads_as_no_node() {
 #[tokio::test]
 async fn a_wrong_version_reads_as_wrong_version() {
     let (tmp, paths, db) = open().await;
-    let node = fake_node(tmp.path());
+    let node = fake_node(tmp.path(), "v24.1.0");
     let env = env_of(vec![("JOBPILOT_NODE_BIN", node.into())]);
     assert!(matches!(
         state_by(&db, &env).await.unwrap(),
@@ -151,10 +171,43 @@ async fn a_wrong_version_reads_as_wrong_version() {
     db.close().await;
 }
 
+#[test]
+fn the_node_floor_is_the_strictest_engine_in_the_lock() {
+    let lock: Value =
+        serde_json::from_str(include_str!("../assets/browser-runtime/package-lock.json")).unwrap();
+    let floor = lock["packages"]
+        .as_object()
+        .unwrap()
+        .values()
+        .filter_map(|entry| entry["engines"]["node"].as_str())
+        .map(|range| range.trim_start_matches(">=").parse::<u64>().unwrap())
+        .max()
+        .unwrap();
+    assert_eq!(floor, NODE_MIN);
+}
+
+#[tokio::test]
+async fn an_old_node_reads_as_too_old_and_setup_refuses_it() {
+    let (tmp, paths, db) = open().await;
+    let node = fake_node(tmp.path(), "v18.19.0");
+    let env = env_of(vec![("JOBPILOT_NODE_BIN", node.into())]);
+    match state_by(&db, &env).await.unwrap() {
+        RuntimeState::NodeTooOld(found) => assert_eq!(found, "v18.19.0"),
+        other => panic!("{other:?}"),
+    }
+    let refused = setup_by(&db, "cli", CancellationToken::new(), &env).await;
+    assert!(
+        matches!(&refused, Err(Error::ManualRequired(reason)) if reason == "node_too_old"),
+        "{refused:?}"
+    );
+    assert!(!paths.browser_runtime().exists());
+    db.close().await;
+}
+
 #[tokio::test]
 async fn the_debug_cli_reads_ready_with_no_install() {
     let (tmp, _paths, db) = open().await;
-    let node = fake_node(tmp.path());
+    let node = fake_node(tmp.path(), "v24.1.0");
     let env = env_of(vec![
         ("JOBPILOT_NODE_BIN", node.clone().into()),
         ("JOBPILOT_PLAYWRIGHT_CLI", "/fake/cli.js".into()),
