@@ -1024,8 +1024,16 @@ async fn a_new_run_starts_after_a_halt_a_cancel_an_early_exit_and_a_crash() {
     let run = apply::start(&w.db, "cli", &app, false).await.unwrap();
     crashed_host(&w.db, &run, 600).await;
 
-    let last = apply::start(&w.db, "cli", &app, false).await.unwrap();
+    // The crashed item had a click, so it is uncertain: that application is never sent
+    // again, and another one starts.
+    let again = apply::start(&w.db, "cli", &app, false).await;
+    assert!(
+        matches!(&again, Err(Error::Refused(why)) if why == "already_submitted"),
+        "{again:?}"
+    );
     assert_eq!(run_state(&w.db, &run).await, "ended");
+    let other = vec![add_app(&w.db, "Globex").await];
+    let last = apply::start(&w.db, "cli", &other, false).await.unwrap();
     assert_eq!(run_state(&w.db, &last).await, "ready");
 }
 

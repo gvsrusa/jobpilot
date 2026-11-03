@@ -90,6 +90,10 @@ pub enum AutonomousCommand {
     Grant { connector: String },
     /// Take an authorization away.
     Revoke { connector: String },
+    /// Fill and submit one application with no review by you. Refused, with nothing
+    /// started, unless its site's register row allows it, its submit is verified, and you
+    /// authorized its connector: today no site qualifies. End its stops with `apply resolve`.
+    Run { application: String },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -209,6 +213,19 @@ async fn autonomous(db: &Db, command: AutonomousCommand) -> Result<Output> {
                 false => format!("authorized for Autonomous: {}", granted.join(", ")),
             };
             return out(json!({"grants": granted}), text);
+        }
+        AutonomousCommand::Run { application } => {
+            agents::autonomous_check(db, &application).await?;
+            eprintln!(
+                "Autonomous is filling the form in a browser window and will submit it once. It \
+                 stops for you there: `jobpilot apply status` shows the stop."
+            );
+            let run = with_interrupts(db, |cancel| {
+                agents::autonomous(db, ACTOR, &application, cancel)
+            })
+            .await?;
+            let text = summary(&run);
+            return out(run, text);
         }
         AutonomousCommand::Grant { connector } => {
             permissions::grant(db, ACTOR, &connector).await?;

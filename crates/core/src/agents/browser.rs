@@ -48,9 +48,10 @@ const NO_FORM: &str = "Open the application form, then press Continue.";
 /// Autonomous: fields the rules left, before anything is submitted.
 const LEFT: &str = "JobPilot will not submit with these empty. Fill them in the browser, then \
                     continue:";
-/// Autonomous: the page is not what the run filled (M-37).
-const CHANGED: &str = "The form changed after JobPilot filled it. Check it in the browser. \
-                       Continue submits the form as it is now.";
+/// Autonomous: the page is not what the run filled, or not what the last stop showed (M-37).
+const CHANGED: &str = "The form changed after JobPilot filled it. Check it in the browser, \
+                       and leave it as it is: Continue submits it only if nothing changes \
+                       again.";
 const OFF_ORIGIN: &str = "This page is not on the posting's site. Go back to the form in the \
                           browser, then continue.";
 /// A landing page's own way to its form, followed only as a link.
@@ -143,8 +144,13 @@ struct Driver {
     typed: guard::Typed,
     form: Form,
     mapped: Vec<Mapped>,
-    /// Fields the browser refused to fill or upload: the person's, with the unmapped ones.
-    left: Vec<String>,
+    /// Fields the browser refused to fill or upload, by ref and label: the person's, with the
+    /// unmapped ones.
+    left: Vec<(String, String)>,
+    /// Autonomous: the controls the page showed when the fill began, by role and name.
+    base: Option<Vec<Control>>,
+    /// Autonomous: the page state a check or a person accepted, which the click must find.
+    accepted: Option<Vec<Control>>,
     /// The item is no longer the run's: a person took it over, or a stop timed out.
     done: bool,
 }
@@ -253,16 +259,11 @@ impl BrowserWorkflow<'_> {
         let db = ctx.db;
         let note = self.decided(db, Action::Drive).await?;
         if self.mode == Mode::Autonomous {
-            // Submission is never retried: an application a submit was ever clicked for, in
-            // any run, is the owner's to check.
-            let clicked: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM apply_items \
-                 WHERE application_id = ? AND submit_clicks > 0)",
-            )
-            .bind(&self.application_id)
-            .fetch_one(&db.pool)
-            .await?;
-            if clicked {
+            // Submission is never retried. The preflight blocks any sign of one in any mode;
+            // this belt also refuses a status past `saved`, which the preflight names
+            // `not_saved`.
+            let app = applications::get(db, &self.application_id).await?;
+            if app.status != "saved" || apply::submitted_before(db, &app.id).await? {
                 return Err(Error::Refused("already_submitted".into()));
             }
         }
@@ -297,6 +298,8 @@ impl BrowserWorkflow<'_> {
             form: parse_snapshot(""),
             mapped: Vec::new(),
             left: Vec::new(),
+            base: None,
+            accepted: None,
             done: false,
         };
         let link = driver.app.link.trim().to_owned();
@@ -743,6 +746,8 @@ impl BrowserWorkflow<'_> {
             }
             self.map(ctx, driver).await?;
         }
+        // What the page showed before anything went in: what Autonomous checks against.
+        driver.base = page_state(&driver.last);
 
         let values: Vec<(String, String, String, String)> = driver
             .mapped
@@ -773,9 +778,11 @@ impl BrowserWorkflow<'_> {
                 )
                 .await?;
             if filled.is_error {
-                driver
-                    .left
-                    .extend(values.iter().map(|(_, _, label, _)| label.clone()));
+                driver.left.extend(
+                    values
+                        .iter()
+                        .map(|(target, _, label, _)| (target.clone(), label.clone())),
+                );
             } else {
                 driver.typed.extend(
                     values
@@ -808,7 +815,7 @@ impl BrowserWorkflow<'_> {
             let path = path.to_string_lossy().into_owned();
             if !guard::upload_ok(std::slice::from_ref(&path), &driver.files) {
                 // Nothing prepared for it: the person attaches one.
-                driver.left.push(label);
+                driver.left.push((target.clone(), label));
                 continue;
             }
             self.decided(ctx.db, Action::Upload).await?;
@@ -821,7 +828,7 @@ impl BrowserWorkflow<'_> {
                 )
                 .await?;
             if clicked.is_error {
-                driver.left.push(label);
+                driver.left.push((target.clone(), label));
                 continue;
             }
             let uploaded = self
@@ -833,7 +840,7 @@ impl BrowserWorkflow<'_> {
                 )
                 .await?;
             if uploaded.is_error {
-                driver.left.push(label);
+                driver.left.push((target.clone(), label));
             } else {
                 // Which file went to this item: a code, never a path or the page's words.
                 let detail = json!({ "kind": kind, "mode": self.mode_name() });
@@ -905,11 +912,18 @@ impl BrowserWorkflow<'_> {
         Ok(StepOutput::default())
     }
 
-    /// Autonomous, before anything is sent: a field the rules left pauses for a person, then a
-    /// fresh snapshot is scanned and read, and any change from what `fill` wrote pauses
-    /// (M-37). Continue on a change is the person's word that the page as it stands is right.
+    /// Autonomous, before anything is sent. A page with a legal declaration or an identity
+    /// request, answered or not, is never submitted by the run: the person submits it. A
+    /// field the rules left pauses for a person. Then the page is read again and must be the
+    /// one `fill` wrote; any change pauses (M-37), and see [`Self::verify`].
     async fn check(&self, ctx: &Ctx<'_>, driver: &mut Driver) -> Result<StepOutput> {
         self.decided(ctx.db, Action::Drive).await?;
+        let page = driver.last.clone();
+        if self.legal_on(ctx, driver, &page).await? {
+            self.end_item(ctx, driver, "manual_required", "legal_declaration")
+                .await?;
+            return Ok(StepOutput::default());
+        }
         let left = left_for_person(driver);
         if !left.is_empty() {
             let excerpt = format!("{LEFT} {}.", left.join("; "));
@@ -920,52 +934,131 @@ impl BrowserWorkflow<'_> {
                 return Ok(StepOutput::default());
             }
         }
-        let mut seen = false;
+        driver.accepted = self.verify(ctx, driver, None).await?;
+        Ok(StepOutput::default())
+    }
+
+    /// Reads the page until it is the one expected: with `shown` `None`, the page `fill`
+    /// wrote; else exactly the controls `shown` holds. Controls are matched by role and name,
+    /// never by ref, and two with one role and name stop the run. A change pauses, and
+    /// Continue authorizes only the page that stop showed: the next read must equal it, or
+    /// it pauses again. Off the posting's site, with a legal declaration, a choice it cannot
+    /// read back, or an ambiguous control, the item ends and the person submits. Returns the
+    /// accepted controls, with `driver.form` read from the same snapshot, or `None` when the
+    /// item left the run.
+    async fn verify(
+        &self,
+        ctx: &Ctx<'_>,
+        driver: &mut Driver,
+        mut shown: Option<Vec<Control>>,
+    ) -> Result<Option<Vec<Control>>> {
+        let home = forms::origin_of(&driver.app.link);
         loop {
             let Some(page) = self.snapshot(ctx, driver).await? else {
                 return Err(Error::Failed("browser_gone".into()));
             };
-            if let Step::Stopped = self.watch(ctx, driver, page, true).await? {
-                return Ok(StepOutput::default());
+            driver.last = page.clone();
+            if self.legal_on(ctx, driver, &page).await? {
+                self.end_item(ctx, driver, "manual_required", "legal_declaration")
+                    .await?;
+                return Ok(None);
             }
-            let now = parse_snapshot(&driver.last);
-            if seen || unchanged(driver, &now) {
-                driver.form = now;
-                return Ok(StepOutput::default());
+            if let Some(hit) = guard::scan(&page, &driver.acks, &driver.typed) {
+                if let Step::Stopped = self.hold(ctx, driver, hit.kind, "page", &hit.line).await? {
+                    return Ok(None);
+                }
+                driver.acks.insert(guard::hit_key(&hit));
+                continue;
+            }
+            let form = parse_snapshot(&page);
+            if form.origin.is_empty() || form.origin != home {
+                self.end_item(ctx, driver, "skipped", "origin_changed")
+                    .await?;
+                return Ok(None);
+            }
+            let (Some(now), Some(base)) = (page_state(&page), driver.base.clone()) else {
+                self.end_item(ctx, driver, "manual_required", "ambiguous_form")
+                    .await?;
+                return Ok(None);
+            };
+            let same = match &shown {
+                Some(shown) => *shown == now,
+                None => match as_filled(driver, &base, &now) {
+                    Ok(same) => same,
+                    Err(why) => {
+                        self.end_item(ctx, driver, "manual_required", why).await?;
+                        return Ok(None);
+                    }
+                },
+            };
+            if same && form.submit.is_some() {
+                driver.form = form;
+                return Ok(Some(now));
             }
             if let Step::Stopped = self
                 .hold(ctx, driver, PauseKind::Other, "guard", CHANGED)
                 .await?
             {
-                return Ok(StepOutput::default());
+                return Ok(None);
             }
-            seen = true;
+            shown = Some(now);
         }
     }
 
-    /// One click on the submit button the check read. The click is counted in the database
-    /// before it is sent, so a crash, a lost reply, or a timeout after it reads `uncertain`,
-    /// and nothing here or in a later run clicks again.
+    /// A legal declaration or identity request anywhere on `page`, answered or not, or a
+    /// field the guards hold as legal.
+    async fn legal_on(&self, ctx: &Ctx<'_>, driver: &Driver, page: &str) -> Result<bool> {
+        let mut seen = HashSet::new();
+        while let Some(hit) = guard::scan(page, &seen, &driver.typed) {
+            if matches!(hit.kind, PauseKind::Legal | PauseKind::Identity) {
+                return Ok(true);
+            }
+            seen.insert(guard::hit_key(&hit));
+        }
+        let basic = profile::basic(ctx.db).await?;
+        let bare = self.brief(driver, &basic, Vec::new());
+        Ok(parse_snapshot(page)
+            .fields
+            .iter()
+            .any(|field| held_back(page, field, &bare) == Some("legal")))
+    }
+
+    /// One click on the submit button of a page read just before it, which must be the page
+    /// the check or a person accepted. The click is counted in the database before it is
+    /// sent, in one statement that also requires the emergency pause off and the grant still
+    /// stored, so a crash, a lost reply, or a timeout after it reads `uncertain`, and nothing
+    /// here or in a later run clicks again.
     async fn submit(&self, ctx: &Ctx<'_>, driver: &mut Driver) -> Result<StepOutput> {
         self.decided(ctx.db, Action::Submit).await?;
-        let Some(target) = driver.form.submit.clone() else {
-            self.end_item(ctx, driver, "manual_required", "no_submit_button")
-                .await?;
-            return Ok(StepOutput::default());
+        let Some(accepted) = driver.accepted.clone() else {
+            return Err(Error::Failed("not_checked".into()));
         };
+        if self.verify(ctx, driver, Some(accepted)).await?.is_none() {
+            return Ok(StepOutput::default());
+        }
+        let Some(target) = driver.form.submit.clone() else {
+            return Err(Error::Failed("not_checked".into()));
+        };
+        let site = permissions::site_of(&driver.app.link)?;
+        let connector = permissions::connector_of(site).unwrap_or("");
         pause::ensure_off(ctx.db).await?;
         ctx.stop_point()?;
-        let mut tx = ctx.db.pool.begin().await?;
         let claimed = sqlx::query(
             "UPDATE apply_items SET submit_clicks = 1 \
-             WHERE id = ? AND submit_clicks = 0 AND state IN ('active', 'filled')",
+             WHERE id = ? AND submit_clicks = 0 AND state IN ('active', 'filled') \
+             AND NOT EXISTS (SELECT 1 FROM emergency_pause WHERE id = 'me') \
+             AND EXISTS (SELECT 1 FROM autonomous_grants WHERE connector = ?)",
         )
         .bind(&driver.item.id)
-        .execute(&mut *tx)
+        .bind(connector)
+        .execute(&ctx.db.pool)
         .await?
         .rows_affected();
-        tx.commit().await?;
         if claimed != 1 {
+            pause::ensure_off(ctx.db).await?;
+            if !permissions::granted(ctx.db, site).await? {
+                return Err(Error::Refused("not_authorized".into()));
+            }
             return Err(Error::Refused("already_submitted".into()));
         }
         driver.item.submit_clicks = 1;
@@ -1044,62 +1137,114 @@ fn left_for_person(driver: &Driver) -> Vec<String> {
             }
             _ => None,
         })
-        .chain(driver.left.iter().cloned())
+        .chain(driver.left.iter().map(|(_, label)| label.clone()))
         .map(|label| quoted(&label))
         .collect()
 }
 
-/// The fields that take a value, by ref, role, and label.
-fn value_fields(form: &Form) -> Vec<(&str, &str, &str)> {
-    form.fields
-        .iter()
-        .filter(|field| {
-            matches!(
-                field.role.as_str(),
-                "textbox" | "combobox" | "checkbox" | "radio"
-            )
-        })
-        .map(|field| {
-            (
-                field.target.as_str(),
-                field.role.as_str(),
-                field.label.as_str(),
-            )
-        })
-        .collect()
+/// One control a page shows, matched by role and name, never by ref: a text field's text,
+/// whether a box or radio is checked, a choice's selection, or what a button shows (a file
+/// input's chosen file, where the page shows it).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Control {
+    role: String,
+    name: String,
+    value: String,
 }
 
-/// The page `now` is the one `fill` worked on: the same origin and submit button, the same
-/// fields that take a value, and each text field holding what was written. A field a person
-/// fills is not compared.
-/// ponytail: a choice's selection is not read back, as the snapshot shape for a chosen
-/// option is not pinned; its field must still be there.
-fn unchanged(driver: &Driver, now: &Form) -> bool {
-    let before = &driver.form;
-    if now.origin.is_empty() || now.origin != before.origin {
-        return false;
-    }
-    if now.submit.is_none() || now.submit != before.submit {
-        return false;
-    }
-    let mut was = value_fields(before);
-    let mut is = value_fields(now);
-    was.sort_unstable();
-    is.sort_unstable();
-    if was != is {
-        return false;
-    }
-    driver.mapped.iter().all(|mapped| match mapped {
-        Mapped::Value { field, text, .. }
-            if field.role == "textbox" && !driver.left.contains(&field.label) =>
-        {
-            now.fields
-                .iter()
-                .find(|shown| shown.target == field.target)
-                .is_some_and(|shown| shown.value.as_deref() == Some(text.as_str()))
+const CONTROL_ROLES: [&str; 6] = [
+    "textbox", "combobox", "listbox", "checkbox", "radio", "button",
+];
+
+/// Every control on the page, sorted, or `None` when two share a role and a name: which one
+/// is which cannot be told without trusting refs.
+/// ponytail: radios in two groups with the same option names read as ambiguous, and stop.
+fn page_state(snapshot: &str) -> Option<Vec<Control>> {
+    let lines: Vec<&str> = snapshot.lines().collect();
+    let indent = |line: &str| line.len() - line.trim_start().len();
+    let marked = |line: &str, mark: &str| {
+        line.match_indices(mark)
+            .any(|(at, _)| guard::outside_quotes(line, at))
+    };
+    let mut controls = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if !line.trim_start().starts_with("- ") {
+            continue;
         }
-        _ => true,
-    })
+        let (role, name, inline) = guard::split_line(line);
+        if !CONTROL_ROLES.contains(&role.as_str()) {
+            continue;
+        }
+        let value = match role.as_str() {
+            "checkbox" | "radio" => match marked(line, "[checked]") {
+                true => "checked".to_owned(),
+                false => String::new(),
+            },
+            "combobox" | "listbox" if inline.trim().is_empty() => {
+                let depth = indent(line);
+                lines[index + 1..]
+                    .iter()
+                    .take_while(|next| next.trim().is_empty() || indent(next) > depth)
+                    .filter(|next| {
+                        guard::split_line(next).0 == "option" && marked(next, "[selected]")
+                    })
+                    .map(|next| guard::split_line(next).1)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            _ => inline.trim().to_owned(),
+        };
+        controls.push(Control { role, name, value });
+    }
+    controls.sort();
+    controls
+        .windows(2)
+        .all(|pair| (&pair[0].role, &pair[0].name) != (&pair[1].role, &pair[1].name))
+        .then_some(controls)
+}
+
+/// `now` is the page `fill` worked on, as `base` showed it: the same controls by role and
+/// name, and each value the run wrote read back as written. A field a person fills is not
+/// compared. `Err` names why it cannot be told: a choice the snapshot shows no selection for.
+fn as_filled(
+    driver: &Driver,
+    base: &[Control],
+    now: &[Control],
+) -> std::result::Result<bool, &'static str> {
+    let keys = |controls: &[Control]| -> Vec<(String, String)> {
+        controls
+            .iter()
+            .map(|control| (control.role.clone(), control.name.clone()))
+            .collect()
+    };
+    if keys(base) != keys(now) {
+        return Ok(false);
+    }
+    for mapped in &driver.mapped {
+        let Mapped::Value { field, text, .. } = mapped else {
+            continue;
+        };
+        if driver
+            .left
+            .iter()
+            .any(|(target, _)| *target == field.target)
+        {
+            continue;
+        }
+        let Some(shown) = now
+            .iter()
+            .find(|control| control.role == field.role && control.name == field.label)
+        else {
+            return Ok(false);
+        };
+        if field.role == "combobox" && shown.value.is_empty() {
+            return Err("choice_unverified");
+        }
+        if shown.value != *text {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// An approved answer's text for this application, or `None` when it may not be used here: a
@@ -1275,6 +1420,25 @@ pub async fn autonomous(
     .await
 }
 
+/// The decision an Autonomous run's first step makes, with no browser, no run row, and no
+/// dialog: `Ok` with the application only when its site's submit row is `allowed`, the site
+/// is verified, and the owner granted its connector. A caller asks the person after this.
+pub async fn autonomous_check(db: &Db, application_id: &str) -> Result<Application> {
+    let app = applications::get(db, application_id).await?;
+    if !permissions::link_allowed(&app.link) {
+        return Err(Error::Refused("link_not_https".into()));
+    }
+    let site = permissions::site_of(&app.link)?;
+    let grant = Grant {
+        owner_started: true,
+        authorized: permissions::granted(db, site).await?,
+    };
+    match permissions::decide(Mode::Autonomous, site, Action::Submit, &grant) {
+        Decision::Allow { .. } => Ok(app),
+        Decision::Refuse(reason) => Err(Error::Refused(reason.into())),
+    }
+}
+
 /// [`autonomous`] on any register text and verified list, so a test can make a site eligible.
 #[doc(hidden)]
 pub async fn autonomous_with(
@@ -1286,6 +1450,12 @@ pub async fn autonomous_with(
     cancel: CancellationToken,
     knobs: &Knobs,
 ) -> Result<RunView> {
+    // Only a debug build takes another register or verified list: a release build always
+    // decides on the shipped ones, whatever a caller passes.
+    let (register, verified) = match cfg!(debug_assertions) {
+        true => (register, verified),
+        false => (REGISTER, VERIFIED),
+    };
     let workflow = |apply_id| BrowserWorkflow {
         apply_id,
         application_id: application_id.to_owned(),

@@ -3850,3 +3850,32 @@ async fn apply_material_and_record_are_manual_mode_from_the_cli() {
     let runs = stdout_json(&run(&home, &["apply", "status", "--json"]));
     assert!(runs.is_null(), "Manual mode starts no run: {runs}");
 }
+
+#[tokio::test]
+async fn apply_autonomous_run_is_refused_with_no_run_while_no_site_is_eligible() {
+    let (_dir, home) = fresh_home();
+    let app = apply_ready_home(&home).await;
+    {
+        let db = Db::open(&AppPaths::new(&home)).await.unwrap();
+        sqlx::query("UPDATE applications SET link = 'https://jobs.lever.co/acme/1' WHERE id = ?")
+            .bind(&app)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    ok(&home, &["apply", "autonomous", "grant", "lever"]);
+    let refused = run(&home, &["apply", "autonomous", "run", &app]);
+    assert!(!refused.status.success());
+    let said = stderr_text(&refused);
+    // `policy_unknown`, in words.
+    assert!(said.contains("error[refused]"), "{said}");
+    assert!(
+        said.contains("policy register has no clear answer"),
+        "{said}"
+    );
+    let status = stdout_json(&run(&home, &["apply", "status", "--json"]));
+    assert!(status.is_null(), "{status}");
+    assert!(
+        !home.join("apply").exists() || std::fs::read_dir(home.join("apply")).unwrap().count() == 0
+    );
+}

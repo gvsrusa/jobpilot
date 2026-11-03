@@ -210,6 +210,10 @@ async fn check_item(
         ));
     }
     let mut blocks = Vec::new();
+    // A submission is never retried, whichever mode made it or whether a click was seen.
+    if submitted_before(db, &app.id).await? {
+        blocks.push("already_submitted");
+    }
     if app.status != "saved" {
         blocks.push("not_saved");
     }
@@ -293,6 +297,21 @@ fn host_of(link: &str) -> String {
         .ok()
         .and_then(|url| url.host_str().map(str::to_owned))
         .unwrap_or_default()
+}
+
+/// Any sign this application was sent before, in any mode: a submission audited, an item a
+/// submit was clicked for, or an item recorded `submitted` or `uncertain`. An uncertain one
+/// stays until the person records the outcome, which moves the status off `saved`.
+pub(crate) async fn submitted_before(db: &Db, application_id: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM audit_log \
+                        WHERE action = 'application_submitted' AND target = ?1) \
+             OR EXISTS (SELECT 1 FROM apply_items WHERE application_id = ?1 \
+                        AND (submit_clicks > 0 OR state IN ('submitted', 'uncertain')))",
+    )
+    .bind(application_id)
+    .fetch_one(&db.pool)
+    .await?)
 }
 
 async fn in_a_run(db: &Db, application_id: &str) -> Result<bool> {

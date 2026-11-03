@@ -62,6 +62,12 @@ export function ApplicationReview({ application, onClose }: { application: Appli
   const key = ["apply", "material", application.id];
   const material = useQuery({ queryKey: key, queryFn: () => ipc.applyMaterial(application.id) });
   const grants = useQuery({ queryKey: ["autonomous", "grants"], queryFn: () => ipc.autonomousGrants() });
+  // Revoking only takes something away, so it needs no dialog. Granting stays in the CLI and
+  // its native dialog: no site qualifies today.
+  const revoke = useMutation({
+    mutationFn: (connector: string) => ipc.autonomousRevoke(connector),
+    onSettled: () => client.invalidateQueries({ queryKey: ["autonomous", "grants"] }),
+  });
   const [mode, setMode] = useState<ModeChoice["mode"]>("manual");
   const [copied, setCopied] = useState<{ id: string; stale: boolean } | null>(null);
   const [showStated, setShowStated] = useState(false);
@@ -157,9 +163,23 @@ export function ApplicationReview({ application, onClose }: { application: Appli
                       {choice.available ? choice.note : `Not available. ${choice.note}`}
                     </p>
                     {choice.mode === "autonomous" && grants.data && (
-                      <p className="pl-6 text-sm text-muted-foreground">
-                        Connectors you authorized for Autonomous: {grants.data.join(", ") || "none"}.
-                      </p>
+                      <div className="grid gap-1 pl-6 text-sm text-muted-foreground">
+                        <p>Connectors you authorized for Autonomous: {grants.data.join(", ") || "none"}.</p>
+                        {grants.data.map((connector) => (
+                          <Button
+                            key={connector}
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="justify-self-start"
+                            disabled={revoke.isPending}
+                            onClick={() => revoke.mutate(connector)}
+                          >
+                            Revoke {connector}
+                          </Button>
+                        ))}
+                        <ErrorAlert error={revoke.error} />
+                      </div>
                     )}
                   </div>
                 );

@@ -940,6 +940,8 @@ export const ipc = {
   /** Rust asks a native yes first; `confirmation_required` when the owner says no. */
   autonomousGrant: (connector: string) => invoke<void>("autonomous_grant", { connector }),
   autonomousRevoke: (connector: string) => invoke<void>("autonomous_revoke", { connector }),
+  /** Rust decides first: an ineligible site (today, every site) is refused with no dialog. */
+  autonomousStart: (applicationId: string) => invoke<ApplyRunView>("autonomous_start", { applicationId }),
 };
 
 export function ptyOpen(cols: number, rows: number): Promise<void> {

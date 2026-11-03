@@ -171,11 +171,42 @@ async fn add_app(db: &Db, link: &str) -> String {
 struct Mock {
     calls: PathBuf,
     cli: PathBuf,
+    /// The page from the fill on, which a test may change while a stop is open.
+    after: PathBuf,
 }
 
 /// `before` until the fill, `after` from the fill, `thanks` once the submit ref is clicked.
 /// With `die`, the server exits on that click with no reply.
 fn mock(w: &World, before: &str, after: &str, die: bool) -> Mock {
+    mock_with(
+        w,
+        Pages {
+            before,
+            after,
+            die,
+            ..Pages::default()
+        },
+    )
+}
+
+/// What the fake server shows: `late` from the `n`th snapshot after the fill on.
+#[derive(Default)]
+struct Pages<'a> {
+    before: &'a str,
+    after: &'a str,
+    thanks: Option<&'a str>,
+    late: Option<(&'a str, u32)>,
+    die: bool,
+}
+
+fn mock_with(w: &World, pages: Pages<'_>) -> Mock {
+    let Pages {
+        before,
+        after,
+        thanks,
+        late,
+        die,
+    } = pages;
     let dir = w.tmp.path().join("mock");
     std::fs::create_dir_all(&dir).unwrap();
     let snapshot = dir.join("snapshot.yml");
@@ -184,8 +215,19 @@ fn mock(w: &World, before: &str, after: &str, die: bool) -> Mock {
     let calls = dir.join("calls.jsonl");
     std::fs::write(&snapshot, before).unwrap();
     std::fs::write(&after_fill, after).unwrap();
-    std::fs::write(&after_click, THANKS).unwrap();
+    std::fs::write(&after_click, thanks.unwrap_or(THANKS)).unwrap();
     std::fs::write(&calls, "").unwrap();
+    let late_file = dir.join("late.yml");
+    let late = match late {
+        Some((page, at)) => {
+            std::fs::write(&late_file, page).unwrap();
+            format!(
+                "process.env.MOCK_LATE = {};\nprocess.env.MOCK_LATE_AT = \"{at}\";\n",
+                json!(late_file.display().to_string())
+            )
+        }
+        None => String::new(),
+    };
     let server = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mock-mcp/server.mjs");
     let url = format!("file://{}", server.display()).replace('\\', "/");
     let die = match die {
@@ -195,7 +237,7 @@ fn mock(w: &World, before: &str, after: &str, die: bool) -> Mock {
     let script = format!(
         "process.env.MOCK_SNAPSHOT = {};\nprocess.env.MOCK_CALLS = {};\n\
          process.env.MOCK_AFTER_FILL = {};\nprocess.env.MOCK_AFTER_CLICK = {};\n\
-         process.env.MOCK_CLICK_REF = {};\n{die}await import({});\n",
+         process.env.MOCK_CLICK_REF = {};\n{die}{late}await import({});\n",
         json!(snapshot.display().to_string()),
         json!(calls.display().to_string()),
         json!(after_fill.display().to_string()),
@@ -205,7 +247,11 @@ fn mock(w: &World, before: &str, after: &str, die: bool) -> Mock {
     );
     let cli = dir.join("wrapper.mjs");
     std::fs::write(&cli, script).unwrap();
-    Mock { calls, cli }
+    Mock {
+        calls,
+        cli,
+        after: after_fill,
+    }
 }
 
 impl Mock {
@@ -223,6 +269,15 @@ impl Mock {
             .iter()
             .filter(|call| call["name"] == "browser_click" && call["args"]["target"] == SUBMIT)
             .count()
+    }
+
+    /// Every click's target, in order.
+    fn clicks(&self) -> Vec<String> {
+        self.calls()
+            .iter()
+            .filter(|call| call["name"] == "browser_click")
+            .map(|call| call["args"]["target"].as_str().unwrap_or("").to_owned())
+            .collect()
     }
 
     fn knobs(&self) -> Knobs {
@@ -589,4 +644,477 @@ async fn a_revoked_grant_stops_the_next_step() {
     assert_eq!(view.items[0].submit_clicks, 0);
     assert_eq!(view.items[0].state, "skipped");
     assert_eq!(status(&w.db, &app).await, "saved");
+}
+
+// ---- Fix round 1 ----
+
+/// The submit-time snapshot: the fill's snapshot, two upload snapshots, and the check's
+/// come first.
+const AT_SUBMIT: u32 = 5;
+
+/// A run with a grant, a doctored register, and Lever verified, on `pages`.
+async fn eligible(pages: Pages<'_>) -> (World, String, Mock, JoinHandle<Result<RunView>>) {
+    let w = world().await;
+    permissions::grant(&w.db, "cli", "lever").await.unwrap();
+    let app = add_app(&w.db, LINK).await;
+    let m = mock_with(&w, pages);
+    let task = run(&w, ALLOWED_LEVER, LEVER, &app, &m);
+    (w, app, m, task)
+}
+
+async fn answer(db: &Db, pause: &PauseView, resolution: Resolution) {
+    apply::resolve_pause(db, "cli", &pause.id, resolution)
+        .await
+        .unwrap();
+}
+
+/// A pause other than `seen`.
+async fn next_pause(db: &Db, seen: &str) -> PauseView {
+    let begun = Instant::now();
+    loop {
+        if let Some(run) = apply::latest(db).await.unwrap()
+            && let Some(pause) = run.active_pause
+            && pause.id != seen
+        {
+            return pause;
+        }
+        assert!(begun.elapsed() < WAIT, "no new pause opened");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn ended_item(task: JoinHandle<Result<RunView>>, db: &Db) -> apply::Item {
+    let _ = ended(task).await;
+    latest(db).await.items.remove(0)
+}
+
+#[tokio::test]
+async fn a_submission_seen_in_any_mode_blocks_every_mode() {
+    // P1: a Claude Code item the model said was submitted, with no click seen.
+    let w = world().await;
+    permissions::grant(&w.db, "cli", "lever").await.unwrap();
+    let app = add_app(&w.db, LINK).await;
+    sqlx::query(
+        "INSERT INTO apply_runs (id, mode, actor, state, created_at) \
+         VALUES ('r0', 'claude_code', 'cli', 'ended', '2026-11-01T00:00:00Z')",
+    )
+    .execute(&w.db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO apply_items (id, apply_run_id, application_id, position, host, state, \
+         reason) VALUES ('i0', 'r0', ?, 0, 'jobs.lever.co', 'uncertain', 'no_submit_seen')",
+    )
+    .bind(&app)
+    .execute(&w.db.pool)
+    .await
+    .unwrap();
+    let m = mock(&w, &blank(""), &filled(""), false);
+    let result = ended(run(&w, ALLOWED_LEVER, LEVER, &app, &m)).await;
+    assert_eq!(refused(&result), Some("already_submitted"), "{result:?}");
+    assert!(m.calls().is_empty());
+    // The preflight every mode runs says the same.
+    let checked = apply::preflight(&w.db, std::slice::from_ref(&app))
+        .await
+        .unwrap();
+    assert!(
+        checked.items[0].blocks.contains(&"already_submitted"),
+        "{:?}",
+        checked.items[0].blocks
+    );
+
+    // An audit row of a submission alone blocks, as does a status past saved.
+    let w = world().await;
+    permissions::grant(&w.db, "cli", "lever").await.unwrap();
+    let app = add_app(&w.db, LINK).await;
+    sqlx::query(
+        "INSERT INTO audit_log (at, actor, action, target, detail) \
+         VALUES ('2026-11-01T00:00:00Z', 'cli', 'application_submitted', ?, '{}')",
+    )
+    .bind(&app)
+    .execute(&w.db.pool)
+    .await
+    .unwrap();
+    let m = mock(&w, &blank(""), &filled(""), false);
+    let result = ended(run(&w, ALLOWED_LEVER, LEVER, &app, &m)).await;
+    assert_eq!(refused(&result), Some("already_submitted"), "{result:?}");
+    let other = add_app(&w.db, LINK).await;
+    sqlx::query("UPDATE applications SET status = 'applied' WHERE id = ?")
+        .bind(&other)
+        .execute(&w.db.pool)
+        .await
+        .unwrap();
+    let result = ended(run(&w, ALLOWED_LEVER, LEVER, &other, &m)).await;
+    assert_eq!(refused(&result), Some("already_submitted"), "{result:?}");
+    assert!(m.calls().is_empty());
+}
+
+#[tokio::test]
+async fn an_autonomous_uncertain_item_blocks_a_claude_code_run() {
+    let (w, app, m, task) = eligible(Pages {
+        before: &blank(""),
+        after: &filled(""),
+        die: true,
+        ..Pages::default()
+    })
+    .await;
+    assert!(ended(task).await.is_err());
+    assert_eq!(m.submit_clicks(), 1);
+    let checked = apply::preflight(&w.db, std::slice::from_ref(&app))
+        .await
+        .unwrap();
+    assert!(checked.items[0].blocks.contains(&"already_submitted"));
+    let started = apply::start(&w.db, "cli", std::slice::from_ref(&app), false).await;
+    assert!(started.is_err(), "{started:?}");
+}
+
+#[tokio::test]
+async fn a_page_off_the_postings_site_before_submit_ends_skipped() {
+    // P2, and C7: the filled page is on another origin.
+    let off = page(
+        "https://other.example/apply",
+        ["Ada Lovelace", "ada@example.com", WHY],
+        "",
+    );
+    let (w, app, m, task) = eligible(Pages {
+        before: &blank(""),
+        after: &off,
+        ..Pages::default()
+    })
+    .await;
+    let item = ended_item(task, &w.db).await;
+    assert_eq!(item.state, "skipped");
+    assert_eq!(item.reason.as_deref(), Some("origin_changed"));
+    assert_eq!(m.submit_clicks(), 0);
+    assert_eq!(status(&w.db, &app).await, "saved");
+
+    // The page moves off the site while a changed-form stop is open.
+    let changed = page(FORM_URL, ["Ada Lovelace", "someone@else.io", WHY], "");
+    let (w, _, m, task) = eligible(Pages {
+        before: &blank(""),
+        after: &changed,
+        ..Pages::default()
+    })
+    .await;
+    let pause = open_pause(&w.db).await;
+    assert!(pause.excerpt.contains("changed"), "{}", pause.excerpt);
+    std::fs::write(&m.after, &off).unwrap();
+    answer(&w.db, &pause, Resolution::Continue).await;
+    let item = ended_item(task, &w.db).await;
+    assert_eq!(item.state, "skipped");
+    assert_eq!(item.reason.as_deref(), Some("origin_changed"));
+    assert_eq!(m.submit_clicks(), 0);
+}
+
+#[tokio::test]
+async fn continue_on_a_changed_form_authorizes_only_the_page_it_showed() {
+    // P3: the page changes again while the stop is open: a new stop, no click.
+    let changed = page(FORM_URL, ["Ada Lovelace", "someone@else.io", WHY], "");
+    let (w, app, m, task) = eligible(Pages {
+        before: &blank(""),
+        after: &changed,
+        ..Pages::default()
+    })
+    .await;
+    let first = open_pause(&w.db).await;
+    let again = page(
+        FORM_URL,
+        ["Ada Byron", "someone@else.io", WHY],
+        "  - textbox \"Referral code\" [ref=e20]\n",
+    );
+    std::fs::write(&m.after, &again).unwrap();
+    answer(&w.db, &first, Resolution::Continue).await;
+    let second = next_pause(&w.db, &first.id).await;
+    assert!(second.excerpt.contains("changed"), "{}", second.excerpt);
+    assert_eq!(m.submit_clicks(), 0);
+    // C3: Continue on the page as the stop showed it submits it, once.
+    answer(&w.db, &second, Resolution::Continue).await;
+    let view = ended(task).await.unwrap();
+    assert_eq!(view.items[0].state, "submitted");
+    assert_eq!(m.submit_clicks(), 1);
+    assert_eq!(status(&w.db, &app).await, "applied");
+}
+
+#[tokio::test]
+async fn the_page_is_read_again_just_before_the_click() {
+    // A change between the check and the click stops the run before it clicks.
+    let late = page(FORM_URL, ["Ada Lovelace", "late@change.io", WHY], "");
+    let (w, _, m, task) = eligible(Pages {
+        before: &blank(""),
+        after: &filled(""),
+        late: Some((&late, AT_SUBMIT)),
+        ..Pages::default()
+    })
+    .await;
+    let pause = open_pause(&w.db).await;
+    assert!(pause.excerpt.contains("changed"), "{}", pause.excerpt);
+    assert_eq!(m.submit_clicks(), 0);
+    answer(&w.db, &pause, Resolution::TakeOver).await;
+    let item = ended_item(task, &w.db).await;
+    assert_eq!(item.state, "manual_required");
+    assert_eq!(m.submit_clicks(), 0);
+
+    // C8: a submit button renamed is a change.
+    let renamed = filled("").replace("Submit application", "Submit and share my data");
+    let (w, _, m, task) = eligible(Pages {
+        before: &blank(""),
+        after: &filled(""),
+        late: Some((&renamed, AT_SUBMIT)),
+        ..Pages::default()
+    })
+    .await;
+    let pause = open_pause(&w.db).await;
+    assert!(pause.excerpt.contains("changed"), "{}", pause.excerpt);
+    answer(&w.db, &pause, Resolution::TakeOver).await;
+    ended(task).await.unwrap();
+    assert!(m.clicks().iter().all(|t| t != SUBMIT));
+
+    // A file button gone is a change.
+    let no_letter = filled("").replace("  - button \"Cover letter\" [ref=e15]\n", "");
+    let (w, _, m, task) = eligible(Pages {
+        before: &blank(""),
+        after: &filled(""),
+        late: Some((&no_letter, AT_SUBMIT)),
+        ..Pages::default()
+    })
+    .await;
+    let pause = open_pause(&w.db).await;
+    assert!(pause.excerpt.contains("changed"), "{}", pause.excerpt);
+    answer(&w.db, &pause, Resolution::TakeOver).await;
+    ended(task).await.unwrap();
+    assert_eq!(m.submit_clicks(), 0);
+}
+
+#[tokio::test]
+async fn refs_are_not_trusted_and_the_click_goes_to_the_fresh_ref() {
+    // The submit button's ref moves between the check and the click: matched by role and
+    // name, the page is unchanged, and the click goes to the ref the last snapshot gave,
+    // never to the one the check read.
+    let checked = filled("").replace("[ref=e14]", "[ref=e99]");
+    let (w, _, m, task) = eligible(Pages {
+        before: &blank(""),
+        after: &checked,
+        late: Some((&filled(""), AT_SUBMIT)),
+        ..Pages::default()
+    })
+    .await;
+    let view = ended(task).await.unwrap();
+    assert_eq!(view.items[0].state, "submitted");
+    assert_eq!(m.submit_clicks(), 1);
+    assert!(m.clicks().iter().all(|t| t != "e99"), "{:?}", m.clicks());
+
+    // Two controls with one role and name: ambiguous, so a person submits.
+    let twice = "  - textbox \"Why this role?\" [ref=e30]\n";
+    let (w2, _, m2, task) = eligible(Pages {
+        before: &blank(twice),
+        after: &filled(twice),
+        ..Pages::default()
+    })
+    .await;
+    let item = ended_item(task, &w2.db).await;
+    assert_eq!(item.state, "manual_required");
+    assert_eq!(item.reason.as_deref(), Some("ambiguous_form"));
+    assert_eq!(m2.submit_clicks(), 0);
+    drop(w);
+}
+
+#[tokio::test]
+async fn checkbox_state_and_choices_are_read_back() {
+    // A box the person ticks at the stop is the accepted state; a flip after it is a change.
+    let updates = "  - checkbox \"Send me job alerts\" [ref=e21]\n";
+    let ticked = "  - checkbox \"Send me job alerts\" [checked] [ref=e21]\n";
+    let (w, _, m, task) = eligible(Pages {
+        before: &blank(updates),
+        after: &filled(updates),
+        late: Some((&filled(ticked), AT_SUBMIT)),
+        ..Pages::default()
+    })
+    .await;
+    let left = open_pause(&w.db).await;
+    assert!(
+        left.excerpt.contains("Send me job alerts"),
+        "{}",
+        left.excerpt
+    );
+    answer(&w.db, &left, Resolution::Continue).await;
+    let changed = next_pause(&w.db, &left.id).await;
+    assert!(changed.excerpt.contains("changed"), "{}", changed.excerpt);
+    assert_eq!(m.submit_clicks(), 0);
+    answer(&w.db, &changed, Resolution::TakeOver).await;
+    ended(task).await.unwrap();
+}
+
+/// A form with a country choice the rules fill from the profile.
+fn with_country(values: [&str; 3], country: &str) -> String {
+    let field = format!(
+        "  - combobox \"Country\" [ref=e7]{country}\n    - option \"PT\"\n    - option \"US\"\n"
+    );
+    page(FORM_URL, values, &field)
+}
+
+async fn country_run(after: &str) -> (World, Mock, JoinHandle<Result<RunView>>) {
+    let w = world().await;
+    let mut basic = profile::basic(&w.db).await.unwrap();
+    basic.countries = vec!["PT".into()];
+    profile::set_basic(&w.db, basic).await.unwrap();
+    permissions::grant(&w.db, "cli", "lever").await.unwrap();
+    let app = add_app(&w.db, LINK).await;
+    let m = mock_with(
+        &w,
+        Pages {
+            before: &with_country(["", "prefill@x.io", ""], ""),
+            after,
+            ..Pages::default()
+        },
+    );
+    let task = run(&w, ALLOWED_LEVER, LEVER, &app, &m);
+    (w, m, task)
+}
+
+#[tokio::test]
+async fn a_choice_is_submitted_only_when_read_back() {
+    let values = ["Ada Lovelace", "ada@example.com", WHY];
+    // Read back as written: submitted.
+    let (w, m, task) = country_run(&with_country(values, ": PT")).await;
+    let view = ended(task).await.unwrap();
+    assert_eq!(view.items[0].state, "submitted");
+    assert_eq!(m.submit_clicks(), 1);
+    let wrote = &m
+        .calls()
+        .into_iter()
+        .find(|c| c["name"] == "browser_fill_form")
+        .unwrap()["args"]["fields"];
+    assert!(wrote.to_string().contains("\"PT\""), "{wrote}");
+    drop(w);
+
+    // Another choice shown: a change.
+    let (w, m, task) = country_run(&with_country(values, ": US")).await;
+    let pause = open_pause(&w.db).await;
+    assert!(pause.excerpt.contains("changed"), "{}", pause.excerpt);
+    answer(&w.db, &pause, Resolution::TakeOver).await;
+    ended(task).await.unwrap();
+    assert_eq!(m.submit_clicks(), 0);
+
+    // No selection the snapshot shows: it cannot be checked, so a person submits.
+    let (w, m, task) = country_run(&with_country(values, "")).await;
+    let item = ended_item(task, &w.db).await;
+    assert_eq!(item.state, "manual_required");
+    assert_eq!(item.reason.as_deref(), Some("choice_unverified"));
+    assert_eq!(m.submit_clicks(), 0);
+}
+
+#[tokio::test]
+async fn a_legal_declaration_is_never_submitted_by_the_run() {
+    // P4b: one Continue on the legal stop before the fill does not lead to a submit.
+    let line = "  - paragraph [ref=e40]: By submitting, I certify that all information is true\n";
+    let (w, _, m, task) = eligible(Pages {
+        before: &blank(line),
+        after: &filled(line),
+        ..Pages::default()
+    })
+    .await;
+    let legal = open_pause(&w.db).await;
+    assert_eq!(legal.kind, "legal");
+    answer(&w.db, &legal, Resolution::Continue).await;
+    let item = ended_item(task, &w.db).await;
+    assert_eq!(item.state, "manual_required");
+    assert_eq!(item.reason.as_deref(), Some("legal_declaration"));
+    assert_eq!(m.submit_clicks(), 0);
+
+    // A legal field is never filled, and its page is never submitted.
+    let field = "  - checkbox \"I certify that the information I provided is true\" [ref=e41]\n";
+    let (w, _, m, task) = eligible(Pages {
+        before: &blank(field),
+        after: &filled(field),
+        ..Pages::default()
+    })
+    .await;
+    // Every stop it opens is continued, as a hurried person might.
+    let begun = Instant::now();
+    loop {
+        if let Some(run) = apply::latest(&w.db).await.unwrap() {
+            if run.state == "ended" {
+                break;
+            }
+            if let Some(pause) = run.active_pause {
+                answer(&w.db, &pause, Resolution::Continue).await;
+            }
+        }
+        assert!(begun.elapsed() < WAIT, "the run did not end");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let item = ended_item(task, &w.db).await;
+    assert_eq!(item.state, "manual_required");
+    assert_eq!(m.submit_clicks(), 0);
+    assert!(m.clicks().iter().all(|t| t != "e41"));
+    for fill in m
+        .calls()
+        .iter()
+        .filter(|c| c["name"] == "browser_fill_form")
+    {
+        assert!(!fill.to_string().contains("e41"), "{fill}");
+    }
+}
+
+#[tokio::test]
+async fn doubt_after_the_click_is_uncertain() {
+    // C4: the form is still there after the click.
+    let (w, app, m, task) = eligible(Pages {
+        before: &blank(""),
+        after: &filled(""),
+        thanks: Some(&filled("")),
+        ..Pages::default()
+    })
+    .await;
+    let item = ended_item(task, &w.db).await;
+    assert_eq!(item.state, "uncertain");
+    assert_eq!(m.submit_clicks(), 1);
+    assert_eq!(status(&w.db, &app).await, "saved");
+
+    // C10: a stop on the page after the click.
+    let captcha = format!("{THANKS}- checkbox \"I'm not a robot\" [ref=e9]\n");
+    let (w, app, m, task) = eligible(Pages {
+        before: &blank(""),
+        after: &filled(""),
+        thanks: Some(&captcha),
+        ..Pages::default()
+    })
+    .await;
+    let item = ended_item(task, &w.db).await;
+    assert_eq!(item.state, "uncertain");
+    assert_eq!(m.submit_clicks(), 1);
+    assert_eq!(status(&w.db, &app).await, "saved");
+}
+
+#[tokio::test]
+async fn a_landing_page_with_only_a_button_is_not_clicked() {
+    let landing = format!(
+        "### Page\n- Page URL: {FORM_URL}\n### Snapshot\n```yaml\n- button \"Apply\" [ref=e2]\n```\n"
+    );
+    let (w, _, m, task) = eligible(Pages {
+        before: &landing,
+        after: &landing,
+        ..Pages::default()
+    })
+    .await;
+    let pause = open_pause(&w.db).await;
+    assert!(
+        pause.excerpt.contains("Open the application form"),
+        "{}",
+        pause.excerpt
+    );
+    answer(&w.db, &pause, Resolution::TakeOver).await;
+    ended(task).await.unwrap();
+    assert!(m.clicks().is_empty(), "{:?}", m.clicks());
+}
+
+#[tokio::test]
+async fn connectors_are_folded_and_an_unknown_revoke_is_refused() {
+    let w = world().await;
+    permissions::grant(&w.db, "cli", "Lever").await.unwrap();
+    assert_eq!(permissions::grants(&w.db).await.unwrap(), ["lever"]);
+    permissions::revoke(&w.db, "cli", "LEVER").await.unwrap();
+    assert!(permissions::grants(&w.db).await.unwrap().is_empty());
+    let unknown = permissions::revoke(&w.db, "cli", "acme").await.unwrap_err();
+    assert!(matches!(unknown, Error::Validation(_)), "{unknown:?}");
 }

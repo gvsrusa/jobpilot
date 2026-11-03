@@ -8,7 +8,8 @@
 // browser_fill_form was called, browser_snapshot answers with this file in place of MOCK_SNAPSHOT.
 // MOCK_CLICK_REF: a ref whose click matters. MOCK_AFTER_CLICK: once that ref was clicked,
 // browser_snapshot answers with this file. MOCK_DIE_ON_CLICK=1: the click on that ref is logged,
-// then the server exits with no reply, as a crash mid-click would.
+// then the server exits with no reply, as a crash mid-click would. MOCK_LATE and MOCK_LATE_AT=n:
+// from the nth browser_snapshot after the fill on, until the click, it answers with MOCK_LATE.
 import fs from "node:fs";
 import readline from "node:readline";
 
@@ -26,6 +27,7 @@ const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
 let calls = 0;
 let filled = false;
 let clicked = false;
+let lateSnapshots = 0;
 
 const lines = readline.createInterface({ input: process.stdin });
 lines.on("line", (line) => {
@@ -61,6 +63,9 @@ lines.on("line", (line) => {
     const after = process.env.MOCK_AFTER_FILL;
     const afterClick = process.env.MOCK_AFTER_CLICK;
     let shown = filled && after && fs.existsSync(after) ? after : process.env.MOCK_SNAPSHOT;
+    if (filled && name === "browser_snapshot") lateSnapshots += 1;
+    const late = process.env.MOCK_LATE;
+    if (filled && late && lateSnapshots >= Number(process.env.MOCK_LATE_AT) && fs.existsSync(late)) shown = late;
     if (clicked && afterClick && fs.existsSync(afterClick)) shown = afterClick;
     const page = shown && fs.existsSync(shown) ? fs.readFileSync(shown, "utf8") : "";
     if (page.startsWith("!rpcerror") && name !== "browser_snapshot") {

@@ -165,7 +165,7 @@ pub const CONNECTORS: &[&str] = &[
 
 /// The connector name a grant for this site is stored under; a fixture reads as the site it
 /// names. `None` for a site with no register row.
-fn connector_of(site: Site) -> Option<&'static str> {
+pub(crate) fn connector_of(site: Site) -> Option<&'static str> {
     let name = integration(site)?;
     CONNECTORS
         .iter()
@@ -238,6 +238,22 @@ pub async fn grants(db: &Db) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// A connector name as typed, folded to the stored form, or `Validation` for one not in
+/// [`CONNECTORS`].
+pub fn known_connector(connector: &str) -> Result<&'static str> {
+    let folded = connector.trim().to_ascii_lowercase();
+    CONNECTORS
+        .iter()
+        .copied()
+        .find(|known| *known == folded)
+        .ok_or_else(|| {
+            crate::error::Error::Validation(format!(
+                "unknown connector; one of: {}",
+                CONNECTORS.join(", ")
+            ))
+        })
+}
+
 /// Whether the owner's stored grant covers this site's connector, read fresh each call.
 pub async fn granted(db: &Db, site: Site) -> Result<bool> {
     let Some(connector) = connector_of(site) else {
@@ -255,12 +271,7 @@ pub async fn granted(db: &Db, site: Site) -> Result<bool> {
 /// grant.
 pub async fn grant(db: &Db, actor: &str, connector: &str) -> Result<()> {
     runner::person(actor)?;
-    if !CONNECTORS.contains(&connector) {
-        return Err(crate::error::Error::Validation(format!(
-            "unknown connector; one of: {}",
-            CONNECTORS.join(", ")
-        )));
-    }
+    let connector = known_connector(connector)?;
     let mut tx = db.pool.begin().await?;
     sqlx::query(
         "INSERT INTO autonomous_grants (connector, granted_by, granted_at) \
@@ -288,6 +299,7 @@ pub async fn grant(db: &Db, actor: &str, connector: &str) -> Result<()> {
 /// Only a person revokes. Revoking what was never granted writes nothing.
 pub async fn revoke(db: &Db, actor: &str, connector: &str) -> Result<()> {
     runner::person(actor)?;
+    let connector = known_connector(connector)?;
     let mut tx = db.pool.begin().await?;
     let removed = sqlx::query("DELETE FROM autonomous_grants WHERE connector = ?")
         .bind(connector)

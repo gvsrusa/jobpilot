@@ -212,6 +212,7 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         autonomous_grants,
         autonomous_grant,
         autonomous_revoke,
+        autonomous_start,
         crate::pty::pty_open,
         crate::pty::pty_open_apply,
         crate::pty::pty_write,
@@ -2137,19 +2138,38 @@ pub async fn autonomous_grant<R: Runtime>(
     state: State<'_, AppState>,
     connector: String,
 ) -> Result<()> {
-    if !permissions::CONNECTORS.contains(&connector.as_str()) {
-        return Err(Error::Validation(format!(
-            "unknown connector; one of: {}",
-            permissions::CONNECTORS.join(", ")
-        )));
-    }
+    let connector = permissions::known_connector(&connector)?;
     let message = format!(
         "Authorize Autonomous submission on {connector}?\n\nOn a site that also has an allowed \
          register row and a verified submit, JobPilot would fill and submit an application \
          there with no review by you. No site has both today."
     );
     native::confirmed(&app, "Authorize Autonomous", message, "Authorize").await?;
-    permissions::grant(&*state.work().await?, ACTOR, &connector).await
+    permissions::grant(&*state.work().await?, ACTOR, connector).await
+}
+
+const AUTONOMOUS_HOLDS: &str = "an Autonomous run holds this until it ends";
+
+/// Autonomous on one application: the webview names it, and Rust decides first, so a site
+/// that is not eligible (today, every site) is refused with no dialog, no run row, and no
+/// browser. Only an eligible one asks a native yes for this submission, then runs in the AI
+/// slot, so Cancel, the emergency pause, and app exit reach it.
+#[tauri::command]
+pub async fn autonomous_start<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    application_id: String,
+) -> Result<RunView> {
+    let application = agents::autonomous_check(&*state.work().await?, &application_id).await?;
+    let message = format!(
+        "Submit the application for {} at {} ({}) with no review by you?\n\nJobPilot fills \
+         the form, stops for anything it cannot fill or check, and clicks submit once.",
+        application.role, application.company, application.link
+    );
+    native::confirmed(&app, "Autonomous submission", message, "Submit").await?;
+    let running = state.ai.begin_as(Some(AUTONOMOUS_HOLDS))?;
+    let db = state.work().await?;
+    agents::autonomous(&db, ACTOR, &application_id, running.token.clone()).await
 }
 
 /// Revoking only takes something away, so it does not ask. A run in progress stops at its
@@ -3440,6 +3460,7 @@ mod tests {
         "autonomous_grants",
         "autonomous_grant",
         "autonomous_revoke",
+        "autonomous_start",
         "pty_open",
         "pty_open_apply",
         "pty_write",
@@ -7119,6 +7140,35 @@ mod tests {
     }
 
     // ---- Autonomous ----
+
+    #[test]
+    fn autonomous_start_is_refused_with_no_dialog_and_no_run_while_no_site_is_eligible() {
+        let h = ready();
+        let app = apply_ready(&h);
+        let id = app.clone();
+        with_db(&h, |db| async move {
+            sqlx::query("UPDATE applications SET link = ? WHERE id = ?")
+                .bind("https://jobs.lever.co/acme/1")
+                .bind(id)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        });
+        h.answer(true);
+        h.call("autonomous_grant", json!({ "connector": "lever" }))
+            .unwrap();
+        let asked = h.asked().len();
+        let refused = h.call("autonomous_start", json!({ "applicationId": app }));
+        assert_eq!(refused.unwrap_err()["message"], "refused: policy_unknown");
+        assert_eq!(h.asked().len(), asked, "no dialog for a refused run");
+        let started = with_db(&h, |db| async move {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM apply_runs")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap()
+        });
+        assert_eq!(started, 0);
+    }
 
     #[test]
     fn autonomous_grant_asks_natively_and_revoke_does_not() {

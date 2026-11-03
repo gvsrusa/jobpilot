@@ -374,7 +374,7 @@ async function openReview(app: Application, overrides: Record<string, (args: Arg
 }
 
 describe("application review", () => {
-  it("Autonomous shows its reason and has no enabled control today", async () => {
+  it("Autonomous shows its reason and has no enabled control today but Revoke", async () => {
     const NONE =
       "No site or connector qualifies today. Needs a site rule of allowed, verified permission, and your explicit authorization.";
     const modes = material().modes.map((m) => (m.mode === "autonomous" ? { ...m, note: NONE } : m));
@@ -386,15 +386,19 @@ describe("application review", () => {
     const autonomous = within(group).getByRole("radio", { name: "Autonomous" });
     expect(autonomous).toHaveAttribute("aria-disabled", "true");
     expect(autonomous).toHaveAccessibleDescription(`Not available. ${NONE}`);
-    // What the owner authorized is shown as text, with nothing to press.
+    // What the owner authorized is shown, and the only control takes it away.
     expect(await screen.findByText("Connectors you authorized for Autonomous: lever.")).toBeInTheDocument();
     await user.click(autonomous);
     expect(autonomous).not.toBeChecked();
     for (const button of screen.queryAllByRole("button")) {
+      if (button.textContent === "Revoke lever") continue;
       expect(button.textContent ?? "").not.toMatch(/autonomous|authori[sz]e|submit/i);
     }
     expect(count(api, "autonomous_grant")).toBe(0);
-    expect(count(api, "autonomous_revoke")).toBe(0);
+    expect(count(api, "autonomous_start")).toBe(0);
+    await user.click(screen.getByRole("button", { name: "Revoke lever" }));
+    await waitFor(() => expect(count(api, "autonomous_revoke")).toBe(1));
+    expect(api.calls.find((c) => c.cmd === "autonomous_revoke")?.args).toEqual({ connector: "lever" });
   });
 
   it("disabled modes read their reason and cannot be selected", async () => {
