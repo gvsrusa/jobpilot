@@ -4,6 +4,7 @@ mod agents;
 mod ai;
 mod analytics;
 mod apps;
+mod browser_cmd;
 mod data;
 mod jobs;
 mod memory;
@@ -78,6 +79,9 @@ pub enum Command {
     /// AI providers, models, and consent.
     #[command(subcommand)]
     Ai(ai::AiCommand),
+    /// The browser runtime that automation drives.
+    #[command(subcommand)]
+    Browser(browser_cmd::BrowserCommand),
     /// Stop all automation.
     #[command(subcommand)]
     Pause(pause::PauseCommand),
@@ -93,6 +97,7 @@ impl Command {
     /// ever takes something away.
     pub fn refused_in_panel(&self) -> bool {
         use ai::{AiCommand, ConsentCommand};
+        use browser_cmd::BrowserCommand;
         use data::{BackupCommand, DataCommand};
         use jobs::JobCommand;
         use memory::MemoryCommand;
@@ -121,6 +126,7 @@ impl Command {
                         | DataCommand::DiscardLocked { .. }
                 )
                 | Command::Pause(PauseCommand::Clear)
+                | Command::Browser(BrowserCommand::Setup)
                 | Command::Kb(KbCommand::Reveal { .. })
                 | Command::Memory(
                     MemoryCommand::Approve { .. }
@@ -295,6 +301,9 @@ fn message(error: &Error) -> String {
         Error::Paused => "Emergency pause is on, so nothing automated runs. Clear it with \
                           `jobpilot pause clear` in an ordinary terminal, or from the title bar."
             .into(),
+        Error::ManualRequired(reason) if reason == "no_node" => {
+            "Install Node 18 or later (nodejs.org), then run `jobpilot browser setup`.".into()
+        }
         Error::ManualRequired(reason) if reason == "no_evidence" => {
             "There is no approved knowledge to work from. Add an item with `jobpilot kb add \
              <kind> <text>`, approve it with `jobpilot kb approve <id>` (`jobpilot kb list` \
@@ -474,6 +483,7 @@ async fn with_db(db: &Db, command: Command) -> Result<Output> {
         Command::Agents(command) => agents::agents(db, command).await,
         Command::Analytics(command) => analytics::analytics(db, command).await,
         Command::Ai(command) => ai::ai(db, command).await,
+        Command::Browser(command) => browser_cmd::browser(db, command).await,
         Command::Pause(command) => pause::pause(db, command).await,
         // `main` and the shell handle this before any command runs.
         Command::Shell => Err(Error::PanelRefused),
@@ -597,6 +607,8 @@ mod tests {
         ("agents resume r", false),
         ("analytics report", false),
         ("analytics show", false),
+        ("browser status", false),
+        ("browser setup", true),
         ("pause set", false),
         ("pause status", false),
         ("pause clear", true),
