@@ -417,6 +417,11 @@ fn message(error: &Error) -> String {
              <id>`, or on the AI screen."
                 .into()
         }
+        Error::Refused(reason) if reason == "copilot_policy" => {
+            "The policy register blocks filling forms on this site, so Copilot started \
+             nothing. Apply on the site yourself (Manual mode)."
+                .into()
+        }
         Error::Refused(reason) if source_reason(reason).is_some() => {
             source_reason(reason).unwrap_or_default().into()
         }

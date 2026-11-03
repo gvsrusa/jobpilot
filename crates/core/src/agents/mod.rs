@@ -21,7 +21,7 @@ pub mod tracking;
 
 use crate::analytics::Report;
 use analytics::Analytics;
-pub use browser::{BrowserWorkflow, autonomous, autonomous_check, copilot};
+pub use browser::{BrowserWorkflow, autonomous, autonomous_check, copilot, copilot_check};
 #[doc(hidden)]
 pub use browser::{autonomous_with, copilot_with};
 #[doc(hidden)]

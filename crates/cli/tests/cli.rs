@@ -3807,6 +3807,31 @@ async fn apply_start_winds_up_on_sighup() {
     assert!(!probe.success(), "claude is gone");
 }
 
+/// A Copilot refused by the register says so in words about filling, and nothing before it
+/// says Copilot is filling the form.
+#[tokio::test]
+async fn apply_copilot_on_a_blocked_site_says_filling_and_nothing_else() {
+    use jobpilot_core::applications::{self, ApplicationInput};
+    let (_dir, home) = fresh_home();
+    let db = Db::open(&AppPaths::new(&home)).await.unwrap();
+    let input = ApplicationInput {
+        company: "Acme".into(),
+        role: "Engineer".into(),
+        link: "https://www.indeed.com/viewjob?jk=1".into(),
+        ..ApplicationInput::default()
+    };
+    let app = applications::add(&db, "cli", input).await.unwrap().id;
+    db.close().await;
+
+    let output = run(&home, &["apply", "copilot", &app]);
+    assert!(!output.status.success());
+    let text = stderr_text(&output);
+    assert!(!text.contains("Copilot is filling"), "{text}");
+    assert!(text.contains("error[refused]"), "{text}");
+    assert!(text.contains("filling"), "{text}");
+    assert!(!text.contains("reading"), "{text}");
+}
+
 #[tokio::test]
 async fn apply_material_and_record_are_manual_mode_from_the_cli() {
     let (_dir, home) = fresh_home();

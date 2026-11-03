@@ -1456,6 +1456,25 @@ pub async fn autonomous_check(db: &Db, application_id: &str) -> Result<Applicati
     }
 }
 
+/// The register decision a Copilot run's first step makes, with no browser and no run row:
+/// `Ok` with the application when its site lets Copilot fill. A caller may say a run is
+/// starting only after this.
+pub async fn copilot_check(db: &Db, application_id: &str) -> Result<Application> {
+    let app = applications::get(db, application_id).await?;
+    if !permissions::link_allowed(&app.link) {
+        return Err(Error::Refused("link_not_https".into()));
+    }
+    let site = permissions::site_of(&app.link)?;
+    let grant = Grant {
+        owner_started: true,
+        authorized: permissions::granted(db, site).await?,
+    };
+    match permissions::decide(Mode::Copilot, site, Action::Fill, &grant) {
+        Decision::Allow { .. } => Ok(app),
+        Decision::Refuse(reason) => Err(Error::Refused(reason.into())),
+    }
+}
+
 /// [`autonomous`] on any register text and verified list, so a test can make a site eligible.
 #[doc(hidden)]
 pub async fn autonomous_with(

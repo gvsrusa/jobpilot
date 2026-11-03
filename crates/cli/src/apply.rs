@@ -9,7 +9,7 @@ use clap::{Subcommand, ValueEnum};
 use jobpilot_core::ai::CancellationToken;
 use jobpilot_core::ai::router::Router;
 use jobpilot_core::apply::{self, Material, Preflight, Resolution, RunView};
-use jobpilot_core::{Db, Result, agents, permissions};
+use jobpilot_core::{Db, Error, Result, agents, permissions};
 use serde_json::json;
 
 use crate::ai::with_interrupts;
@@ -155,6 +155,15 @@ pub async fn apply(db: &Db, command: ApplyCommand) -> Result<Output> {
             out(json!({"id": id}), format!("cancel asked for run {id}"))
         }
         ApplyCommand::Copilot { application } => {
+            // The register's word first, so nothing says Copilot is filling before a refusal.
+            agents::copilot_check(db, &application)
+                .await
+                .map_err(|error| match error {
+                    Error::Refused(reason) if reason.starts_with("policy_") => {
+                        Error::Refused("copilot_policy".into())
+                    }
+                    other => other,
+                })?;
             let router = Router::from_settings(db).await?;
             eprintln!(
                 "Copilot is filling the form in a browser window. It stops for you there: \
