@@ -142,6 +142,21 @@ describe("copilot", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("policy_blocked");
   });
 
+  it("a run that ends uncertain on an error shows what to do beside the error", async () => {
+    let started = false;
+    await openReview({
+      copilot_start: () => {
+        started = true;
+        throw { code: "paused", message: "paused" };
+      },
+      apply_latest: () =>
+        started ? run({ state: "ended", items: [item("uncertain")], ended_at: "2026-11-03T10:05:00.000Z" }) : null,
+    });
+    await screen.getByRole("button", { name: "Start Copilot" }).click();
+    expect(await screen.findByRole("alert")).toHaveTextContent("paused");
+    expect(await screen.findByText(/Check the site\. JobPilot will not try again\./)).toBeInTheDocument();
+  });
+
   it("its stop shows in the app whatever view is open, and leaving the review loses nothing", async () => {
     let latest: ApplyRunView | null = null;
     const live = run({

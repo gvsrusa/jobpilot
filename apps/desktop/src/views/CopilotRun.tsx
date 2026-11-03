@@ -34,6 +34,12 @@ export function CopilotRun({ applicationId }: { applicationId: string }) {
   const ours = running?.items.some((item) => item.application_id === applicationId) ?? false;
   const busy = start.isPending || running !== null;
   const ended = start.data?.items[0]?.state;
+  // A run that ends on an error (a pause or a cancel after Continue) returns no view: its end
+  // is read from the run itself, so "Check the site" still shows beside the error.
+  const lastRun = live.data && live.data.mode === "copilot" && live.data.state === "ended" ? live.data : null;
+  const endedOnError = start.isError
+    ? lastRun?.items.find((item) => item.application_id === applicationId)?.state
+    : undefined;
 
   return (
     <div className="grid gap-2">
@@ -58,6 +64,11 @@ export function CopilotRun({ applicationId }: { applicationId: string }) {
       {start.isSuccess && !running && (
         <p role="status" className="text-sm">
           Copilot run ended. {(ended && ENDED[ended]) ?? "Nothing was submitted."}
+        </p>
+      )}
+      {endedOnError && ENDED[endedOnError] && (
+        <p role="status" className="text-sm">
+          Copilot run ended. {ENDED[endedOnError]}
         </p>
       )}
       <ErrorAlert error={start.error} />
