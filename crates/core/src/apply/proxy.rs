@@ -256,16 +256,18 @@ fn picks_options(tool: &str, args: &Value) -> HashSet<String> {
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .filter(|field| {
-                !matches!(
-                    field.get("type").and_then(Value::as_str),
-                    Some("textbox" | "slider" | "checkbox" | "radio")
-                )
-            })
+            .filter(|field| picks_by_type(field.get("type").and_then(Value::as_str)))
             .map(target_of)
             .collect(),
         _ => HashSet::new(),
     }
+}
+
+/// Whether a `browser_fill_form` field of this declared type selects an option: anything
+/// but text, a slider, a checkbox, or a radio. apply-mcp judges a call's fields by it, and
+/// Copilot the fields it is about to fill, so one field cannot be judged two ways.
+pub(crate) fn picks_by_type(declared: Option<&str>) -> bool {
+    !matches!(declared, Some("textbox" | "slider" | "checkbox" | "radio"))
 }
 
 /// Every guard a typed or selected value passes, the same for apply-mcp and Copilot: the

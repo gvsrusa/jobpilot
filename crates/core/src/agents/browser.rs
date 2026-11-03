@@ -24,7 +24,7 @@ use crate::applications::{self, Application};
 use crate::apply::brief::{Brief, BriefAnswer};
 use crate::apply::guard::{self, PauseKind};
 use crate::apply::proxy::Knobs;
-use crate::apply::proxy::judge_field;
+use crate::apply::proxy::{judge_field, picks_by_type};
 use crate::apply::{self, Held, Item, PAUSE_HOLD, RunView, Submitter, session};
 use crate::browser::mcp::{McpClient, ToolReply};
 use crate::browser::runtime::{self, BrowserSpec, RuntimeState};
@@ -692,7 +692,8 @@ impl BrowserWorkflow<'_> {
             let why = if !guard::value_ok(text, &allowed) {
                 Some("unapproved")
             } else {
-                let picks = field.role == "combobox";
+                // Declared to the server as `type: role`, so judged as apply-mcp judges it.
+                let picks = picks_by_type(Some(&field.role));
                 match judge_field(&driver.last, &field.target, text, picks, &brief) {
                     None => Some("unlabeled"),
                     Some(Ok(())) => None,
