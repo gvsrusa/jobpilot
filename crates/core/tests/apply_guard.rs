@@ -1160,12 +1160,14 @@ fn every_line_before_a_choice_is_its_question() {
         "- radio \"Yes\" [ref=e2]",
     ]);
     assert_eq!(choice_guard(&near, "e2", &b), Err(Sensitive));
-    let stopped = page(&[
+    // An earlier ungrouped option of the same role and depth is a sibling, so the question
+    // above it still counts (final fix, E1).
+    let sibling = page(&[
         "- text: Are you a protected veteran?",
         "- radio \"No\" [ref=e1]",
         "- radio \"Yes\" [ref=e2]",
     ]);
-    assert_eq!(choice_guard(&stopped, "e2", &b), Ok(()));
+    assert_eq!(choice_guard(&sibling, "e2", &b), Err(Sensitive));
 }
 
 #[test]
@@ -1294,4 +1296,100 @@ fn yes_and_no_buttons_share_the_question_above_them() {
             "{released}"
         );
     }
+}
+
+#[test]
+fn ungrouped_options_keep_their_question() {
+    let b = released();
+    let lever = page(&[
+        "- generic [ref=e1]: Are you legally authorized to work in the United States?",
+        "- list [ref=e5]:",
+        "  - listitem [ref=e6]:",
+        "    - generic [ref=e7]:",
+        "      - radio \"Yes\" [ref=e2]",
+        "      - text: \"Yes\"",
+        "  - listitem [ref=e8]:",
+        "    - generic [ref=e9]:",
+        "      - radio \"No\" [ref=e3]",
+        "      - text: \"No\"",
+    ]);
+    assert_eq!(choice_guard(&lever, "e2", &b), Ok(()));
+    assert_eq!(choice_guard(&lever, "e3", &b), Err(Sensitive));
+    for (question, first, second) in [
+        (
+            "Are you a protected veteran?",
+            "radio \"No\" [ref=e3]",
+            "radio \"Yes\" [ref=e2]",
+        ),
+        (
+            "Will you require sponsorship to work in the United States?",
+            "radio \"No\" [ref=e3]",
+            "radio \"Yes\" [ref=e2]",
+        ),
+        (
+            "Race",
+            "checkbox \"Asian\" [ref=e3]",
+            "checkbox \"Middle Eastern or North African\" [ref=e2]",
+        ),
+        (
+            "Sexual orientation",
+            "radio \"Heterosexual\" [ref=e3]",
+            "radio \"Gay\" [ref=e2]",
+        ),
+    ] {
+        let snap = format!("- generic [ref=e0]:\n  - text: {question}\n  - {first}\n  - {second}");
+        assert_eq!(choice_guard(&snap, "e2", &b), Err(Sensitive), "{question}");
+    }
+    let veteran_no = "- generic [ref=e0]:\n  - text: Are you a protected veteran?\n  - radio \"Yes\" [ref=e3]\n  - radio \"No\" [ref=e2]";
+    assert_eq!(choice_guard(veteran_no, "e2", &b), Ok(()));
+}
+
+#[test]
+fn a_side_list_takes_its_comboboxs_question() {
+    let b = released();
+    let auth = page(&[
+        "- generic [ref=e0]:",
+        "  - text: Are you legally authorized to work in the United States?",
+        "  - combobox \"Are you legally authorized to work in the United States?\" [expanded] [ref=e4]",
+        "  - listbox [ref=e5]:",
+        "    - option \"Yes\" [ref=e2]",
+        "    - option \"No\" [ref=e3]",
+    ]);
+    assert_eq!(choice_guard(&auth, "e2", &b), Ok(()));
+    assert_eq!(choice_guard(&auth, "e3", &b), Err(Sensitive));
+    let gender = page(&[
+        "- generic [ref=e0]:",
+        "  - text: Gender",
+        "  - combobox \"Gender\" [expanded] [ref=e4]",
+        "  - listbox [ref=e5]:",
+        "    - option \"Male\" [ref=e2]",
+        "    - option \"Female\" [ref=e3]",
+    ]);
+    assert_eq!(choice_guard(&gender, "e2", &b), Err(Sensitive));
+    assert_eq!(choice_guard(&gender, "e3", &b), Ok(()));
+}
+
+#[test]
+fn a_helper_button_does_not_cut_off_the_question() {
+    let b = released();
+    let clear = page(&[
+        "- generic [ref=e0]:",
+        "  - text: Are you a protected veteran?",
+        "  - radiogroup [ref=e4]:",
+        "    - button \"Clear\" [ref=e9]",
+        "    - radio \"Yes\" [ref=e2]",
+        "    - radio \"No\" [ref=e3]",
+    ]);
+    assert_eq!(choice_guard(&clear, "e2", &b), Err(Sensitive));
+    assert_eq!(choice_guard(&clear, "e3", &b), Ok(()));
+    let info = page(&[
+        "- generic [ref=e0]:",
+        "  - text: Are you a protected veteran?",
+        "  - button \"More info\" [ref=e9]",
+        "  - radiogroup [ref=e4]:",
+        "    - radio \"Yes\" [ref=e2]",
+        "    - radio \"No\" [ref=e3]",
+    ]);
+    assert_eq!(choice_guard(&info, "e2", &b), Err(Sensitive));
+    assert_eq!(choice_guard(&info, "e3", &b), Ok(()));
 }

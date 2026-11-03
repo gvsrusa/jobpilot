@@ -842,11 +842,14 @@ fn role_at(line: &str) -> String {
 }
 
 /// Every question a choice may answer, within its own field: the name of each option-group
-/// ancestor ([`GROUP_ROLES`]), and the text of lines before the target at any depth. The walk
-/// back passes over the target's ancestors, its group's own options, yes, no, and sensitive-option
-/// buttons, links, and images, and stops at another field, another group's choice, any other
-/// button, or after 8 texts. The same text,
-/// folded, counts once.
+/// ancestor ([`GROUP_ROLES`]), and the text of lines before the target at any depth, at most 8.
+/// The walk back passes over the target's ancestors, links, images, and yes, no, and
+/// sensitive-option buttons. Inside an option group it passes over the group's own options and
+/// buttons, and stops at another field or another group's choice. A combobox's name is taken
+/// before the walk stops there. With no option group it passes over earlier choices of the
+/// target's role and depth, and stops at a field or another choice only once a text is taken.
+/// Any other button is passed over until a text is taken, and stops the walk after that. The
+/// same text, folded, counts once.
 fn questions(lines: &[&str], index: usize) -> Questions {
     let mut ancestors = Vec::new();
     let mut limit = indent_of(lines[index]);
@@ -869,6 +872,8 @@ fn questions(lines: &[&str], index: usize) -> Questions {
         .map(|at| text_of_line(lines[*at]))
         .filter(|text| !text.is_empty())
         .collect();
+    let own_role = role_at(lines[index]);
+    let own_indent = indent_of(lines[index]);
     let mut before = 0;
     for at in (0..index).rev() {
         let line = lines[at];
@@ -880,14 +885,37 @@ fn questions(lines: &[&str], index: usize) -> Questions {
         }
         let role = role_at(line);
         let same_group = own_group.is_some_and(|group| at > group);
-        if role == "button" && button_answers(line) {
+        let collected = before > 0;
+        if role == "button" {
+            if button_answers(line) || same_group || !collected {
+                continue;
+            }
+            break;
+        }
+        if role == "combobox" {
+            let text = text_of_line(line);
+            if !text.is_empty() {
+                texts.push(text);
+                before += 1;
+            }
+            if own_group.is_some() || before > 0 {
+                break;
+            }
             continue;
         }
-        if FIELD_ROLES.contains(&role.as_str()) || role == "button" {
+        if FIELD_ROLES.contains(&role.as_str()) {
+            if own_group.is_none() && !collected {
+                continue;
+            }
             break;
         }
         if role_in(&role, &CHOICE_ROLES) {
             if same_group {
+                continue;
+            }
+            if own_group.is_none()
+                && ((role == own_role && indent_of(line) == own_indent) || !collected)
+            {
                 continue;
             }
             break;
