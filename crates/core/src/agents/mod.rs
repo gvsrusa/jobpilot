@@ -4,21 +4,31 @@
 use crate::ai::router::Router;
 use crate::ai::{CancellationToken, TaskType};
 use crate::applications::{self, Application};
+use crate::connectors::fetch::Fetcher;
 use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::runner::{self, Finished, RunInput, RunState, Workflow, store};
 
 pub mod analytics;
+pub mod discovery;
 pub mod draft;
+pub mod matching;
 pub mod memory;
+pub mod research;
 pub mod tracking;
 
 use crate::analytics::Report;
 use analytics::Analytics;
+use discovery::DiscoveryWorkflow;
+pub use discovery::{DiscoveryReport, SourceResult, discover, discover_with};
 use draft::DraftWorkflow;
 pub use draft::{draft_cover_letter, draft_resume};
+use matching::MatchingWorkflow;
+pub use matching::{AiPlan, MATCH_BATCH, MatchReport, MatchRequest, match_jobs, match_plan};
 use memory::MemoryWorkflow;
 pub use memory::{MemoryRefreshed, memory_refresh};
+use research::ResearchWorkflow;
+pub use research::{CompanyResearch, research_company, research_plan};
 use tracking::Tracking;
 
 /// Bad input gets its plain error and no run, which also keeps a run's stored input to a
@@ -71,6 +81,32 @@ pub async fn resume_run(
     run_id: &str,
     cancel: CancellationToken,
 ) -> Result<Finished> {
+    resume_from(db, router, None, actor, run_id, cancel).await
+}
+
+/// [`resume_run`] with the fetcher a discovery run reads through, so a test can point it at a
+/// loopback server.
+#[doc(hidden)]
+pub async fn resume_run_with(
+    db: &Db,
+    router: &Router,
+    fetcher: &Fetcher,
+    actor: &str,
+    run_id: &str,
+    cancel: CancellationToken,
+) -> Result<Finished> {
+    resume_from(db, router, Some(fetcher), actor, run_id, cancel).await
+}
+
+/// Only a discovery run needs a fetcher, so only it builds the hosted one when none is given.
+async fn resume_from(
+    db: &Db,
+    router: &Router,
+    fetcher: Option<&Fetcher>,
+    actor: &str,
+    run_id: &str,
+    cancel: CancellationToken,
+) -> Result<Finished> {
     let stored = store::load(db, run_id).await?;
     match stored.input {
         RunInput::Tracking {
@@ -109,6 +145,26 @@ pub async fn resume_run(
         } => {
             let task = TaskType::DraftCoverLetter;
             let workflow = DraftWorkflow::new(task, &job_text_id, export, router);
+            runner::resume(db, actor, run_id, &workflow, cancel).await
+        }
+        RunInput::Discovery { source_ids } => {
+            let hosted;
+            let fetcher = match fetcher {
+                Some(fetcher) => fetcher,
+                None => {
+                    hosted = Fetcher::hosted()?;
+                    &hosted
+                }
+            };
+            let workflow = DiscoveryWorkflow::new(source_ids, fetcher);
+            runner::resume(db, actor, run_id, &workflow, cancel).await
+        }
+        RunInput::Matching { job_ids, ai } => {
+            let workflow = MatchingWorkflow::new(router, job_ids, ai, true);
+            runner::resume(db, actor, run_id, &workflow, cancel).await
+        }
+        RunInput::Research { company_id } => {
+            let workflow = ResearchWorkflow::new(router, company_id, true);
             runner::resume(db, actor, run_id, &workflow, cancel).await
         }
         RunInput::MemoryRefresh => {

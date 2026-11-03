@@ -41,6 +41,8 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        // Rust opens a stored https link. No capability gives the webview this plugin.
+        .plugin(tauri_plugin_opener::init())
         .manage(PtyState::default())
         .menu(menu::build)
         .on_menu_event(menu::on_event)

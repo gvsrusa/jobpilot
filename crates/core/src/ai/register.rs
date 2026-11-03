@@ -228,3 +228,27 @@ pub fn register_date() -> String {
     let date = line.split_once(DATE_LABEL).map_or("", |(_, rest)| rest);
     date.split('.').next().unwrap_or_default().to_string()
 }
+
+const VERDICT_CELL: usize = 5;
+
+/// A connector's row of the vendor table: its verdict and Date read, backticks stripped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SiteRow {
+    pub verdict: String,
+    pub date_read: String,
+}
+
+pub(crate) fn site_row(register: &str, integration: &str, op: &str) -> Option<SiteRow> {
+    let mut rows = register
+        .lines()
+        .map(cells)
+        .filter(|cells| cells.len() > VERDICT_CELL && cells[0] == integration && cells[1] == op);
+    let first = rows.next()?;
+    let verdict = first[VERDICT_CELL].replace('`', "");
+    // A repeated row that disagrees leaves the verdict undecided, so it fails closed.
+    let agreed = rows.all(|row| row[VERDICT_CELL].replace('`', "") == verdict);
+    Some(SiteRow {
+        verdict: if agreed { verdict } else { "unknown".into() },
+        date_read: first[DATE_READ_CELL].replace('`', ""),
+    })
+}

@@ -59,7 +59,8 @@ async fn export_covers_every_user_table() {
 
     let expected: BTreeSet<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_master WHERE type = 'table' \
-         AND name NOT GLOB '_sqlx_*' AND name NOT GLOB 'documents_fts*' AND name NOT GLOB 'memory_fts*'",
+         AND name NOT GLOB '_sqlx_*' AND name NOT GLOB 'documents_fts*' AND name NOT GLOB 'memory_fts*' \
+         AND name NOT GLOB 'jobs_fts*'",
     )
     .fetch_all(&db.pool)
     .await
@@ -74,6 +75,47 @@ async fn export_covers_every_user_table() {
     assert_eq!(data["format"], 1);
     assert_eq!(data["schema_version"], jobpilot_core::app_schema_version());
     assert!(data["exported_at"].as_str().unwrap().ends_with('Z'));
+}
+
+#[tokio::test]
+async fn export_writes_the_new_tables_and_no_fts() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let job = jobpilot_core::jobs::import_pasted(
+        &db,
+        jobpilot_core::jobs::PastedJob {
+            title: "Backend Engineer".into(),
+            company: "Acme".into(),
+            url: None,
+            text: "We need Rust".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let dir = transfer::export_all(&db, "cli").await.unwrap();
+    db.close().await;
+
+    let (_, data) = read_export(&dir);
+    let names = table_names(&data);
+    for table in [
+        "jobs",
+        "companies",
+        "job_sources",
+        "match_results",
+        "company_notes",
+        "connector_limits",
+    ] {
+        assert!(names.contains(table), "{table} in {names:?}");
+    }
+    assert!(
+        !names.iter().any(|name| name.starts_with("jobs_fts")),
+        "{names:?}"
+    );
+    let rows = data["tables"]["jobs"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], job.id.as_str());
+    assert_eq!(rows[0]["title"], "Backend Engineer");
 }
 
 #[tokio::test]

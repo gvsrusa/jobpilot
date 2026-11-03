@@ -64,6 +64,17 @@ pub const RUN_REASONS: &[&str] = &[
     "endpoint_changed",
     "cli_account_refused",
     "unusable_reply",
+    "policy_unknown",
+    "policy_blocked",
+    "policy_user_assisted",
+    "operation_not_declared",
+    "source_blocked",
+    "source_not_found",
+    "bad_feed",
+    "needs_text",
+    "network",
+    "no_sources",
+    "company_gone",
 ];
 
 /// Absent capabilities are false: a declaration lists only what the provider proves.
@@ -99,6 +110,8 @@ pub enum TaskType {
     DraftCoverLetter,
     ClassifyAnswer,
     Embed,
+    SemanticMatch,
+    SummarizeCompany,
 }
 
 #[derive(Debug)]
@@ -147,6 +160,22 @@ static CLASSIFY_ANSWER: TaskSpec = TaskSpec {
     categories: &[DataCategory::JobText],
     attempts: 1,
 };
+/// Resume text and a posting, so a provider needs both categories. The reply is data: Rust
+/// keeps only the strengths that cite real evidence, and the score never reads it.
+static SEMANTIC_MATCH: TaskSpec = TaskSpec {
+    task: TaskType::SemanticMatch,
+    schema: include_str!("../../schemas/semantic_match.json"),
+    required: DRAFTING,
+    categories: &[DataCategory::JobText, DataCategory::ResumeText],
+    attempts: 2,
+};
+static SUMMARIZE_COMPANY: TaskSpec = TaskSpec {
+    task: TaskType::SummarizeCompany,
+    schema: include_str!("../../schemas/summarize_company.json"),
+    required: DRAFTING,
+    categories: &[DataCategory::CompanyText, DataCategory::JobText],
+    attempts: 2,
+};
 static EMBED: TaskSpec = TaskSpec {
     task: TaskType::Embed,
     schema: "",
@@ -163,6 +192,8 @@ pub fn spec(task: TaskType) -> &'static TaskSpec {
         TaskType::DraftCoverLetter => &DRAFT_COVER_LETTER,
         TaskType::ClassifyAnswer => &CLASSIFY_ANSWER,
         TaskType::Embed => &EMBED,
+        TaskType::SemanticMatch => &SEMANTIC_MATCH,
+        TaskType::SummarizeCompany => &SUMMARIZE_COMPANY,
     }
 }
 
@@ -397,11 +428,13 @@ pub struct Sharing {
 }
 
 /// `Embed` is local only, so it never reaches a consent screen.
-const COMPLETION_TASKS: [TaskType; 4] = [
+const COMPLETION_TASKS: [TaskType; 6] = [
     TaskType::ParseJob,
     TaskType::DraftResume,
     TaskType::DraftCoverLetter,
     TaskType::ClassifyAnswer,
+    TaskType::SemanticMatch,
+    TaskType::SummarizeCompany,
 ];
 
 pub async fn sharing(db: &Db, name: &str) -> Result<Sharing> {

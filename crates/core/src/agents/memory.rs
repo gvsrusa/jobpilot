@@ -97,7 +97,7 @@ impl<'r> MemoryWorkflow<'r> {
         let result = classify_pending(ctx.db, self.router, ctx.actor, ctx.cancel.clone()).await;
         // What left the machine is read from the router's own log, so a call that came back
         // unusable still counts: the text was sent.
-        let asked = asked_since(ctx.db, &since).await;
+        let asked = asked_since(ctx.db, &since, TaskType::ClassifyAnswer).await;
         // The classify error is the one to report: a log that cannot be read must not hide it.
         let classified = result?;
         let (provider, categories) = asked?;
@@ -105,6 +105,7 @@ impl<'r> MemoryWorkflow<'r> {
         Ok(StepOutput {
             provider,
             categories,
+            dropped: 0,
         })
     }
 
@@ -194,7 +195,7 @@ pub fn sealed(result: Result<usize>) -> Result<(usize, Option<String>)> {
     }
 }
 
-async fn now(db: &Db) -> Result<String> {
+pub(crate) async fn now(db: &Db) -> Result<String> {
     Ok(
         sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
             .fetch_one(&db.pool)
@@ -202,16 +203,22 @@ async fn now(db: &Db) -> Result<String> {
     )
 }
 
-/// The provider a classify call went to since `since`, and the data it carried. An external
+/// The provider a call of `task` went to since `since`, and the data it carried. An external
 /// one wins over a local one, since that is what left the machine. `NoAi` is no provider.
-async fn asked_since(
+pub(crate) async fn asked_since(
     db: &Db,
     since: &str,
+    task: TaskType,
 ) -> Result<(Option<ProviderId>, &'static [DataCategory])> {
+    let code = serde_json::to_value(task)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default();
     let used: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT provider FROM task_runs WHERE task_type = 'classify_answer' \
+        "SELECT DISTINCT provider FROM task_runs WHERE task_type = ? \
          AND attempt >= 1 AND provider <> 'no_ai' AND started_at >= ?",
     )
+    .bind(code)
     .bind(since)
     .fetch_all(&db.pool)
     .await?;
@@ -223,7 +230,7 @@ async fn asked_since(
         .find(|id| *id != ProviderId::Ollama)
         .or_else(|| named().next());
     let categories = if provider.is_some() {
-        spec(TaskType::ClassifyAnswer).categories
+        spec(task).categories
     } else {
         &[]
     };

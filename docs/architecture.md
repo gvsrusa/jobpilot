@@ -1,6 +1,6 @@
 # JobPilot AI: Architecture
 
-Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md), [PRD](prd.md), and [milestone plan](milestones.md). Requirement IDs (`FR-<section>.<n>`) come from the PRD. Releases 0.1 to 0.4 are built; this document describes 0.1 in detail, adds the 0.2 and 0.3 modules, and names later pieces only as extension points.
+Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md), [PRD](prd.md), and [milestone plan](milestones.md). Requirement IDs (`FR-<section>.<n>`) come from the PRD. Releases 0.1 to 0.5 are built; this document describes 0.1 in detail, adds the 0.2 to 0.5 modules, and names later pieces only as extension points.
 
 Related documents: [AI providers](ai-providers.md), [policy register](policy-register.md), [threat model](security/threat-model.md), [agents](agents.md). They own connector, AI, security, and agent design. This document does not specify those designs. The database is described in [database-schema.md](database-schema.md).
 
@@ -189,11 +189,70 @@ Modules added in 0.4, inside `ai`:
 
 The keychain path for a provider key is `secrets` (`set_api_key`, `read_api_key`, `delete_api_key`): the OS credential store under `ai-key-<name>`, `secret_index` holding only the name, reads inside a send. The desktop adapter adds `ai_key_from_clipboard` (Rust reads the clipboard through `tauri-plugin-clipboard-manager`, shows a native dialog, stores the key, clears the clipboard), and the CLI adds `ai key set` (a hidden prompt or piped stdin). Neither passes a key through the webview or argv.
 
-Planned later modules (connector SDK, permissions engine) will be added to this crate in later releases. Their designs belong to the documents listed at the top and are not decided here.
+Modules added in 0.5:
+
+| Module | Responsibility | Requirements |
+|---|---|---|
+| `connectors` | The connector SDK: `ConnectorDecl`, the pure `request` and `parse` of each source, `check`, `gate`, `vet`, and `statuses`. `fetch` is the only file that opens a socket (`Fetcher`); `limit` keeps rate limits in the database. Lever, RemoteOK, We Work Remotely, Greenhouse, and Ashby read; Workday, Indeed, LinkedIn, and company pages only import a paste. The register is read at build time. See the [Connector SDK](connector-sdk.md). | FR-5.1 to FR-5.18, FR-13.5, M-33 |
+| `jobs` | The job store: sources, jobs, companies, versioned job texts, import, upsert, duplicate groups (`dedupe`), parsing rules for place, pay, seniority and skills (`rules`, `geo`, `pay`), the weighted rules score (`score`), match preferences (`prefs`), the model's separate evaluation (`semantic`), and company notes (`company`). Every job text is made here, through `knowledge`. | FR-5.x, FR-6.1 to FR-6.12 |
+| `agents::{discovery, matching, research}` | Three more workflows on the runner. `discovery` fetches source by source and then groups duplicates, with no model. `matching` fills blanks, scores by rules, and stores an optional evaluation. `research` summarizes a company from stored text. See [Agents](agents.md#4-the-nine-agents). | FR-11.1, FR-11.2, FR-11.8 |
+
+Two task types, `semantic_match` and `summarize_company`, join the router ([AI providers](ai-providers.md#as-built-in-05)). Nothing else in `ai` changes.
+
+The permissions engine for browser automation is a later module (0.6). Its design belongs to the documents listed at the top and is not decided here.
 
 ### 6.2 `crates/cli` (`jobpilot`)
 
 A binary crate that depends on `jobpilot-core`. It parses arguments, calls core with actor `"cli"`, and prints text or, with `--json`, JSON. Errors go to standard error as `error[<code>]: <message>` with exit code 1. The 0.1 surface is `status`, `doc`, `backup`, and `data`. It contains no business logic. Later releases add the commands in FR-10.3 to FR-10.12. This is the 0.1 slice of FR-10.13.
+
+The 0.5 CLI adds the `job` surface (alias `job src` for `job source`):
+
+| Command | Does |
+|---|---|
+| `job paste <title>`, `job import --url <u> --title <t>` | Store a posting from standard input or `--file`. The link is kept and never requested. |
+| `job list [--country C] [--mode remote\|hybrid\|onsite] [--min-pay 90000:EUR:year] [--all]`, `job search <q>`, `job show <id>` | Read stored jobs, best score first. A filter keeps a job that does not state the field. |
+| `job remove <id>`, `job split <id>` | Remove a job, or say it is not a duplicate. |
+| `job sources`, `job source add <connector> [target]`, `job source list`, `job source remove <id>` | Each source with its read status, limit, and attribution; add and remove a source. |
+| `job fetch [--src <id>]...` | Read the sources, or only those named. |
+| `job analyze [ids] [--ai --yes]` | Score by rules. With `--ai`, a model also fills blanks and writes an evaluation, after the call count is stated. |
+| `job research <company-id> [--yes]`, `job company list`, `job company note <id>` | Summarize a company from stored text; list companies; store a pasted note. |
+| `job prefs show`, `job prefs set [--min-pay ...] [--seniority ...]` | Wanted pay and seniority, which never reach a prompt. |
+
+`job show <id> --json` prints the job detail as one object. Field names are the Rust field names; a missing value is `null`.
+
+```text
+{
+  "job": {
+    "id", "job_text_id", "connector", "title",
+    "company", "company_id", "location", "country",
+    "work_mode", "employment_type", "url", "attribution", "posted_on",
+    "pay": { "min", "max", "currency", "period" } | null,
+    "seniority", "skills": [..], "fields_by",
+    "duplicate_of", "duplicates", "findings",
+    "first_seen_at", "last_seen_at",
+    "score", "scored", "stale", "not_stated": [..]
+  },
+  "text": "...",                       // the cleaned posting; untrusted
+  "findings": [ { "kind", "excerpt" } ],
+  "explanation": {
+    "rows": [ { "criterion": "skills|seniority|location|pay",
+                "weight", "points" | null, "note" } ],
+    "score" | null, "compared_weight",
+    "matched_skills": [..], "missing_skills": [..], "by": "rules"
+  } | null,
+  "semantic": { "fit", "summary", "strengths": [ { "text", "evidence_ids" } ],
+                "gaps": [..], "dropped", "provider", "at" } | null,
+  "group": [ <job>, .. ],             // the same job on other sources
+  "authorization": { "kind": "no_country" }
+                 | { "kind": "not_stated", "country" }
+                 | { "kind": "stated", "country", "authorized", "needs_sponsorship" }
+                 | { "kind": "locked" },
+  "mentions_authorization": false,
+  "notes": [ { "id", "text", "origin", "source_ref", "provider", "created_at" } ]
+}
+```
+
+`pay.period` is `hour`, `day`, `week`, `month`, or `year`, and is `null` when the source names none. `authorized` and `needs_sponsorship` are `not_stated`, `yes`, or `no`. `points` is `null` for a criterion that was not compared. `by` is always `rules`: the model's number is only in `semantic.fit`.
 
 The 0.3 CLI adds `app` (add, list, show, history, edit, status, note, answers, remove), `memory` (add-question, add-answer, list, show, edit-answer, approve, unapprove, reviewed, set-class, reveal, confirm, use, authorization, remove-question, remove-answer, search, refresh), `agents` (list, show, log, cancel, resume), `analytics` (report, show), and `pause` (set, status, clear). Each has a row in the `PANEL` table, and what its GUI twin confirms natively (for example `pause clear`) is refused in the terminal panel.
 
@@ -228,6 +287,7 @@ Built with Vite, Tailwind CSS, shadcn/ui, Zustand for client state, and TanStack
 | Applications view | `src/views/ApplicationsView.tsx` | Add, filter, edit, and change the status of applications, their history, the answers an application used, and the analytics summary (0.3). |
 | Memory view | `src/views/MemoryView.tsx` | Questions, answers, classes, approval, search, and the refresh with its call count (0.3). |
 | Agents view | `src/views/AgentsView.tsx` | Runs and their logs, with resume and cancel (0.3). |
+| Jobs view | `src/views/JobsView.tsx`, `src/views/JobDetail.tsx` | Ctrl+0. Sources with their read status and a Fetch button, filters, the job list, paste, preferences, and the job detail with its explained score (0.5). It holds no scoring logic: Rust scores. |
 | Title bar | `src/components/TitleBar.tsx` | First in the page on every screen: the Emergency pause button, the paused notice, and Clear pause (0.3). |
 
 Screen layouts are in the UI wireframes (plan Task A5) and are not repeated here.
@@ -265,6 +325,6 @@ These are named so that 0.1 does not block them. They are not designed here.
 | Later area | Release | Owner document |
 |---|---|---|
 | AI task router and providers | 0.2, 0.4 | [ai-providers.md](ai-providers.md) |
-| Connector SDK and policy review | 0.5 | [policy-register.md](policy-register.md) |
+| Connector SDK and policy review | 0.5 (built) | [connector-sdk.md](connector-sdk.md), [policy-register.md](policy-register.md) |
 | Threat model and prompt-injection controls | 0.1 onward | [security/threat-model.md](security/threat-model.md) |
 | Agents and workflow runner | 0.3, 0.5, 0.6 | [agents.md](agents.md) |

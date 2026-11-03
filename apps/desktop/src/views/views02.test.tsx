@@ -61,6 +61,7 @@ const draft = (over: Partial<Draft>): Draft => ({
   origin: "generated",
   title: "Backend Engineer, Acme",
   job_text_id: "j1",
+  current_text_id: over.job_text_id === undefined ? "j1" : over.job_text_id,
   provider: "ollama",
   doc: { name: "Ada", contact: [], summary: [], sections: [] },
   created_at: "2026-11-01T10:00:00Z",
@@ -297,6 +298,51 @@ describe("resumes", () => {
   });
 
   const OLLAMA_UP = aiWith({ ollama: { state: "running", url: "http://127.0.0.1:11434", version: "1", models: [] } });
+
+  it("a_draft_citing_an_older_version_of_a_posting_still_shows_with_that_text", async () => {
+    resumeBackend({
+      job_list: () => [{ ...JOB, id: "j2", normalized: "The revised text." }],
+      resume_list: () => [draft({ current_text_id: "j2" })],
+      job_get: ({ id }) => ({ ...JOB, id, normalized: "The older text." }),
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    expect(await screen.findByText("The older text.")).toBeInTheDocument();
+    expect(screen.queryByText("This draft is not tied to a job posting.")).toBeNull();
+  });
+
+  it("a_draft_on_a_revised_job_shows_under_that_job_and_not_under_another", async () => {
+    resumeBackend({
+      job_list: () => [
+        { ...JOB, id: "b", title: "Job B" },
+        { ...JOB, id: "a2", title: "Job A" },
+      ],
+      resume_list: () => [draft({ job_text_id: "a1", current_text_id: "a2" })],
+      job_get: ({ id }) => ({ ...JOB, id, normalized: "The older text." }),
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    expect(await screen.findByText("No generated resume for this job yet.")).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Compare" })).toBeNull();
+    await user.selectOptions(screen.getByLabelText("Job posting"), "a2");
+    expect(await screen.findByText("The older text.")).toBeInTheDocument();
+  });
+
+  it("a_draft_whose_job_was_removed_shows_under_no_job", async () => {
+    resumeBackend({
+      job_list: () => [
+        { ...JOB, id: "a", title: "Job A" },
+        { ...JOB, id: "b", title: "Job B" },
+      ],
+      resume_list: () => [draft({ job_text_id: "gone" })],
+    });
+    const { user } = renderApp();
+    await go(user, "Resumes", "Resumes");
+    expect(await screen.findByText("No generated resume for this job yet.")).toBeInTheDocument();
+    await user.selectOptions(screen.getByLabelText("Job posting"), "b");
+    expect(await screen.findByText("No generated resume for this job yet.")).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Compare" })).toBeNull();
+  });
 
   it("no_evidence_points_at_the_knowledge_section", async () => {
     resumeBackend({
@@ -1437,6 +1483,12 @@ describe("ai", () => {
     expect(said("model_not_found")).toMatch(/Model id/);
     expect(said("model_refused")).toMatch(/declined this task/);
     expect(said("endpoint_changed")).toMatch(/endpoint address changed/);
+  });
+
+  it("the_research_reasons_read_in_plain_words", () => {
+    const said = (word: string) => explainReason({ code: "manual_required", message: `this needs manual work: ${word}` });
+    expect(said("no_sources")).toMatch(/no stored text/i);
+    expect(said("company_gone")).toMatch(/no longer exists/i);
   });
 
   it("consent_focus_starts_on_cancel", async () => {

@@ -24,7 +24,7 @@ const PATH: &str = "/chat/completions";
 const USAGE_CAP: &str = "You have reached your specified API usage limits. Access returns on x.";
 const KEY: &str = "sk-test";
 const JOB: &str = r#"{"title":"Engineer","company":"Acme","location":"Oslo","remote":"hybrid",
-    "skills":["Rust"],"seniority":"senior","compensation":""}"#;
+    "skills":["Rust"],"seniority":"senior"}"#;
 const DRAFTING: [DataCategory; 3] = [
     DataCategory::JobText,
     DataCategory::ProfileBasic,
@@ -802,6 +802,8 @@ fn every_schema_is_strict_ready_after_provider_schema() {
         TaskType::DraftResume,
         TaskType::DraftCoverLetter,
         TaskType::ClassifyAnswer,
+        TaskType::SemanticMatch,
+        TaskType::SummarizeCompany,
     ] {
         let schema = spec(task).schema;
         check(&provider_schema(schema).unwrap(), schema);

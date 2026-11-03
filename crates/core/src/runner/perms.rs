@@ -23,6 +23,13 @@ pub enum Permission {
     WriteReports,
     Model(TaskType),
     EmbedLocal,
+    ReadMatches,
+    WriteJobs,
+    WriteMatches,
+    WriteCompanyNotes,
+    WriteJobFields,
+    /// Reads a connector's declared endpoints, through the `Fetcher` only: no other socket.
+    NetConnector,
 }
 
 use Permission::*;
@@ -79,6 +86,37 @@ static ANALYTICS: AgentSpec = AgentSpec {
     run_timeout: Duration::from_secs(60),
 };
 
+static DISCOVERY: AgentSpec = AgentSpec {
+    agent: Agent::Discovery,
+    permissions: &[NetConnector, ReadJobText, WriteJobs],
+    run_timeout: Duration::from_secs(10 * 60),
+};
+
+static MATCHING: AgentSpec = AgentSpec {
+    agent: Agent::Matching,
+    permissions: &[
+        ReadJobText,
+        ReadProfileBasic,
+        ReadResumeText,
+        Model(TaskType::ParseJob),
+        Model(TaskType::SemanticMatch),
+        WriteJobFields,
+        WriteMatches,
+    ],
+    run_timeout: Duration::from_secs(30 * 60),
+};
+
+static RESEARCH: AgentSpec = AgentSpec {
+    agent: Agent::Research,
+    permissions: &[
+        ReadJobText,
+        ReadCompanyText,
+        Model(TaskType::SummarizeCompany),
+        WriteCompanyNotes,
+    ],
+    run_timeout: Duration::from_secs(10 * 60),
+};
+
 pub fn spec_of(agent: Agent) -> &'static AgentSpec {
     match agent {
         Agent::Resume => &RESUME,
@@ -86,5 +124,8 @@ pub fn spec_of(agent: Agent) -> &'static AgentSpec {
         Agent::CareerMemory => &CAREER_MEMORY,
         Agent::Tracking => &TRACKING,
         Agent::Analytics => &ANALYTICS,
+        Agent::Discovery => &DISCOVERY,
+        Agent::Matching => &MATCHING,
+        Agent::Research => &RESEARCH,
     }
 }

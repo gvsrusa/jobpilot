@@ -275,6 +275,7 @@ export type LogRow = {
   provider: string | null;
   data_categories: DataCategory[];
   outcome: string;
+  dropped: number;
 };
 
 export type RunDetail = { run: RunSummary; log: LogRow[] };
@@ -307,6 +308,8 @@ export type Draft = {
   origin: string;
   title: string;
   job_text_id: string | null;
+  /** The current text of this draft's job, or `job_text_id` when no job holds it. */
+  current_text_id: string | null;
   provider: string | null;
   doc: ResumeDoc;
   created_at: string;
@@ -399,7 +402,13 @@ export type ExternalStatus = {
 };
 
 export type TaskSharing = {
-  task: "parse_job" | "draft_resume" | "draft_cover_letter" | "classify_answer";
+  task:
+    | "parse_job"
+    | "draft_resume"
+    | "draft_cover_letter"
+    | "classify_answer"
+    | "semantic_match"
+    | "summarize_company";
   categories: DataCategory[];
   runs: boolean;
   skipped_because: string | null;
@@ -463,6 +472,150 @@ export type AuditEntry = {
   detail: unknown;
 };
 
+export type PayPeriod = "hour" | "day" | "week" | "month" | "year";
+/** `period` is null when the posting names none. It is never guessed. */
+export type PayRange = { min: number | null; max: number | null; currency: string | null; period: PayPeriod | null };
+export type PayWish = { amount: number; currency: string; period: PayPeriod };
+
+/** Text fields come from outside postings. Render them as text only. */
+export type Job = {
+  id: string;
+  job_text_id: string;
+  /** The source: a connector name, or `import`. */
+  connector: string;
+  title: string;
+  company: string | null;
+  company_id: string | null;
+  location: string;
+  country: string | null;
+  work_mode: string | null;
+  employment_type: string | null;
+  url: string | null;
+  /** Shown on every card from a source that asks for it. */
+  attribution: string | null;
+  posted_on: string | null;
+  pay: PayRange | null;
+  seniority: string | null;
+  skills: string[];
+  fields_by: string;
+  duplicate_of: string | null;
+  duplicates: number;
+  findings: number;
+  first_seen_at: string;
+  last_seen_at: string;
+  score: number | null;
+  /** A result is stored: with a null `score`, it had nothing to compare. */
+  scored: boolean;
+  stale: boolean;
+  not_stated: string[];
+};
+
+export type JobFilter = {
+  country: string | null;
+  work_mode: WorkMode | null;
+  min_pay: PayWish | null;
+  query: string | null;
+  include_duplicates: boolean;
+};
+
+export type PastedJob = { title: string; company: string; url: string | null; text: string };
+
+export type ExplanationRow = {
+  criterion: "skills" | "seniority" | "location" | "pay";
+  weight: number;
+  points: number | null;
+  note: string;
+};
+export type Explanation = {
+  rows: ExplanationRow[];
+  score: number | null;
+  compared_weight: number;
+  matched_skills: string[];
+  missing_skills: string[];
+  by: string;
+};
+/** Each strength cites evidence that exists; the rest were cut and counted in `dropped`. */
+export type Strength = { text: string; evidence_ids: string[] };
+export type Semantic = {
+  fit: number;
+  summary: string;
+  strengths: Strength[];
+  gaps: string[];
+  dropped: number;
+  provider: string;
+  at: string;
+};
+export type AuthNote =
+  | { kind: "no_country" }
+  | { kind: "not_stated"; country: string }
+  | { kind: "stated"; country: string; authorized: Stated; needs_sponsorship: Stated }
+  | { kind: "locked" };
+export type CompanyNote = {
+  id: string;
+  text: string;
+  origin: string;
+  source_ref: string | null;
+  provider: string | null;
+  created_at: string;
+};
+export type Company = { id: string; name: string; jobs: number; notes: number };
+export type JobDetail = {
+  job: Job;
+  text: string;
+  findings: Finding[];
+  explanation: Explanation | null;
+  semantic: Semantic | null;
+  group: Job[];
+  authorization: AuthNote;
+  mentions_authorization: boolean;
+  notes: CompanyNote[];
+};
+
+export type SourceStatus = {
+  name: string;
+  label: string;
+  read: "allowed" | "silent_read" | "user_assisted" | "blocked" | "unknown";
+  can_fetch: boolean;
+  operations: string[];
+  attribution: string | null;
+  date_read: string | null;
+  target: "board" | "feed" | "none";
+  min_interval_secs: number | null;
+  per_day: number | null;
+  /** The R1 note, on Greenhouse and Ashby. */
+  note: string | null;
+};
+export type SourceRow = {
+  id: string;
+  connector: string;
+  target: string;
+  query: string;
+  cursor: number;
+  created_at: string;
+};
+export type SourceResult = {
+  source_id: string;
+  connector: string;
+  target: string;
+  added: number;
+  updated: number;
+  skipped: number;
+  reason: string | null;
+  /** When a rate-limited source may be read again, from the stored hold. */
+  next_at: string | null;
+};
+export type DiscoveryReport = { sources: SourceResult[]; grouped: number };
+export type MatchReport = { scored: number; parsed: number; evaluated: number; dropped: number; reason: string | null };
+export type AiPlan = { jobs: number; external_calls: number };
+export type CompanyResearch = {
+  company_id: string;
+  sources: number;
+  facts: number;
+  dropped: number;
+  reason: string | null;
+};
+export type MatchPrefs = { min_pay: PayWish | null; seniority: string | null };
+
 export const ipc = {
   status: () => invoke<Status>("status"),
   retryOpen: () => invoke<Status>("retry_open"),
@@ -507,6 +660,31 @@ export const ipc = {
   jobPaste: (title: string, raw: string) => invoke<JobText>("job_paste", { title, raw }),
   jobList: () => invoke<JobText[]>("job_list"),
   jobGet: (id: string) => invoke<JobText>("job_get", { id }),
+
+  jobsList: (filter: JobFilter, limit: number) => invoke<Job[]>("jobs_list", { filter, limit }),
+  jobDetail: (id: string) => invoke<JobDetail>("job_detail", { id }),
+  jobImport: (input: PastedJob) => invoke<Job>("job_import", { input }),
+  jobRemove: (id: string) => invoke<void>("job_remove", { id }),
+  jobSplit: (id: string) => invoke<void>("job_split", { id }),
+  /** Rust opens the stored link when it is https. The webview never names a URL. */
+  jobOpen: (id: string) => invoke<void>("job_open", { id }),
+  jobToApp: (id: string) => invoke<Application>("job_to_app", { id }),
+  jobSourcesStatus: () => invoke<SourceStatus[]>("job_sources_status"),
+  jobSourcesList: () => invoke<SourceRow[]>("job_sources_list"),
+  jobSrcAdd: (connector: string, target: string, query: string) =>
+    invoke<SourceRow>("job_src_add", { connector, target, query }),
+  jobSrcRemove: (id: string) => invoke<void>("job_src_remove", { id }),
+  jobsFetch: (srcIds: string[]) => invoke<DiscoveryReport>("jobs_fetch", { srcIds }),
+  jobsAnalyzePlan: (ids: string[]) => invoke<AiPlan>("jobs_analyze_plan", { ids }),
+  /** With `ai`, Rust names the count in its own dialog first. */
+  jobsAnalyze: (ids: string[], ai: boolean) => invoke<MatchReport>("jobs_analyze", { ids, ai }),
+  jobResearchPlan: (companyId: string) => invoke<AiPlan>("job_research_plan", { companyId }),
+  jobResearch: (companyId: string) => invoke<CompanyResearch>("job_research", { companyId }),
+  companiesList: () => invoke<Company[]>("companies_list"),
+  companyNoteAdd: (companyId: string, text: string) =>
+    invoke<CompanyNote>("company_note_add", { companyId, text }),
+  matchPrefsGet: () => invoke<MatchPrefs>("match_prefs_get"),
+  matchPrefsSet: (prefs: MatchPrefs) => invoke<void>("match_prefs_set", { prefs }),
 
   appList: (status: ApplicationStatus | null) =>
     invoke<Application[]>("app_list", { status }),

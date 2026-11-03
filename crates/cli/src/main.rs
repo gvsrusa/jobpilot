@@ -5,6 +5,7 @@ mod ai;
 mod analytics;
 mod apps;
 mod data;
+mod jobs;
 mod memory;
 mod pause;
 mod profile;
@@ -55,7 +56,7 @@ pub enum Command {
     Kb(profile::KbCommand),
     /// Pasted job postings.
     #[command(subcommand)]
-    Job(profile::JobCommand),
+    Job(jobs::JobCommand),
     /// Resume drafts.
     #[command(subcommand)]
     Resume(resume::ResumeCommand),
@@ -93,9 +94,10 @@ impl Command {
     pub fn refused_in_panel(&self) -> bool {
         use ai::{AiCommand, ConsentCommand};
         use data::{BackupCommand, DataCommand};
+        use jobs::JobCommand;
         use memory::MemoryCommand;
         use pause::PauseCommand;
-        use profile::{JobCommand, KbCommand};
+        use profile::KbCommand;
         use resume::{ExportArgs, LetterCommand, ResumeCommand};
         matches!(
             self,
@@ -130,7 +132,10 @@ impl Command {
                         | MemoryCommand::Authorization { .. }
                         | MemoryCommand::Refresh { yes: true }
                 )
-                | Command::Job(JobCommand::Paste { file: Some(_), .. })
+                | Command::Job(
+                    JobCommand::Paste { file: Some(_), .. }
+                        | JobCommand::Import { file: Some(_), .. }
+                )
                 | Command::Resume(
                     ResumeCommand::Import { .. }
                         | ResumeCommand::Export(ExportArgs { out: Some(_), .. })
@@ -237,12 +242,70 @@ pub fn error_line(error: &Error) -> String {
     )
 }
 
+/// Plain words for a job-source refusal. The reason words are the ones on `RUN_REASONS`.
+fn source_reason(reason: &str) -> Option<&'static str> {
+    Some(match reason {
+        "policy_unknown" => {
+            "The policy register has no clear answer for this source, so nothing was requested."
+        }
+        "policy_blocked" => {
+            "The policy register blocks reading this source, so nothing was requested."
+        }
+        "policy_user_assisted" => {
+            "This source is user-assisted only, so nothing is read from it. Import the posting. \
+             Use `jobpilot job import --url <link> --title <title>` with its text on standard \
+             input."
+        }
+        "operation_not_declared" => {
+            "This source does not declare that operation, so nothing was requested. Import the \
+             posting. Use `jobpilot job import --url <link> --title <title>` with its text on \
+             standard input."
+        }
+        "source_blocked" => {
+            "The source refused or showed a challenge page. JobPilot stops there, tries nothing else, and leaves it alone for a day."
+        }
+        "source_not_found" => "The source says that board or feed does not exist. Check the name.",
+        "bad_feed" => {
+            "The source answered in a shape JobPilot does not read, so nothing was stored."
+        }
+        "needs_text" => "That posting has no text to read. Import it with its text instead.",
+        "network" => "The source could not be reached. Check the connection and try again.",
+        "too_large" => "The source sent more than 16 MiB, so that answer was not stored.",
+        "timeout" => "The source took too long to answer. Try again later.",
+        "no_sources" => {
+            "This company has no stored text to read yet. Import a posting or paste a note first."
+        }
+        "company_gone" => "This company no longer exists, so nothing was saved.",
+        _ => return None,
+    })
+}
+
+fn wait_words(wait: std::time::Duration) -> String {
+    let secs = wait.as_secs();
+    match secs {
+        0..=89 => format!("{secs} seconds"),
+        90..=5399 => format!("{} minutes", secs.div_ceil(60)),
+        _ => format!("{} hours", secs.div_ceil(3600)),
+    }
+}
+
 fn message(error: &Error) -> String {
     match error {
         Error::PanelRefused => shell::REFUSAL.into(),
         Error::Paused => "Emergency pause is on, so nothing automated runs. Clear it with \
                           `jobpilot pause clear` in an ordinary terminal, or from the title bar."
             .into(),
+        Error::ManualRequired(reason) if reason == "no_evidence" => {
+            "There is no approved knowledge to work from. Add an item with `jobpilot kb add \
+             <kind> <text>`, approve it with `jobpilot kb approve <id>` (`jobpilot kb list` \
+             shows the ids), then run this again."
+                .into()
+        }
+        Error::ManualRequired(reason) if reason == "no_ai" => {
+            "No AI provider is on, so this needs doing by hand. Turn one on with `jobpilot ai \
+             enable <provider>`, then run this again."
+                .into()
+        }
         Error::ManualRequired(reason) if reason == "not_logged_in" => {
             "This CLI is not signed in. Run it once in your own terminal to sign in, then try \
              again."
@@ -319,6 +382,15 @@ fn message(error: &Error) -> String {
              <id>`, or on the AI screen."
                 .into()
         }
+        Error::Refused(reason) if source_reason(reason).is_some() => {
+            source_reason(reason).unwrap_or_default().into()
+        }
+        Error::RateLimited {
+            retry_after: Some(wait),
+        } => format!(
+            "This source asked JobPilot to wait, or its limit is reached. Try again in about {}.",
+            wait_words(*wait)
+        ),
         Error::ManualRequired(reason) | Error::Refused(reason) if reason == "origin_refused" => {
             "That model is not eligible through OpenRouter. Use an openai/, anthropic/, or \
              google/ model, not a free one, with no suffix but :nitro or :floor."
@@ -394,7 +466,7 @@ async fn with_db(db: &Db, command: Command) -> Result<Output> {
         Command::Profile(command) => profile::profile(db, command).await,
         Command::Prefs(command) => profile::prefs(db, command).await,
         Command::Kb(command) => profile::kb(db, command).await,
-        Command::Job(command) => profile::job(db, command).await,
+        Command::Job(command) => jobs::job(db, command).await,
         Command::Resume(command) => resume::resume(db, command).await,
         Command::Letter(command) => resume::letter(db, command).await,
         Command::App(command) => apps::app(db, command).await,
@@ -452,8 +524,30 @@ mod tests {
         ("kb search q", false),
         ("job paste t", false),
         ("job paste t --file /f", true),
+        ("job import --url u --title t", false),
+        ("job import --url u --title t --file /f", true),
         ("job list", false),
+        (
+            "job list --country PT --mode remote --min-pay 90000:EUR:year --all",
+            false,
+        ),
+        ("job search q", false),
         ("job show i", false),
+        ("job remove i", false),
+        ("job split i", false),
+        ("job sources", false),
+        ("job source list", false),
+        ("job source add lever acme", false),
+        ("job source remove i", false),
+        ("job fetch", false),
+        ("job fetch --source i", false),
+        ("job analyze", false),
+        ("job analyze i --ai --yes", false),
+        ("job research c --yes", false),
+        ("job company list", false),
+        ("job company note c", false),
+        ("job prefs show", false),
+        ("job prefs set --seniority senior", false),
         ("resume import /r", true),
         ("resume list", false),
         ("resume versions l", false),
@@ -561,6 +655,15 @@ mod tests {
     }
 
     #[test]
+    fn no_evidence_and_no_ai_say_what_to_do() {
+        let evidence = message(&Error::ManualRequired("no_evidence".into()));
+        assert!(evidence.contains("jobpilot kb add") && evidence.contains("jobpilot kb approve"));
+        let none = message(&Error::ManualRequired("no_ai".into()));
+        assert!(none.contains("jobpilot ai enable"), "{none}");
+        assert!(!none.contains("no_ai") && !evidence.contains("no_evidence"));
+    }
+
+    #[test]
     fn consent_hint_names_the_whole_command() {
         let text = message(&Error::ManualRequired("consent_needed".into()));
         assert!(
@@ -664,6 +767,13 @@ mod tests {
                 !takes_path || refused,
                 "takes a path, has no refused row: {path}"
             );
+        }
+    }
+
+    #[test]
+    fn the_research_reasons_read_in_plain_words() {
+        for word in ["no_sources", "company_gone", "too_large", "timeout"] {
+            assert!(super::source_reason(word).is_some(), "{word}");
         }
     }
 

@@ -21,7 +21,7 @@ use tokio::sync::{Mutex, MutexGuard};
 const NAME: &str = "ai-key-endpoint";
 const PATH: &str = "/chat/completions";
 const JOB: &str = r#"{"title":"Engineer","company":"Acme","location":"Oslo","remote":"hybrid",
-    "skills":["Rust"],"seniority":"senior","compensation":""}"#;
+    "skills":["Rust"],"seniority":"senior"}"#;
 
 static ONE_AT_A_TIME: Mutex<()> = Mutex::const_new(());
 

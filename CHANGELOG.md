@@ -4,9 +4,27 @@ Format follows Keep a Changelog. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.5.0] - unreleased
+
+Job discovery and job intelligence. See `docs/releases/0.5.0.md` for what was and was not exercised.
+
 ### Added
+- Connector SDK: a declaration of operations, automation, rate limit, and policy status, two pure functions, and a gate that reads the build-time policy register. `docs/connector-sdk.md`.
+- Read connectors for Lever, RemoteOK, and We Work Remotely (`allowed` rows), and for Greenhouse and Ashby under ruling R1, a controller ruling and not an owner decision (`silent-read`). One fetcher sends every request: pause check, gate, declared host, a rate limit kept in the database, and no redirect, cookie, or proxy. Workday, Indeed, LinkedIn, and company pages take a pasted posting only.
+- A job store: sources, jobs, companies, versioned job texts, duplicate groups, and match results. Migrations 0013 to 0015. Schema version 15.
+- Deterministic parsing of place, pay, seniority, and skills; a weighted rules score with an explanation; objective filters; and a stated-only work authorization line.
+- Discovery, matching, and research agents on the workflow runner, and two router tasks, `semantic_match` and `summarize_company`. A model's evaluation is shown apart from the score.
+- `jobpilot job` commands (paste, import, list, search, show, remove, split, sources, source, fetch, analyze, research, company, prefs) and the Jobs view on Ctrl/Cmd+0, with a job detail that explains its score.
+- Injection corpus files 20 to 22 and tests for connector text, the fit score, and company claims.
 - CI on macOS and Windows, and a tag-triggered draft release workflow producing dmg, nsis, and msi installers.
-- Development guide, contributing guide, and Connector SDK stub.
+- Development guide and contributing guide.
+
+### Changed
+- A model never sets pay: only the deterministic parser does. A model sets work mode or seniority only when the word is in the posting and is not negated. On a revised posting only your own fields stay.
+- Import refuses an http link and a link with a user name or a port.
+- `Retry-After` is capped at 24 hours.
+- The instruction-like markers were narrowed so ordinary postings stop raising findings: `as an ai` is gone, and `system:` counts only as a leading order, so `System: Linux servers` is a plain label.
+- Version 0.5.0.
 
 ### Fixed
 - Windows: keychain calls no longer overlap, within a process or between the app and the CLI. Credential Manager could answer "no such entry" for a stored key, which reads as a lost key and offers discard.

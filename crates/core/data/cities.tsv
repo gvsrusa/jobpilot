@@ -1,0 +1,190 @@
+# city<TAB>country<TAB>state or province (if any). Only settles a two-letter suffix such as `Berlin, DE`.
+New York	US	NY
+Los Angeles	US	CA
+San Francisco	US	CA
+San Jose	US	CA
+San Diego	US	CA
+Oakland	US	CA
+Sacramento	US	CA
+Palo Alto	US	CA
+Mountain View	US	CA
+Sunnyvale	US	CA
+Santa Clara	US	CA
+Irvine	US	CA
+Santa Monica	US	CA
+Seattle	US	WA
+Bellevue	US	WA
+Redmond	US	WA
+Spokane	US	WA
+Portland	US	OR
+Austin	US	TX
+Dallas	US	TX
+Houston	US	TX
+San Antonio	US	TX
+Plano	US	TX
+Fort Worth	US	TX
+Boston	US	MA
+Cambridge	US	MA
+Worcester	US	MA
+Chicago	US	IL
+Springfield	US	IL
+Indianapolis	US	IN
+Fort Wayne	US	IN
+Denver	US	CO
+Boulder	US	CO
+Colorado Springs	US	CO
+Atlanta	US	GA
+Savannah	US	GA
+Miami	US	FL
+Orlando	US	FL
+Tampa	US	FL
+Jacksonville	US	FL
+Philadelphia	US	PA
+Pittsburgh	US	PA
+Baltimore	US	MD
+Bethesda	US	MD
+Detroit	US	MI
+Ann Arbor	US	MI
+Minneapolis	US	MN
+Saint Paul	US	MN
+St Paul	US	MN
+Columbus	US	OH
+Cleveland	US	OH
+Cincinnati	US	OH
+Nashville	US	TN
+Memphis	US	TN
+Phoenix	US	AZ
+Tucson	US	AZ
+Las Vegas	US	NV
+Salt Lake City	US	UT
+Raleigh	US	NC
+Charlotte	US	NC
+Durham	US	NC
+Jackson	US	MS
+Kansas City	US	MO
+Saint Louis	US	MO
+St Louis	US	MO
+Omaha	US	NE
+Lincoln	US	NE
+Little Rock	US	AR
+Birmingham	US	AL
+Huntsville	US	AL
+Wilmington	US	DE
+Dover	US	DE
+Baton Rouge	US	LA
+New Orleans	US	LA
+Billings	US	MT
+Columbia	US	SC
+Charleston	US	SC
+Sioux Falls	US	SD
+Burlington	US	VT
+Madison	US	WI
+Milwaukee	US	WI
+Richmond	US	VA
+Arlington	US	VA
+Washington	US	DC
+Honolulu	US	HI
+Anchorage	US	AK
+Albuquerque	US	NM
+Louisville	US	KY
+Boise	US	ID
+Oklahoma City	US	OK
+Tulsa	US	OK
+Providence	US	RI
+Hartford	US	CT
+Stamford	US	CT
+Newark	US	NJ
+Jersey City	US	NJ
+Des Moines	US	IA
+Wichita	US	KS
+Charleston	US	WV
+Portland	US	ME
+Manchester	US	NH
+Cheyenne	US	WY
+Toronto	CA	ON
+Ottawa	CA	ON
+Mississauga	CA	ON
+Waterloo	CA	ON
+Montreal	CA	QC
+Quebec City	CA	QC
+Vancouver	CA	BC
+Victoria	CA	BC
+Calgary	CA	AB
+Edmonton	CA	AB
+Winnipeg	CA	MB
+Halifax	CA	NS
+Saskatoon	CA	SK
+Regina	CA	SK
+Mumbai	IN	
+Bangalore	IN	
+Bengaluru	IN	
+Delhi	IN	
+New Delhi	IN	
+Hyderabad	IN	
+Chennai	IN	
+Pune	IN	
+Kolkata	IN	
+Gurgaon	IN	
+Gurugram	IN	
+Noida	IN	
+Ahmedabad	IN	
+Jaipur	IN	
+Kochi	IN	
+Berlin	DE	
+Munich	DE	
+Hamburg	DE	
+Frankfurt	DE	
+Cologne	DE	
+Stuttgart	DE	
+Dusseldorf	DE	
+Leipzig	DE	
+Dresden	DE	
+Nuremberg	DE	
+Hannover	DE	
+Amsterdam	NL	
+Rotterdam	NL	
+The Hague	NL	
+Utrecht	NL	
+Eindhoven	NL	
+Delft	NL	
+Tel Aviv	IL	
+Jerusalem	IL	
+Haifa	IL	
+Herzliya	IL	
+Ramat Gan	IL	
+Lima	PE	
+Cusco	PE	
+Arequipa	PE	
+Casablanca	MA	
+Rabat	MA	
+Marrakech	MA	
+Tangier	MA	
+Bogota	CO	
+Medellin	CO	
+Cali	CO	
+Barranquilla	CO	
+Buenos Aires	AR	
+Cordoba	AR	
+Rosario	AR	
+Panama City	PA	
+Tirana	AL	
+Baku	AZ	
+Jakarta	ID	
+Bandung	ID	
+Surabaya	ID	
+Vientiane	LA	
+Chisinau	MD	
+Podgorica	ME	
+Ulaanbaatar	MN	
+Valletta	MT	
+Bratislava	SK	
+Kosice	SK	
+Tunis	TN	
+Khartoum	SD	
+Libreville	GA	
+Victoria Mahe	SC	
+Niamey	NE	
+Noumea	NC	
+Macau	MO	
+Pago Pago	AS	
+George Town	KY	

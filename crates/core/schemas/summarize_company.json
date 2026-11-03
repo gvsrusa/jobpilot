@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "required": ["facts", "gaps"],
+  "properties": {
+    "facts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["text", "source"],
+        "properties": {
+          "text": { "type": "string", "maxLength": 500 },
+          "source": { "type": "string", "maxLength": 500 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "gaps": { "type": "array", "items": { "type": "string", "maxLength": 500 } }
+  },
+  "additionalProperties": false
+}

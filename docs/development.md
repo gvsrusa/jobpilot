@@ -48,6 +48,21 @@ Release 0.3 adds sealed answers (`memory_answers.body_enc`), so `memory`, `memor
 
 `real_claude_has_no_tools_smoke`, `real_gemini_has_no_tools_smoke`, `real_tls_handshake`, and `make_fixtures` are also ignored, and are skipped by name (`real_claude`, `real_gemini`, `real_tls`, `make_fixtures`), so CI never calls the real `claude` or `gemini` or rewrites the committed resume fixtures, and the keychain steps never open the TLS check. `locked_keychain_is_unavailable_not_missing` swaps the default macOS keychain for a throwaway one, so it runs only with `JOBPILOT_ALLOW_KEYCHAIN_SWAP=1` and is not run in CI.
 
+### Job connectors (release 0.5)
+
+**Fixtures.** `crates/core/tests/fixtures/connectors` holds the recorded shapes of the five read sources: `lever.json`, `remoteok.json`, `wwr.rss`, `greenhouse.json`, `ashby.json`, plus `lever_empty.json`, `lever_changed.json`, and `challenge.html` for the refusal cases. They are synthetic. Each holds invented postings in the shape the source sends, and never a real company's posting. Add no capture of a live source to the repository. Each source fixture carries one hidden `display:none` line, which the injection tests use.
+
+**No test or CI step reaches a job source.** Every connector test uses a fixture, a pure parser, or a fake on `127.0.0.1` (`crates/core/tests/fake_http`). `Fetcher::for_test` accepts a loopback address only. `only_fetch_rs_touches_the_network` fails if any file but `fetch.rs` names a network type. The CI `TLS handshake` step contacts the four AI vendor hosts, and no job source. The live check of the five sources is a controller task for each release, run by hand on a temporary root.
+
+**CLI.** `job` commands are in `crates/cli/src/jobs.rs`. To try them without touching your data, use a debug build with a temporary root and a test keychain service:
+
+```bash
+E=$(mktemp -d); export JOBPILOT_HOME="$E/home" JOBPILOT_SECRET_SERVICE=jobpilot-test
+cargo run -p jobpilot-cli -- job sources
+```
+
+A release build ignores `JOBPILOT_SECRET_SERVICE`, so use a debug build for anything that touches the keychain. The `job show` JSON shape is in [architecture](architecture.md#62-cratescli-jobpilot).
+
 ### Claude Code
 
 The headless adapter and the panel's `claude` launcher use the `claude` you installed. Resolution order: `JOBPILOT_CLAUDE_BIN` (an absolute path), the `ai.claude_path` setting, `PATH`, the usual install folders, then one lookup through your login shell. The adapter and launcher run it with your own login; JobPilot never reads its credentials. The tests use a mock `claude` (`crates/core/tests/mock-claude`) and need no login. To run the real smoke once, which spends a little of your subscription:
@@ -114,7 +129,7 @@ JOBPILOT_HOME=/tmp/jobpilot-dev cargo run -p jobpilot-cli -- status
 
 Migrations live in `crates/core/migrations/` and run through `sqlx::migrate!`.
 
-1. Add the next file, for example `0006_<name>.sql` (the last shipped is `0012`, schema version 12). Number sequentially.
+1. Add the next file, for example `0006_<name>.sql` (the last shipped is `0015`, schema version 15). Number sequentially.
 2. Never edit a migration that has shipped. SQLx stores a hash of each applied file; a change breaks every existing database. Fix forward with a new file.
 3. Keep line endings LF. `.gitattributes` forces `*.sql text eol=lf`, since CRLF changes the hash.
 4. Use runtime `sqlx::query`, not `query!`, so builds need no `DATABASE_URL` or `sqlx-cli`.

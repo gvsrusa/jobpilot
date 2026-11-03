@@ -237,6 +237,33 @@ describe("applications", () => {
     expect(await screen.findByText("No applications yet. Add the first one.")).toBeInTheDocument();
   });
 
+  it("an_application_tied_to_an_older_version_of_a_posting_still_names_it", async () => {
+    const application: Application = {
+      id: "a1",
+      company: "Acme",
+      role: "Engineer",
+      status: "saved",
+      job_text_id: "old",
+      resume_draft_id: null,
+      letter_draft_id: null,
+      link: "",
+      country: "",
+      notes: "",
+      applied_on: null,
+      created_at: "2026-11-01T10:00:00Z",
+      updated_at: "2026-11-01T10:00:00Z",
+    };
+    backend({
+      app_list: () => [application],
+      app_get: () => application,
+      job_get: () => ({ id: "old", title: "Older posting", normalized: "x", findings: [] }),
+    });
+    const { user } = renderApp();
+    await open(user);
+    await user.click(await screen.findByRole("button", { name: "Acme" }));
+    await waitFor(() => expect(screen.getByLabelText("Job posting")).toHaveDisplayValue("Older posting"));
+  });
+
   it("applications_add_change_status_and_see_history", async () => {
     const api = tracking();
     const { user } = renderApp();
@@ -1124,6 +1151,7 @@ describe("agents", () => {
     duration_ms: 12,
     provider: null,
     data_categories: [],
+    dropped: 0,
     outcome: "ok",
     ...over,
   });

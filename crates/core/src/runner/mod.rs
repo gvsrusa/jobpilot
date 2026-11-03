@@ -49,6 +49,9 @@ pub enum Agent {
     CareerMemory,
     Tracking,
     Analytics,
+    Discovery,
+    Matching,
+    Research,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +95,8 @@ pub struct StepDef {
 pub struct StepOutput {
     pub provider: Option<ProviderId>,
     pub categories: &'static [DataCategory],
+    /// Model output the checks cut in this step, logged as a count.
+    pub dropped: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +117,18 @@ pub enum RunInput {
         on: Option<String>,
     },
     Analytics,
+    Discovery {
+        source_ids: Vec<String>,
+    },
+    /// Hex job ids and a flag: no text.
+    Matching {
+        job_ids: Vec<String>,
+        ai: bool,
+    },
+    /// A hex company id: no text.
+    Research {
+        company_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -154,6 +171,8 @@ pub struct Ctx<'a> {
     pub cancel: CancellationToken,
     run_id: String,
     agent: Agent,
+    /// Bumped by each resume, so a run that was resumed has a generation above 0.
+    generation: i64,
     checkpoint: Mutex<Checkpoint>,
 }
 
@@ -161,6 +180,12 @@ impl Ctx<'_> {
     /// The row this step belongs to, so a result can be tied to its run.
     pub fn run_id(&self) -> &str {
         &self.run_id
+    }
+
+    /// Whether this process took the run over from an earlier one. A checkpoint cannot say:
+    /// a crash stores none, and a pause may come before the first thing worth saving.
+    pub fn resumed(&self) -> bool {
+        self.generation > 0
     }
 
     pub fn check(&self, permission: Permission) -> Result<()> {
@@ -251,6 +276,7 @@ pub struct LogRow {
     pub provider: Option<String>,
     pub data_categories: Vec<DataCategory>,
     pub outcome: String,
+    pub dropped: usize,
 }
 
 /// A run's bounds. Public only so tests can shorten them through [`start_with`].
@@ -450,6 +476,7 @@ impl Run<'_> {
                 provider: output.and_then(|output| output.provider.as_ref()),
                 categories: output.map_or(&[], |output| output.categories),
                 duration_ms: i64::try_from(self.clock.elapsed().as_millis()).unwrap_or(i64::MAX),
+                dropped: output.map_or(0, |output| i64::try_from(output.dropped).unwrap_or(0)),
             },
         )
         .await?;
@@ -625,6 +652,7 @@ async fn execute(
         cancel,
         run_id: id.clone(),
         agent: run.agent,
+        generation: run.generation,
         checkpoint: Mutex::new(saved),
     };
     match walk(run, &ctx, workflow, &limits).await {

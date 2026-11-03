@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use jobpilot_core::agents::{self, analytics, draft, memory, tracking};
+use jobpilot_core::agents::{
+    self, analytics, discovery, draft, matching, memory, research, tracking,
+};
 use jobpilot_core::ai::{BoxFuture, CancellationToken, DataCategory, ProviderId, TaskType};
 use jobpilot_core::runner::{
     self, Agent, Ctx, Limits, Permission, RunInput, RunState, StepDef, StepOutput, Workflow,
@@ -184,6 +186,7 @@ async fn a_run_logs_each_state_in_order() {
             Ok(StepOutput {
                 provider: Some(ProviderId::NoAi),
                 categories: &[DataCategory::JobText],
+                dropped: 0,
             })
         })
     });
@@ -263,6 +266,9 @@ fn every_agent_step_stays_in_its_set() {
         (Agent::Resume, draft::RESUME_STEPS),
         (Agent::CoverLetter, draft::LETTER_STEPS),
         (Agent::CareerMemory, memory::STEPS),
+        (Agent::Discovery, discovery::STEPS),
+        (Agent::Matching, matching::STEPS),
+        (Agent::Research, research::STEPS),
     ];
     for (agent, steps) in table {
         let spec = spec_of(*agent);
@@ -329,6 +335,50 @@ fn each_step_names_exactly_what_it_needs() {
                 ("embed", &[ReadCareerMemory, EmbedLocal, WriteCareerMemory]),
             ],
         ),
+        (
+            discovery::STEPS,
+            &[
+                ("fetch", &[NetConnector, ReadJobText, WriteJobs]),
+                ("dedupe", &[ReadJobText, WriteJobs]),
+            ],
+        ),
+        (
+            matching::STEPS,
+            &[
+                (
+                    "fields",
+                    &[ReadJobText, Model(TaskType::ParseJob), WriteJobFields],
+                ),
+                (
+                    "score",
+                    &[ReadJobText, ReadProfileBasic, ReadResumeText, WriteMatches],
+                ),
+                (
+                    "semantic",
+                    &[
+                        ReadJobText,
+                        ReadResumeText,
+                        Model(TaskType::SemanticMatch),
+                        WriteMatches,
+                    ],
+                ),
+            ],
+        ),
+        (
+            research::STEPS,
+            &[
+                ("gather", &[ReadJobText, ReadCompanyText]),
+                (
+                    "summarize",
+                    &[
+                        ReadJobText,
+                        ReadCompanyText,
+                        Model(TaskType::SummarizeCompany),
+                        WriteCompanyNotes,
+                    ],
+                ),
+            ],
+        ),
     ];
     for (steps, wanted) in table {
         assert_eq!(steps.len(), wanted.len());
@@ -389,6 +439,34 @@ fn permission_sets_match_the_spec_table() {
             &[ReadApplications, WriteReports],
             Duration::from_secs(60),
         ),
+        (
+            Agent::Discovery,
+            &[NetConnector, ReadJobText, WriteJobs],
+            Duration::from_secs(10 * 60),
+        ),
+        (
+            Agent::Matching,
+            &[
+                ReadJobText,
+                ReadProfileBasic,
+                ReadResumeText,
+                Model(TaskType::ParseJob),
+                Model(TaskType::SemanticMatch),
+                WriteJobFields,
+                WriteMatches,
+            ],
+            Duration::from_secs(30 * 60),
+        ),
+        (
+            Agent::Research,
+            &[
+                ReadJobText,
+                ReadCompanyText,
+                Model(TaskType::SummarizeCompany),
+                WriteCompanyNotes,
+            ],
+            Duration::from_secs(10 * 60),
+        ),
     ];
     for (agent, permissions, timeout) in table {
         let spec = spec_of(*agent);
@@ -418,7 +496,15 @@ fn no_permission_names_a_forbidden_power() {
         Model(TaskType::DraftCoverLetter),
         Model(TaskType::ClassifyAnswer),
         Model(TaskType::Embed),
+        Model(TaskType::SemanticMatch),
+        Model(TaskType::SummarizeCompany),
         EmbedLocal,
+        ReadMatches,
+        WriteJobs,
+        WriteMatches,
+        WriteCompanyNotes,
+        WriteJobFields,
+        NetConnector,
     ];
     for permission in all {
         let name = format!("{permission:?}").to_lowercase();

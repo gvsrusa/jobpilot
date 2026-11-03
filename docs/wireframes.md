@@ -1,6 +1,6 @@
 # JobPilot AI: UI Wireframes
 
-Status: draft for owner approval. Date: 2026-11-01. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) section 9 (UI wireframes), [PRD](prd.md), [milestones](milestones.md), [architecture](architecture.md#64-appsdesktopsrc-react-frontend), [policy register](policy-register.md), [AI providers](ai-providers.md), [agents](agents.md), and [threat model](security/threat-model.md). Requirement IDs (`FR-<section>.<n>`) come from the PRD. Screens 2 to 7, 10, 12 to 14, and 16 to 18 are built (through release 0.3). Screens 8, 9, and 11 are proposals for 0.5 and 0.6.
+Status: draft for owner approval. Date: 2026-11-02. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) section 9 (UI wireframes), [PRD](prd.md), [milestones](milestones.md), [architecture](architecture.md#64-appsdesktopsrc-react-frontend), [policy register](policy-register.md), [AI providers](ai-providers.md), [agents](agents.md), and [threat model](security/threat-model.md). Requirement IDs (`FR-<section>.<n>`) come from the PRD. Screens 2 to 7, 10, 12 to 14, and 16 to 18 are built (through release 0.3). Screens 8, 9, and 11 are proposals for 0.5 and 0.6.
 
 These are layout sketches, not visual design. They fix what each screen shows, what it refuses to show, and how a keyboard user moves through it. Colours, type, and spacing belong to the shadcn/ui theme.
 
@@ -73,7 +73,7 @@ The shell is a title bar, a left navigation, and one main view. Zustand holds on
 |             |                                                                |
 |             |                                                                |
 +-------------+----------------------------------------------------------------+
-| Local only. No account. No network.                    Data: {data root}     |
+| Your data stays on this computer. No account.          Data: {data root}     |
 +------------------------------------------------------------------------------+
 ```
 
@@ -340,80 +340,96 @@ Multi-valued location, currency, time zone, language, and work-mode fields (FR-4
 
 ## 8. Job list (release 0.5)
 
-Jobs come only from connectors whose register read verdict is `allowed` (Lever, RemoteOK, We Work Remotely today) or from user-assisted import. The register verdict is shown, so the user sees why a source has no connector.
+Built. Ctrl+0 opens it. Jobs come from connectors whose register read verdict is `allowed` (Lever, RemoteOK, We Work Remotely), from the two R1 reads (Greenhouse and Ashby), or from user-assisted import. The register verdict is shown, so the user sees why a source has no connector.
 
 ```text
 +-------------+----------------------------------------------------------------+
-| ...         | Jobs                                [Import a posting...]      |
+| ...         | Jobs                                [Import a posting]         |
 | Jobs        +----------------------------------------------------------------+
-|             | Filter: Country [ v ] Mode [ v ] Min salary [    ] [Apply]     |
-|             | Filters are exact rules. Score uses your stated preferences.   |
+|             | Country [  ] Mode [Any v] Min salary [    ] Currency [   ]     |
+|             | Per [year v]  [Apply]                                          |
+|             | Filters are exact rules. A job that does not state a field     |
+|             | stays listed and says so. Score uses your stated preferences.  |
 |             +----------------------------------------------------------------+
+|             | Job text came from outside and is shown as plain text.         |
 |             | Score  Title / Company          Where       Source             |
-|             |  82    Backend Engineer, Acme   Remote, PT  RemoteOK >        ||
+|             |  82    Backend Engineer, Acme   Remote, PT  Remote OK         |
+|             |        not stated: country                                     |
 |             |  74    Platform Dev, Beta       Lisbon       Lever             |
 |             |  --    Data Eng, Gamma          Toronto      Imported          |
-|             |        (no score: nothing in your profile to compare)          |
+|             |        No score: nothing in your profile to compare            |
 |             +----------------------------------------------------------------+
 |             | Sources                                                        |
-|             |  Lever          read: allowed        [Fetch: {company site}]   |
-|             |  RemoteOK       read: allowed        attribution shown         |
-|             |  We Work Remotely  read: allowed (RSS)                         |
-|             |  Greenhouse     read: unknown   No connector. Import instead.  |
-|             |  Ashby          read: unknown   No connector. Import instead.  |
-|             |  Workday        read: unknown   No connector. Import instead.  |
-|             |  Indeed         read: blocked   No connector. Import instead.  |
-|             |  LinkedIn       read: unknown   User-assisted only.            |
+|             |  Lever       read: allowed       [Board] [Fetch]               |
+|             |  RemoteOK    read: allowed       [Fetch]  attribution shown    |
+|             |  We Work Remotely  read: allowed [Fetch]  attribution shown    |
+|             |  Greenhouse  read: ruling R1 [Board] [Fetch]              |
+|             |    Vendor is silent on third-party readers. Read under         |
+|             |    ruling R1.                                                  |
+|             |  Ashby       read: ruling R1 [Board] [Fetch]  (same note) |
+|             |  Workday     read: unknown   No connector. Import instead.     |
+|             |  Indeed      read: blocked   No connector. Import instead.     |
+|             |  LinkedIn    read: blocked   No connector. Import instead.     |
+|             |  Company career page  read: unknown  No connector. ...         |
 +-------------+----------------------------------------------------------------+
 ```
 
-- Rows for sources without an `allowed` read verdict have no fetch button, only the import route. Attribution ("Remote OK", "We Work Remotely") shows on every card from those sources. Job text is labelled untrusted.
+- A source that cannot fetch has no Fetch button, only the import route. A board source (Lever, Greenhouse, Ashby) asks for the board name first. Attribution ("Remote OK", "We Work Remotely") shows on every card from those sources. Job text is labelled as outside text and renders as plain text: no links, no images, no logos.
+- The fixed R1 note is "Vendor is silent on third-party readers. Read under ruling R1." **R1 is a controller ruling, not an owner decision.** The GUI label for these two rows still reads `read: ruling R1`. That wording is wrong and is listed as a known issue in the [0.5 release note](releases/0.5.0.md#known-issues).
+- A score shows `--` with "No score: nothing in your profile to compare" when nothing could be compared, and "Not scored yet" when no result is stored. A score made from older inputs shows "Out of date" under the number, and on the job detail beside it. The rules score runs when the screen opens, if a listed job has no result or a stale one, and after a fetch or an import, for every such job. With nothing to do it starts no run.
+- A duplicate shows under its first source as "+{n} other sources". The list hides duplicates.
 - **Release:** 0.5.
-- **Keyboard:** Tab to the filter bar, then the job table (one tab stop, arrows move rows, Enter opens screen 9, `i` opens import). Home and End jump to the first and last row.
-- **Focus order:** Import a posting, filter controls, Apply, job table, Sources list (Fetch buttons only where they exist).
+- **Keyboard:** Tab to the filter form, then the job table (one tab stop; arrows, Home, and End move rows; Enter opens screen 9; `i` opens the import dialog). Back from a job returns to the same row with the filters as they were left.
+- **Focus order:** Import a posting, filter controls, Apply, job table, then each source's board field and Fetch button.
 - **Empty state:** "No jobs yet. Import a posting, or fetch from a source marked allowed." The Sources list is still shown.
-- **Error state:** a fetch that hits a rate limit or a refusal shows the reason in an alert on that source row ("Refused by policy: unknown"). A source never retries beyond its declared limit.
+- **Error state:** a fetch that stops shows its reason in an alert on that source row, with the code: "Refused by policy: unknown", "Rate limited. Next fetch at {time}." (the time is the true hold, up to 24 hours), a source that refused or showed a challenge page, a board or feed that does not exist, a changed shape, an answer over 16 MiB, or a source too slow to answer. A source never retries beyond its declared limit. A fetch that works reads "{n} added, {n} updated, {n} skipped."
 
 ## 9. Job detail with score explanation (release 0.5)
 
+Built in `JobDetail.tsx`.
+
 ```text
 +-------------+----------------------------------------------------------------+
-| ...         | < Jobs   Backend Engineer, Acme              Score 82 / 100    |
-| Jobs        +----------------------------------------------------------------+
-|             | Source: RemoteOK (link)   Untrusted text. Shown as plain text. |
+| ...         | [Back to Jobs]                                                 |
+| Jobs        | Backend Engineer, Acme                  Score 82 / 100         |
+|             | Source: Remote OK (link, remoteok.com)  Untrusted text. Shown  |
+|             |   as plain text.                                               |
 |             +-----------------------------+----------------------------------+
 |             | Why this score              | Posting text                     |
-|             |  Criterion   Wt  Pts        | {plain text, no HTML, no         |
-|             |  Skills      40  34         |  images, no live links}          |
-|             |  Seniority   20  18         |                                  |
-|             |  Location    20  20         |                                  |
-|             |  Pay         20  10         |                                  |
-|             |                             |                                  |
+|             |  Criterion Weight Points    | {plain text in a focusable,      |
+|             |  skills      40    34       |  scrollable region; no HTML,     |
+|             |  seniority   20    18       |  no images, no live links}       |
+|             |  location    20    20       |                                  |
+|             |  pay         20    not      | Findings: {kind}: {excerpt}      |
+|             |                    compared |                                  |
+|             | Compared weight: 80 of 100  |                                  |
 |             | Missing skills: Kubernetes  |                                  |
-|             | Seniority: senior (posting) |                                  |
-|             |   vs senior (your profile)  |                                  |
-|             | Pay: posting 70-80k EUR,    |                                  |
-|             |   you want 90k+ EUR         |                                  |
-|             | Location: remote, PT ok     |                                  |
+|             | Pay: 70000-80000 EUR,       |                                  |
+|             |   per year                  |                                  |
 |             |                             |                                  |
-|             | Work authorization:         |                                  |
-|             |  Portugal: not stated by    |                                  |
-|             |  you. Not checked.          |                                  |
-|             |                             |                                  |
-|             | Scored by: rules. [Add AI   |                                  |
-|             | evaluation] (if enabled)    |                                  |
+|             | Work authorization          |                                  |
+|             |  PT: not stated by you.     |                                  |
+|             |  Not checked.               |                                  |
+|             | Scored by: rules.           |                                  |
+|             | [Add AI evaluation]         |                                  |
+|             | (only if a backend is on)   |                                  |
+|             | AI evaluation (own panel)   |                                  |
 |             +-----------------------------+----------------------------------+
-|             | [Add to tracker]  [Open posting in my browser]  [Prepare...]   |
+|             | [Add to tracker] [Open posting in my browser] [Prepare...]     |
+|             | [Remove job]                                                   |
 +-------------+----------------------------------------------------------------+
 ```
 
-- The explanation lists every criterion with its weight and the points it gave (FR-6.4, FR-6.10). Objective filters are rules (FR-6.11). Semantic evaluation runs only when an AI backend is enabled and consented (FR-6.12), and labels itself as such.
-- Work authorization is only ever one of `not stated by you` or `you stated: {value} for {country}`. It is never shown as eligible or ineligible (FR-4.10, agents.md Matching).
+- The explanation lists every criterion with its weight and the points it gave (FR-6.4, FR-6.10). A criterion that could not be compared says `not compared`, and the compared weight shows below 100. Unknown is never a mismatch. Objective filters are rules (FR-6.11). Semantic evaluation runs only when an AI backend is enabled and consented (FR-6.12).
+- The Source line shows the attribution or the source's name and, for an https link, a button labelled with the host. Rust reads the stored link and opens it in the default browser. The page sends only the job id. A link with a user name, a port, or plain http is refused at import, and again on open.
+- **Work authorization** is exactly one line: "No country on this posting. Not checked.", "{country}: not stated by you. Not checked.", "You stated: authorized {value}, needs sponsorship {value} for {country}. Not checked against this posting.", or "Locked, see Recovery." It is never shown as eligible, ineligible, or likely. When the posting itself speaks of work authorization, a second line says so and tells the person to read it.
+- **AI evaluation** is a separate panel: fit ("the model's own number: it is not part of the score"), summary, strengths with the evidence they cite, gaps, provider, date, and `dropped: {n}` when Rust cut values. "Scored by: rules." is always shown. A strength with no real evidence never reaches the panel.
+- A job with a duplicate shows "Same job on {n} other sources" and a "Not a duplicate" button. Company notes show with their origin. **Prepare...** opens Resumes on this job's text. **Remove job** asks first, and says the text goes with the job unless a draft cites it, and that an application in the tracker stays but loses its posting text.
 - **Release:** 0.5.
-- **Keyboard:** Alt+Left or the Back link returns to the list with the same row focused. Tab goes explanation first, then posting text (scrollable region, focusable, arrows scroll), then the action row.
-- **Focus order:** Back, Score explanation table, Add AI evaluation (only if enabled), posting text, Add to tracker, Open posting in my browser, Prepare.
-- **Empty state:** a job with no parsed fields shows "Could not read this posting's fields" and lets the user fix them by hand. Missing skills reads "None found" only when the knowledge base is not empty. With an empty profile it reads "Add your profile to see this."
-- **Error state:** an AI evaluation that fails or is refused shows the router reason (consent missing, provider ineligible, validation failed) and the rules score stays visible. The score is never blank because of an AI failure.
+- **Keyboard:** Alt+Left or Back returns to the list with the same row focused. Opening a job moves focus to its heading. Tab goes through the explanation table, the work authorization line, Add AI evaluation (only if enabled), the posting text, then the action row.
+- **Focus order:** Back, heading, Source link, Score explanation table, Add AI evaluation (only if enabled), posting text, Add to tracker, Open posting in my browser, Prepare..., Remove job.
+- **Empty state:** a job with no explanation shows "Could not read this posting's fields, or it has not been scored yet." Missing skills reads "None found" only when the skills criterion was compared. With nothing to compare it reads "Add your profile to see this."
+- **Error state:** an AI evaluation that fails or is refused shows "AI evaluation stopped. The rules score stands." in an alert with its code, and the rules score stays visible. The score is never blank because of an AI failure.
 
 ## 10. Resume compare with evidence (release 0.2)
 
@@ -486,7 +502,7 @@ Why a mode is unavailable comes from the site's register row and the mode rules.
 | Register verdict for that mode and site | Text under the disabled mode |
 |---|---|
 | `unknown` with "no clause found" (Copilot, D2) | Copilot is selectable. Text beside it: "No clause found for this site. You review and submit." |
-| `unknown` otherwise | "The site has not said whether tools may do this. Treated as blocked until it answers." (Workday, LinkedIn) |
+| `unknown` otherwise | "The site has not said whether tools may do this. Treated as blocked until it answers." (Workday) |
 | `blocked` | "The site's terms forbid this. JobPilot will not do it, even if you ask." (Indeed) |
 | Autonomous with no eligible connector | "No site or connector qualifies today. Needs a site rule of allowed, verified permission, and your explicit authorization." |
 | Autonomous with an OpenAI-origin model | "Not allowed with OpenAI models for submissions with no human review." |

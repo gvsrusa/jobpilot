@@ -326,11 +326,11 @@ async fn a_0_2_database_upgrades_to_0_3() {
 }
 
 #[tokio::test]
-async fn a_fresh_database_is_schema_12() {
+async fn a_fresh_database_is_schema_15() {
     let (_tmp, paths) = temp_root();
     let db = Db::open(&paths).await.unwrap();
-    assert_eq!(db.schema_version().await.unwrap(), 12);
-    assert_eq!(app_schema_version(), 12);
+    assert_eq!(db.schema_version().await.unwrap(), 15);
+    assert_eq!(app_schema_version(), 15);
     db.close().await;
 }
 
@@ -360,7 +360,7 @@ async fn a_0_3_database_upgrades_to_0_4() {
 
     let db = Db::open(&paths).await.unwrap();
 
-    assert_eq!(db.schema_version().await.unwrap(), 12);
+    assert_eq!(db.schema_version().await.unwrap(), 15);
     assert_eq!(snapshots(&paths, "pre-migrate-11-").len(), 1);
     let kept: (String, String) = sqlx::query_as("SELECT provider, register_row FROM consent")
         .fetch_one(&db.pool)
@@ -372,5 +372,154 @@ async fn a_0_3_database_upgrades_to_0_4() {
         ConsentState::Suspended(vec![DataCategory::JobText, DataCategory::ResumeText])
     );
     assert_eq!(consent::active(&db, CLAUDE).await.unwrap(), None);
+    db.close().await;
+}
+
+// One row the rules cannot read must not lock a person out of the rest. A job with no text
+// cannot be made with foreign keys on, so this connection turns them off.
+#[tokio::test]
+async fn a_job_the_rules_cannot_read_does_not_stop_the_open() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open_with(&paths, &MIGRATOR).await.unwrap();
+    let mut one = db.pool.acquire().await.unwrap();
+    for sql in [
+        "PRAGMA foreign_keys = OFF",
+        "INSERT INTO jobs (id, job_text_id, connector, title, first_seen_at, last_seen_at) \
+         VALUES ('bad', 'no-such-text', 'import', 'Bad', 't', 't')",
+        "PRAGMA foreign_keys = ON",
+        "INSERT INTO job_texts (id, title, raw, normalized, created_at) \
+         VALUES ('j1', 'Dev', 'raw', 'We need Rust', 't')",
+        "INSERT INTO jobs (id, job_text_id, connector, title, first_seen_at, last_seen_at) \
+         VALUES ('j1', 'j1', 'import', 'Dev', 't', 't')",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&mut *one)
+            .await
+            .unwrap();
+    }
+    drop(one);
+    db.close().await;
+
+    let db = Db::open(&paths).await.unwrap();
+
+    let by: String = sqlx::query_scalar("SELECT fields_by FROM jobs WHERE id = 'j1'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(by, "rules", "the row after the bad one is still read");
+    db.close().await;
+}
+
+// A 0.4 database (schema 12) holds a job text and a draft citing it. Opening it with 0.5
+// snapshots first, keeps every row, and adds one jobs row that carries the text's id.
+#[tokio::test]
+async fn a_0_4_database_upgrades_to_0_5() {
+    let (_tmp, paths) = temp_root();
+    let release_0_4: Vec<Migration> = MIGRATOR
+        .iter()
+        .filter(|m| m.version <= 12)
+        .cloned()
+        .collect();
+    let db = Db::open_with(&paths, &Migrator::with_migrations(release_0_4))
+        .await
+        .unwrap();
+    assert_eq!(db.schema_version().await.unwrap(), 12);
+    for sql in [
+        "INSERT INTO job_texts (id, title, raw, normalized, created_at) \
+         VALUES ('j1', 'Dev', 'raw posting', 'We need Rust and Python. Pay is $150,000 per year. \
+         5+ years of experience required. Must be authorized to work in the US.', \
+         '2026-10-01T00:00:00.000Z')",
+        "INSERT INTO job_texts (id, title, raw, normalized, created_at) \
+         VALUES ('j2', 'Ops', 'raw posting', 'We need Rust', '2026-10-02T00:00:00.000Z')",
+        "INSERT INTO drafts (id, kind, lineage_id, version, origin, title, job_text_id, body, \
+         created_at) VALUES ('dr1', 'resume', 'l1', 1, 'generated', 'Draft', 'j1', '{}', 't')",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    db.close().await;
+
+    // One row a person has set since, and one with a company: open_with stops at the migration.
+    let db = Db::open_with(&paths, &MIGRATOR).await.unwrap();
+    for sql in [
+        "UPDATE jobs SET fields_by = 'user' WHERE id = 'j2'",
+        "INSERT INTO companies (id, name, key, created_at) VALUES ('c1', 'Acme', 'acme', 't')",
+        "UPDATE jobs SET company_id = 'c1' WHERE id = 'j1'",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    db.close().await;
+
+    let db = Db::open(&paths).await.unwrap();
+
+    assert_eq!(db.schema_version().await.unwrap(), 15);
+    assert_eq!(snapshots(&paths, "pre-migrate-12-").len(), 1);
+    let draft: String = sqlx::query_scalar("SELECT job_text_id FROM drafts WHERE id = 'dr1'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(draft, "j1");
+    let rows: Vec<(String, String, String, String, String)> =
+        sqlx::query_as("SELECT id, job_text_id, connector, title, fields_by FROM jobs LIMIT 1")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        vec![(
+            "j1".into(),
+            "j1".into(),
+            "import".into(),
+            "Dev".into(),
+            "rules".into()
+        )]
+    );
+    // The rules read it as they read a job pasted today.
+    let job = jobpilot_core::jobs::get(&db, "j1").await.unwrap();
+    assert_eq!(job.skills, ["Python", "Rust"]);
+    assert_eq!(job.seniority.as_deref(), Some("senior"));
+    assert_eq!(job.pay.unwrap().min, Some(150_000));
+    let (authorization, key): (i64, String) =
+        sqlx::query_as("SELECT mentions_authorization, dedupe_key FROM jobs WHERE id = 'j1'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(authorization, 1);
+    assert!(key.starts_with("acme|dev|"), "{key}");
+    // A person's row is not read at all.
+    let kept = jobpilot_core::jobs::get(&db, "j2").await.unwrap();
+    assert!(kept.skills.is_empty());
+    assert_eq!(kept.fields_by, "user");
+    // It runs once: a row the rules have read is not read again at the next open.
+    sqlx::query("UPDATE jobs SET skills = '[]' WHERE id = 'j1'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    db.close().await;
+    let db = Db::open(&paths).await.unwrap();
+    let job = jobpilot_core::jobs::get(&db, "j1").await.unwrap();
+    assert!(job.skills.is_empty());
+    let found = jobpilot_core::jobs::list(
+        &db,
+        &jobpilot_core::jobs::JobFilter {
+            query: Some("Rust".into()),
+            ..Default::default()
+        },
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(found.len(), 2, "the backfilled rows are searchable");
+    assert_eq!(jobpilot_core::jobs::text_id(&db, "j1").await.unwrap(), "j1");
+    // The generator reads the text by the same id.
+    let text = jobpilot_core::knowledge::get_job_text(&db, "j1")
+        .await
+        .unwrap();
+    assert!(text.normalized.starts_with("We need Rust"));
     db.close().await;
 }

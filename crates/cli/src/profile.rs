@@ -1,8 +1,5 @@
 //! Profile, preferences, knowledge items, and pasted job postings.
 
-use std::io::Read;
-use std::path::PathBuf;
-
 use clap::{Subcommand, ValueEnum};
 use jobpilot_core::ai::router::Router;
 use jobpilot_core::profile::{
@@ -126,20 +123,6 @@ pub enum KbCommand {
         query: String,
         #[arg(long, default_value_t = 5)]
         limit: usize,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum JobCommand {
-    /// Store a posting from a file, or from standard input.
-    Paste {
-        title: String,
-        #[arg(long)]
-        file: Option<PathBuf>,
-    },
-    List,
-    Show {
-        id: String,
     },
 }
 
@@ -416,56 +399,4 @@ fn hits_json(hits: &[impl serde::Serialize]) -> Vec<Value> {
     hits.iter()
         .filter_map(|h| serde_json::to_value(h).ok())
         .collect()
-}
-
-/// Readers stop here: a posting is at most 200,000 characters after cleanup.
-const READ_LIMIT: u64 = 4 * 1024 * 1024;
-
-pub async fn job(db: &Db, command: JobCommand) -> Result<Output> {
-    match command {
-        JobCommand::Paste { title, file } => {
-            let mut bytes = Vec::new();
-            match file {
-                Some(path) => std::fs::File::open(path)?
-                    .take(READ_LIMIT)
-                    .read_to_end(&mut bytes)?,
-                None => std::io::stdin()
-                    .lock()
-                    .take(READ_LIMIT)
-                    .read_to_end(&mut bytes)?,
-            };
-            let raw = String::from_utf8_lossy(&bytes);
-            let job = knowledge::import_job_text(db, &title, &raw).await?;
-            let mut text = format!("saved {}", job.id);
-            if !job.findings.is_empty() {
-                text.push_str(&format!(
-                    "\n{} finding(s); see `job show`",
-                    job.findings.len()
-                ));
-            }
-            out(job, text)
-        }
-        JobCommand::List => {
-            let jobs = knowledge::list_job_texts(db).await?;
-            let text = jobs
-                .iter()
-                .map(|j| format!("{}  {}", j.id, j.title))
-                .collect::<Vec<_>>()
-                .join("\n");
-            out(jobs, text)
-        }
-        JobCommand::Show { id } => {
-            let job = knowledge::get_job_text(db, &id).await?;
-            let mut text = format!("{}  {}\n", job.id, job.title);
-            for finding in &job.findings {
-                text.push_str(&format!(
-                    "finding ({}): {}\n",
-                    finding.kind, finding.excerpt
-                ));
-            }
-            text.push('\n');
-            text.push_str(&job.normalized);
-            out(job, text)
-        }
-    }
 }

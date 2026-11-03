@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CompareTable } from "@/components/CompareTable";
 import { CopyPath } from "@/components/CopyPath";
@@ -29,18 +29,9 @@ import {
   type JobText,
   type Template,
 } from "@/lib/ipc";
+import { backendEnabled } from "@/lib/backend";
+import { useUiStore } from "@/lib/store";
 import { ENDPOINT_SUSPENDED, explainReason, SUSPENDED } from "@/lib/reasons";
-
-/** A generation backend is one that can answer now: Ollama running, or an external provider that is on, available, consented, and able to carry a posting. */
-function backendEnabled(ai: AiStatus | undefined): boolean {
-  if (!ai) return false;
-  const ollama = ai.enabled.ollama && ai.ollama.state === "running";
-  const claude = ai.enabled.claude_code && ai.claude_code.available && ai.claude_code.consent !== null;
-  const external = ai.external.some(
-    (p) => ai.enabled[p.name] && p.available && p.consent !== null && p.runs_job_text,
-  );
-  return ollama || claude || external;
-}
 
 function endpointSuspended(ai: AiStatus | undefined): boolean {
   return ai?.external.some((p) => p.kind === "endpoint" && ai.enabled[p.name] && p.suspended) ?? false;
@@ -59,7 +50,7 @@ function lineages(drafts: Draft[]): Draft[][] {
   return [...groups.values()].map((g) => g.sort((a, b) => a.version - b.version));
 }
 
-const tied = (group: Draft[], jobId: string | null) => group.some((d) => d.job_text_id === jobId);
+const tied = (group: Draft[], jobId: string | null) => group.some((d) => d.current_text_id === jobId);
 const latest = (group: Draft[]) => group[group.length - 1];
 
 function PostingForm({ onSaved, onClose }: { onSaved(job: JobText): void; onClose(): void }) {
@@ -177,7 +168,11 @@ function ClaimEditor({
 export function ResumesView() {
   const client = useQueryClient();
   const [kind, setKind] = useState<DraftKind>("resume");
-  const [jobChoice, setJobChoice] = useState<string | null>(null);
+  // Prepare on a job sets this: read once, then cleared so a later visit starts fresh.
+  const [jobChoice, setJobChoice] = useState<string | null>(() => useUiStore.getState().resumeJob);
+  useEffect(() => {
+    useUiStore.setState({ resumeJob: null });
+  }, []);
   const [lineageChoice, setLineageChoice] = useState<string | null>(null);
   const [draftChoice, setDraftChoice] = useState<string | null>(null);
   const [originalId, setOriginalId] = useState<string | null>(null);
@@ -199,6 +194,13 @@ export function ResumesView() {
     groups.find((g) => g[0].lineage_id === lineageChoice) ?? (lineageChoice === null ? forJob[0] : undefined);
   const current = group ? (group.find((d) => d.id === draftChoice) ?? latest(group)) : null;
   const earlier = group && current ? group.filter((d) => d.version < current.version) : [];
+  const postingId = current?.job_text_id ?? null;
+  const listed = jobs.data?.find((j) => j.id === postingId);
+  const older = useQuery({
+    queryKey: ["job-text", postingId],
+    queryFn: () => ipc.jobGet(postingId!),
+    enabled: jobs.isSuccess && postingId !== null && !listed,
+  });
 
   const compare = useQuery({
     queryKey: ["compare", current?.id, originalId],
@@ -477,7 +479,7 @@ export function ResumesView() {
               <CompareTable
                 compare={compare.data}
                 kind={kind}
-                posting={jobs.data?.find((j) => j.id === current.job_text_id) ?? null}
+                posting={listed ?? older.data ?? null}
                 selected={Math.min(selected, claims.length - 1)}
                 onSelect={setSelected}
                 onEdit={() => claim && setClaimEditing(true)}

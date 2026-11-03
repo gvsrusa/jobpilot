@@ -35,7 +35,7 @@ pub enum AgentsCommand {
 }
 
 /// The snake_case name of a run value.
-fn word(value: &impl Serialize) -> String {
+pub fn word(value: &impl Serialize) -> String {
     serde_json::to_value(value)
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))

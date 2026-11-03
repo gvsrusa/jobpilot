@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Once};
 
 use fake_http::{Canned, Fake};
+use jobpilot_core::agents::{MatchRequest, match_jobs, research_company};
 use jobpilot_core::ai::api::{self, ApiProvider, KeySource};
 use jobpilot_core::ai::gemini_cli::GeminiCli;
 use jobpilot_core::ai::router::Router;
@@ -22,6 +23,7 @@ use jobpilot_core::ai::{CancellationToken, DataCategory, Provider, consent};
 use jobpilot_core::crypto::{self, KeyState};
 use jobpilot_core::drafts::{self, ExportFormat};
 use jobpilot_core::generate::{self, Generated};
+use jobpilot_core::jobs::{self, PastedJob, company};
 use jobpilot_core::knowledge::{self, JobText};
 use jobpilot_core::memory::{self, Class};
 use jobpilot_core::profile::{self, ProfileBasic, Stated, WorkAuthorization};
@@ -771,6 +773,93 @@ async fn a_tool_call_in_a_reply_stores_nothing() {
         assert_eq!(hosted.draft_count().await, before, "{who}");
         assert_eq!(hosted.run_reasons().await[0], "permission_denied", "{who}");
         assert!(!PathBuf::from(hosted.canary()).exists(), "{who}");
+    }
+}
+
+/// The three tasks 0.5 added carry a posting too, so each must refuse a tool call the way the
+/// drafts do, on every wire. A refusal ends the task: nothing is stored from it, and no tool
+/// ever runs. A refused provider is set aside for the rest of the session, so each task gets
+/// its own set of backends.
+#[tokio::test]
+async fn a_tool_call_reply_stores_nothing_on_each_new_task() {
+    let companies = [
+        DataCategory::JobText,
+        DataCategory::ResumeText,
+        DataCategory::CompanyText,
+    ];
+    for task in ["parse_job", "semantic_match", "summarize_company"] {
+        for hosted in every_backend().await {
+            let who = hosted.name();
+            consent::give_for(&hosted.db, who, &companies, true, "test")
+                .await
+                .unwrap();
+            let cases = corpus(&hosted.canary());
+            let mut text = case(&cases, "19").raw.clone();
+            if task == "parse_job" {
+                // The rules read `bash` as a skill, and a job with a skill is not parsed by a model.
+                text = text.replace("bash", "shell");
+            }
+            let pasted = PastedJob {
+                title: "Site Reliability Engineer".into(),
+                company: "Example Corp".into(),
+                url: None,
+                text,
+            };
+            let job = jobs::import_pasted(&hosted.db, pasted).await.unwrap();
+            let posting = knowledge::get_job_text(&hosted.db, &job.job_text_id)
+                .await
+                .unwrap();
+            hosted.aim(&posting.normalized, &job.id);
+            let before = jobs::get(&hosted.db, &job.id).await.unwrap();
+            if task == "parse_job" {
+                assert!(
+                    jobpilot_core::jobs::semantic::needs_parsing(&before),
+                    "{who}"
+                );
+            }
+            let company_id = job.company_id.clone().unwrap();
+            let router = hosted.router();
+            let cancel = CancellationToken::new();
+
+            if task == "summarize_company" {
+                let done = research_company(&hosted.db, &router, "gui", &company_id, cancel)
+                    .await
+                    .unwrap();
+                assert_eq!(done.facts, 0, "{who}: {done:?}");
+                assert!(done.reason.is_some(), "{who}: {done:?}");
+                let notes = company::notes(&hosted.db, &company_id).await.unwrap();
+                assert!(notes.iter().all(|note| note.origin != "model"), "{who}");
+            } else {
+                let ask = MatchRequest {
+                    job_ids: vec![job.id.clone()],
+                    ai: true,
+                };
+                let done = match_jobs(&hosted.db, &router, "gui", ask, cancel)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    (done.parsed, done.evaluated),
+                    (0, 0),
+                    "{who} {task}: {done:?}"
+                );
+                assert!(done.reason.is_some(), "{who} {task}: {done:?}");
+                let after = jobs::get(&hosted.db, &job.id).await.unwrap();
+                assert_eq!(after.skills, before.skills, "{who} {task}");
+                assert_eq!(after.fields_by, before.fields_by, "{who} {task}");
+                assert!(
+                    jobs::detail(&hosted.db, &job.id)
+                        .await
+                        .unwrap()
+                        .semantic
+                        .is_none()
+                );
+            }
+
+            // The refusal is on the run log as a denied permission, and no tool touched the canary.
+            let reasons = hosted.run_reasons().await;
+            assert_eq!(reasons[0], "permission_denied", "{who} {task}: {reasons:?}");
+            assert!(!PathBuf::from(hosted.canary()).exists(), "{who} {task}");
+        }
     }
 }
 

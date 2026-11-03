@@ -540,3 +540,16 @@ fn panel_help_and_other_parse_errors_are_unchanged() {
     assert!(reply.contains("nosuch"), "{reply}");
     assert!(!reply.contains("error[usage]"), "{reply}");
 }
+
+#[test]
+fn job_import_with_a_file_is_refused_in_the_panel() {
+    let (_dir, home) = fresh_home();
+    let reply = text(&session(
+        &home,
+        b"job import --url https://example.com/a --title t --file /f\nexit\n",
+        &[],
+    ));
+    assert!(reply.contains("error[panel_refused]"), "{reply}");
+    assert!(reply.contains(REFUSAL), "{reply}");
+    assert!(!home.join("jobpilot.db").exists(), "{reply}");
+}

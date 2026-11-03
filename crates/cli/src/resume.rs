@@ -7,6 +7,7 @@ use jobpilot_core::agents;
 use jobpilot_core::ai::router::Router;
 use jobpilot_core::drafts::{self, ClaimInput, Draft, ExportFormat};
 use jobpilot_core::generate::Generated;
+use jobpilot_core::jobs;
 use jobpilot_core::render::Template;
 use jobpilot_core::runner::ExportChoice;
 use jobpilot_core::{Db, Result, parse};
@@ -153,9 +154,10 @@ pub async fn resume(db: &Db, command: ResumeCommand) -> Result<Output> {
         }
         ResumeCommand::Generate(args) => {
             let router = Router::from_settings(db).await?;
+            let job = jobs::text_id(db, &args.job_id).await?;
             let choice = args.choice();
             let made = with_interrupts(db, |cancel| {
-                agents::draft_resume(db, &router, ACTOR, &args.job_id, choice, cancel)
+                agents::draft_resume(db, &router, ACTOR, &job, choice, cancel)
             })
             .await?;
             generated(made)
@@ -205,9 +207,10 @@ pub async fn letter(db: &Db, command: LetterCommand) -> Result<Output> {
     match command {
         LetterCommand::Generate(args) => {
             let router = Router::from_settings(db).await?;
+            let job = jobs::text_id(db, &args.job_id).await?;
             let choice = args.choice();
             let made = with_interrupts(db, |cancel| {
-                agents::draft_cover_letter(db, &router, ACTOR, &args.job_id, choice, cancel)
+                agents::draft_cover_letter(db, &router, ACTOR, &job, choice, cancel)
             })
             .await?;
             generated(made)

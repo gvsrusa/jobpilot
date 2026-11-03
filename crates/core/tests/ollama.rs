@@ -20,7 +20,7 @@ use tempfile::TempDir;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 const JOB: &str = r#"{"title":"Engineer","company":"Acme","location":"Oslo","remote":"hybrid",
-    "skills":["Rust"],"seniority":"senior","compensation":""}"#;
+    "skills":["Rust"],"seniority":"senior"}"#;
 
 enum Reply {
     Json(u16, Value),

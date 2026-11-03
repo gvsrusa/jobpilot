@@ -452,26 +452,35 @@ pub fn normalize(raw: &str) -> (String, Vec<Finding>) {
     (text, findings)
 }
 
-const INSTRUCTION_MARKERS: [&str; 12] = [
+const INSTRUCTION_MARKERS: [&str; 10] = [
     "ignore previous",
     "ignore all previous",
     "ignore the previous",
     "ignore prior",
     "ignore the above",
     "you are",
-    "system:",
     "assistant:",
     "disregard",
-    "as an ai",
     "include the word",
     "forget your instructions",
 ];
 
+/// What opens an order after a leading `system:`. `System: Linux servers` is a plain label.
+const SYSTEM_ORDERS: [&str; 9] = [
+    "the", "you", "obey", "ignore", "follow", "forget", "reveal", "print", "do",
+];
+
 fn instruction_like(line: &str) -> bool {
     let lower = line.to_lowercase();
-    INSTRUCTION_MARKERS
-        .iter()
-        .any(|marker| lower.contains(marker))
+    let system_order = lower
+        .trim_start()
+        .strip_prefix("system:")
+        .and_then(|rest| rest.split_whitespace().next())
+        .is_some_and(|word| SYSTEM_ORDERS.contains(&word));
+    system_order
+        || INSTRUCTION_MARKERS
+            .iter()
+            .any(|marker| lower.contains(marker))
 }
 
 fn excerpt(text: &str, max: usize) -> String {
@@ -997,7 +1006,7 @@ fn html_to_text(input: &str, findings: &mut Vec<Finding>) -> (String, bool) {
     (out, saw_tag)
 }
 
-fn decode_entities(input: &str) -> String {
+pub(crate) fn decode_entities(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
     while let Some(at) = rest.find('&') {
@@ -1107,11 +1116,13 @@ pub async fn get_job_text(db: &Db, id: &str) -> Result<JobText> {
     row.into_job_text()
 }
 
-/// Newest first.
+/// Newest first, the current version of each. An older one is read by its id.
 pub async fn list_job_texts(db: &Db) -> Result<Vec<JobText>> {
-    let rows: Vec<JobRow> =
-        sqlx::query_as("SELECT id, title, normalized, findings FROM job_texts ORDER BY seq DESC")
-            .fetch_all(&db.pool)
-            .await?;
+    let rows: Vec<JobRow> = sqlx::query_as(
+        "SELECT id, title, normalized, findings FROM job_texts WHERE version_of IS NULL \
+         ORDER BY seq DESC",
+    )
+    .fetch_all(&db.pool)
+    .await?;
     rows.into_iter().map(JobRow::into_job_text).collect()
 }
