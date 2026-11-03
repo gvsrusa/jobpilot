@@ -29,6 +29,9 @@ pub const READY_STALE: Duration = Duration::from_secs(10 * 60);
 /// Fixed: no fact and no page text. Each application's facts come from `apply_next`.
 pub const SYSTEM_PROMPT: &str = include_str!("../../assets/apply_system_prompt.txt");
 
+/// In the run folder, written by `prepare`, gone with the folder.
+const MCP_CONFIG: &str = "mcp.json";
+pub const SYSTEM_PROMPT_FILE: &str = "system-prompt.txt";
 /// The session folder `claude` runs in. Fixed, so `claude purge` can name it.
 const SESSION: &str = "session";
 /// How often the host looks for the cancel token.
@@ -109,19 +112,15 @@ pub fn mcp_config(sidecar: &Path, root: &Path, dir: &Path, service: Option<&str>
     })
 }
 
-/// The exact argument list, verified against `claude --help` 2.1.316. `--tools ToolSearch` keeps
-/// one built-in, which loads tool schemas and nothing else: an interactive Claude Code 2.1.317
-/// defers MCP tools behind it, so `--tools ""` leaves the proxy's tools unreachable.
-/// `--strict-mcp-config` leaves only the proxy's tools, `--allowedTools` allows them without a
-/// prompt, and `dontAsk` denies anything else. The prompt goes last, after a one-value flag,
-/// because the list flags take every word after them.
-pub fn argv(mcp_config: &Path, system: &str, batch: bool) -> Vec<OsString> {
-    // Line breaks are the only change: Windows refuses them in a batch-file argument.
-    let system = if batch {
-        system.replace("\r\n", " ").replace('\n', " ")
-    } else {
-        system.to_owned()
-    };
+/// The exact argument list, verified against `claude --help` 2.1.316 and 2.1.317. `--tools
+/// ToolSearch` keeps one built-in, which loads tool schemas and nothing else: an interactive
+/// Claude Code 2.1.317 defers MCP tools behind it, so `--tools ""` leaves the proxy's tools
+/// unreachable. `--strict-mcp-config` leaves only the proxy's tools, `--allowedTools` allows
+/// them without a prompt, and `dontAsk` denies anything else. The system prompt is a file in
+/// the run folder (`--system-prompt-file`): a `claude.cmd` passes its arguments through
+/// cmd.exe, which turns every line break into a space. The prompt goes last, after a one-value
+/// flag, because the list flags take every word after them.
+pub fn argv(mcp_config: &Path, system_prompt: &Path) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "--tools",
         "ToolSearch",
@@ -143,14 +142,12 @@ pub fn argv(mcp_config: &Path, system: &str, batch: bool) -> Vec<OsString> {
             "--permission-mode",
             "dontAsk",
             "--no-chrome",
-            "--system-prompt",
-            &system,
-            "--name",
-            "jobpilot-apply",
-            SESSION_PROMPT,
+            "--system-prompt-file",
         ]
         .map(OsString::from),
     );
+    args.push(system_prompt.as_os_str().to_owned());
+    args.extend(["--name", "jobpilot-apply", SESSION_PROMPT].map(OsString::from));
     args
 }
 
@@ -180,11 +177,6 @@ pub fn session_cwd(paths: &AppPaths) -> PathBuf {
     paths.apply().join(SESSION)
 }
 
-fn is_batch(bin: &Path) -> bool {
-    let extension = bin.extension().unwrap_or_default();
-    extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
-}
-
 /// Run ids are hex, and `session` is not a run: anything else never names a folder to delete.
 fn checked_id(apply_id: &str) -> Result<&str> {
     let ok = !apply_id.is_empty()
@@ -205,7 +197,7 @@ fn write_mcp_config(paths: &AppPaths, dir: &Path, sidecar: &Path) -> Result<Path
         false => None,
     };
     std::fs::create_dir_all(dir)?;
-    let path = dir.join("mcp.json");
+    let path = dir.join(MCP_CONFIG);
     let config = mcp_config(sidecar, paths.root(), dir, service.as_deref());
     std::fs::write(&path, config.to_string())?;
     Ok(path)
@@ -215,6 +207,7 @@ fn write_mcp_config(paths: &AppPaths, dir: &Path, sidecar: &Path) -> Result<Path
 pub(crate) fn prepare_folders(db: &Db, apply_id: &str, sidecar: &Path) -> Result<()> {
     let dir = super::run_dir(db, checked_id(apply_id)?);
     write_mcp_config(db.paths(), &dir, sidecar)?;
+    std::fs::write(dir.join(SYSTEM_PROMPT_FILE), SYSTEM_PROMPT)?;
     let spec = BrowserSpec {
         profile: dir.join("profile"),
         output: dir.join("output"),
@@ -242,14 +235,17 @@ pub async fn run_claude(
     apply_id: &str,
     cancel: CancellationToken,
 ) -> Result<SessionEnd> {
-    let config = dir.join("mcp.json");
-    if !config.is_file() {
-        return Err(Error::Validation("the run folder has no mcp.json".into()));
+    let config = dir.join(MCP_CONFIG);
+    let system = dir.join(SYSTEM_PROMPT_FILE);
+    if !config.is_file() || !system.is_file() {
+        return Err(Error::Validation(
+            "the run folder has no mcp.json or system prompt".into(),
+        ));
     }
     let cwd = session_cwd(db.paths());
     std::fs::create_dir_all(&cwd)?;
     let mut child = Command::new(bin)
-        .args(argv(&config, SYSTEM_PROMPT, is_batch(bin)))
+        .args(argv(&config, &system))
         .env_clear()
         .envs(child_env())
         .current_dir(&cwd)

@@ -77,7 +77,29 @@ const BASE_ENV: &[&str] = &[
     "TMPDIR",
 ];
 
-/// `BASE_ENV` then `spec_extra`, each only when set. Names are copied, values never read.
+/// What a Windows child needs of the system: node will not start without `SystemRoot`, and a
+/// `.cmd` shim needs `ComSpec` and `PATHEXT`. Folders and names only, no secret.
+const WINDOWS_SYSTEM_ENV: &[&str] = &[
+    "SystemRoot",
+    "SystemDrive",
+    "windir",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PATHEXT",
+    "ComSpec",
+];
+
+/// The system names every child gets on top of `BASE_ENV`: `WINDOWS_SYSTEM_ENV` on Windows,
+/// none elsewhere. A pure function of the OS, so every OS can test the Windows list.
+pub fn system_env(windows: bool) -> &'static [&'static str] {
+    if windows { WINDOWS_SYSTEM_ENV } else { &[] }
+}
+
+/// `BASE_ENV`, `system_env` for this OS, then `spec_extra`, each once and only when set.
+/// Names are copied, values never read.
 pub fn child_env(spec_extra: &[&str]) -> Vec<(String, String)> {
     child_env_from(spec_extra, &|name| std::env::var(name).ok())
 }
@@ -86,11 +108,20 @@ pub fn child_env_from(
     spec_extra: &[&str],
     get: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<(String, String)> {
-    BASE_ENV
+    let mut env: Vec<(String, String)> = Vec::new();
+    for name in BASE_ENV
         .iter()
+        .chain(system_env(cfg!(windows)))
         .chain(spec_extra)
-        .filter_map(|name| Some(((*name).to_string(), get(name)?)))
-        .collect()
+    {
+        if env.iter().any(|(known, _)| known == name) {
+            continue;
+        }
+        if let Some(value) = get(name) {
+            env.push(((*name).to_string(), value));
+        }
+    }
+    env
 }
 
 /// What a run needs. `env` is final: `run_piped` adds nothing to it.

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use jobpilot_core::Error;
 use jobpilot_core::ai::CancellationToken;
+use jobpilot_core::ai::child::system_env;
 use jobpilot_core::browser::mcp::{
     Incoming, McpClient, error_reply, read_message, reply, tool_text,
 };
@@ -35,15 +36,30 @@ fn server() -> OsString {
         .into_os_string()
 }
 
-fn env_of(extra: &[(&str, &Path)]) -> Vec<(String, String)> {
+/// `PATH` and, on Windows, the system names node needs to start, as the product's
+/// `child_env` carries them; then `extra`.
+fn env_with(extra: &[(&str, String)]) -> Vec<(String, String)> {
     let mut env = vec![(
         "PATH".to_string(),
         std::env::var("PATH").unwrap_or_default(),
     )];
+    for name in system_env(cfg!(windows)) {
+        if let Ok(value) = std::env::var(name) {
+            env.push((name.to_string(), value));
+        }
+    }
     for (name, value) in extra {
-        env.push((name.to_string(), value.display().to_string()));
+        env.push((name.to_string(), value.clone()));
     }
     env
+}
+
+fn env_of(extra: &[(&str, &Path)]) -> Vec<(String, String)> {
+    let extra: Vec<(&str, String)> = extra
+        .iter()
+        .map(|(name, value)| (*name, value.display().to_string()))
+        .collect();
+    env_with(&extra)
 }
 
 async fn start(extra: &[(&str, &Path)], cwd: &Path) -> McpClient {
@@ -96,10 +112,7 @@ async fn a_server_that_exits_is_browser_gone_not_a_hang() {
     let mut client = McpClient::start(
         &node(),
         &[server()],
-        &[
-            ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
-            ("MOCK_EXIT_AFTER".into(), "1".into()),
-        ],
+        &env_with(&[("MOCK_EXIT_AFTER", "1".into())]),
         tmp.path(),
     )
     .await
@@ -140,10 +153,7 @@ async fn a_line_over_the_cap_is_refused() {
     let mut client = McpClient::start(
         &node(),
         &[server()],
-        &[
-            ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
-            ("MOCK_BIG".into(), "1".into()),
-        ],
+        &env_with(&[("MOCK_BIG", "1".into())]),
         tmp.path(),
     )
     .await
@@ -365,11 +375,10 @@ async fn the_client_answers_a_ping_and_skips_noise_and_a_stray_string_id() {
     let mut client = McpClient::start(
         &node(),
         &[server()],
-        &[
-            ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
-            ("MOCK_NOISE".into(), "1".into()),
-            ("MOCK_CALLS".into(), calls.display().to_string()),
-        ],
+        &env_with(&[
+            ("MOCK_NOISE", "1".into()),
+            ("MOCK_CALLS", calls.display().to_string()),
+        ]),
         tmp.path(),
     )
     .await

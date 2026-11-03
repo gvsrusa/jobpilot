@@ -4,7 +4,8 @@
 //
 // --version          prints the mock version.
 // purge <dir> --yes  is recorded, then exits with JOBPILOT_FAKE_PURGE_EXIT (default 0).
-// anything else      is a session: it records argv and env to JOBPILOT_FAKE_RECORD, starts the
+// anything else      is a session: it records argv, env, and the text of --system-prompt-file
+//                    to JOBPILOT_FAKE_RECORD, starts the
 //                    `jobpilot` server from --mcp-config with that server's env over its own,
 //                    sends initialize and tools/list, then runs JOBPILOT_FAKE_SCENARIO (a JSON
 //                    file, or inline JSON) step by step: {"tool", "args"}, {"sleep_ms"},
@@ -33,7 +34,10 @@ function append(file, entry) {
   if (file) fs.appendFileSync(file, JSON.stringify(entry) + "\n");
 }
 
-append(env.JOBPILOT_FAKE_RECORD, { pid: process.pid, argv, env: { ...env }, cwd: process.cwd() });
+// The run folder goes with the run: the prompt is read now, as the real `claude` reads it.
+const promptAt = argv.indexOf("--system-prompt-file");
+const system_prompt = promptAt >= 0 ? fs.readFileSync(argv[promptAt + 1], "utf8") : null;
+append(env.JOBPILOT_FAKE_RECORD, { pid: process.pid, argv, env: { ...env }, cwd: process.cwd(), system_prompt });
 
 if (argv[0] === "purge") {
   process.exit(Number(env.JOBPILOT_FAKE_PURGE_EXIT || 0));

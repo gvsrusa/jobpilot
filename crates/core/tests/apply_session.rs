@@ -16,8 +16,8 @@ use jobpilot_core::ai::router::Router;
 use jobpilot_core::ai::{CancellationToken, DataCategory, consent};
 use jobpilot_core::applications::{self, ApplicationInput};
 use jobpilot_core::apply::session::{
-    self, HostKnobs, READY_STALE, SESSION_PROMPT, SYSTEM_PROMPT, argv, child_env, mcp_config,
-    session_cwd,
+    self, HostKnobs, READY_STALE, SESSION_PROMPT, SYSTEM_PROMPT, SYSTEM_PROMPT_FILE, argv,
+    child_env, mcp_config, session_cwd,
 };
 use jobpilot_core::apply::{self, RunView};
 use jobpilot_core::drafts;
@@ -47,7 +47,10 @@ fn strings(args: Vec<std::ffi::OsString>) -> Vec<String> {
 
 #[test]
 fn argv_is_exactly_the_verified_list() {
-    let args = strings(argv(Path::new("/d/mcp.json"), "sys", false));
+    let args = strings(argv(
+        Path::new("/d/mcp.json"),
+        Path::new("/d/system-prompt.txt"),
+    ));
     assert_eq!(
         args,
         [
@@ -66,8 +69,8 @@ fn argv_is_exactly_the_verified_list() {
             "--permission-mode",
             "dontAsk",
             "--no-chrome",
-            "--system-prompt",
-            "sys",
+            "--system-prompt-file",
+            "/d/system-prompt.txt",
             "--name",
             "jobpilot-apply",
             SESSION_PROMPT,
@@ -76,16 +79,12 @@ fn argv_is_exactly_the_verified_list() {
 }
 
 #[test]
-fn a_batch_file_gets_the_prompt_on_one_line() {
-    let args = strings(argv(Path::new("/d/mcp.json"), "one\r\ntwo\nthree", true));
-    assert!(args.contains(&"one two three".to_owned()), "{args:?}");
-    let args = strings(argv(Path::new("/d/mcp.json"), "one\ntwo", false));
-    assert!(args.contains(&"one\ntwo".to_owned()), "{args:?}");
-}
-
-#[test]
 fn no_flag_of_the_session_widens_it() {
-    let joined = strings(argv(Path::new("/d/mcp.json"), "sys", false)).join(" ");
+    let joined = strings(argv(
+        Path::new("/d/mcp.json"),
+        Path::new("/d/system-prompt.txt"),
+    ))
+    .join(" ");
     for flag in [
         "--dangerously-skip-permissions",
         "--allow-dangerously",
@@ -163,8 +162,12 @@ fn child_env_holds_no_key_and_keeps_memory_out() {
         "CLAUDE_CODE_DISABLE_CLAUDE_MDS",
         "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
     ];
+    let system = jobpilot_core::ai::child::system_env(cfg!(windows));
     for (name, _) in &env {
-        assert!(allowed.contains(&name.as_str()), "{name}");
+        assert!(
+            allowed.contains(&name.as_str()) || system.contains(&name.as_str()),
+            "{name}"
+        );
     }
     assert!(get("JOBPILOT_PANEL").is_none());
     let names: Vec<&str> = env.iter().map(|(name, _)| name.as_str()).collect();
@@ -706,8 +709,10 @@ async fn a_scripted_session_applies_to_two_applications_and_ends() {
     let recorded: Vec<String> = serde_json::from_value(session["argv"].clone()).unwrap();
     assert_eq!(
         recorded,
-        strings(argv(&dir.join("mcp.json"), SYSTEM_PROMPT, false))
+        strings(argv(&dir.join("mcp.json"), &dir.join(SYSTEM_PROMPT_FILE)))
     );
+    // Read from the run folder by the fake as the session started, line breaks and all.
+    assert_eq!(session["system_prompt"], SYSTEM_PROMPT);
     let cwd = PathBuf::from(session["cwd"].as_str().unwrap());
     let folder = session_cwd(w.db.paths());
     assert_eq!(cwd.canonicalize().unwrap(), folder.canonicalize().unwrap());
