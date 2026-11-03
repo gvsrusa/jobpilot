@@ -159,8 +159,11 @@ pub async fn apply(db: &Db, command: ApplyCommand) -> Result<Output> {
             agents::copilot_check(db, &application)
                 .await
                 .map_err(|error| match error {
-                    Error::Refused(reason) if reason.starts_with("policy_") => {
-                        Error::Refused("copilot_policy".into())
+                    Error::Refused(reason) if reason == "policy_blocked" => {
+                        Error::Refused("copilot_blocked".into())
+                    }
+                    Error::Refused(reason) if reason == "policy_unknown" => {
+                        Error::Refused("copilot_unknown".into())
                     }
                     other => other,
                 })?;

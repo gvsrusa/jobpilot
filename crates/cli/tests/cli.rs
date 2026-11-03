@@ -3832,6 +3832,30 @@ async fn apply_copilot_on_a_blocked_site_says_filling_and_nothing_else() {
     assert!(!text.contains("reading"), "{text}");
 }
 
+/// A site the register has no clear answer for is not called blocked: Copilot is refused
+/// with words that say so (final re-review F8).
+#[tokio::test]
+async fn apply_copilot_on_an_unknown_site_says_unclear_not_blocked() {
+    use jobpilot_core::applications::{self, ApplicationInput};
+    let (_dir, home) = fresh_home();
+    let db = Db::open(&AppPaths::new(&home)).await.unwrap();
+    let input = ApplicationInput {
+        company: "Acme".into(),
+        role: "Engineer".into(),
+        link: "https://acme.wd1.myworkdayjobs.com/en-US/careers/job/1".into(),
+        ..ApplicationInput::default()
+    };
+    let app = applications::add(&db, "cli", input).await.unwrap().id;
+    db.close().await;
+
+    let output = run(&home, &["apply", "copilot", &app]);
+    assert!(!output.status.success());
+    let text = stderr_text(&output);
+    assert!(!text.contains("Copilot is filling"), "{text}");
+    assert!(!text.contains("blocks"), "{text}");
+    assert!(text.contains("no clear answer"), "{text}");
+}
+
 #[tokio::test]
 async fn apply_material_and_record_are_manual_mode_from_the_cli() {
     let (_dir, home) = fresh_home();
