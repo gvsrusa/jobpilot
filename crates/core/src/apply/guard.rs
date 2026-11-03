@@ -479,7 +479,7 @@ fn is_ref(target: &str) -> bool {
 
 /// The index of the one snapshot line that holds `[ref=<target>]`. A marker inside a quoted
 /// name is not a ref, and a ref held twice is no element.
-fn index_of(snapshot: &str, target: &str) -> Option<usize> {
+pub(crate) fn index_of(snapshot: &str, target: &str) -> Option<usize> {
     if !is_ref(target) {
         return None;
     }
@@ -497,7 +497,7 @@ fn line_of<'a>(snapshot: &'a str, target: &str) -> Option<&'a str> {
 }
 
 /// True when byte `at` follows an even number of unescaped double quotes.
-fn outside_quotes(line: &str, at: usize) -> bool {
+pub(crate) fn outside_quotes(line: &str, at: usize) -> bool {
     let mut quotes = 0;
     let mut chars = line[..at].chars();
     while let Some(c) = chars.next() {

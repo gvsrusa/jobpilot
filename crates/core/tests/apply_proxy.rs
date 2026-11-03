@@ -1572,6 +1572,97 @@ async fn a_selected_value_is_judged_as_an_option() {
     s.close().await.unwrap();
 }
 
+/// An option named `Yes [ref=e50]` under the target, and a decoy option of the same name at
+/// the real ref e50 under a Normal question. The option judged is the one in the target.
+#[tokio::test]
+async fn a_selected_option_is_judged_in_its_own_list_not_at_a_ref_its_name_quotes() {
+    const DECOY: &str = "- listbox \"Favorite color\" [ref=e40]:\n  \
+        - option \"Yes [ref=e50]\" [ref=e50]\n  - option \"Blue\" [ref=e41]\n";
+    let own = ["", " [ref=e31]"];
+    let pages = [
+        ("I certify the following", "legal", true),
+        ("Are you a protected veteran?", "sensitive", false),
+    ];
+    for (heading, kind, stops) in pages {
+        for own in own {
+            let w = world().await;
+            let run = released_run(&w).await;
+            let page = format!(
+                "- heading \"{heading}\" [level=2] [ref=e2]\n- listbox [ref=e30]:\n  \
+                 - option \"Yes [ref=e50]\"{own}\n  - option \"No\"\n{DECOY}"
+            );
+            let m = mock(&w, &page, None);
+            let mut s = open(&w, &run, &m, None).await;
+            s.brief().await;
+            let id = s.tool("browser_snapshot", json!({})).await;
+            if stops {
+                assert_eq!(open_pause(&w.db, &run).await.origin, "page");
+                resolve(&w.db, &run, Resolution::Continue).await;
+            }
+            assert_eq!(s.next().await["id"], id);
+
+            let calls = [
+                (
+                    "browser_select_option",
+                    json!({"target": "e30", "values": ["Yes [ref=e50]"]}),
+                ),
+                (
+                    "browser_fill_form",
+                    json!({"fields": [
+                        {"name": "x", "type": "combobox", "target": "e30", "value": "Yes [ref=e50]"},
+                    ]}),
+                ),
+            ];
+            for (name, args) in calls {
+                let id = s.tool(name, args).await;
+                let pause = open_pause(&w.db, &run).await;
+                assert_eq!(
+                    (pause.kind.as_str(), pause.origin.as_str()),
+                    (kind, "guard"),
+                    "{heading} {own:?} {name}"
+                );
+                resolve(&w.db, &run, Resolution::Continue).await;
+                assert_eq!(s.next().await["id"], id);
+            }
+            assert!(m.named("browser_select_option").is_empty());
+            assert!(m.named("browser_fill_form").is_empty());
+            s.close().await.unwrap();
+        }
+    }
+}
+
+/// A select on a target that is not a combobox or listbox pauses, even when option lines
+/// sit under it: a label can retarget such an element to a select elsewhere on the page.
+#[tokio::test]
+async fn a_select_on_a_target_that_is_not_a_list_pauses() {
+    let w = world().await;
+    let run = released_run(&w).await;
+    let page = "- heading \"Survey\" [level=1] [ref=e2]\n- link \"Pick\" [ref=e60]:\n  \
+        - option \"Blue\" [ref=e61]\n- generic [ref=e62]:\n  - option \"Blue\" [ref=e63]\n";
+    let m = mock(&w, page, None);
+    let mut s = open(&w, &run, &m, None).await;
+    s.brief().await;
+    s.call("browser_snapshot", json!({})).await;
+    for target in ["e60", "e62"] {
+        let id = s
+            .tool(
+                "browser_select_option",
+                json!({"target": target, "values": ["Blue"]}),
+            )
+            .await;
+        let pause = open_pause(&w.db, &run).await;
+        assert_eq!(
+            (pause.kind.as_str(), pause.origin.as_str()),
+            ("other", "guard"),
+            "{target}"
+        );
+        resolve(&w.db, &run, Resolution::Continue).await;
+        assert_eq!(s.next().await["id"], id);
+    }
+    assert!(m.named("browser_select_option").is_empty());
+    s.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn an_unlabeled_field_has_its_own_refusal() {
     let w = world().await;

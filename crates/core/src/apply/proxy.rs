@@ -249,6 +249,14 @@ fn option_guard(
     if value.chars().any(char::is_control) {
         return Err(PauseKind::Other);
     }
+    // Playwright retargets an element inside a label to the label's control, so option lines
+    // under any other role could be a decoy for a select elsewhere on the page.
+    if !matches!(
+        guard::role_of(snapshot, target).as_deref(),
+        Some("combobox" | "listbox")
+    ) {
+        return Err(PauseKind::Other);
+    }
     let marker = format!("[ref={target}]");
     let lines: Vec<&str> = snapshot.lines().collect();
     // A marker quoted inside another line's name could point at the wrong line: a person decides.
@@ -292,8 +300,11 @@ fn option_guard(
     }
     let copy = copy.join("\n");
     let wanted = fold(value);
+    // A ref resolves to one line by `index_of`'s rule; only a line inside the subtree counts.
+    let inside = index + 1..=index + subtree;
     let mut matching = refs.iter().filter(|r| {
-        guard::role_of(&copy, r).as_deref() == Some("option")
+        guard::index_of(&copy, r).is_some_and(|at| inside.contains(&at))
+            && guard::role_of(&copy, r).as_deref() == Some("option")
             && guard::label_of(&copy, r).is_some_and(|name| fold(&name) == wanted)
     });
     match (matching.next(), matching.next()) {
@@ -302,10 +313,14 @@ fn option_guard(
     }
 }
 
-/// The ref a snapshot line names, if any.
+/// The ref a snapshot line names: the last `[ref=…]` outside quotes, by `guard::index_of`'s
+/// rule. A marker inside a quoted name is part of the name, not a ref.
 fn ref_in(line: &str) -> Option<String> {
-    let (_, rest) = line.split_once("[ref=")?;
-    let (found, _) = rest.split_once(']')?;
+    let (at, _) = line
+        .match_indices("[ref=")
+        .filter(|(at, _)| guard::outside_quotes(line, *at))
+        .last()?;
+    let (found, _) = line[at + "[ref=".len()..].split_once(']')?;
     Some(found.to_owned())
 }
 
