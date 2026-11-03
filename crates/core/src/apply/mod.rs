@@ -1238,22 +1238,64 @@ async fn stop(db: &Db, pause_id: &str) -> Result<bool> {
 }
 
 /// The run has ended, a person asked its agent run to stop, or its host is gone: the agent
-/// run is no longer active (halted or ended), or its heartbeat is older than the runner's
-/// `STALE`. A session that outlives its host so refuses its next call and ends.
+/// run is no longer active (halted or ended), or, for a Claude Code run, its heartbeat is
+/// older than the runner's `STALE` and `host_gone_by_evidence` says the host process is gone.
+/// A heartbeat's age alone ends nothing: after a system sleep a live host's beat is minutes
+/// old until it next beats. A Copilot or Autonomous run's hold runs inside its own host, so
+/// for those only the state counts. A session that outlives its host refuses its next call.
 pub(crate) async fn run_cancelled(db: &Db, run_id: &str) -> Result<bool> {
     let stale = format!("-{:.3} seconds", runner::STALE.as_secs_f64());
-    let stopped: Option<bool> = sqlx::query_scalar(
+    let row: Option<(bool, bool, Option<String>, Option<i64>)> = sqlx::query_as(
         "SELECT r.state = 'ended' OR coalesce(a.cancel_requested, 0) = 1 \
-           OR (a.id IS NOT NULL AND (a.state NOT IN \
-             ('queued','checking','running','checkpointed','retrying','waiting_for_human') \
-             OR a.heartbeat_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?))) \
+           OR (a.id IS NOT NULL AND a.state NOT IN \
+             ('queued','checking','running','checkpointed','retrying','waiting_for_human')), \
+           r.mode = 'claude_code' AND a.heartbeat_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?), \
+           a.id, CAST(strftime('%s', a.created_at) AS INTEGER) \
          FROM apply_runs r LEFT JOIN agent_runs a ON a.id = r.agent_run_id WHERE r.id = ?",
     )
     .bind(&stale)
     .bind(run_id)
     .fetch_optional(&db.pool)
     .await?;
-    Ok(stopped.unwrap_or(true))
+    Ok(match row {
+        None => true,
+        Some((true, ..)) => true,
+        Some((false, true, Some(agent_run), Some(claimed_at))) => {
+            host_gone_by_evidence(db, run_id, &agent_run, claimed_at)
+        }
+        Some(_) => false,
+    })
+}
+
+/// Evidence that a Claude Code run's host is gone: `host.json` names no host for this claim,
+/// or its pid is not a live process that started by the time the claim's agent run was made
+/// (a later start is a reused pid, not the host). `claimed_at` is in Unix seconds.
+pub(crate) fn host_gone_by_evidence(
+    db: &Db,
+    apply_id: &str,
+    agent_run: &str,
+    claimed_at: i64,
+) -> bool {
+    match recorded_host(&run_dir(db, apply_id)) {
+        Some((pid, recorded)) if recorded == agent_run => !process_started_by(pid, claimed_at),
+        _ => true,
+    }
+}
+
+/// True when `pid` is a live process that started no later than `when` (Unix seconds, with
+/// two seconds of slack for clock rounding).
+fn process_started_by(pid: u32, when: i64) -> bool {
+    use sysinfo::{Pid, ProcessStatus, ProcessesToUpdate, System};
+    let Ok(mut system) = System::new() else {
+        // The table cannot be read: no evidence, so the host is taken as alive.
+        return true;
+    };
+    let pid = Pid::from_u32(pid);
+    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+    system.process(pid).is_some_and(|process| {
+        process.status() != ProcessStatus::Zombie
+            && i64::try_from(process.start_time()).is_ok_and(|start| start <= when + 2)
+    })
 }
 
 fn ended() -> Error {
@@ -1472,4 +1514,17 @@ async fn rendered(
     // As the preflight renders them, so every claim guard holds. A blocked document is none.
     let (_, path) = export_doc(db, "system", app, Some(draft_id), kind).await?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod host_evidence_tests {
+    #[test]
+    fn this_process_started_before_now() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!(super::process_started_by(std::process::id(), now));
+        assert!(!super::process_started_by(std::process::id(), now - 3600));
+    }
 }

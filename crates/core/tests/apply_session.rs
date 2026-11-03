@@ -884,6 +884,72 @@ async fn a_proxy_left_in_a_hold_is_killed_when_the_session_ends() {
     assert!(!apply::run_dir(&w.db, &run).exists());
 }
 
+/// A machine that slept with a session in a hold: on waking, the host's heartbeat is a minute
+/// old, but the host is alive (its `host.json` pid is this process). A person's look and the
+/// hold's own poll must not end the run before the host's next beat.
+#[tokio::test]
+async fn a_stale_beat_of_a_live_host_ends_nothing() {
+    let w = world().await;
+    let (run, _) = run_of(&w, &["Acme"]).await;
+    let lines = [
+        r#"{"tool": "apply_next"}"#,
+        r#"{"tool": "browser_snapshot"}"#,
+        r#"{"tool": "apply_pause", "args": {"kind": "login"}, "nowait": true}"#,
+    ];
+    let f = fake(&w, steps(&lines), &[]).await;
+    let task = host(&w, &run, &f);
+    let begun = Instant::now();
+    let held = loop {
+        if let Some(pause) = apply::view(&w.db, &run).await.unwrap().active_pause {
+            break pause;
+        }
+        assert!(begun.elapsed() < WAIT, "the proxy holds a pause");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    sqlx::query(
+        "UPDATE agent_runs SET heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-60 seconds') \
+         WHERE id = (SELECT agent_run_id FROM apply_runs WHERE id = ?)",
+    )
+    .bind(&run)
+    .execute(&w.db.pool)
+    .await
+    .unwrap();
+
+    let seen = apply::latest_swept(&w.db).await.unwrap().unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    assert_eq!(seen.state, "running");
+    let view = apply::view(&w.db, &run).await.unwrap();
+    assert_eq!(view.state, "running");
+    assert_eq!(view.active_pause.map(|p| p.id), Some(held.id));
+    assert_ne!(agent_state(&w.db, &run).await.0, "halted");
+    assert!(apply::run_dir(&w.db, &run).is_dir());
+
+    apply::cancel(&w.db, "cli", &run).await.unwrap();
+    let _ = ended(task).await;
+}
+
+/// A read polled every second leaves an ended run's leftover folder to the full sweep, and
+/// starts no purge when it wound nothing up (final re-review F2).
+#[tokio::test]
+async fn a_status_read_leaves_leftover_folders_and_starts_no_purge() {
+    let w = world().await;
+    let (run, _) = run_of(&w, &["Acme"]).await;
+    apply::finish_items(&w.db, &run).await.unwrap();
+    let dir = apply::run_dir(&w.db, &run);
+    std::fs::create_dir_all(dir.join("profile")).unwrap();
+    std::fs::create_dir_all(session_cwd(w.db.paths())).unwrap();
+    let f = fake(&w, json!([]), &[]).await;
+
+    apply::latest_swept(&w.db).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert!(dir.is_dir());
+    assert!(f.purges().is_empty());
+    assert_eq!(session::sweep_orphans(&w.db).await.unwrap(), 0);
+    assert!(!dir.exists(), "the full sweep removes it");
+}
+
 // ---- The sweep ----
 
 /// A host that died mid-run: its agent run is `running` with a heartbeat long gone, the

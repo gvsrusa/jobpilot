@@ -389,10 +389,14 @@ async fn purge(bin: &Path, session: &Path) -> bool {
     )
 }
 
-/// `sweep_orphans` for a path a person waits on: a status read, a show, a Manual record.
-/// The same runs end and the same folders go, but `claude purge` is started and not waited
-/// for (it can take up to `PURGE_TIMEOUT`), and the binary is looked up without a login
-/// shell. The purge outlives this process if it must; a failure to start it is logged.
+/// `sweep_orphans` for a path a person waits on, often every second: a status read, a show,
+/// the run screen, a Manual record. It ends only runs whose host is gone by evidence: an agent
+/// run already halted or ended, or a Claude Code run whose heartbeat is stale and whose host
+/// process is gone (`apply::host_gone_by_evidence`). A stale heartbeat alone reaps nothing,
+/// so a live run after a system sleep is left alone, and a Copilot or Autonomous run is never
+/// reaped here. Leftover folders are the full sweep's. `claude purge` is started, detached,
+/// only when this call wound a run up, and is not waited for; a failure to start it is
+/// logged, and a purge that starts and then fails is not.
 pub async fn sweep_orphans_quickly(db: &Db) -> Result<usize> {
     sweep(db, Purge::Detached).await
 }
@@ -414,7 +418,12 @@ enum Purge {
 }
 
 async fn sweep(db: &Db, purge: Purge) -> Result<usize> {
-    runner::reap_stale(db).await?;
+    match purge {
+        Purge::Wait => {
+            runner::reap_stale(db).await?;
+        }
+        Purge::Detached => reap_dead_hosts(db).await?,
+    }
     let orphans: Vec<String> = sqlx::query_scalar(
         "SELECT r.id FROM apply_runs r LEFT JOIN agent_runs a ON a.id = r.agent_run_id \
          WHERE r.state <> 'ended' AND NOT ( \
@@ -429,7 +438,11 @@ async fn sweep(db: &Db, purge: Purge) -> Result<usize> {
     .await?;
 
     let mut leftovers = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(db.paths().apply()) {
+    let entries = match purge {
+        Purge::Wait => std::fs::read_dir(db.paths().apply()).ok(),
+        Purge::Detached => None,
+    };
+    if let Some(entries) = entries {
         for entry in entries.flatten() {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
@@ -470,13 +483,35 @@ async fn sweep(db: &Db, purge: Purge) -> Result<usize> {
     }
     if purge == Purge::Detached
         && let Some(bin) = &bin
+        && let Some(first) = orphans.first()
         && !purge_detached(bin, &session)
     {
         let detail = json!({ "folder": session.display().to_string() });
-        let first = orphans.iter().chain(&leftovers).next().map(String::as_str);
-        audit::record(db, "system", "purge_failed", first, detail).await?;
+        audit::record(db, "system", "purge_failed", Some(first), detail).await?;
     }
     Ok(orphans.len())
+}
+
+/// Halts the agent run of each Claude Code run whose heartbeat is older than the runner's
+/// `STALE` and whose host is gone by evidence. Nothing else is reaped.
+async fn reap_dead_hosts(db: &Db) -> Result<()> {
+    let stale = format!("-{:.3} seconds", runner::STALE.as_secs_f64());
+    let quiet: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT r.id, a.id, CAST(strftime('%s', a.created_at) AS INTEGER) \
+         FROM apply_runs r JOIN agent_runs a ON a.id = r.agent_run_id \
+         WHERE r.mode = 'claude_code' AND r.state <> 'ended' AND a.state IN \
+           ('queued','checking','running','checkpointed','retrying','waiting_for_human') \
+           AND a.heartbeat_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)",
+    )
+    .bind(&stale)
+    .fetch_all(&db.pool)
+    .await?;
+    for (apply_id, agent_run, claimed_at) in quiet {
+        if super::host_gone_by_evidence(db, &apply_id, &agent_run, claimed_at) {
+            runner::store::halt(db, &agent_run, "interrupted").await?;
+        }
+    }
+    Ok(())
 }
 
 /// `claude purge <session> --yes`, started and left to run: nobody waits for it, and it is

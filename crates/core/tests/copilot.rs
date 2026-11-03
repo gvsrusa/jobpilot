@@ -993,6 +993,40 @@ async fn a_continue_that_lands_as_the_pause_stops_the_hold_is_kept() {
     assert_eq!(view.items[0].state, "uncertain");
 }
 
+/// The machine slept through the review stop: the run's heartbeat is a minute old when it
+/// wakes. The app's look at the run (`apply_latest`, polled every second) and the hold's own
+/// poll must leave the run, its stop, and its browser alone until the runner beats again.
+#[tokio::test]
+async fn a_stale_beat_after_a_sleep_leaves_a_live_copilot_run_alone() {
+    let w = world().await;
+    let app = add_app(&w.db, LINK).await;
+    let m = mock(&w, &page(LINK, ""));
+    let task = run(&w, no_model(), &app, m.knobs());
+    let p = open_pause(&w.db).await;
+    let run = run_id(&w.db).await;
+    sqlx::query(
+        "UPDATE agent_runs SET heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-60 seconds') \
+         WHERE id = (SELECT agent_run_id FROM apply_runs WHERE id = ?)",
+    )
+    .bind(&run)
+    .execute(&w.db.pool)
+    .await
+    .unwrap();
+
+    apply::latest_swept(&w.db).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let view = apply::view(&w.db, &run).await.unwrap();
+    assert_eq!(view.state, "running");
+    assert_eq!(view.active_pause.map(|pause| pause.id), Some(p.id.clone()));
+    let (state, _) = agent_run(&w.db, &run).await;
+    assert_ne!(state, "halted");
+    apply::resolve_pause(&w.db, "cli", &p.id, Resolution::TakeOver)
+        .await
+        .unwrap();
+    ended(task).await.unwrap();
+}
+
 #[tokio::test]
 async fn continue_then_a_cancel_ends_uncertain_with_its_note() {
     let w = world().await;
