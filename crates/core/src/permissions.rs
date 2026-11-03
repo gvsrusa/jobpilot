@@ -153,6 +153,26 @@ fn integration(site: Site) -> Option<&'static str> {
     })
 }
 
+/// The connectors a person can authorize for Autonomous mode: the sites with register rows.
+pub const CONNECTORS: &[&str] = &[
+    "greenhouse",
+    "lever",
+    "ashby",
+    "workday",
+    "indeed",
+    "linkedin",
+];
+
+/// The connector name a grant for this site is stored under; a fixture reads as the site it
+/// names. `None` for a site with no register row.
+fn connector_of(site: Site) -> Option<&'static str> {
+    let name = integration(site)?;
+    CONNECTORS
+        .iter()
+        .copied()
+        .find(|connector| connector.eq_ignore_ascii_case(name))
+}
+
 fn row(register: &str, rows: &[(&str, &str)], site: Site) -> Option<crate::ai::register::SiteRow> {
     let name = integration(site)?;
     let (_, op) = rows.iter().find(|(integration, _)| *integration == name)?;
@@ -218,9 +238,29 @@ pub async fn grants(db: &Db) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// Only a person grants, and the audit row lands with the grant.
+/// Whether the owner's stored grant covers this site's connector, read fresh each call.
+pub async fn granted(db: &Db, site: Site) -> Result<bool> {
+    let Some(connector) = connector_of(site) else {
+        return Ok(false);
+    };
+    let found: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM autonomous_grants WHERE connector = ?)")
+            .bind(connector)
+            .fetch_one(&db.pool)
+            .await?;
+    Ok(found)
+}
+
+/// Only a person grants, only a connector in [`CONNECTORS`], and the audit row lands with the
+/// grant.
 pub async fn grant(db: &Db, actor: &str, connector: &str) -> Result<()> {
     runner::person(actor)?;
+    if !CONNECTORS.contains(&connector) {
+        return Err(crate::error::Error::Validation(format!(
+            "unknown connector; one of: {}",
+            CONNECTORS.join(", ")
+        )));
+    }
     let mut tx = db.pool.begin().await?;
     sqlx::query(
         "INSERT INTO autonomous_grants (connector, granted_by, granted_at) \

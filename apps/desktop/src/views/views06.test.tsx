@@ -374,6 +374,29 @@ async function openReview(app: Application, overrides: Record<string, (args: Arg
 }
 
 describe("application review", () => {
+  it("Autonomous shows its reason and has no enabled control today", async () => {
+    const NONE =
+      "No site or connector qualifies today. Needs a site rule of allowed, verified permission, and your explicit authorization.";
+    const modes = material().modes.map((m) => (m.mode === "autonomous" ? { ...m, note: NONE } : m));
+    const { api, user } = await openReview(application({ link: "https://jobs.lever.co/acme/1" }), {
+      apply_material: () => material({ modes }),
+      autonomous_grants: () => ["lever"],
+    });
+    const group = await screen.findByRole("radiogroup", { name: "How do you want to apply?" });
+    const autonomous = within(group).getByRole("radio", { name: "Autonomous" });
+    expect(autonomous).toHaveAttribute("aria-disabled", "true");
+    expect(autonomous).toHaveAccessibleDescription(`Not available. ${NONE}`);
+    // What the owner authorized is shown as text, with nothing to press.
+    expect(await screen.findByText("Connectors you authorized for Autonomous: lever.")).toBeInTheDocument();
+    await user.click(autonomous);
+    expect(autonomous).not.toBeChecked();
+    for (const button of screen.queryAllByRole("button")) {
+      expect(button.textContent ?? "").not.toMatch(/autonomous|authori[sz]e|submit/i);
+    }
+    expect(count(api, "autonomous_grant")).toBe(0);
+    expect(count(api, "autonomous_revoke")).toBe(0);
+  });
+
   it("disabled modes read their reason and cannot be selected", async () => {
     const { user } = await openReview(application({}), { apply_material: () => material() });
     const group = await screen.findByRole("radiogroup", { name: "How do you want to apply?" });

@@ -6,6 +6,9 @@
 // A MOCK_SNAPSHOT page that starts with "!error" makes browser_snapshot a tool error; one that
 // starts with "!rpcerror" makes every other tool a JSON-RPC error. MOCK_AFTER_FILL: once
 // browser_fill_form was called, browser_snapshot answers with this file in place of MOCK_SNAPSHOT.
+// MOCK_CLICK_REF: a ref whose click matters. MOCK_AFTER_CLICK: once that ref was clicked,
+// browser_snapshot answers with this file. MOCK_DIE_ON_CLICK=1: the click on that ref is logged,
+// then the server exits with no reply, as a crash mid-click would.
 import fs from "node:fs";
 import readline from "node:readline";
 
@@ -22,6 +25,7 @@ const NAMES = [
 const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
 let calls = 0;
 let filled = false;
+let clicked = false;
 
 const lines = readline.createInterface({ input: process.stdin });
 lines.on("line", (line) => {
@@ -50,8 +54,14 @@ lines.on("line", (line) => {
     }
     if (name === "slow") return;
     if (name === "browser_fill_form") filled = true;
+    if (name === "browser_click" && process.env.MOCK_CLICK_REF && args?.target === process.env.MOCK_CLICK_REF) {
+      clicked = true;
+      if (process.env.MOCK_DIE_ON_CLICK) process.exit(0);
+    }
     const after = process.env.MOCK_AFTER_FILL;
-    const shown = filled && after && fs.existsSync(after) ? after : process.env.MOCK_SNAPSHOT;
+    const afterClick = process.env.MOCK_AFTER_CLICK;
+    let shown = filled && after && fs.existsSync(after) ? after : process.env.MOCK_SNAPSHOT;
+    if (clicked && afterClick && fs.existsSync(afterClick)) shown = afterClick;
     const page = shown && fs.existsSync(shown) ? fs.readFileSync(shown, "utf8") : "";
     if (page.startsWith("!rpcerror") && name !== "browser_snapshot") {
       send({ jsonrpc: "2.0", id, error: { code: -32000, message: "failed" } });

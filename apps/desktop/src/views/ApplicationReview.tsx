@@ -61,6 +61,7 @@ export function ApplicationReview({ application, onClose }: { application: Appli
   const ids = useId();
   const key = ["apply", "material", application.id];
   const material = useQuery({ queryKey: key, queryFn: () => ipc.applyMaterial(application.id) });
+  const grants = useQuery({ queryKey: ["autonomous", "grants"], queryFn: () => ipc.autonomousGrants() });
   const [mode, setMode] = useState<ModeChoice["mode"]>("manual");
   const [copied, setCopied] = useState<{ id: string; stale: boolean } | null>(null);
   const [showStated, setShowStated] = useState(false);
@@ -155,6 +156,11 @@ export function ApplicationReview({ application, onClose }: { application: Appli
                     <p id={noteId} className="pl-6 text-sm text-muted-foreground">
                       {choice.available ? choice.note : `Not available. ${choice.note}`}
                     </p>
+                    {choice.mode === "autonomous" && grants.data && (
+                      <p className="pl-6 text-sm text-muted-foreground">
+                        Connectors you authorized for Autonomous: {grants.data.join(", ") || "none"}.
+                      </p>
+                    )}
                   </div>
                 );
               })}

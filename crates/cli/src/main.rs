@@ -142,6 +142,7 @@ impl Command {
                     ApplyCommand::Start { .. }
                         | ApplyCommand::Session { .. }
                         | ApplyCommand::Copilot { .. }
+                        | ApplyCommand::Autonomous(apply::AutonomousCommand::Grant { .. })
                 )
                 | Command::ApplyMcp { .. }
                 | Command::Kb(KbCommand::Reveal { .. })
@@ -649,6 +650,9 @@ mod tests {
         ("apply cancel r", false),
         ("apply material a", false),
         ("apply copilot a", true),
+        ("apply autonomous list", false),
+        ("apply autonomous grant c", true),
+        ("apply autonomous revoke c", false),
         ("apply record a --outcome applied", false),
         (
             "apply record a --outcome applied --on 2026-11-02 --note n",

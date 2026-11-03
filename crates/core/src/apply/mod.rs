@@ -909,6 +909,7 @@ pub async fn settle(db: &Db, actor: &str, apply_id: &str) -> Result<usize> {
                 .collect();
             let by = match run.mode.as_str() {
                 "copilot" => "Copilot",
+                "autonomous" => "Autonomous",
                 _ => "Claude Code",
             };
             let note = format!("Applied by {by} run {apply_id}. The page said: {said}");
@@ -1010,18 +1011,24 @@ pub(crate) async fn record_submitted(
     .await
 }
 
-/// A Copilot run of one application, held by `agent_run` from the start, with the files the
-/// preflight renders. Refused with the first block the preflight finds, or when another run
-/// is active. The audit row carries `policy_note`: what the register said about this mode.
+/// A Copilot or Autonomous run of one application, held by `agent_run` from the start, with
+/// the files the preflight renders. Refused with the first block the preflight finds, or when
+/// another run is active. The audit row carries `policy_note`: what the register said about this mode.
 pub(crate) async fn open_assisted(
     db: &Db,
     actor: &str,
     apply_id: &str,
     application_id: &str,
     agent_run: &str,
+    mode: Mode,
     policy_note: Option<&str>,
 ) -> Result<Item> {
     runner::person(actor)?;
+    let mode = match mode {
+        Mode::Copilot => "copilot",
+        Mode::Autonomous => "autonomous",
+        _ => return Err(Error::Refused("mode_does_not_allow".into())),
+    };
     let approved = usage::approved_for(db).await?;
     let item = check_item(db, actor, application_id, &approved).await?;
     if let Some(block) = item.check.blocks.first() {
@@ -1030,12 +1037,13 @@ pub(crate) async fn open_assisted(
     let mut tx = db.pool.begin().await?;
     let inserted = sqlx::query(concat!(
         "INSERT INTO apply_runs (id, agent_run_id, mode, actor, state, created_at) \
-         SELECT ?, ?, 'copilot', ?, 'running', ",
+         SELECT ?, ?, ?, ?, 'running', ",
         now!(),
         " WHERE NOT EXISTS (SELECT 1 FROM apply_runs WHERE state IN ('ready', 'running'))"
     ))
     .bind(apply_id)
     .bind(agent_run)
+    .bind(mode)
     .bind(actor)
     .execute(&mut *tx)
     .await?
@@ -1057,7 +1065,7 @@ pub(crate) async fn open_assisted(
     .execute(&mut *tx)
     .await?;
     let detail = json!({
-        "mode": "copilot",
+        "mode": mode,
         "items": 1,
         "hosts": [item.check.host],
         "policy_note": policy_note,
@@ -1266,9 +1274,7 @@ pub async fn material(db: &Db, application_id: &str) -> Result<Material> {
     };
     let grant = Grant {
         owner_started: true,
-        // ponytail: no site is in `permissions::VERIFIED`, so a grant changes no decision
-        // yet. Task 12 reads the stored grant for the site's connector.
-        authorized: false,
+        authorized: permissions::granted(db, site).await?,
     };
     let decide = |mode, action| permissions::decide(mode, site, action, &grant);
     let manual = matches!(

@@ -149,6 +149,7 @@ export function backend(overrides: Record<string, Handler> = {}): Backend {
     pty_open_apply: () => undefined,
     apply_cancel: () => undefined,
     apply_latest: () => null,
+    autonomous_grants: () => [],
     browser_status: () => ({ state: "ready", found: null, playwright_mcp: "0.0.84" }),
     pty_write: () => undefined,
     pty_resize: () => undefined,

@@ -1,6 +1,6 @@
 //! Claude Code apply runs. `start` and `session` host a tool-enabled session in this terminal,
-//! so the panel refuses them, as it does `apply-mcp`, and `copilot`, which starts a browser.
-//! The rest read, stop, or finish.
+//! so the panel refuses them, as it does `apply-mcp`, `copilot`, which starts a browser, and
+//! `autonomous grant`, which widens what may run. The rest read, stop, take away, or finish.
 
 use std::io::Write;
 use std::path::Path;
@@ -9,7 +9,7 @@ use clap::{Subcommand, ValueEnum};
 use jobpilot_core::ai::CancellationToken;
 use jobpilot_core::ai::router::Router;
 use jobpilot_core::apply::{self, Material, Preflight, Resolution, RunView};
-use jobpilot_core::{Db, Result, agents};
+use jobpilot_core::{Db, Result, agents, permissions};
 use serde_json::json;
 
 use crate::ai::with_interrupts;
@@ -63,6 +63,10 @@ pub enum ApplyCommand {
     Copilot {
         application: String,
     },
+    /// Autonomous mode: the connectors you authorized. A grant alone makes no site eligible:
+    /// a site also needs an allowed register row and a verified submit, and none has one.
+    #[command(subcommand)]
+    Autonomous(AutonomousCommand),
     /// Manual mode: record what happened after you applied by hand.
     Record {
         application: String,
@@ -75,6 +79,17 @@ pub enum ApplyCommand {
         #[arg(long, default_value = "")]
         note: String,
     },
+}
+
+#[derive(Subcommand)]
+pub enum AutonomousCommand {
+    /// The connectors you authorized.
+    List,
+    /// Authorize Autonomous submission on a connector: greenhouse, lever, ashby, workday,
+    /// indeed, or linkedin.
+    Grant { connector: String },
+    /// Take an authorization away.
+    Revoke { connector: String },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -149,6 +164,7 @@ pub async fn apply(db: &Db, command: ApplyCommand) -> Result<Output> {
             let text = summary(&run);
             out(run, text)
         }
+        ApplyCommand::Autonomous(command) => autonomous(db, command).await,
         ApplyCommand::Material { application } => {
             let material = apply::material(db, &application).await?;
             let text = material_text(&material);
@@ -182,6 +198,34 @@ pub async fn apply(db: &Db, command: ApplyCommand) -> Result<Output> {
             out(&saved, format!("{} is {}", saved.id, saved.status))
         }
     }
+}
+
+async fn autonomous(db: &Db, command: AutonomousCommand) -> Result<Output> {
+    let (connector, text) = match command {
+        AutonomousCommand::List => {
+            let granted = permissions::grants(db).await?;
+            let text = match granted.is_empty() {
+                true => "no connector authorized for Autonomous".to_owned(),
+                false => format!("authorized for Autonomous: {}", granted.join(", ")),
+            };
+            return out(json!({"grants": granted}), text);
+        }
+        AutonomousCommand::Grant { connector } => {
+            permissions::grant(db, ACTOR, &connector).await?;
+            let text = format!(
+                "{connector}: authorized for Autonomous. A site is eligible only when its \
+                 register row allows it and its submit is verified as well."
+            );
+            (connector, text)
+        }
+        AutonomousCommand::Revoke { connector } => {
+            permissions::revoke(db, ACTOR, &connector).await?;
+            let text = format!("{connector}: not authorized for Autonomous");
+            (connector, text)
+        }
+    };
+    let granted = permissions::grants(db).await?;
+    out(json!({"connector": connector, "grants": granted}), text)
 }
 
 /// Names and states only: a sealed answer's text and the stated authorization values stay

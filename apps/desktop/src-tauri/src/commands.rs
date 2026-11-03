@@ -209,6 +209,9 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         apply_record,
         apply_copy,
         copilot_start,
+        autonomous_grants,
+        autonomous_grant,
+        autonomous_revoke,
         crate::pty::pty_open,
         crate::pty::pty_open_apply,
         crate::pty::pty_write,
@@ -2116,6 +2119,43 @@ pub async fn copilot_start(state: State<'_, AppState>, application_id: String) -
     agents::copilot(&db, &router, ACTOR, &application_id, running.token.clone()).await
 }
 
+/// The connectors the owner authorized for Autonomous mode.
+#[tauri::command]
+pub async fn autonomous_grants(state: State<'_, AppState>) -> Result<Vec<String>> {
+    permissions::grants(&*state.work().await?).await
+}
+
+/// Authorizing widens what may run, so it asks a native yes that script in the webview cannot
+/// give. A grant alone makes no site eligible: the site also needs an allowed register row and
+/// a verified submit. Core refuses an unknown connector, so that is checked before the dialog.
+#[tauri::command]
+pub async fn autonomous_grant<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    connector: String,
+) -> Result<()> {
+    if !permissions::CONNECTORS.contains(&connector.as_str()) {
+        return Err(Error::Validation(format!(
+            "unknown connector; one of: {}",
+            permissions::CONNECTORS.join(", ")
+        )));
+    }
+    let message = format!(
+        "Authorize Autonomous submission on {connector}?\n\nOn a site that also has an allowed \
+         register row and a verified submit, JobPilot would fill and submit an application \
+         there with no review by you. No site has both today."
+    );
+    native::confirmed(&app, "Authorize Autonomous", message, "Authorize").await?;
+    permissions::grant(&*state.work().await?, ACTOR, &connector).await
+}
+
+/// Revoking only takes something away, so it does not ask. A run in progress stops at its
+/// next step.
+#[tauri::command]
+pub async fn autonomous_revoke(state: State<'_, AppState>, connector: String) -> Result<()> {
+    permissions::revoke(&*state.work().await?, ACTOR, &connector).await
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -3394,6 +3434,9 @@ mod tests {
         "apply_record",
         "apply_copy",
         "copilot_start",
+        "autonomous_grants",
+        "autonomous_grant",
+        "autonomous_revoke",
         "pty_open",
         "pty_open_apply",
         "pty_write",
@@ -7053,5 +7096,37 @@ mod tests {
                 .unwrap()
         });
         assert_eq!(started, 0);
+    }
+
+    // ---- Autonomous ----
+
+    #[test]
+    fn autonomous_grant_asks_natively_and_revoke_does_not() {
+        let h = ready();
+        assert_eq!(h.call("autonomous_grants", json!({})).unwrap(), json!([]));
+        // Declined: nothing stored.
+        h.answer(false);
+        let declined = h.call("autonomous_grant", json!({ "connector": "lever" }));
+        assert_eq!(declined.unwrap_err()["code"], "confirmation_required");
+        assert_eq!(h.asked().len(), 1);
+        assert!(h.asked()[0].contains("lever"), "{:?}", h.asked());
+        assert_eq!(h.call("autonomous_grants", json!({})).unwrap(), json!([]));
+        // Yes: stored.
+        h.answer(true);
+        h.call("autonomous_grant", json!({ "connector": "lever" }))
+            .unwrap();
+        assert_eq!(
+            h.call("autonomous_grants", json!({})).unwrap(),
+            json!(["lever"])
+        );
+        // An unknown connector is refused before anyone is asked.
+        let unknown = h.call("autonomous_grant", json!({ "connector": "acme" }));
+        assert_eq!(unknown.unwrap_err()["code"], "validation");
+        assert_eq!(h.asked().len(), 2);
+        // Revoking only takes something away: no dialog.
+        h.call("autonomous_revoke", json!({ "connector": "lever" }))
+            .unwrap();
+        assert_eq!(h.asked().len(), 2);
+        assert_eq!(h.call("autonomous_grants", json!({})).unwrap(), json!([]));
     }
 }

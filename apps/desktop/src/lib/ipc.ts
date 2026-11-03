@@ -935,6 +935,11 @@ export const ipc = {
     invoke<{ stale: boolean }>("apply_copy", { applicationId, answerId }),
   /** Copilot on one application. Resolves when the run ends: after the person's review. */
   copilotStart: (applicationId: string) => invoke<ApplyRunView>("copilot_start", { applicationId }),
+  /** Connectors the owner authorized for Autonomous mode. A grant alone makes no site eligible. */
+  autonomousGrants: () => invoke<string[]>("autonomous_grants"),
+  /** Rust asks a native yes first; `confirmation_required` when the owner says no. */
+  autonomousGrant: (connector: string) => invoke<void>("autonomous_grant", { connector }),
+  autonomousRevoke: (connector: string) => invoke<void>("autonomous_revoke", { connector }),
 };
 
 export function ptyOpen(cols: number, rows: number): Promise<void> {

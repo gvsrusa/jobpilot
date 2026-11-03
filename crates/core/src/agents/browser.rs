@@ -1,11 +1,13 @@
-//! Copilot: Rust drives the browser as an MCP client of the pinned Playwright server, fills
-//! what the rules and the owner's approved answers cover, uploads the two prepared files, and
-//! stops. A person reviews the form in the visible browser and clicks submit. Nothing here
-//! clicks a submit button, and no model chooses a step, a file, or a tool: `map_form_field`
-//! only names an answer by its id (decision 23).
+//! Copilot and Autonomous: Rust drives the browser as an MCP client of the pinned Playwright
+//! server, fills what the rules and the owner's approved answers cover, and uploads the two
+//! prepared files. Copilot then stops: a person reviews the form in the visible browser and
+//! clicks submit. Autonomous checks the page again and clicks submit once, and only on a site
+//! with an `allowed` row, a verified submit, and the owner's grant (decision 24). No model
+//! chooses a step, a file, or a tool: Copilot's `map_form_field` only names an answer by its
+//! id (decision 23), and Autonomous calls no model at all.
 //!
-//! Every step asks `permissions::decide` again, so a register change stops the run. Every
-//! page the run reads goes through `guard::scan`, and only a person ends a stop.
+//! Every step asks `permissions::decide` again, so a register change or a revoked grant stops
+//! the run. Every page the run reads goes through `guard::scan`, and only a person ends a stop.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -15,6 +17,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::ai::register::REGISTER;
 use crate::ai::router::Router;
 use crate::ai::{BoxFuture, CancellationToken, ProviderId, TaskType, spec};
 use crate::applications::{self, Application};
@@ -31,7 +34,7 @@ use crate::forms::{
     map_rules, parse_snapshot,
 };
 use crate::memory::{self, Class, usage};
-use crate::permissions::{self, Action, Decision, Grant, Mode};
+use crate::permissions::{self, Action, Decision, Grant, Mode, Site, VERIFIED};
 use crate::runner::{self, Agent, Ctx, Permission, RunInput, StepDef, StepOutput, Workflow};
 use crate::{audit, pause, profile};
 
@@ -41,12 +44,18 @@ use Permission::*;
 pub const REVIEW: &str = "Review the form in the browser and click submit yourself.";
 const NO_FORM: &str =
     "No form fields found on this page. Open the form in the browser, then continue.";
+/// Autonomous: fields the rules left, before anything is submitted.
+const LEFT: &str = "JobPilot will not submit with these empty. Fill them in the browser, then \
+                    continue:";
+/// Autonomous: the page is not what the run filled (M-37).
+const CHANGED: &str = "The form changed after JobPilot filled it. Check it in the browser. \
+                       Continue submits the form as it is now.";
 const OFF_ORIGIN: &str = "This page is not on the posting's site. Go back to the form in the \
                           browser, then continue.";
 /// A landing page's own way to its form. Not a submit: these words never send anything.
 const OPENERS: [&str; 3] = ["apply", "apply now", "apply for this job"];
 
-static STEPS: &[StepDef] = &[
+static COPILOT_STEPS: &[StepDef] = &[
     StepDef {
         name: "open",
         needs: &[ReadApplications, BrowserDrive],
@@ -77,6 +86,48 @@ static STEPS: &[StepDef] = &[
     },
 ];
 
+/// Copilot's steps with no model, then a check of the page, one click, and the capture. Only
+/// `submit` holds `BrowserSubmit`, and no step is tried twice.
+static AUTONOMOUS_STEPS: &[StepDef] = &[
+    StepDef {
+        name: "open",
+        needs: &[ReadApplications, BrowserDrive],
+        attempts: 1,
+    },
+    StepDef {
+        name: "detect",
+        needs: &[
+            BrowserDrive,
+            ReadJobText,
+            ReadProfileBasic,
+            ReadCareerMemory,
+            ReadSensitive,
+            WriteCareerMemory,
+        ],
+        attempts: 1,
+    },
+    StepDef {
+        name: "fill",
+        needs: &[BrowserDrive, BrowserFill, BrowserUpload],
+        attempts: 1,
+    },
+    StepDef {
+        name: "check",
+        needs: &[BrowserDrive],
+        attempts: 1,
+    },
+    StepDef {
+        name: "submit",
+        needs: &[BrowserDrive, BrowserSubmit, WriteApplications],
+        attempts: 1,
+    },
+    StepDef {
+        name: "confirm",
+        needs: &[BrowserDrive, WriteApplications],
+        attempts: 1,
+    },
+];
+
 /// What the run holds between steps: the browser, the item, and what the page showed.
 struct Driver {
     client: McpClient,
@@ -97,12 +148,16 @@ struct Driver {
     done: bool,
 }
 
-/// One Copilot run of one application. `mode` is Copilot; Autonomous would share the driver.
+/// One Copilot or Autonomous run of one application.
 pub struct BrowserWorkflow<'a> {
     apply_id: String,
     application_id: String,
     mode: Mode,
-    router: &'a Router,
+    /// Copilot's model for `map_form_field`. Autonomous has none: rules mapping only.
+    router: Option<&'a Router>,
+    /// What `permissions::decide_on` reads: `REGISTER` and `VERIFIED` outside tests.
+    register: &'a str,
+    verified: &'a [Site],
     knobs: &'a Knobs,
     slot: Mutex<Option<Driver>>,
 }
@@ -131,18 +186,38 @@ impl BrowserWorkflow<'_> {
         }
     }
 
-    /// The register's word on this mode, site, and action, read again at each step.
+    fn mode_name(&self) -> &'static str {
+        match self.mode {
+            Mode::Autonomous => "autonomous",
+            _ => "copilot",
+        }
+    }
+
+    /// The register's word on this mode, site, and action, read again at each step, with the
+    /// owner's stored grant as it stands now.
     async fn decided(&self, db: &Db, action: Action) -> Result<Option<&'static str>> {
         let app = applications::get(db, &self.application_id).await?;
         if !permissions::link_allowed(&app.link) {
             return Err(Error::Refused("link_not_https".into()));
         }
         let site = permissions::site_of(&app.link)?;
+        let authorized = match self.mode {
+            Mode::Autonomous => permissions::granted(db, site).await?,
+            _ => false,
+        };
         let grant = Grant {
             owner_started: true,
-            authorized: false,
+            authorized,
         };
-        match permissions::decide(self.mode, site, action, &grant) {
+        let decided = permissions::decide_on(
+            self.register,
+            self.verified,
+            self.mode,
+            site,
+            action,
+            &grant,
+        );
+        match decided {
             Decision::Allow { note } => Ok(note),
             Decision::Refuse(reason) => Err(Error::Refused(reason.into())),
         }
@@ -158,9 +233,12 @@ impl BrowserWorkflow<'_> {
             self.put(driver);
             return Ok(StepOutput::default());
         }
-        let done = match index {
-            1 => self.detect(ctx, &mut driver).await,
-            2 => self.fill(ctx, &mut driver).await,
+        let done = match self.steps()[index].name {
+            "detect" => self.detect(ctx, &mut driver).await,
+            "fill" => self.fill(ctx, &mut driver).await,
+            "check" => self.check(ctx, &mut driver).await,
+            "submit" => self.submit(ctx, &mut driver).await,
+            "confirm" => self.confirm(ctx, &mut driver).await,
             _ => self.review(ctx, &mut driver).await,
         };
         match done.is_ok() {
@@ -173,12 +251,27 @@ impl BrowserWorkflow<'_> {
     async fn open(&self, ctx: &Ctx<'_>) -> Result<StepOutput> {
         let db = ctx.db;
         let note = self.decided(db, Action::Drive).await?;
+        if self.mode == Mode::Autonomous {
+            // Submission is never retried: an application a submit was ever clicked for, in
+            // any run, is the owner's to check.
+            let clicked: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM apply_items \
+                 WHERE application_id = ? AND submit_clicks > 0)",
+            )
+            .bind(&self.application_id)
+            .fetch_one(&db.pool)
+            .await?;
+            if clicked {
+                return Err(Error::Refused("already_submitted".into()));
+            }
+        }
         let item = apply::open_assisted(
             db,
             ctx.actor,
             &self.apply_id,
             &self.application_id,
             ctx.run_id(),
+            self.mode,
             note,
         )
         .await?;
@@ -486,7 +579,10 @@ impl BrowserWorkflow<'_> {
                 question: row.question.clone(),
             })
             .collect();
-        if candidates.is_empty() || self.router.declarations().is_empty() {
+        let Some(router) = self.router else {
+            return Ok(None);
+        };
+        if candidates.is_empty() || router.declarations().is_empty() {
             return Ok(None);
         }
         let mut provider = None;
@@ -511,7 +607,7 @@ impl BrowserWorkflow<'_> {
             ctx.stop_point()?;
             let (pick, by) = map_field(
                 db,
-                self.router,
+                router,
                 ctx.actor,
                 &field.label,
                 &candidates,
@@ -649,7 +745,7 @@ impl BrowserWorkflow<'_> {
                 driver.left.push(label);
             } else {
                 // Which file went to this item: a code, never a path or the page's words.
-                let detail = json!({ "kind": kind, "mode": "copilot" });
+                let detail = json!({ "kind": kind, "mode": self.mode_name() });
                 audit::record(
                     ctx.db,
                     ctx.actor,
@@ -676,17 +772,7 @@ impl BrowserWorkflow<'_> {
     /// the run's end, by `settle`.
     async fn review(&self, ctx: &Ctx<'_>, driver: &mut Driver) -> Result<StepOutput> {
         self.decided(ctx.db, Action::Drive).await?;
-        let left: Vec<&str> = driver
-            .mapped
-            .iter()
-            .filter_map(|mapped| match mapped {
-                Mapped::Person { field, .. } if !field.label.trim().is_empty() => {
-                    Some(field.label.as_str())
-                }
-                _ => None,
-            })
-            .chain(driver.left.iter().map(String::as_str))
-            .collect();
+        let left = left_for_person(driver);
         let excerpt = match left.is_empty() {
             true => REVIEW.to_owned(),
             false => format!("{REVIEW} Left for you: {}.", left.join("; ")),
@@ -715,12 +801,200 @@ impl BrowserWorkflow<'_> {
         Ok(StepOutput::default())
     }
 
+    /// Autonomous, before anything is sent: a field the rules left pauses for a person, then a
+    /// fresh snapshot is scanned and read, and any change from what `fill` wrote pauses
+    /// (M-37). Continue on a change is the person's word that the page as it stands is right.
+    async fn check(&self, ctx: &Ctx<'_>, driver: &mut Driver) -> Result<StepOutput> {
+        self.decided(ctx.db, Action::Drive).await?;
+        let left = left_for_person(driver);
+        if !left.is_empty() {
+            let excerpt = format!("{LEFT} {}.", left.join("; "));
+            if let Step::Stopped = self
+                .hold(ctx, driver, PauseKind::Other, "guard", &excerpt)
+                .await?
+            {
+                return Ok(StepOutput::default());
+            }
+        }
+        let mut seen = false;
+        loop {
+            let Some(page) = self.snapshot(ctx, driver).await? else {
+                return Err(Error::Failed("browser_gone".into()));
+            };
+            if let Step::Stopped = self.watch(ctx, driver, page, true).await? {
+                return Ok(StepOutput::default());
+            }
+            let now = parse_snapshot(&driver.last);
+            if seen || unchanged(driver, &now) {
+                driver.form = now;
+                return Ok(StepOutput::default());
+            }
+            if let Step::Stopped = self
+                .hold(ctx, driver, PauseKind::Other, "guard", CHANGED)
+                .await?
+            {
+                return Ok(StepOutput::default());
+            }
+            seen = true;
+        }
+    }
+
+    /// One click on the submit button the check read. The click is counted in the database
+    /// before it is sent, so a crash, a lost reply, or a timeout after it reads `uncertain`,
+    /// and nothing here or in a later run clicks again.
+    async fn submit(&self, ctx: &Ctx<'_>, driver: &mut Driver) -> Result<StepOutput> {
+        self.decided(ctx.db, Action::Submit).await?;
+        let Some(target) = driver.form.submit.clone() else {
+            self.end_item(ctx, driver, "manual_required", "no_submit_button")
+                .await?;
+            return Ok(StepOutput::default());
+        };
+        pause::ensure_off(ctx.db).await?;
+        ctx.stop_point()?;
+        let mut tx = ctx.db.pool.begin().await?;
+        let claimed = sqlx::query(
+            "UPDATE apply_items SET submit_clicks = 1 \
+             WHERE id = ? AND submit_clicks = 0 AND state IN ('active', 'filled')",
+        )
+        .bind(&driver.item.id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        if claimed != 1 {
+            return Err(Error::Refused("already_submitted".into()));
+        }
+        driver.item.submit_clicks = 1;
+        let clicked = driver
+            .client
+            .call(
+                "browser_click",
+                json!({"target": target, "element": "Submit"}),
+                &ctx.cancel,
+            )
+            .await?;
+        sqlx::query("UPDATE apply_items SET tool_calls = tool_calls + 1 WHERE id = ?")
+            .bind(&driver.item.id)
+            .execute(&ctx.db.pool)
+            .await?;
+        if clicked.is_error {
+            // The browser said no, and whether anything was sent is unknown.
+            self.end_item(ctx, driver, "uncertain", "submit_unconfirmed")
+                .await?;
+        }
+        Ok(StepOutput::default())
+    }
+
+    /// The page after the click, kept as the page's claim (M-39). A page that still shows the
+    /// submit button, a stop, or no snapshot is doubt: `uncertain`, and never another click.
+    /// No register check here: a submission already made is recorded whatever the rows say.
+    async fn confirm(&self, ctx: &Ctx<'_>, driver: &mut Driver) -> Result<StepOutput> {
+        let capture = self.snapshot(ctx, driver).await?;
+        let doubt = match (&capture, &driver.form.submit) {
+            (None, _) => true,
+            (Some(page), submit) => {
+                submit
+                    .as_deref()
+                    .is_some_and(|target| guard::submit_target(page, target))
+                    || guard::scan(page, &driver.acks, &driver.typed).is_some()
+            }
+        };
+        if doubt {
+            self.end_item(ctx, driver, "uncertain", "submit_unconfirmed")
+                .await?;
+            return Ok(StepOutput::default());
+        }
+        let by = Submitter {
+            agent: "browser_application",
+            mode: "autonomous",
+        };
+        apply::record_submitted(
+            ctx.db,
+            ctx.actor,
+            &self.apply_id,
+            &driver.item,
+            capture.as_deref(),
+            by,
+        )
+        .await?;
+        driver.done = true;
+        Ok(StepOutput::default())
+    }
+
     /// Ends the browser, if a step left it open.
     async fn close(&self) {
         if let Some(driver) = self.take() {
             driver.client.close().await;
         }
     }
+}
+
+/// The labels a person fills: fields the rules left, and fields the browser refused.
+fn left_for_person(driver: &Driver) -> Vec<String> {
+    driver
+        .mapped
+        .iter()
+        .filter_map(|mapped| match mapped {
+            Mapped::Person { field, .. } if !field.label.trim().is_empty() => {
+                Some(field.label.clone())
+            }
+            _ => None,
+        })
+        .chain(driver.left.iter().cloned())
+        .collect()
+}
+
+/// The fields that take a value, by ref, role, and label.
+fn value_fields(form: &Form) -> Vec<(&str, &str, &str)> {
+    form.fields
+        .iter()
+        .filter(|field| {
+            matches!(
+                field.role.as_str(),
+                "textbox" | "combobox" | "checkbox" | "radio"
+            )
+        })
+        .map(|field| {
+            (
+                field.target.as_str(),
+                field.role.as_str(),
+                field.label.as_str(),
+            )
+        })
+        .collect()
+}
+
+/// The page `now` is the one `fill` worked on: the same origin and submit button, the same
+/// fields that take a value, and each text field holding what was written. A field a person
+/// fills is not compared.
+/// ponytail: a choice's selection is not read back, as the snapshot shape for a chosen
+/// option is not pinned; its field must still be there.
+fn unchanged(driver: &Driver, now: &Form) -> bool {
+    let before = &driver.form;
+    if now.origin.is_empty() || now.origin != before.origin {
+        return false;
+    }
+    if now.submit.is_none() || now.submit != before.submit {
+        return false;
+    }
+    let mut was = value_fields(before);
+    let mut is = value_fields(now);
+    was.sort_unstable();
+    is.sort_unstable();
+    if was != is {
+        return false;
+    }
+    driver.mapped.iter().all(|mapped| match mapped {
+        Mapped::Value { field, text, .. }
+            if field.role == "textbox" && !driver.left.contains(&field.label) =>
+        {
+            now.fields
+                .iter()
+                .find(|shown| shown.target == field.target)
+                .is_some_and(|shown| shown.value.as_deref() == Some(text.as_str()))
+        }
+        _ => true,
+    })
 }
 
 /// An approved answer's text for this application, or `None` when it may not be used here: a
@@ -776,7 +1050,10 @@ impl Workflow for BrowserWorkflow<'_> {
     }
 
     fn steps(&self) -> &'static [StepDef] {
-        STEPS
+        match self.mode {
+            Mode::Autonomous => AUTONOMOUS_STEPS,
+            _ => COPILOT_STEPS,
+        }
     }
 
     fn step<'a>(&'a self, ctx: &'a Ctx<'a>, index: usize) -> BoxFuture<'a, Result<StepOutput>> {
@@ -806,20 +1083,80 @@ pub async fn copilot_with(
     cancel: CancellationToken,
     knobs: &Knobs,
 ) -> Result<RunView> {
+    let workflow = |apply_id| BrowserWorkflow {
+        apply_id,
+        application_id: application_id.to_owned(),
+        mode: Mode::Copilot,
+        router: Some(router),
+        register: REGISTER,
+        verified: VERIFIED,
+        knobs,
+        slot: Mutex::new(None),
+    };
+    run_one(db, actor, cancel, workflow).await
+}
+
+/// A person's act: one Autonomous run of one application. Refused, with no browser started,
+/// unless the site's submit row is `allowed`, the site is in `permissions::VERIFIED`, and the
+/// owner granted its connector: today no site is. It fills by rules only, stops for anything
+/// they leave and for any change on the page, clicks submit once, and captures the result.
+pub async fn autonomous(
+    db: &Db,
+    actor: &str,
+    application_id: &str,
+    cancel: CancellationToken,
+) -> Result<RunView> {
+    autonomous_with(
+        db,
+        REGISTER,
+        VERIFIED,
+        actor,
+        application_id,
+        cancel,
+        &Knobs::default(),
+    )
+    .await
+}
+
+/// [`autonomous`] on any register text and verified list, so a test can make a site eligible.
+#[doc(hidden)]
+pub async fn autonomous_with(
+    db: &Db,
+    register: &str,
+    verified: &[Site],
+    actor: &str,
+    application_id: &str,
+    cancel: CancellationToken,
+    knobs: &Knobs,
+) -> Result<RunView> {
+    let workflow = |apply_id| BrowserWorkflow {
+        apply_id,
+        application_id: application_id.to_owned(),
+        mode: Mode::Autonomous,
+        router: None,
+        register,
+        verified,
+        knobs,
+        slot: Mutex::new(None),
+    };
+    run_one(db, actor, cancel, workflow).await
+}
+
+/// Runs the workflow on the runner, then, whatever the ending, `finish_items`, `settle`, and
+/// `session::cleanup`, so the browser and run folder are gone and the run row is ended.
+async fn run_one<'a>(
+    db: &Db,
+    actor: &str,
+    cancel: CancellationToken,
+    workflow: impl FnOnce(String) -> BrowserWorkflow<'a>,
+) -> Result<RunView> {
     runner::person(actor)?;
     pause::ensure_off(db).await?;
     session::sweep_orphans(db).await?;
     let apply_id: String = sqlx::query_scalar("SELECT lower(hex(randomblob(16)))")
         .fetch_one(&db.pool)
         .await?;
-    let workflow = BrowserWorkflow {
-        apply_id: apply_id.clone(),
-        application_id: application_id.to_owned(),
-        mode: Mode::Copilot,
-        router,
-        knobs,
-        slot: Mutex::new(None),
-    };
+    let workflow = workflow(apply_id.clone());
     let started = runner::start(db, actor, &workflow, cancel).await;
     workflow.close().await;
     let opened: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM apply_runs WHERE id = ?)")
