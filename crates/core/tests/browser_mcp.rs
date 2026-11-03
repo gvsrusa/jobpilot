@@ -81,7 +81,10 @@ async fn the_client_lists_and_calls_tools_on_a_server() {
     let log = fs::read_to_string(&calls).unwrap();
     let names: Vec<Value> = log
         .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap()["name"].clone())
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        // The server also logs its own start.
+        .filter(|entry| entry.get("started").is_none())
+        .map(|entry| entry["name"].clone())
         .collect();
     assert_eq!(names, ["browser_snapshot", "fail"]);
     client.close().await;

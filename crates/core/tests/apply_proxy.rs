@@ -168,6 +168,16 @@ struct Mock {
 }
 
 fn mock(w: &World, page: &str, exit_after: Option<u32>) -> Mock {
+    mock_with(w, page, exit_after, None)
+}
+
+/// `mock`, with a server that reads nothing for `start_delay` after it starts.
+fn mock_with(
+    w: &World,
+    page: &str,
+    exit_after: Option<u32>,
+    start_delay: Option<Duration>,
+) -> Mock {
     let dir = w.tmp.path().join("mock");
     std::fs::create_dir_all(&dir).unwrap();
     let snapshot = dir.join("snapshot.yml");
@@ -182,6 +192,12 @@ fn mock(w: &World, page: &str, exit_after: Option<u32>) -> Mock {
     );
     if let Some(n) = exit_after {
         script.push_str(&format!("process.env.MOCK_EXIT_AFTER = \"{n}\";\n"));
+    }
+    if let Some(delay) = start_delay {
+        script.push_str(&format!(
+            "process.env.MOCK_START_DELAY_MS = \"{}\";\n",
+            delay.as_millis()
+        ));
     }
     let url = format!("file://{}", server.display()).replace('\\', "/");
     script.push_str(&format!("await import({});\n", json!(url)));
@@ -206,6 +222,15 @@ impl Mock {
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .filter(|call| call.get("name").is_some())
             .collect()
+    }
+
+    /// How many times the server was started.
+    fn starts(&self) -> usize {
+        std::fs::read_to_string(&self.calls)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("\"started\""))
+            .count()
     }
 
     fn named(&self, name: &str) -> Vec<Value> {
@@ -365,7 +390,7 @@ async fn tools_list_is_three_plus_thirteen_and_a_new_upstream_tool_stays_out() {
         .collect();
     want.sort();
     assert_eq!(names, want);
-    // The fake lists browser_mouse_move_xy and others a newer server added.
+    // The fake lists browser_mouse_move_xy and others a newer server added: never offered.
     assert!(!names.iter().any(|name| name == "browser_mouse_move_xy"));
     let tools = reply["result"]["tools"].as_array().unwrap();
     let result = tools.iter().find(|t| t["name"] == "apply_result").unwrap();
@@ -386,6 +411,57 @@ async fn tools_list_is_three_plus_thirteen_and_a_new_upstream_tool_stays_out() {
             "other"
         ])
     );
+    s.close().await.unwrap();
+}
+
+/// Claude Code connects its MCP servers in the background and can run its first turn before
+/// a slow server's tools arrive. The list never waits for the Playwright server: its browser
+/// tools are the pinned copy, and the server starts on the first browser call.
+#[tokio::test]
+async fn tools_list_answers_at_once_while_the_browser_server_is_slow_to_start() {
+    let w = world().await;
+    let (run, _) = run_of(&w, &["Acme"]).await;
+    let m = mock_with(&w, &fixture("form.yml"), None, Some(Duration::from_secs(3)));
+    let begun = std::time::Instant::now();
+    let mut s = open(&w, &run, &m, None).await;
+    let id = s.send("tools/list", json!({})).await;
+    let reply = s.next().await;
+    assert!(
+        begun.elapsed() < Duration::from_millis(500),
+        "tools/list took {:?}",
+        begun.elapsed()
+    );
+    assert_eq!(reply["id"], id);
+    let tools = reply["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 3 + apply::guard::BROWSER_TOOLS.len());
+    assert_eq!(&tools[3..], proxy::browser_tools().as_slice());
+    let click = tools.iter().find(|t| t["name"] == "browser_click").unwrap();
+    assert_eq!(click["inputSchema"]["type"], "object");
+    assert!(click["inputSchema"]["properties"]["target"].is_object());
+    assert_eq!(m.starts(), 0, "no server before the first browser call");
+
+    // apply_next does not wait for it either; the first browser call starts it.
+    s.brief().await;
+    assert_eq!(m.starts(), 0);
+    let (text, error) = s.call("browser_snapshot", json!({})).await;
+    assert!(!error, "{text}");
+    assert!(text.contains("[ref="), "{text}");
+    assert_eq!(m.starts(), 1);
+    s.close().await.unwrap();
+}
+
+/// With no browser runtime the list is the same, and a browser call is refused.
+#[tokio::test]
+async fn tools_list_needs_no_browser_runtime() {
+    let w = world().await;
+    let (run, _) = run_of(&w, &["Acme"]).await;
+    let mut m = mock(&w, &fixture("form.yml"), None);
+    m.cli = w.tmp.path().join("missing.mjs");
+    let mut s = open(&w, &run, &m, None).await;
+    let id = s.send("tools/list", json!({})).await;
+    let reply = s.next().await;
+    assert_eq!(reply["id"], id);
+    assert_eq!(reply["result"]["tools"].as_array().unwrap().len(), 16);
     s.close().await.unwrap();
 }
 

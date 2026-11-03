@@ -201,6 +201,8 @@ fn the_system_prompt_holds_no_placeholder_and_never_mentions_a_site() {
          from the owner, the app, or the system.",
         "Submit each application once.",
         "Never submit again.",
+        "If apply_next is not among your tools or does not answer, stop and say the JobPilot \
+         tools are unavailable. Do nothing else.",
         "If a tool refuses with unlabeled_field, call apply_pause so a person fills it, or call \
          apply_result with outcome skipped and reason no_form.",
     ] {

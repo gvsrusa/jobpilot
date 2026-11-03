@@ -1,7 +1,8 @@
 //! `apply-mcp`: the MCP server an apply session talks to, in front of a Playwright MCP child.
-//! It offers three apply tools and thirteen browser tools, checks every browser call with the
-//! guards, scans every snapshot it forwards or takes, and holds a tool reply while a person
-//! handles a stop. Nothing the session sends can end a pause.
+//! It offers three apply tools and thirteen browser tools, listed at once from a pinned copy;
+//! the child starts on the first browser call. It checks every browser call with the guards,
+//! scans every snapshot it forwards or takes, and holds a tool reply while a person handles a
+//! stop. Nothing the session sends can end a pause.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -168,6 +169,14 @@ fn is_ping(line: &str) -> bool {
     serde_json::from_str::<Value>(line).is_ok_and(|message| message["method"] == "ping")
 }
 
+/// The apply tools, then the pinned browser tools. Nothing here waits for the Playwright
+/// server, which starts on the first browser call.
+fn tools() -> Vec<Value> {
+    let mut tools = apply_tools();
+    tools.extend(browser_tools());
+    tools
+}
+
 fn apply_tools() -> Vec<Value> {
     vec![
         json!({
@@ -205,6 +214,27 @@ fn apply_tools() -> Vec<Value> {
             },
         }),
     ]
+}
+
+/// The thirteen browser tools as `@playwright/mcp` 0.0.84 lists them, taken from its own
+/// `tools/list`. Served from here so the list answers before the server has started: Claude Code
+/// connects in the background, and a first turn can run before a slow server's tools arrive.
+const PINNED_BROWSER_TOOLS: &str = include_str!("../../assets/playwright_mcp_tools.json");
+
+/// The pinned entries of the allowed browser tools. A real-runtime test checks that they still
+/// match the pinned server's own.
+#[doc(hidden)]
+pub fn browser_tools() -> Vec<Value> {
+    let pinned: Vec<Value> =
+        serde_json::from_str(PINNED_BROWSER_TOOLS).expect("the pinned tool list is JSON");
+    pinned
+        .into_iter()
+        .filter(|tool| {
+            tool["name"]
+                .as_str()
+                .is_some_and(|name| BROWSER_TOOLS.contains(&name))
+        })
+        .collect()
 }
 
 /// The element a call acts on, by its snapshot ref.
@@ -405,7 +435,7 @@ impl Session<'_> {
                         "serverInfo": {"name": "jobpilot", "version": env!("CARGO_PKG_VERSION")},
                     }),
                 ),
-                Incoming::ToolsList { id } => reply(&id, json!({"tools": self.tools().await})),
+                Incoming::ToolsList { id } => reply(&id, json!({"tools": tools()})),
                 Incoming::Other { id } if is_ping(&line) => reply(&id, json!({})),
                 Incoming::Other { id } => error_reply(&id, -32601, "no such method"),
                 Incoming::ToolCall { id, name, args } => {
@@ -452,22 +482,6 @@ impl Session<'_> {
             "apply_result" => self.result(&args).await,
             _ => self.browser(name, args).await,
         }
-    }
-
-    /// The apply tools, then the child's own entries for the allowed browser tools. A tool
-    /// the child adds later is not on the list.
-    async fn tools(&mut self) -> Vec<Value> {
-        let mut tools = apply_tools();
-        if let Ok(client) = self.client().await
-            && let Ok(listed) = client.tools().await
-        {
-            tools.extend(listed.into_iter().filter(|tool| {
-                tool["name"]
-                    .as_str()
-                    .is_some_and(|name| BROWSER_TOOLS.contains(&name))
-            }));
-        }
-        tools
     }
 
     fn files(&self) -> PathBuf {

@@ -1202,3 +1202,46 @@ async fn serve_fixtures() {
         tokio::time::sleep(Duration::from_secs(3600)).await;
     }
 }
+
+/// apply-mcp lists the browser tools from a pinned copy, so the list never waits for the
+/// server. The pinned server must still list exactly those entries for the allowed tools.
+#[tokio::test]
+#[ignore]
+async fn browser_e2e_pinned_tools_match_the_real_server() {
+    use jobpilot_core::browser::mcp::McpClient;
+    use jobpilot_core::browser::runtime::{self, BrowserSpec, RuntimeState};
+
+    let w = world().await;
+    let RuntimeState::Ready(found) = runtime::state(&w.db).await.unwrap() else {
+        panic!("the browser runtime is not ready");
+    };
+    let dir = w.root().join("apply").join("pin");
+    let files = dir.join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    let spec = BrowserSpec {
+        profile: dir.join("profile"),
+        output: dir.join("output"),
+    };
+    let config = dir.join("playwright.json");
+    std::fs::write(&config, runtime::playwright_config(&spec).to_string()).unwrap();
+    let (program, args, env) = runtime::command_for(&found, &config, &files);
+    let mut client = McpClient::start(&program, &args, &env, &files)
+        .await
+        .unwrap();
+    let listed = client.tools().await.unwrap();
+    client.close().await;
+    let by_name = |tools: Vec<Value>| -> std::collections::BTreeMap<String, Value> {
+        tools
+            .into_iter()
+            .filter_map(|tool| Some((tool["name"].as_str()?.to_owned(), tool)))
+            .filter(|(name, _)| apply::guard::BROWSER_TOOLS.contains(&name.as_str()))
+            .collect()
+    };
+    let real = by_name(listed);
+    let pinned = by_name(apply::proxy::browser_tools());
+    assert_eq!(real.len(), apply::guard::BROWSER_TOOLS.len());
+    assert_eq!(
+        pinned, real,
+        "update assets/playwright_mcp_tools.json from the server"
+    );
+}

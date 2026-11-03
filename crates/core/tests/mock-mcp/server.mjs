@@ -10,6 +10,8 @@
 // browser_snapshot answers with this file. MOCK_DIE_ON_CLICK=1: the click on that ref is logged,
 // then the server exits with no reply, as a crash mid-click would. MOCK_LATE and MOCK_LATE_AT=n:
 // from the nth browser_snapshot after the fill on, until the click, it answers with MOCK_LATE.
+// MOCK_START_DELAY_MS=n: read nothing for n ms after starting, as a slow server start would.
+// Each start appends {"started": pid} to MOCK_CALLS.
 import fs from "node:fs";
 import readline from "node:readline";
 
@@ -29,8 +31,9 @@ let filled = false;
 let clicked = false;
 let lateSnapshots = 0;
 
-const lines = readline.createInterface({ input: process.stdin });
-lines.on("line", (line) => {
+if (process.env.MOCK_CALLS) fs.appendFileSync(process.env.MOCK_CALLS, JSON.stringify({ started: process.pid }) + "\n");
+const delay = Number(process.env.MOCK_START_DELAY_MS || 0);
+const begin = () => readline.createInterface({ input: process.stdin }).on("line", (line) => {
   const message = JSON.parse(line);
   const { id, method, params } = message;
   if (id === undefined) return;
@@ -92,3 +95,4 @@ lines.on("line", (line) => {
     send({ jsonrpc: "2.0", id, error: { code: -32601, message: "no such method" } });
   }
 });
+if (delay > 0) setTimeout(begin, delay); else begin();
