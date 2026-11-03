@@ -52,7 +52,7 @@ fn argv_is_exactly_the_verified_list() {
         args,
         [
             "--tools",
-            "",
+            "ToolSearch",
             "--strict-mcp-config",
             "--mcp-config",
             "/d/mcp.json",

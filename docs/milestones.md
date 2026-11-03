@@ -231,7 +231,7 @@ Details and the full lists are in [release 0.6.0](releases/0.6.0.md). Rows marke
 | 5. Docs and risks | Updated: policy register (prose and site-row consequences only; no AI provider row, no owner decision table row, no verdict), agents, architecture, database schema, AI providers, threat model, wireframes (screens 11, 12, and 19), development guide, PRD, README, changelog, and the release note. Risks are in the release note. |
 
 Exit tests not proven end to end:
-- Every apply mode exit test above ran against a scripted fake `claude` and fixture forms. A real `claude` session: `PLACEHOLDER_TASK_14_REAL_CLAUDE`. Whether `--tools ""` leaves the MCP tools reachable in an interactive session, and whether the trust dialog shows, are read off that run.
+- Every apply mode exit test above ran against a scripted fake `claude` and fixture forms. A real `claude` session: `PLACEHOLDER_TASK_14_REAL_CLAUDE`. `--tools ""` left the MCP tools unreachable in an interactive session on Claude Code 2.1.317, which defers them behind `ToolSearch`; the session now keeps that one built-in, which loads tool schemas and nothing else. Whether the trust dialog shows is read off that run.
 - Emergency pause from the native menu and from `jobpilot pause set` in a second terminal, with a real session: `PLACEHOLDER_TASK_14_PAUSE`.
 - A crash of the desktop mid-run, then a relaunch: `PLACEHOLDER_TASK_14_CRASH`.
 - Manual and Copilot once each in the real window: `PLACEHOLDER_TASK_14_MODES`.

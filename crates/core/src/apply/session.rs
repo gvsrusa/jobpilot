@@ -109,8 +109,10 @@ pub fn mcp_config(sidecar: &Path, root: &Path, dir: &Path, service: Option<&str>
     })
 }
 
-/// The exact argument list, verified against `claude --help` 2.1.316. `--tools ""` and
-/// `--strict-mcp-config` leave only the proxy's tools, `--allowedTools` allows them without a
+/// The exact argument list, verified against `claude --help` 2.1.316. `--tools ToolSearch` keeps
+/// one built-in, which loads tool schemas and nothing else: an interactive Claude Code 2.1.317
+/// defers MCP tools behind it, so `--tools ""` leaves the proxy's tools unreachable.
+/// `--strict-mcp-config` leaves only the proxy's tools, `--allowedTools` allows them without a
 /// prompt, and `dontAsk` denies anything else. The prompt goes last, after a one-value flag,
 /// because the list flags take every word after them.
 pub fn argv(mcp_config: &Path, system: &str, batch: bool) -> Vec<OsString> {
@@ -120,9 +122,14 @@ pub fn argv(mcp_config: &Path, system: &str, batch: bool) -> Vec<OsString> {
     } else {
         system.to_owned()
     };
-    let mut args: Vec<OsString> = ["--tools", "", "--strict-mcp-config", "--mcp-config"]
-        .map(OsString::from)
-        .into();
+    let mut args: Vec<OsString> = [
+        "--tools",
+        "ToolSearch",
+        "--strict-mcp-config",
+        "--mcp-config",
+    ]
+    .map(OsString::from)
+    .into();
     args.push(mcp_config.as_os_str().to_owned());
     args.extend(
         [

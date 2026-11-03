@@ -57,7 +57,7 @@ Checked on **2026-11-02**. No real `claude` session was started and no model was
 
 | Flag or fact | Source text | Use |
 |---|---|---|
-| `--tools <tools...>` | `Use "" to disable all tools` | `""`, as the headless adapter does |
+| `--tools <tools...>` | `Use "" to disable all tools` | `ToolSearch`: the one built-in kept, which loads tool schemas and nothing else. Claude Code 2.1.317 defers MCP tools behind it in an interactive session, so `""` (the headless adapter's value) left them unreachable (real run, 2026-11-03) |
 | `--mcp-config <configs...>`, `--strict-mcp-config` | `Only use MCP servers from --mcp-config, ignoring all other MCP configurations` | One server, `jobpilot` |
 | `--allowedTools <tools...>` | Permissions doc: allow rules accept globs after a literal `mcp__<server>__` prefix | `mcp__jobpilot__*` |
 | `--permission-mode dontAsk` | Permissions doc: "Auto-denies every call that would otherwise prompt, though a mod you installed can still approve some of those calls." | No prompts; the proxy's list is the second wall |
