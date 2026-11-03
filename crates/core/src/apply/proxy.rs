@@ -120,6 +120,9 @@ struct Current {
     last: String,
     /// Stops a person already answered, by `guard::hit_key`.
     acks: HashSet<String>,
+    /// What the session typed into each field, by ref, so the scan knows the owner's own
+    /// answer when the page shows it back.
+    typed: guard::Typed,
 }
 
 enum Step {
@@ -671,6 +674,11 @@ impl Session<'_> {
             }
         }
 
+        // Only text the session sends as typing; a choice is judged by its own guards.
+        let typing: Vec<(String, String)> = match name {
+            "browser_type" | "browser_fill_form" => guard::fields_in(name, &args),
+            _ => Vec::new(),
+        };
         let forwarded = match self.forward(name, args).await {
             Ok(forwarded) => forwarded,
             Err(error) => {
@@ -679,6 +687,11 @@ impl Session<'_> {
                 return Err(error);
             }
         };
+        if !forwarded.is_error
+            && let Some(current) = self.current.as_mut()
+        {
+            current.typed.extend(typing);
+        }
         sqlx::query("UPDATE apply_items SET tool_calls = tool_calls + 1 WHERE id = ?")
             .bind(&item_id)
             .execute(&self.db.pool)
@@ -739,7 +752,7 @@ impl Session<'_> {
             if is_snapshot {
                 current.last = page.clone();
             }
-            match guard::scan(&page, &current.acks) {
+            match guard::scan(&page, &current.acks, &current.typed) {
                 Some(hit) => {
                     let step = self.pause(hit.kind, "page", &hit.line, end_item).await?;
                     if let Step::Stopped = step {
@@ -818,6 +831,7 @@ impl Session<'_> {
                         brief,
                         last: String::new(),
                         acks: HashSet::new(),
+                        typed: guard::Typed::new(),
                     });
                     return Ok(said_text(&text));
                 }

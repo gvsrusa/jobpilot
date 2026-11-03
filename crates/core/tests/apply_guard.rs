@@ -1,12 +1,17 @@
 //! The page, value, upload, and argument guards. Pure: no browser, no network, no `claude`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use jobpilot_core::apply::brief::{AuthorizationFact, Brief, BriefAnswer, Fact};
 use jobpilot_core::apply::guard::PauseKind::*;
 use jobpilot_core::apply::guard::*;
 use serde_json::json;
+
+/// Nothing typed in this item yet.
+fn none() -> HashMap<String, String> {
+    HashMap::new()
+}
 
 fn fixture(name: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -62,15 +67,23 @@ fn each_stop_is_found_on_its_fixture() {
         ("login", Login),
         ("legal", Legal),
     ] {
-        assert_eq!(scan(&fixture(file), &HashSet::new()).unwrap().kind, kind);
+        assert_eq!(
+            scan(&fixture(file), &HashSet::new(), &none()).unwrap().kind,
+            kind
+        );
     }
-    assert!(scan(&fixture("form"), &HashSet::new()).is_none());
-    assert!(scan(&fixture("injection"), &HashSet::new()).is_none());
+    assert!(scan(&fixture("form"), &HashSet::new(), &none()).is_none());
+    assert!(scan(&fixture("injection"), &HashSet::new(), &none()).is_none());
 }
 
 #[test]
 fn a_dialog_is_an_other_stop() {
-    let hit = scan("- dialog \"Leave site?\" [ref=e1]", &HashSet::new()).unwrap();
+    let hit = scan(
+        "- dialog \"Leave site?\" [ref=e1]",
+        &HashSet::new(),
+        &none(),
+    )
+    .unwrap();
     assert_eq!(hit.kind, Other);
 }
 
@@ -84,7 +97,7 @@ fn a_dialog_holding_a_form_is_no_stop() {
                  \x20   - textbox \"Email *\" [ref=e4]\n\
                  \x20 - button \"Submit application\" [ref=e5]\n\
                  - button \"Elsewhere\" [ref=e6]";
-    assert_eq!(scan(modal, &HashSet::new()), None);
+    assert_eq!(scan(modal, &HashSet::new(), &none()), None);
     for control in [
         "textbox",
         "combobox",
@@ -96,16 +109,16 @@ fn a_dialog_holding_a_form_is_no_stop() {
         "searchbox",
     ] {
         let page = format!("- dialog \"Apply\" [ref=e1]:\n  - {control} \"Field\" [ref=e2]");
-        assert_eq!(scan(&page, &HashSet::new()), None, "{control}");
+        assert_eq!(scan(&page, &HashSet::new(), &none()), None, "{control}");
     }
 
     let notice = "- dialog \"Leave site?\" [ref=e1]:\n\
                   \x20 - paragraph [ref=e2]: Changes you made may not be saved.\n\
                   \x20 - button \"Leave\" [ref=e3]\n\
                   - textbox \"Outside\" [ref=e4]";
-    assert_eq!(scan(notice, &HashSet::new()).unwrap().kind, Other);
+    assert_eq!(scan(notice, &HashSet::new(), &none()).unwrap().kind, Other);
     let alert = "- alertdialog \"Session ending\" [ref=e1]:\n  - textbox \"Note\" [ref=e2]";
-    assert_eq!(scan(alert, &HashSet::new()).unwrap().kind, Other);
+    assert_eq!(scan(alert, &HashSet::new(), &none()).unwrap().kind, Other);
 }
 
 /// A decoy control the person cannot use (aria-hidden, or too small to get a ref) does not
@@ -120,51 +133,138 @@ fn a_decoy_control_does_not_make_a_dialog_a_form() {
         let page = format!(
             "- dialog \"Session expired\" [ref=e1]:\n  - paragraph [ref=e2]: Verify you are human\n  {decoy}\n  - button \"OK\" [ref=e4]"
         );
-        let hits: Vec<PauseKind> = std::iter::successors(scan(&page, &HashSet::new()), |hit| {
-            let mut acked = HashSet::new();
-            acked.insert(hit_key(hit));
-            scan(&page, &acked)
-        })
-        .take(3)
-        .map(|hit| hit.kind)
-        .collect();
+        let hits: Vec<PauseKind> =
+            std::iter::successors(scan(&page, &HashSet::new(), &none()), |hit| {
+                let mut acked = HashSet::new();
+                acked.insert(hit_key(hit));
+                scan(&page, &acked, &none())
+            })
+            .take(3)
+            .map(|hit| hit.kind)
+            .collect();
         assert!(hits.contains(&Other), "{decoy}: {hits:?}");
         let text_only =
             format!("- dialog \"Notice\" [ref=e1]:\n  - paragraph [ref=e2]: Read this.\n  {decoy}");
         assert_eq!(
-            scan(&text_only, &HashSet::new()).unwrap().kind,
+            scan(&text_only, &HashSet::new(), &none()).unwrap().kind,
             Other,
             "{decoy}"
         );
     }
 }
 
-/// The reply to `browser_type` and the snapshot after it, as Playwright MCP 0.0.84 prints
-/// them. An approved answer with a legal word is the owner's own text: echoed back, in the
-/// code the server ran or as the field's value, it is no stop.
-const TYPED: &str = "### Ran Playwright code\n```js\nawait page.getByRole('textbox', { name: 'Why this role?' }).fill('I agree with your mission');\n```";
-const AFTER_TYPING: &str = "### Ran Playwright code\n```js\nawait page.getByRole('button', { name: 'Go' }).click();\n```\n### Page\n- Page URL: http://127.0.0.1:51982/\n- Page Title: Probe\n### Snapshot\n```yaml\n- generic [ref=e1]:\n  - text: Why this role?\n  - textbox \"Why this role?\" [ref=e2]: I agree with your mission\n  - button \"Go\" [active] [ref=e3]\n```\n### Events\n- New console entries: .playwright-mcp/console.log#L1";
-const FAILED: &str = "### Error\nError: browserBackend.callTool: Error: Element is not an <input>\nCall log:\n  - fill(\"I agree with your mission\")";
+/// The snapshot after `browser_type`, as Playwright MCP 0.0.84 prints it under JobPilot's
+/// config (`codegen: "none"`: the reply to the typing itself is empty). The field shows the
+/// value the session typed.
+const AFTER_TYPING: &str = "### Page\n- Page URL: http://127.0.0.1:51982/\n- Page Title: Probe\n### Snapshot\n```yaml\n- generic [ref=e1]:\n  - text: Why this role?\n  - textbox \"Why this role?\" [ref=e2]: I agree with your mission\n  - button \"Go\" [active] [ref=e3]\n```\n### Events\n- New console entries: .playwright-mcp/console.log#L1";
 
+fn typed(target: &str, value: &str) -> HashMap<String, String> {
+    HashMap::from([(target.to_owned(), value.to_owned())])
+}
+
+/// An approved answer with a legal word, typed by the session into that field, is the
+/// owner's own text: echoed back as the field's value, it is no stop.
 #[test]
 fn a_typed_answer_echoed_back_is_no_stop() {
-    for reply in [TYPED, AFTER_TYPING, FAILED] {
-        assert_eq!(scan(reply, &HashSet::new()), None, "{reply}");
+    let own = typed("e2", "I agree with your mission");
+    assert_eq!(scan(AFTER_TYPING, &HashSet::new(), &own), None);
+    assert_eq!(scan("", &HashSet::new(), &own), None);
+    // Case and spacing as Playwright folds them.
+    let spaced = typed("e2", "  i agree   with your\nmission ");
+    assert_eq!(scan(AFTER_TYPING, &HashSet::new(), &spaced), None);
+}
+
+/// The same text, never typed, or typed into another field, or changed since, is the page's.
+#[test]
+fn a_value_the_session_did_not_type_is_read() {
+    for own in [
+        none(),
+        typed("e9", "I agree with your mission"),
+        typed("e2", "I agree"),
+    ] {
+        let hit = scan(AFTER_TYPING, &HashSet::new(), &own).unwrap();
+        assert_eq!(hit.kind, Legal, "{own:?}");
     }
+}
+
+/// Text the page put in a field, read-only or prefilled, and a custom combobox's shown text.
+#[test]
+fn a_value_the_page_wrote_is_read() {
+    for (line, kind) in [
+        (
+            "- textbox \"Attestation\" [ref=e3]: I certify that my answers are true",
+            Legal,
+        ),
+        (
+            "- textbox \"Terms\" [ref=e3]: \"Terms of use By clicking Accept, I certify that my answers are true.\"",
+            Legal,
+        ),
+        (
+            "- textbox \"Code\" [ref=e3]: Enter the verification code we sent",
+            Mfa,
+        ),
+        (
+            "- combobox \"Consent\" [ref=e2]: I acknowledge the policy",
+            Legal,
+        ),
+        (
+            "- searchbox \"Find\" [ref=e2]: security check required",
+            Captcha,
+        ),
+    ] {
+        let page = format!(
+            "### Page\n- Page URL: http://127.0.0.1:1/\n### Snapshot\n```yaml\n{line}\n- button \"Accept\" [ref=e4]\n```"
+        );
+        assert_eq!(
+            scan(&page, &HashSet::new(), &none()).unwrap().kind,
+            kind,
+            "{line}"
+        );
+    }
+    // A blocking dialog whose message sits in a read-only field still stops.
+    let dialog = "- dialog \"Notice\" [ref=e1]:\n  - textbox \"Info\" [ref=e2]: Verify you are human\n  - button \"OK\" [ref=e3]";
+    assert_eq!(
+        scan(dialog, &HashSet::new(), &none()).unwrap().kind,
+        Captcha
+    );
+}
+
+/// The page part runs from the first page section to the end: a heading inside a dialog's
+/// message, or one the scan does not know, hides nothing after it.
+#[test]
+fn a_heading_after_the_page_starts_hides_nothing() {
+    let alert = "### Error\nError: Tool \"browser_snapshot\" does not handle the modal state.\n### Modal state\n- [\"alert\" dialog with message \"Session expired\n### Ran Playwright code\nI certify that I read this\"]: can be handled by browser_handle_dialog";
+    assert_eq!(scan(alert, &HashSet::new(), &none()).unwrap().kind, Legal);
+    let mfa = alert.replace("I certify that I read this", "Enter the verification code");
+    assert_eq!(scan(&mfa, &HashSet::new(), &none()).unwrap().kind, Mfa);
+    let renamed = "### Page\n- Page URL: http://127.0.0.1:1/\n### Page snapshot\n```yaml\n- paragraph: Verify you are human\n```";
+    assert_eq!(
+        scan(renamed, &HashSet::new(), &none()).unwrap().kind,
+        Captcha
+    );
+    // Before the page part, the server echoes the call: not read. With no page part at all,
+    // the reply is read whole.
+    let echoed = "### Error\nCall log:\n  - fill(\"I agree with your mission\")\n### Page\n- Page URL: http://127.0.0.1:1/";
+    assert_eq!(scan(echoed, &HashSet::new(), &none()), None);
+    let bare = "### Error\nCall log:\n  - fill(\"I agree with your mission\")";
+    assert_eq!(scan(bare, &HashSet::new(), &none()).unwrap().kind, Legal);
 }
 
 /// The page itself is still read in a reply: its snapshot, its address and title.
 #[test]
 fn a_reply_whose_page_holds_a_stop_still_pauses() {
     let page = "### Ran Playwright code\n```js\nawait page.goto('http://127.0.0.1:1/');\n```\n### Page\n- Page URL: http://127.0.0.1:1/\n- Page Title: Apply\n### Snapshot\n```yaml\n- generic [ref=e1]:\n  - checkbox \"I certify that my answers are true\" [ref=e2]\n```";
-    assert_eq!(scan(page, &HashSet::new()).unwrap().kind, Legal);
+    assert_eq!(scan(page, &HashSet::new(), &none()).unwrap().kind, Legal);
     let titled = "### Page\n- Page URL: http://127.0.0.1:1/\n- Page Title: Verify you are human\n### Snapshot\n```yaml\n- generic [ref=e1]\n```";
-    assert_eq!(scan(titled, &HashSet::new()).unwrap().kind, Captcha);
+    assert_eq!(
+        scan(titled, &HashSet::new(), &none()).unwrap().kind,
+        Captcha
+    );
     // A text the page wrote into a field's name, or as its own text, still stops.
     let named = "### Snapshot\n```yaml\n- textbox \"I agree to the terms\" [ref=e2]: x\n```";
-    assert_eq!(scan(named, &HashSet::new()).unwrap().kind, Legal);
+    assert_eq!(scan(named, &HashSet::new(), &none()).unwrap().kind, Legal);
     let text = "### Snapshot\n```yaml\n- paragraph [ref=e2]: I agree to the terms\n```";
-    assert_eq!(scan(text, &HashSet::new()).unwrap().kind, Legal);
+    assert_eq!(scan(text, &HashSet::new(), &none()).unwrap().kind, Legal);
 }
 
 /// Every other stop is found inside a modal that holds a form.
@@ -179,49 +279,61 @@ fn a_stop_inside_a_form_dialog_still_pauses() {
     ] {
         let page =
             format!("- dialog \"Apply\" [ref=e1]:\n  - textbox \"Email *\" [ref=e2]\n  {line}");
-        assert_eq!(scan(&page, &HashSet::new()).unwrap().kind, kind, "{line}");
+        assert_eq!(
+            scan(&page, &HashSet::new(), &none()).unwrap().kind,
+            kind,
+            "{line}"
+        );
     }
 }
 
 #[test]
 fn an_acknowledged_line_does_not_hit_and_another_does() {
     let page = fixture("captcha");
-    let first = scan(&page, &HashSet::new()).unwrap();
+    let first = scan(&page, &HashSet::new(), &none()).unwrap();
     assert_eq!(first.kind, Captcha);
     let mut acked = HashSet::new();
     acked.insert(hit_key(&first));
-    let next = scan(&page, &acked).unwrap();
+    let next = scan(&page, &acked, &none()).unwrap();
     assert_eq!(next.kind, Captcha);
     assert_ne!(hit_key(&next), hit_key(&first));
     acked.insert(hit_key(&next));
-    let last = scan(&page, &acked).unwrap();
+    let last = scan(&page, &acked, &none()).unwrap();
     assert_eq!(last.kind, Other);
     acked.insert(hit_key(&last));
-    assert!(scan(&page, &acked).is_none());
+    assert!(scan(&page, &acked, &none()).is_none());
 }
 
 #[test]
 fn legal_words_count_on_every_role() {
     for role in ["checkbox", "generic", "listitem", "heading"] {
         let line = format!("- {role} \"I agree to the terms\" [ref=e1]");
-        assert_eq!(scan(&line, &HashSet::new()).unwrap().kind, Legal, "{role}");
+        assert_eq!(
+            scan(&line, &HashSet::new(), &none()).unwrap().kind,
+            Legal,
+            "{role}"
+        );
     }
     for word in ["I confirm", "I consent to", "I authorize"] {
         let line = format!("- text: {word} the check");
-        assert_eq!(scan(&line, &HashSet::new()).unwrap().kind, Legal, "{word}");
+        assert_eq!(
+            scan(&line, &HashSet::new(), &none()).unwrap().kind,
+            Legal,
+            "{word}"
+        );
     }
 }
 
 #[test]
 fn quoted_keys_and_hidden_characters_are_seen() {
     assert_eq!(
-        scan(&fixture("quoted_legal"), &HashSet::new())
+        scan(&fixture("quoted_legal"), &HashSet::new(), &none())
             .unwrap()
             .kind,
         Legal
     );
     assert_eq!(
-        scan(&fixture("quoted_login"), &HashSet::new())
+        scan(&fixture("quoted_login"), &HashSet::new(), &none())
             .unwrap()
             .kind,
         Login
@@ -232,9 +344,12 @@ fn quoted_keys_and_hidden_characters_are_seen() {
         Some("Submit: final step")
     );
     let hidden = "- paragraph: I cer\u{200c}tify this";
-    assert_eq!(scan(hidden, &HashSet::new()).unwrap().kind, Legal);
+    assert_eq!(scan(hidden, &HashSet::new(), &none()).unwrap().kind, Legal);
     let hidden = "- text: cap\u{2060}tcha";
-    assert_eq!(scan(hidden, &HashSet::new()).unwrap().kind, Captcha);
+    assert_eq!(
+        scan(hidden, &HashSet::new(), &none()).unwrap().kind,
+        Captcha
+    );
 }
 
 #[test]
@@ -253,8 +368,8 @@ fn the_ack_key_holds_the_whole_line() {
     let a = format!("- checkbox \"Background {long}: I agree\" [ref=e6]");
     let b = format!("- checkbox \"Arbitration {long}: I agree\" [ref=e6]");
     let (a, b) = (
-        scan(&a, &HashSet::new()).unwrap(),
-        scan(&b, &HashSet::new()).unwrap(),
+        scan(&a, &HashSet::new(), &none()).unwrap(),
+        scan(&b, &HashSet::new(), &none()).unwrap(),
     );
     assert_ne!(hit_key(&a), hit_key(&b));
 }
@@ -262,7 +377,7 @@ fn the_ack_key_holds_the_whole_line() {
 #[test]
 fn scan_takes_at_most_300_characters_of_a_line() {
     let line = format!("- paragraph: {} i certify", "x".repeat(5000));
-    let hit = scan(&line, &HashSet::new()).unwrap();
+    let hit = scan(&line, &HashSet::new(), &none()).unwrap();
     assert_eq!(hit.kind, Legal);
     assert!(hit.line.chars().count() <= 300);
     assert!(hit.line.contains("i certify"));
@@ -905,7 +1020,12 @@ fn inline_text_is_not_a_name() {
 
 #[test]
 fn an_ack_survives_a_state_change() {
-    let before = scan("- checkbox \"I certify this\" [ref=e6]", &HashSet::new()).unwrap();
+    let before = scan(
+        "- checkbox \"I certify this\" [ref=e6]",
+        &HashSet::new(),
+        &none(),
+    )
+    .unwrap();
     let mut acked = HashSet::new();
     acked.insert(hit_key(&before));
     for after in [
@@ -913,9 +1033,9 @@ fn an_ack_survives_a_state_change() {
         "- checkbox \"I certify this\" [checked=mixed] [active] [ref=e6]",
         "- checkbox \"I certify this\" [focused] [disabled] [expanded] [pressed] [selected] [ref=e6]",
     ] {
-        assert!(scan(after, &acked).is_none(), "{after}");
+        assert!(scan(after, &acked, &none()).is_none(), "{after}");
     }
-    assert!(scan("- checkbox \"I certify that\" [ref=e6]", &acked).is_some());
+    assert!(scan("- checkbox \"I certify that\" [ref=e6]", &acked, &none()).is_some());
 }
 
 fn page(lines: &[&str]) -> String {

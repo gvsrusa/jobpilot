@@ -2,7 +2,7 @@
 //! A page that needs a person (a CAPTCHA, a code, an identity check, a login, a legal
 //! statement, a dialog) is a stop. Nothing here tries to get past one.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::Serialize;
@@ -218,8 +218,8 @@ const SCAN_ORDER: [PauseKind; 6] = [
 
 /// The first stop on the page that a person has not already acknowledged. The whole line is
 /// read; the excerpt is cut after the match starts.
-pub fn scan(snapshot: &str, acknowledged: &HashSet<String>) -> Option<Hit> {
-    let lines = page_lines(snapshot);
+pub fn scan(snapshot: &str, acknowledged: &HashSet<String>, typed: &Typed) -> Option<Hit> {
+    let lines = page_lines(snapshot, typed);
     for kind in SCAN_ORDER {
         for (index, folded) in lines.iter().enumerate() {
             let found = match kind {
@@ -240,47 +240,53 @@ pub fn scan(snapshot: &str, acknowledged: &HashSet<String>) -> Option<Hit> {
     None
 }
 
-/// The sections of a Playwright reply that show the page. The code the server ran, its
-/// errors, and its event list echo the session's own arguments, so they are not read.
-const PAGE_SECTIONS: [&str; 3] = ["### page", "### snapshot", "### modal state"];
-/// Roles whose inline text is the field's value, which the session typed or chose.
-const VALUE_ROLES: [&str; 5] = ["textbox", "searchbox", "spinbutton", "combobox", "slider"];
+/// The headings where a Playwright reply starts to show the page. The sections before them
+/// (an error, a result, the code the server ran) echo the session's own call.
+const PAGE_SECTIONS: [&str; 3] = ["### page", "### modal state", "### snapshot"];
 
-/// The folded lines the stop scan reads. A reply with `### ` sections keeps only the page's
-/// sections; a bare snapshot is read whole. A field's value, and any continuation of it, is
-/// left out: an approved answer with a legal word, typed by the session, is no stop. The
-/// field's name, and every other line, is read.
-// ponytail: a value the page wrote into a field is not read either; its label and the
-// text around it are (Task 13 threat model).
-fn page_lines(text: &str) -> Vec<String> {
+/// What the session typed into each field of this item, by ref, as the proxy forwarded it.
+pub type Typed = HashMap<String, String>;
+
+fn folded_value(text: &str) -> String {
+    clean(text).split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The folded lines the stop scan reads. A reply holding a page heading is read from the
+/// first one to its end: Playwright prints its sections in a fixed order, so nothing the page
+/// wrote comes before it, and a heading inside a dialog's message hides nothing. A reply with
+/// none is read whole. A field's value is left out only when it is exactly what the session
+/// typed into that field: an approved answer with a legal word is no stop, and any text the
+/// page wrote into a field is read.
+fn page_lines(text: &str, typed: &Typed) -> Vec<String> {
     let lines: Vec<String> = text.lines().map(clean).collect();
-    let sectioned = lines.iter().any(|line| line.starts_with("### "));
-    let mut keep = !sectioned;
-    let mut value_depth: Option<usize> = None;
-    let mut out = Vec::new();
-    for line in lines {
-        if sectioned && line.starts_with("### ") {
-            keep = PAGE_SECTIONS.contains(&line.trim_end());
-            value_depth = None;
-            continue;
-        }
-        if !keep {
-            continue;
-        }
-        if let Some(depth) = value_depth {
-            if indent_of(&line) > depth && !line.trim_start().starts_with("- ") {
-                continue;
+    let start = lines
+        .iter()
+        .position(|line| PAGE_SECTIONS.contains(&line.trim_end()))
+        .unwrap_or(0);
+    let typed: HashMap<&str, String> = typed
+        .iter()
+        .map(|(target, value)| (target.as_str(), folded_value(value)))
+        .collect();
+    lines[start..]
+        .iter()
+        .map(|line| {
+            let own = ref_of(line).and_then(|found| typed.get(found.as_str()));
+            match own {
+                Some(value) if folded_value(&split_line(line).2) == *value => without_value(line),
+                _ => line.clone(),
             }
-            value_depth = None;
-        }
-        if VALUE_ROLES.contains(&parts(&line).0.as_str()) {
-            value_depth = Some(indent_of(&line));
-            out.push(without_value(&line));
-        } else {
-            out.push(line);
-        }
-    }
-    out
+        })
+        .collect()
+}
+
+/// The ref a line names: the last `[ref=…]` outside quotes.
+fn ref_of(line: &str) -> Option<String> {
+    let (at, _) = line
+        .match_indices("[ref=")
+        .filter(|(at, _)| outside_quotes(line, *at))
+        .last()?;
+    let (found, _) = line[at + "[ref=".len()..].split_once(']')?;
+    Some(found.to_owned())
 }
 
 /// A field's line up to the `:` that starts its value.
