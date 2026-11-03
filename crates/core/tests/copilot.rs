@@ -1027,6 +1027,29 @@ async fn a_stale_beat_after_a_sleep_leaves_a_live_copilot_run_alone() {
     ended(task).await.unwrap();
 }
 
+/// A stop that finds no open pause row, and none resolved either (the row is gone), ends
+/// the hold with the pause's error at once, instead of spinning until the runner gives up on
+/// the step after its 5 s grace (final re-review F6).
+#[tokio::test]
+async fn a_hold_whose_pause_row_is_gone_ends_on_the_emergency_pause() {
+    let w = world().await;
+    let app = add_app(&w.db, LINK).await;
+    let m = mock(&w, &page(LINK, ""));
+    let task = run(&w, no_model(), &app, m.knobs());
+    let p = open_pause(&w.db).await;
+    sqlx::query("DELETE FROM apply_pauses WHERE id = ?")
+        .bind(&p.id)
+        .execute(&w.db.pool)
+        .await
+        .unwrap();
+    pause::set(&w.db, "cli").await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("the hold ends")
+        .unwrap();
+    assert!(matches!(result, Err(Error::Paused)), "{result:?}");
+}
+
 #[tokio::test]
 async fn continue_then_a_cancel_ends_uncertain_with_its_note() {
     let w = world().await;

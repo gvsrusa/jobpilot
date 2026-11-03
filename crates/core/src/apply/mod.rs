@@ -1175,31 +1175,25 @@ async fn wait(
 ) -> Result<Held> {
     let begun = tokio::time::Instant::now();
     loop {
-        let resolution: Option<Option<String>> = sqlx::query_scalar(
-            "SELECT resolution FROM apply_pauses WHERE id = ? AND resolved_at IS NOT NULL",
-        )
-        .bind(pause_id)
-        .fetch_optional(&db.pool)
-        .await?;
-        match resolution.flatten().as_deref() {
-            Some("continue") => return Ok(Held::Continue),
-            Some("take_over") => return Ok(Held::TakenOver),
-            Some("timeout") => return Ok(Held::TimedOut),
-            // Stopped by `finish_items` from another process.
-            Some(_) => return Err(Error::Cancelled),
-            None => {}
+        if let Some(held) = resolved(db, pause_id).await? {
+            return held;
         }
         // A stop that finds the pause already resolved lost a race to the person: the
-        // person's word came first, so it is read again at the top and stands.
+        // person's word came first, so it is read once more and stands. A pause neither open
+        // nor resolved (its row is gone) ends with the stop's own error.
         if pause::is_set(db).await? {
-            if !stop(db, pause_id).await? {
-                continue;
+            if !stop(db, pause_id).await?
+                && let Some(held) = resolved(db, pause_id).await?
+            {
+                return held;
             }
             return Err(Error::Paused);
         }
         if cancel.is_cancelled() || run_cancelled(db, run_id).await? {
-            if !stop(db, pause_id).await? {
-                continue;
+            if !stop(db, pause_id).await?
+                && let Some(held) = resolved(db, pause_id).await?
+            {
+                return held;
             }
             return Err(Error::Cancelled);
         }
@@ -1222,6 +1216,24 @@ async fn wait(
         }
         tokio::time::sleep(HOLD_POLL).await;
     }
+}
+
+/// What a resolved pause means for the hold; `None` while it is open (or gone).
+async fn resolved(db: &Db, pause_id: &str) -> Result<Option<Result<Held>>> {
+    let resolution: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT resolution FROM apply_pauses WHERE id = ? AND resolved_at IS NOT NULL",
+    )
+    .bind(pause_id)
+    .fetch_optional(&db.pool)
+    .await?;
+    Ok(match resolution.flatten().as_deref() {
+        Some("continue") => Some(Ok(Held::Continue)),
+        Some("take_over") => Some(Ok(Held::TakenOver)),
+        Some("timeout") => Some(Ok(Held::TimedOut)),
+        // Stopped by `finish_items` from another process.
+        Some(_) => Some(Err(Error::Cancelled)),
+        None => None,
+    })
 }
 
 /// True when this stop ended the pause; false when someone had resolved it first.
