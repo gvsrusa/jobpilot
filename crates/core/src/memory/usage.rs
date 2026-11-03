@@ -48,6 +48,38 @@ pub struct AuthorizationAnswer {
     pub stated: bool,
 }
 
+/// An approved answer, with no text.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovedRow {
+    pub answer_id: String,
+    pub question: String,
+    pub class: Class,
+    pub stale: bool,
+}
+
+/// Every approved answer that still has text, oldest first. Asks the keychain nothing.
+pub async fn approved_for(db: &Db) -> Result<Vec<ApprovedRow>> {
+    let rows: Vec<(String, String, String, bool)> = sqlx::query_as(
+        "SELECT a.id, q.text, q.class, \
+         coalesce(julianday('now') - julianday(a.reviewed_at) > ?1, 1) \
+         FROM memory_answers a JOIN memory_questions q ON q.id = a.question_id \
+         WHERE a.approved = 1 AND (a.body <> '' OR a.body_enc IS NOT NULL) ORDER BY a.seq",
+    )
+    .bind(super::FRESH_DAYS)
+    .fetch_all(&db.pool)
+    .await?;
+    rows.into_iter()
+        .map(|(answer_id, question, class, stale)| {
+            Ok(ApprovedRow {
+                answer_id,
+                question,
+                class: class.parse()?,
+                stale,
+            })
+        })
+        .collect()
+}
+
 /// The checks both calls share, in order: actor, answer, application, class, approval.
 async fn checked(
     db: &Db,

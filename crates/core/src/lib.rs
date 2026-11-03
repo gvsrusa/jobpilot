@@ -4,6 +4,7 @@ pub mod agents;
 pub mod ai;
 pub mod analytics;
 pub mod applications;
+pub mod apply;
 pub mod audit;
 pub mod backup;
 pub mod browser;

@@ -1,0 +1,625 @@
+//! Apply runs in Claude Code mode: the checks before a run, the run and its item rows, and
+//! the pauses a person resolves. Sealed values are released only here, at start, by a person.
+//! No row written here holds an answer's text.
+
+pub mod brief;
+
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+use crate::ai::DataCategory;
+use crate::ai::claude_code::{self, PROVIDER};
+use crate::ai::consent;
+use crate::applications::{self, Application};
+use crate::browser::runtime::{self, RuntimeState};
+use crate::db::Db;
+use crate::drafts::{self, ExportFormat};
+use crate::error::{Error, Result};
+use crate::memory::Class;
+use crate::memory::usage::{self, ApprovedRow};
+use crate::permissions::{self, Action, Decision, Grant, Mode};
+use crate::render::Template;
+use crate::{agents, audit, pause, runner};
+
+pub const MAX_RUN_ITEMS: usize = 25;
+pub const PAUSE_HOLD: Duration = Duration::from_secs(30 * 60);
+/// Recorded on every item: this mode rests on the owner's decision, not a register row.
+pub const POLICY_NOTE: &str = "owner decision 2026-11-01";
+/// What a run sends to the session, besides `Sensitive` when sealed values are released.
+const CATEGORIES: [DataCategory; 3] = [
+    DataCategory::JobText,
+    DataCategory::ProfileBasic,
+    DataCategory::CareerMemory,
+];
+
+macro_rules! now {
+    () => {
+        "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+    };
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocState {
+    Ready,
+    Missing,
+    Blocked(&'static str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorizationState {
+    Stated,
+    NotStated,
+    NoCountry,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ItemCheck {
+    pub application_id: String,
+    pub company: String,
+    pub role: String,
+    pub host: String,
+    pub country: String,
+    pub resume: DocState,
+    pub letter: DocState,
+    /// Approved fresh normal answers the brief will hold.
+    pub answers: i64,
+    pub stale_left_out: i64,
+    /// Sealed answers and the authorization row a release would open for this application.
+    pub sealed: i64,
+    pub authorization: AuthorizationState,
+    pub blocks: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Preflight {
+    pub items: Vec<ItemCheck>,
+    pub runtime: &'static str,
+    pub claude: Option<String>,
+    pub consent_missing: Vec<DataCategory>,
+    pub sealed_total: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Item {
+    pub id: String,
+    pub run_id: String,
+    pub application_id: Option<String>,
+    pub position: i64,
+    pub host: String,
+    pub state: String,
+    pub submit_clicks: i64,
+    pub auth_released: bool,
+    pub resume_path: Option<PathBuf>,
+    pub letter_path: Option<PathBuf>,
+    pub policy_note: Option<String>,
+    pub confirmation_text: Option<String>,
+    pub confirmation_url: Option<String>,
+    pub status_written: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct PauseView {
+    pub id: String,
+    pub item_id: String,
+    pub kind: String,
+    pub origin: String,
+    pub excerpt: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RunView {
+    pub id: String,
+    pub mode: String,
+    pub state: String,
+    pub items: Vec<Item>,
+    pub active_pause: Option<PauseView>,
+    pub created_at: String,
+    pub ended_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Resolution {
+    Continue,
+    TakeOver,
+}
+
+impl Resolution {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Resolution::Continue => "continue",
+            Resolution::TakeOver => "take_over",
+        }
+    }
+}
+
+/// One application as checked, with what `start` stores for it.
+struct Checked {
+    check: ItemCheck,
+    resume_path: Option<PathBuf>,
+    letter_path: Option<PathBuf>,
+}
+
+/// Reads and exports only: it releases nothing and writes no run.
+pub async fn preflight(db: &Db, application_ids: &[String]) -> Result<Preflight> {
+    let approved = usage::approved_for(db).await?;
+    let mut items = Vec::with_capacity(application_ids.len());
+    for id in application_ids {
+        items.push(check_item(db, "system", id, &approved).await?.check);
+    }
+    let runtime = match runtime::state(db).await? {
+        RuntimeState::NoNode => "no_node",
+        RuntimeState::NodeTooOld(_) => "node_too_old",
+        RuntimeState::NotInstalled => "not_installed",
+        RuntimeState::WrongVersion(_) => "wrong_version",
+        RuntimeState::Ready(_) => "ready",
+    };
+    let claude = claude_code::find_binary(Some(db))
+        .await
+        .ok()
+        .map(|path| path.display().to_string());
+    Ok(Preflight {
+        sealed_total: items.iter().map(|item| item.sealed).sum(),
+        consent_missing: consent_missing(db, &CATEGORIES).await?,
+        items,
+        runtime,
+        claude,
+    })
+}
+
+async fn consent_missing(db: &Db, needed: &[DataCategory]) -> Result<Vec<DataCategory>> {
+    let given = consent::active(db, PROVIDER).await?.unwrap_or_default();
+    Ok(needed
+        .iter()
+        .copied()
+        .filter(|category| !given.contains(category))
+        .collect())
+}
+
+async fn check_item(
+    db: &Db,
+    actor: &str,
+    application_id: &str,
+    approved: &[ApprovedRow],
+) -> Result<Checked> {
+    let app = applications::get(db, application_id).await?;
+    if !app.id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(Error::Validation(
+            "this application id cannot name a folder".into(),
+        ));
+    }
+    let mut blocks = Vec::new();
+    if app.status != "saved" {
+        blocks.push("not_saved");
+    }
+    if !permissions::link_allowed(&app.link) {
+        blocks.push("link_not_https");
+    } else {
+        let grant = Grant {
+            owner_started: true,
+            authorized: false,
+        };
+        let site = permissions::site_of(&app.link)?;
+        if let Decision::Refuse(reason) =
+            permissions::decide(Mode::ClaudeCode, site, Action::Submit, &grant)
+        {
+            blocks.push(reason);
+        }
+    }
+    if in_a_run(db, &app.id).await? {
+        blocks.push("already_in_a_run");
+    }
+    let (resume, resume_path) =
+        export_doc(db, actor, &app, app.resume_draft_id.as_deref(), "resume").await?;
+    if matches!(resume, DocState::Blocked(_)) {
+        blocks.push("resume_blocked");
+    }
+    let (letter, letter_path) = export_doc(
+        db,
+        actor,
+        &app,
+        app.letter_draft_id.as_deref(),
+        "cover_letter",
+    )
+    .await?;
+    if matches!(letter, DocState::Blocked(_)) {
+        blocks.push("letter_blocked");
+    }
+    let count =
+        |keep: &dyn Fn(&ApprovedRow) -> bool| approved.iter().filter(|r| keep(r)).count() as i64;
+    let authorization = if app.country.is_empty() {
+        AuthorizationState::NoCountry
+    } else if usage::authorization_for(db, &app.country).await?.stated {
+        AuthorizationState::Stated
+    } else {
+        AuthorizationState::NotStated
+    };
+    let sealed = count(&|row| row.class == Class::Sensitive)
+        + i64::from(authorization == AuthorizationState::Stated);
+    Ok(Checked {
+        check: ItemCheck {
+            host: host_of(&app.link),
+            answers: count(&|row| row.class == Class::Normal && !row.stale),
+            stale_left_out: count(&|row| row.class == Class::Normal && row.stale),
+            sealed,
+            authorization,
+            resume,
+            letter,
+            blocks,
+            application_id: app.id,
+            company: app.company,
+            role: app.role,
+            country: app.country,
+        },
+        resume_path,
+        letter_path,
+    })
+}
+
+fn host_of(link: &str) -> String {
+    reqwest::Url::parse(link)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+async fn in_a_run(db: &Db, application_id: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM apply_items i JOIN apply_runs r ON r.id = i.apply_run_id \
+         WHERE i.application_id = ? AND r.state IN ('ready', 'running'))",
+    )
+    .bind(application_id)
+    .fetch_one(&db.pool)
+    .await?)
+}
+
+/// Through `drafts::export`, so every claim guard holds. Each application and kind has its
+/// own folder, as two drafts with one title and version share a file name.
+async fn export_doc(
+    db: &Db,
+    actor: &str,
+    app: &Application,
+    draft_id: Option<&str>,
+    kind: &str,
+) -> Result<(DocState, Option<PathBuf>)> {
+    let Some(draft_id) = draft_id else {
+        return Ok((DocState::Missing, None));
+    };
+    let dir = db.paths().exports().join("apply").join(&app.id).join(kind);
+    match drafts::export(
+        db,
+        draft_id,
+        Template::Classic,
+        ExportFormat::Pdf,
+        &dir,
+        actor,
+    )
+    .await
+    {
+        Ok(path) => Ok((DocState::Ready, Some(path))),
+        Err(Error::Refused(reason)) if reason == "claims_blocked" => {
+            Ok((DocState::Blocked("claims_blocked"), None))
+        }
+        Err(
+            error @ (Error::Locked
+            | Error::KeyMissing { .. }
+            | Error::KeyMismatch { .. }
+            | Error::KeyUnavailable(_)
+            | Error::NotFound),
+        ) => Ok((DocState::Blocked(error.code()), None)),
+        Err(error) => Err(error),
+    }
+}
+
+async fn run_active(db: &Db) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM apply_runs WHERE state IN ('ready', 'running'))",
+    )
+    .fetch_one(&db.pool)
+    .await?)
+}
+
+/// A person's act. With `release_sealed`, each approved sensitive answer is confirmed for each
+/// application of this run, and each item whose exact country has a stated row is released.
+pub async fn start(
+    db: &Db,
+    actor: &str,
+    application_ids: &[String],
+    release_sealed: bool,
+) -> Result<String> {
+    runner::person(actor)?;
+    pause::ensure_off(db).await?;
+    if application_ids.is_empty() || application_ids.len() > MAX_RUN_ITEMS {
+        return Err(Error::Validation(format!(
+            "a run takes 1 to {MAX_RUN_ITEMS} applications"
+        )));
+    }
+    if application_ids.iter().collect::<HashSet<_>>().len() != application_ids.len() {
+        return Err(Error::Validation("an application is listed twice".into()));
+    }
+    if run_active(db).await? {
+        return Err(Error::Refused("apply_run_active".into()));
+    }
+    let mut categories = CATEGORIES.to_vec();
+    if release_sealed {
+        categories.push(DataCategory::Sensitive);
+    }
+    if !consent_missing(db, &categories).await?.is_empty() {
+        return Err(Error::Refused("consent_required".into()));
+    }
+    let approved = usage::approved_for(db).await?;
+    let mut checked = Vec::with_capacity(application_ids.len());
+    for id in application_ids {
+        let item = check_item(db, actor, id, &approved).await?;
+        if let Some(block) = item.check.blocks.first() {
+            return Err(Error::Refused((*block).into()));
+        }
+        checked.push(item);
+    }
+
+    let mut confirmed = 0;
+    if release_sealed {
+        // Legal answers are never confirmed here: each one stops for a person.
+        for row in approved.iter().filter(|row| row.class == Class::Sensitive) {
+            for item in &checked {
+                usage::confirm_use(db, actor, &row.answer_id, &item.check.application_id).await?;
+                confirmed += 1;
+            }
+        }
+    }
+    let released =
+        |item: &Checked| release_sealed && item.check.authorization == AuthorizationState::Stated;
+
+    let mut tx = db.pool.begin().await?;
+    let id: String = sqlx::query_scalar("SELECT lower(hex(randomblob(16)))")
+        .fetch_one(&mut *tx)
+        .await?;
+    let inserted = sqlx::query(concat!(
+        "INSERT INTO apply_runs (id, mode, actor, state, created_at) \
+         SELECT ?, 'claude_code', ?, 'ready', ",
+        now!(),
+        " WHERE NOT EXISTS (SELECT 1 FROM apply_runs WHERE state IN ('ready', 'running'))"
+    ))
+    .bind(&id)
+    .bind(actor)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if inserted == 0 {
+        return Err(Error::Refused("apply_run_active".into()));
+    }
+    for (position, item) in checked.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO apply_items (id, apply_run_id, application_id, position, host, state, \
+             resume_path, letter_path, auth_released, policy_note) \
+             VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, 'queued', ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(&item.check.application_id)
+        .bind(position as i64)
+        .bind(&item.check.host)
+        .bind(path_text(item.resume_path.as_deref())?)
+        .bind(path_text(item.letter_path.as_deref())?)
+        .bind(released(item))
+        .bind(POLICY_NOTE)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let hosts: Vec<&str> = checked
+        .iter()
+        .map(|item| item.check.host.as_str())
+        .collect();
+    let detail = json!({
+        "items": checked.len(),
+        "hosts": hosts,
+        "release_sealed": release_sealed,
+        "answers_confirmed": confirmed,
+        "authorization_released": checked.iter().filter(|item| released(item)).count(),
+    });
+    audit::record_to(&mut *tx, actor, "apply_run_created", Some(&id), detail).await?;
+    let detail = json!({ "provider": PROVIDER, "categories": categories });
+    audit::record_to(&mut *tx, actor, "ai_external_call", Some(&id), detail).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+fn path_text(path: Option<&Path>) -> Result<Option<&str>> {
+    path.map(|path| {
+        path.to_str()
+            .ok_or_else(|| Error::Validation("a file path is not valid text".into()))
+    })
+    .transpose()
+}
+
+#[derive(sqlx::FromRow)]
+struct ItemRow {
+    id: String,
+    apply_run_id: String,
+    application_id: Option<String>,
+    position: i64,
+    host: String,
+    state: String,
+    submit_clicks: i64,
+    auth_released: bool,
+    resume_path: Option<String>,
+    letter_path: Option<String>,
+    policy_note: Option<String>,
+    confirmation_text: Option<String>,
+    confirmation_url: Option<String>,
+    status_written: bool,
+    reason: Option<String>,
+}
+
+impl From<ItemRow> for Item {
+    fn from(row: ItemRow) -> Item {
+        Item {
+            id: row.id,
+            run_id: row.apply_run_id,
+            application_id: row.application_id,
+            position: row.position,
+            host: row.host,
+            state: row.state,
+            submit_clicks: row.submit_clicks,
+            auth_released: row.auth_released,
+            resume_path: row.resume_path.map(PathBuf::from),
+            letter_path: row.letter_path.map(PathBuf::from),
+            policy_note: row.policy_note,
+            confirmation_text: row.confirmation_text,
+            confirmation_url: row.confirmation_url,
+            status_written: row.status_written,
+            reason: row.reason,
+        }
+    }
+}
+
+pub async fn view(db: &Db, id: &str) -> Result<RunView> {
+    let (mode, state, created_at, ended_at): (String, String, String, Option<String>) =
+        sqlx::query_as("SELECT mode, state, created_at, ended_at FROM apply_runs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&db.pool)
+            .await?
+            .ok_or(Error::NotFound)?;
+    let items: Vec<ItemRow> = sqlx::query_as(
+        "SELECT id, apply_run_id, application_id, position, host, state, submit_clicks, \
+         auth_released, resume_path, letter_path, policy_note, confirmation_text, \
+         confirmation_url, status_written, reason \
+         FROM apply_items WHERE apply_run_id = ? ORDER BY position",
+    )
+    .bind(id)
+    .fetch_all(&db.pool)
+    .await?;
+    let active_pause = sqlx::query_as(
+        "SELECT p.id, p.item_id, p.kind, p.origin, p.excerpt, p.created_at \
+         FROM apply_pauses p JOIN apply_items i ON i.id = p.item_id \
+         WHERE i.apply_run_id = ? AND p.resolved_at IS NULL ORDER BY p.seq DESC LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&db.pool)
+    .await?;
+    Ok(RunView {
+        id: id.to_owned(),
+        mode,
+        state,
+        items: items.into_iter().map(Item::from).collect(),
+        active_pause,
+        created_at,
+        ended_at,
+    })
+}
+
+/// The newest run, whatever its state.
+pub async fn latest(db: &Db) -> Result<Option<RunView>> {
+    let id: Option<String> =
+        sqlx::query_scalar("SELECT id FROM apply_runs ORDER BY seq DESC LIMIT 1")
+            .fetch_optional(&db.pool)
+            .await?;
+    match id {
+        Some(id) => Ok(Some(view(db, &id).await?)),
+        None => Ok(None),
+    }
+}
+
+/// Only a person ends a pause: page text and the session cannot.
+pub async fn resolve_pause(
+    db: &Db,
+    actor: &str,
+    pause_id: &str,
+    resolution: Resolution,
+) -> Result<()> {
+    runner::person(actor)?;
+    let mut tx = db.pool.begin().await?;
+    let done = sqlx::query(concat!(
+        "UPDATE apply_pauses SET resolved_at = ",
+        now!(),
+        ", resolved_by = ?, resolution = ? WHERE id = ? AND resolved_at IS NULL"
+    ))
+    .bind(actor)
+    .bind(resolution.as_str())
+    .bind(pause_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if done == 0 {
+        let found: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM apply_pauses WHERE id = ?)")
+                .bind(pause_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        return Err(if found {
+            Error::Validation("this pause is already resolved".into())
+        } else {
+            Error::NotFound
+        });
+    }
+    let detail = json!({ "resolution": resolution.as_str() });
+    audit::record_to(
+        &mut *tx,
+        actor,
+        "apply_pause_resolved",
+        Some(pause_id),
+        detail,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// A person's act. A `ready` run has no agent run: it ends here. Any other goes to
+/// `agents::cancel_run`.
+pub async fn cancel(db: &Db, actor: &str, id: &str) -> Result<()> {
+    runner::person(actor)?;
+    let (state, agent_run): (String, Option<String>) =
+        sqlx::query_as("SELECT state, agent_run_id FROM apply_runs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&db.pool)
+            .await?
+            .ok_or(Error::NotFound)?;
+    if state == "ended" {
+        return Err(ended());
+    }
+    if let Some(agent_run) = agent_run {
+        return agents::cancel_run(db, actor, &agent_run).await;
+    }
+    let mut tx = db.pool.begin().await?;
+    let moved = sqlx::query(concat!(
+        "UPDATE apply_runs SET state = 'ended', ended_at = ",
+        now!(),
+        " WHERE id = ? AND state <> 'ended' AND agent_run_id IS NULL"
+    ))
+    .bind(id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if moved == 0 {
+        return Err(ended());
+    }
+    let skipped = sqlx::query(
+        "UPDATE apply_items SET state = 'skipped', reason = 'run_ended' \
+         WHERE apply_run_id = ? AND state IN ('queued', 'active')",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    let detail = json!({ "skipped": skipped });
+    audit::record_to(&mut *tx, actor, "apply_run_cancelled", Some(id), detail).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+fn ended() -> Error {
+    Error::Validation("this run has ended".into())
+}
+
+/// `<root>/apply/<id>`: the run's browser profile, staged files, and config.
+pub fn run_dir(db: &Db, id: &str) -> PathBuf {
+    db.paths().apply().join(id)
+}
