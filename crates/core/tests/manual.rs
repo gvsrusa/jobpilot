@@ -5,14 +5,19 @@
 
 use std::sync::Once;
 
+use jobpilot_core::agents::{self, tracking};
+use jobpilot_core::ai::BoxFuture;
 use jobpilot_core::ai::CancellationToken;
+use jobpilot_core::ai::router::Router;
 use jobpilot_core::applications::{self, ApplicationInput};
 use jobpilot_core::apply::{self, Material};
 use jobpilot_core::crypto::{self, KeyState};
+use jobpilot_core::drafts::ClaimInput;
 use jobpilot_core::memory::{self, Class};
 use jobpilot_core::profile::{self, Stated, WorkAuthorization};
 use jobpilot_core::render::{Entry, ResumeDoc, Section};
-use jobpilot_core::{AppPaths, Db, Error, audit, drafts};
+use jobpilot_core::runner::{self, Agent, Ctx, RunInput, RunState, StepDef, StepOutput, Workflow};
+use jobpilot_core::{AppPaths, Db, Error, audit, drafts, knowledge, pause};
 use tempfile::TempDir;
 
 const BLOCKED: &str = "The site's terms forbid this. JobPilot will not do it, even if you ask.";
@@ -363,7 +368,7 @@ async fn recording_refuses_an_application_in_a_run_that_has_not_ended() {
     let app = add_app(&db, "https://jobs.lever.co/acme/1", "PT").await;
     for statement in [
         "INSERT INTO apply_runs (id, mode, actor, state, created_at) \
-         VALUES ('run1', 'claude_code', 'cli', 'running', '2026-11-02T10:00:00.000Z')",
+         VALUES ('run1', 'claude_code', 'cli', 'ready', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
         "INSERT INTO apply_items (id, apply_run_id, application_id, position, host) \
          SELECT 'item1', 'run1', id, 0, 'jobs.lever.co' FROM applications",
     ] {
@@ -491,6 +496,17 @@ async fn no_child_process_probe() {
         return;
     }
     let (_tmp, db) = world().await;
+    // An installed runtime, so the Claude Code lookup is reached.
+    let runtime = db.paths().browser_runtime();
+    let server = runtime.join("node_modules/@playwright/mcp");
+    std::fs::create_dir_all(&server).unwrap();
+    std::fs::create_dir_all(runtime.join("browsers")).unwrap();
+    std::fs::write(server.join("cli.js"), "").unwrap();
+    let manifest =
+        serde_json::json!({ "version": jobpilot_core::browser::runtime::PLAYWRIGHT_MCP });
+    std::fs::write(server.join("package.json"), manifest.to_string()).unwrap();
+    assert!(jobpilot_core::browser::runtime::installed(&db));
+
     let app = add_app(&db, "https://jobs.lever.co/acme/1", "PT").await;
     apply::material(&db, &app).await.unwrap();
     record(&db, &app, "applied").await.unwrap();
@@ -542,4 +558,184 @@ fn the_review_screen_starts_no_child_process() {
     );
     let spawned = std::fs::read_to_string(&marker).unwrap_or_default();
     assert!(spawned.is_empty(), "started: {spawned}");
+}
+
+#[tokio::test]
+async fn a_cached_document_still_passes_the_claim_guard() {
+    let (_tmp, db) = world().await;
+    let bullet = "Built Rust services";
+    let evidence = knowledge::add(&db, "experience", bullet, "user", None)
+        .await
+        .unwrap();
+    let doc = ResumeDoc {
+        name: String::new(),
+        contact: Vec::new(),
+        summary: Vec::new(),
+        sections: vec![Section {
+            heading: "Experience".into(),
+            entries: vec![Entry {
+                bullets: vec![bullet.into()],
+                ..Entry::default()
+            }],
+        }],
+    };
+    let draft = drafts::create_version(
+        &db,
+        "resume",
+        None,
+        "generated",
+        "Tailored resume",
+        None,
+        Some("ollama"),
+        doc,
+        vec![ClaimInput {
+            text: bullet.into(),
+            evidence_ids: vec![evidence.id.clone()],
+        }],
+    )
+    .await
+    .unwrap();
+    let input = ApplicationInput {
+        company: "Acme".into(),
+        role: "Engineer".into(),
+        link: "https://jobs.lever.co/acme/1".into(),
+        resume_draft_id: Some(draft.id),
+        ..ApplicationInput::default()
+    };
+    let app = applications::add(&db, "cli", input).await.unwrap().id;
+    let exports = || {
+        count(
+            &db,
+            "SELECT count(*) FROM audit_log WHERE action = 'export'",
+        )
+    };
+
+    assert!(apply::material(&db, &app).await.unwrap().resume.is_some());
+    assert_eq!(exports().await, 1);
+
+    // The evidence is withdrawn: the file on disk now holds an unsupported claim.
+    knowledge::approve(&db, &evidence.id, false).await.unwrap();
+    assert!(apply::material(&db, &app).await.unwrap().resume.is_none());
+    assert_eq!(exports().await, 1, "the check renders nothing");
+}
+
+#[tokio::test]
+async fn a_run_whose_host_died_does_not_block_a_record() {
+    let (_tmp, db) = world().await;
+    let app = add_app(&db, "https://jobs.lever.co/acme/1", "PT").await;
+    for statement in [
+        "INSERT INTO apply_runs (id, mode, actor, state, created_at) \
+         VALUES ('run2', 'claude_code', 'cli', 'running', '2026-11-02T10:00:00.000Z')",
+        "INSERT INTO apply_items (id, apply_run_id, application_id, position, host) \
+         SELECT 'item2', 'run2', id, 0, 'jobs.lever.co' FROM applications",
+    ] {
+        sqlx::query(statement).execute(&db.pool).await.unwrap();
+    }
+    assert_eq!(record(&db, &app, "applied").await.unwrap(), "applied");
+}
+
+/// Tracking's step, with the emergency pause set as it starts, so the record halts.
+struct PausedAtStep(tracking::Tracking);
+
+impl Workflow for PausedAtStep {
+    fn agent(&self) -> Agent {
+        self.0.agent()
+    }
+
+    fn input(&self) -> RunInput {
+        self.0.input()
+    }
+
+    fn steps(&self) -> &'static [StepDef] {
+        self.0.steps()
+    }
+
+    fn step<'a>(
+        &'a self,
+        ctx: &'a Ctx<'a>,
+        index: usize,
+    ) -> BoxFuture<'a, jobpilot_core::Result<StepOutput>> {
+        Box::pin(async move {
+            pause::set(ctx.db, "cli").await?;
+            self.0.step(ctx, index).await
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_resumed_manual_record_still_writes_its_submission_row() {
+    let (_tmp, db) = world().await;
+    let id = add_app(&db, "https://jobs.lever.co/acme/1", "PT").await;
+    let app = applications::get(&db, &id).await.unwrap();
+    let workflow = PausedAtStep(tracking::Tracking::manual(&app, "applied", None, ""));
+    let halted = runner::start(&db, "cli", &workflow, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(halted.state, RunState::Halted);
+    assert!(submissions(&db, &id).await.is_empty());
+
+    pause::clear(&db, "cli").await.unwrap();
+    let router = Router::with_providers(Vec::new());
+    let done = agents::resume_run(
+        &db,
+        &router,
+        "cli",
+        &halted.run_id,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(done.state, RunState::Completed);
+    assert_eq!(applications::get(&db, &id).await.unwrap().status, "applied");
+    assert_eq!(submissions(&db, &id).await, ["manual"]);
+}
+
+#[tokio::test]
+async fn a_preflight_render_moves_the_marker_with_the_file() {
+    let (_tmp, db) = world().await;
+    let a = uploaded(&db, "resume", "First").await;
+    let b = uploaded(&db, "resume", "Second").await;
+    // One title and version: both render to one file name.
+    assert_eq!(
+        drafts::export_file_name(&a, drafts::ExportFormat::Pdf),
+        drafts::export_file_name(&b, drafts::ExportFormat::Pdf)
+    );
+    let input = ApplicationInput {
+        company: "Acme".into(),
+        role: "Engineer".into(),
+        link: "https://jobs.lever.co/acme/1".into(),
+        resume_draft_id: Some(a.id.clone()),
+        ..ApplicationInput::default()
+    };
+    let app = applications::add(&db, "cli", input.clone())
+        .await
+        .unwrap()
+        .id;
+    let exports = || {
+        count(
+            &db,
+            "SELECT count(*) FROM audit_log WHERE action = 'export'",
+        )
+    };
+    apply::material(&db, &app).await.unwrap();
+    assert_eq!(exports().await, 1);
+
+    let with = |draft: &drafts::Draft| ApplicationInput {
+        resume_draft_id: Some(draft.id.clone()),
+        ..input.clone()
+    };
+    applications::update(&db, "cli", &app, with(&b))
+        .await
+        .unwrap();
+    apply::preflight(&db, std::slice::from_ref(&app))
+        .await
+        .unwrap();
+    assert_eq!(exports().await, 2);
+
+    // Back to the first draft: the file on disk is the second's, so it renders again.
+    applications::update(&db, "cli", &app, with(&a))
+        .await
+        .unwrap();
+    apply::material(&db, &app).await.unwrap();
+    assert_eq!(exports().await, 3);
 }

@@ -72,6 +72,7 @@ pub fn run() {
         .run(|app, event| {
             if matches!(event, RunEvent::Exit) {
                 app.state::<PtyState>().close();
+                tauri::async_runtime::block_on(commands::clear_copied(app));
                 if let Some(state) = app.try_state::<AppState>() {
                     tauri::async_runtime::block_on(state.shutdown());
                 }

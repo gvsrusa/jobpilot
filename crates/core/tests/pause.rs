@@ -696,7 +696,7 @@ fn applications_updates(files: &[(PathBuf, String)]) -> Vec<(String, String, Str
 }
 
 /// Every route to a status write. The only statement that sets the column is inside
-/// `set_status`, which gates itself before it. A new one, however it is spelled, fails here
+/// `set_status_with`, which gates itself before it. A new one, however it is spelled, fails here
 /// until it is looked at: `force_status`, `SET updated_at = 'x', status = ...`, `set status`.
 #[test]
 fn every_route_to_a_status_write_passes_the_gate() {
@@ -729,7 +729,7 @@ fn every_route_to_a_status_write_passes_the_gate() {
     let body = &body[body.find("pub(crate) async fn set_status_with").unwrap()..];
     let gate = body
         .find("pause::ensure_off(db)")
-        .expect("set_status gates itself");
+        .expect("set_status_with gates itself");
     assert!(gate < body.find("update applications").unwrap());
 
     // Nothing but the gated function and the agent that runs it names it.

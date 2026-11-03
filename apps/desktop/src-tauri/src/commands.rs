@@ -50,7 +50,7 @@ use jobpilot_core::secrets::Zeroizing;
 use jobpilot_core::{Db, Error, Result, agents, permissions, secrets, settings, transfer};
 use serde_json::{Value, json};
 use tauri::ipc::Invoke;
-use tauri::{AppHandle, Runtime, State};
+use tauri::{AppHandle, Manager, Runtime, State};
 
 use crate::native::{self, FileDialog};
 use crate::pty::PtyState;
@@ -2021,7 +2021,7 @@ fn link_refusal(url: &str) -> &'static str {
 #[cfg(not(test))]
 const CLIPBOARD_CLEAR: std::time::Duration = std::time::Duration::from_secs(60);
 #[cfg(test)]
-const CLIPBOARD_CLEAR: std::time::Duration = std::time::Duration::from_millis(100);
+const CLIPBOARD_CLEAR: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// What a person did after applying by hand, through the tracking agent.
 #[tauri::command]
@@ -2059,14 +2059,44 @@ pub async fn apply_copy<R: Runtime>(
     let stale = used.stale;
     let text = Zeroizing::new(used.text);
     native::write_clipboard(&app, text.clone()).await?;
+    *lock(&state.copied) = Some(text.clone());
     // Cleared only while it still holds this answer: what the person copied since is theirs.
+    // A quit before the timer is cleared by `clear_copied` at exit.
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(CLIPBOARD_CLEAR).await;
-        if native::clear_clipboard(&app, &text).await.is_err() {
+        let mine = {
+            let state = app.state::<AppState>();
+            let mut slot = lock(&state.copied);
+            // A newer copy owns the slot and its own timer.
+            match slot.as_ref() == Some(&text) {
+                true => slot.take(),
+                false => None,
+            }
+        };
+        if mine.is_some() && native::clear_clipboard(&app, &text).await.is_err() {
             eprintln!("apply_copy: the clipboard could not be cleared");
         }
     });
     Ok(Copied { stale })
+}
+
+/// At exit: clears an answer `apply_copy` left on the clipboard, if it still holds it.
+pub async fn clear_copied<R: Runtime>(app: &AppHandle<R>) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let pending = lock(&state.copied).take();
+    if let Some(text) = pending
+        && native::clear_clipboard(app, &text).await.is_err()
+    {
+        eprintln!("exit: the clipboard could not be cleared");
+    }
+}
+
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[derive(serde::Serialize)]
@@ -6952,7 +6982,7 @@ mod tests {
         );
 
         // It is cleared once the time is up, while it still holds the answer.
-        std::thread::sleep(super::CLIPBOARD_CLEAR * 4);
+        std::thread::sleep(super::CLIPBOARD_CLEAR * 3);
         assert!(hook.clipboard.lock().unwrap().is_none());
 
         // Something the person copied since is theirs, and stays.
@@ -6961,7 +6991,31 @@ mod tests {
             json!({ "applicationId": app, "answerId": answer }),
         );
         *hook.clipboard.lock().unwrap() = Some("mine".into());
-        std::thread::sleep(super::CLIPBOARD_CLEAR * 4);
+        std::thread::sleep(super::CLIPBOARD_CLEAR * 3);
+        assert_eq!(hook.clipboard.lock().unwrap().as_deref(), Some("mine"));
+    }
+
+    #[test]
+    fn a_copied_answer_is_cleared_when_the_app_exits() {
+        let h = ready();
+        let (answer, app) = waiting_sensitive_answer(&h);
+        let hook = h.app.state::<NativeHook>();
+        h.answer(true);
+        h.ok(
+            "memory_confirm_use",
+            json!({ "answerId": answer, "applicationId": app }),
+        );
+        let args = json!({ "applicationId": app, "answerId": answer });
+
+        // The app quits well before the timer: the exit clears it.
+        h.ok("apply_copy", args.clone());
+        tauri::async_runtime::block_on(super::clear_copied(h.app.handle()));
+        assert!(hook.clipboard.lock().unwrap().is_none());
+
+        // What the person copied since is theirs, at exit too.
+        h.ok("apply_copy", args);
+        *hook.clipboard.lock().unwrap() = Some("mine".into());
+        tauri::async_runtime::block_on(super::clear_copied(h.app.handle()));
         assert_eq!(hook.clipboard.lock().unwrap().as_deref(), Some("mine"));
     }
 

@@ -117,6 +117,10 @@ pub enum RunInput {
         application_id: String,
         status: String,
         on: Option<String>,
+        /// A Manual-mode record, whose `applied` also writes the submission row. A flag, so
+        /// the row holds no text; older rows read false.
+        #[serde(default)]
+        manual: bool,
     },
     Analytics,
     Discovery {

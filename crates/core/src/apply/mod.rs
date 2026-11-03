@@ -317,8 +317,8 @@ async fn export_doc(
     let Some(draft_id) = draft_id else {
         return Ok((DocState::Missing, None));
     };
-    let dir = db.paths().exports().join("apply").join(&app.id).join(kind);
-    match drafts::export(
+    let dir = doc_dir(db, app, kind);
+    let exported = drafts::export(
         db,
         draft_id,
         Template::Classic,
@@ -326,20 +326,35 @@ async fn export_doc(
         &dir,
         actor,
     )
-    .await
-    {
-        Ok(path) => Ok((DocState::Ready, Some(path))),
-        Err(Error::Refused(reason)) if reason == "claims_blocked" => {
-            Ok((DocState::Blocked("claims_blocked"), None))
+    .await;
+    match exported {
+        Ok(path) => {
+            // Names the draft this file came from, for `material`'s reuse.
+            std::fs::write(dir.join(DRAFT_MARKER), draft_id)?;
+            Ok((DocState::Ready, Some(path)))
         }
-        Err(
-            error @ (Error::Locked
-            | Error::KeyMissing { .. }
-            | Error::KeyMismatch { .. }
-            | Error::KeyUnavailable(_)
-            | Error::NotFound),
-        ) => Ok((DocState::Blocked(error.code()), None)),
-        Err(error) => Err(error),
+        Err(error) => Ok((blocked(error)?, None)),
+    }
+}
+
+const DRAFT_MARKER: &str = "draft-id";
+
+fn doc_dir(db: &Db, app: &Application, kind: &str) -> PathBuf {
+    db.paths().exports().join("apply").join(&app.id).join(kind)
+}
+
+/// A refusal of the claim guard or of a locked key is a blocked document, not an error.
+fn blocked(error: Error) -> Result<DocState> {
+    match error {
+        Error::Refused(reason) if reason == "claims_blocked" => {
+            Ok(DocState::Blocked("claims_blocked"))
+        }
+        error @ (Error::Locked
+        | Error::KeyMissing { .. }
+        | Error::KeyMismatch { .. }
+        | Error::KeyUnavailable(_)
+        | Error::NotFound) => Ok(DocState::Blocked(error.code())),
+        error => Err(error),
     }
 }
 
@@ -1348,19 +1363,28 @@ pub async fn record_outcome(
 ) -> Result<Application> {
     runner::person(actor)?;
     let app = applications::get(db, application_id).await?;
-    // A run's own proxy writes this status: a second writer would race it.
-    if in_a_run(db, &app.id).await? {
-        return Err(Error::Refused("in_active_run".into()));
+    refuse_in_a_run(db, &app.id).await?;
+    agents::set_status_with(db, actor, &app.id, outcome, on, note, true, cancel).await
+}
+
+/// A run's own proxy writes this application's status: a second writer would race it. A run
+/// whose host died is swept first, as `start` does, so it does not block a record for ever.
+pub(crate) async fn refuse_in_a_run(db: &Db, application_id: &str) -> Result<()> {
+    session::sweep_orphans(db).await?;
+    match in_a_run(db, application_id).await? {
+        true => Err(Error::Refused("in_active_run".into())),
+        false => Ok(()),
     }
-    let submission = (outcome == "applied").then(|| {
-        json!({
-            "agent": "manual",
-            "mode": "manual",
-            "application": app.id,
-            "host": host_of(&app.link),
-        })
-    });
-    agents::set_status_with(db, actor, &app.id, outcome, on, note, submission, cancel).await
+}
+
+/// The `application_submitted` detail of a Manual record: ids and the host, no text.
+pub fn manual_submission(app: &Application) -> serde_json::Value {
+    json!({
+        "agent": "manual",
+        "mode": "manual",
+        "application": app.id,
+        "host": host_of(&app.link),
+    })
 }
 
 /// The file Rust rendered for this application's draft, rendered again only when it is gone
@@ -1372,7 +1396,6 @@ async fn rendered(
     draft_id: Option<&str>,
     kind: &str,
 ) -> Result<Option<PathBuf>> {
-    const MARKER: &str = "draft-id";
     let Some(draft_id) = draft_id else {
         return Ok(None);
     };
@@ -1381,16 +1404,17 @@ async fn rendered(
         Err(Error::NotFound) => return Ok(None),
         Err(error) => return Err(error),
     };
-    let dir = db.paths().exports().join("apply").join(&app.id).join(kind);
+    let dir = doc_dir(db, app, kind);
     let path = dir.join(drafts::export_file_name(&draft, ExportFormat::Pdf));
-    let marker = dir.join(MARKER);
-    if path.is_file() && std::fs::read_to_string(&marker).ok().as_deref() == Some(&draft.id) {
-        return Ok(Some(path));
+    let marker = std::fs::read_to_string(dir.join(DRAFT_MARKER)).ok();
+    if path.is_file() && marker.as_deref() == Some(&draft.id) {
+        // The file stands, but the claim guard is asked again: its answer is live.
+        return match drafts::export_check(db, draft_id).await {
+            Ok(()) => Ok(Some(path)),
+            Err(error) => blocked(error).map(|_| None),
+        };
     }
     // As the preflight renders them, so every claim guard holds. A blocked document is none.
     let (_, path) = export_doc(db, "system", app, Some(draft_id), kind).await?;
-    if path.is_some() {
-        std::fs::write(&marker, &draft.id)?;
-    }
     Ok(path)
 }

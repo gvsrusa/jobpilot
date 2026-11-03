@@ -50,11 +50,11 @@ pub async fn set_status(
     note: &str,
     cancel: CancellationToken,
 ) -> Result<Application> {
-    set_status_with(db, actor, application_id, status, on, note, None, cancel).await
+    set_status_with(db, actor, application_id, status, on, note, false, cancel).await
 }
 
-/// [`set_status`], also writing an `application_submitted` row with `submission` as its
-/// detail in the status write's own transaction, when no such row exists for the application.
+/// [`set_status`], and for a `manual` record of `applied`, an `application_submitted` row in
+/// the status write's own transaction, when no such row exists for the application.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn set_status_with(
     db: &Db,
@@ -63,17 +63,14 @@ pub(crate) async fn set_status_with(
     status: &str,
     on: Option<&str>,
     note: &str,
-    submission: Option<serde_json::Value>,
+    manual: bool,
     cancel: CancellationToken,
 ) -> Result<Application> {
-    applications::get(db, application_id).await?;
+    let app = applications::get(db, application_id).await?;
     applications::check_change(db, status, on, note).await?;
-    let workflow = Tracking {
-        application_id: application_id.to_owned(),
-        status: status.to_owned(),
-        on: on.map(str::to_owned),
-        note: note.to_owned(),
-        submission,
+    let workflow = match manual {
+        true => Tracking::manual(&app, status, on, note),
+        false => Tracking::new(application_id, status, on, note),
     };
     runner::start(db, actor, &workflow, cancel)
         .await?
@@ -138,6 +135,7 @@ async fn resume_from(
             application_id,
             status,
             on,
+            manual,
         } => {
             let current = applications::get(db, &application_id).await?;
             if current.status != status
@@ -148,14 +146,14 @@ async fn resume_from(
                     "this application's status changed after the run began; cancel the run".into(),
                 ));
             }
-            let workflow = Tracking {
-                application_id,
-                status,
-                on,
-                note: String::new(),
-                // ponytail: a run's stored input holds no submission, so a resumed Manual
-                // record writes the status alone. The halted record is the trace.
-                submission: None,
+            // A Manual record is checked again as `record_outcome` checks it, and its
+            // submission row is rebuilt from the application as it is now.
+            let workflow = match manual {
+                true => {
+                    crate::apply::refuse_in_a_run(db, &application_id).await?;
+                    Tracking::manual(&current, &status, on.as_deref(), "")
+                }
+                false => Tracking::new(&application_id, &status, on.as_deref(), ""),
             };
             runner::resume(db, actor, run_id, &workflow, cancel).await
         }

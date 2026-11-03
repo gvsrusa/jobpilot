@@ -31,6 +31,9 @@ pub struct AppState {
     /// A model download, which can outlast many tasks and is cancelled on its own.
     pub pull: InFlight,
     restored_key_state: Mutex<Option<KeyState>>,
+    /// The answer `apply_copy` last put on the clipboard, until its clear: the exit clears it
+    /// when the timer has not.
+    pub copied: Mutex<Option<jobpilot_core::secrets::Zeroizing<String>>>,
 }
 
 /// A handle that stays open without the `db` lock, for as long as this is held. `db` is
@@ -133,6 +136,7 @@ impl AppState {
             ai: InFlight::default(),
             pull: InFlight::default(),
             restored_key_state: Mutex::new(None),
+            copied: Mutex::new(None),
         }
     }
 

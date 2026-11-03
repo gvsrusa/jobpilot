@@ -311,13 +311,7 @@ impl Workflow for Wrapped {
 
 fn wrapped(app: &Application, agent: Agent, fire: bool) -> Wrapped {
     Wrapped {
-        inner: tracking::Tracking {
-            application_id: app.id.clone(),
-            status: "applied".into(),
-            on: None,
-            note: String::new(),
-            submission: None,
-        },
+        inner: tracking::Tracking::new(&app.id, "applied", None, ""),
         agent,
         fire,
     }
