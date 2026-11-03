@@ -167,6 +167,9 @@ async fn resume_from(
             let workflow = ResearchWorkflow::new(router, company_id, true);
             runner::resume(db, actor, run_id, &workflow, cancel).await
         }
+        RunInput::BrowserApply { .. } | RunInput::ClaudeApply { .. } => Err(Error::Validation(
+            "an apply run does not resume; start a new run".into(),
+        )),
         RunInput::MemoryRefresh => {
             let workflow = MemoryWorkflow::new(router, true);
             runner::resume(db, actor, run_id, &workflow, cancel).await

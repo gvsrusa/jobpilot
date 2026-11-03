@@ -20,7 +20,7 @@ use crate::pause;
 use crate::render::Template;
 
 mod perms;
-pub(crate) mod store;
+pub mod store;
 
 pub use perms::{AgentSpec, Permission, spec_of};
 
@@ -52,6 +52,8 @@ pub enum Agent {
     Discovery,
     Matching,
     Research,
+    BrowserApplication,
+    ClaudeApply,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +130,13 @@ pub enum RunInput {
     /// A hex company id: no text.
     Research {
         company_id: String,
+    },
+    /// A hex apply-run id: the items and their files live in `apply_runs`.
+    BrowserApply {
+        apply_id: String,
+    },
+    ClaudeApply {
+        apply_id: String,
     },
 }
 

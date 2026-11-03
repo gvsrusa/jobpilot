@@ -19,6 +19,7 @@ use crate::error::{Error, Result};
 
 const RUN_STEP: &str = "run";
 const INTERRUPTED: &str = "interrupted";
+const WAITING: &str = "waiting_for_human";
 
 macro_rules! now {
     () => {
@@ -244,14 +245,27 @@ pub(super) async fn transition(db: &Db, change: &Change<'_>) -> Result<bool> {
     Ok(true)
 }
 
+/// A run waiting for a person is still in the step it was running, so a writer that last saw
+/// `running` also finds it there (decision 18).
+fn held_in(state: RunState) -> Result<(String, String)> {
+    let from = name(&state)?;
+    let alt = if state == RunState::Running {
+        WAITING.to_owned()
+    } else {
+        from.clone()
+    };
+    Ok((from, alt))
+}
+
 async fn transition_in(tx: &mut sqlx::SqliteConnection, change: &Change<'_>) -> Result<bool> {
+    let (from, alt) = held_in(change.from)?;
     let moved = sqlx::query(concat!(
         "UPDATE agent_runs SET state = ?, step = ?, checkpoint = ?, reason = ?, \
          generation = generation + ?, heartbeat_at = ",
         now!(),
         ", finished_at = CASE WHEN ? THEN ",
         now!(),
-        " END WHERE id = ? AND state = ? AND generation = ?"
+        " END WHERE id = ? AND state IN (?, ?) AND generation = ?"
     ))
     .bind(name(&change.to)?)
     .bind(change.step)
@@ -260,7 +274,8 @@ async fn transition_in(tx: &mut sqlx::SqliteConnection, change: &Change<'_>) -> 
     .bind(i64::from(change.bump))
     .bind(change.to.is_terminal())
     .bind(change.id)
-    .bind(name(&change.from)?)
+    .bind(from)
+    .bind(alt)
     .bind(change.generation)
     .execute(&mut *tx)
     .await?;
@@ -269,6 +284,54 @@ async fn transition_in(tx: &mut sqlx::SqliteConnection, change: &Change<'_>) -> 
     }
     log_row(tx, change).await?;
     Ok(true)
+}
+
+/// Moves a `running` run to `waiting_for_human` and back, from any process: `apply-mcp` holds a
+/// pause while the runner's process owns the run. Nothing else moves, so a run that ended or
+/// halted meanwhile is left as it is. A log row marks each change, with no text.
+pub async fn set_waiting(db: &Db, run_id: &str, waiting: bool) -> Result<()> {
+    let (from, to) = if waiting {
+        (RunState::Running, RunState::WaitingForHuman)
+    } else {
+        (RunState::WaitingForHuman, RunState::Running)
+    };
+    let mut tx = db.pool.begin().await?;
+    let moved: Option<(String, i64)> = sqlx::query_as(concat!(
+        "UPDATE agent_runs SET state = ?, heartbeat_at = ",
+        now!(),
+        " WHERE id = ? AND state = ? RETURNING agent, step"
+    ))
+    .bind(name(&to)?)
+    .bind(run_id)
+    .bind(name(&from)?)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((agent, step)) = moved {
+        let outcome = if waiting { "waiting" } else { "running" };
+        log_row(
+            &mut tx,
+            &Change {
+                id: run_id,
+                agent: parsed(&agent)?,
+                from,
+                to,
+                generation: 0,
+                bump: false,
+                step,
+                step_name: RUN_STEP,
+                checkpoint: &Checkpoint::default(),
+                reason: None,
+                outcome,
+                provider: None,
+                categories: &[],
+                duration_ms: 0,
+                dropped: 0,
+            },
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 /// False when the run has stopped being this process's.
@@ -288,11 +351,13 @@ pub(super) async fn heartbeat(db: &Db, id: &str, generation: i64) -> Result<bool
 
 /// Whether the row is still as this process last wrote it.
 pub(super) async fn owns(db: &Db, id: &str, state: RunState, generation: i64) -> Result<bool> {
+    let (from, alt) = held_in(state)?;
     let held: Option<i64> = sqlx::query_scalar(
-        "SELECT 1 FROM agent_runs WHERE id = ? AND state = ? AND generation = ?",
+        "SELECT 1 FROM agent_runs WHERE id = ? AND state IN (?, ?) AND generation = ?",
     )
     .bind(id)
-    .bind(name(&state)?)
+    .bind(from)
+    .bind(alt)
     .bind(generation)
     .fetch_optional(&db.pool)
     .await?;
