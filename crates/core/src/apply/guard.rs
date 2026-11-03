@@ -843,8 +843,9 @@ fn role_at(line: &str) -> String {
 
 /// Every question a choice may answer, within its own field: the name of each option-group
 /// ancestor ([`GROUP_ROLES`]), and the text of lines before the target at any depth. The walk
-/// back passes over the target's ancestors, its group's own options, links, and images, and
-/// stops at another field, another group's choice, a button, or after 8 texts. The same text,
+/// back passes over the target's ancestors, its group's own options, yes, no, and sensitive-option
+/// buttons, links, and images, and stops at another field, another group's choice, any other
+/// button, or after 8 texts. The same text,
 /// folded, counts once.
 fn questions(lines: &[&str], index: usize) -> Questions {
     let mut ancestors = Vec::new();
@@ -879,6 +880,9 @@ fn questions(lines: &[&str], index: usize) -> Questions {
         }
         let role = role_at(line);
         let same_group = own_group.is_some_and(|group| at > group);
+        if role == "button" && button_answers(line) {
+            continue;
+        }
         if FIELD_ROLES.contains(&role.as_str()) || role == "button" {
             break;
         }
@@ -905,6 +909,13 @@ fn questions(lines: &[&str], index: usize) -> Questions {
     }
 }
 
+/// A button whose own name makes it an answer: yes, no, or a sensitive option.
+fn button_answers(line: &str) -> bool {
+    let (_, name) = parts(line);
+    let folded = label_words(&name).join(" ");
+    sensitive_option(&name) || folded == "yes" || folded == "no"
+}
+
 /// True when a click on the target picks an answer, so `choice_guard` must pass first. An
 /// unknown target counts as a choice. A button that is not a submit is a choice when its name
 /// is yes, no, or a sensitive option, or when it sits in an option group whose questions are
@@ -914,16 +925,14 @@ pub fn is_choice(snapshot: &str, target: &str) -> bool {
         return true;
     };
     let lines: Vec<&str> = snapshot.lines().collect();
-    let (role, name) = parts(lines[index]);
-    let role = role.to_lowercase();
+    let role = role_at(lines[index]);
     if role != "button" {
         return !PLAIN_ROLES.contains(&role.as_str());
     }
     if submit_target(snapshot, target) {
         return false;
     }
-    let folded = label_words(&name).join(" ");
-    if sensitive_option(&name) || folded == "yes" || folded == "no" {
+    if button_answers(lines[index]) {
         return true;
     }
     let questions = questions(&lines, index);

@@ -1272,3 +1272,26 @@ fn a_realistic_form_pauses_only_where_it_must() {
         assert!(is_choice(&form, choice), "{choice}");
     }
 }
+
+#[test]
+fn yes_and_no_buttons_share_the_question_above_them() {
+    let toggles = page(&[
+        "- generic [ref=e1]:",
+        "  - text: Are you a protected veteran?",
+        "  - button \"Yes\" [ref=e2]",
+        "  - button \"No\" [ref=e3]",
+    ]);
+    for (released, ok, paused) in [("Yes", "e2", "e3"), ("No", "e3", "e2")] {
+        let mut b = brief(Some(("yes", "no")));
+        b.answers = vec![BriefAnswer {
+            question: "Are you a protected veteran?".into(),
+            answer: released.into(),
+        }];
+        assert_eq!(choice_guard(&toggles, ok, &b), Ok(()), "{released}");
+        assert_eq!(
+            choice_guard(&toggles, paused, &b),
+            Err(Sensitive),
+            "{released}"
+        );
+    }
+}
