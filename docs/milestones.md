@@ -217,6 +217,7 @@ Apply mode exit tests (the Claude Code apply mode, owner decision of 2026-11-01)
 - Emergency pause kills every process of the run, `claude`, `apply-mcp`, the Playwright server, and Chromium, within 2 s (`browser_e2e_emergency_pause_closes_the_browser_and_deletes_the_profile`, `emergency_pause_kills_claude_the_server_and_the_browser_marker`, desktop `pause_set_closes_the_apply_session_before_the_row`).
 
 Gates: all five apply. Build includes the pinned runtime manifest; `browser setup` downloads the runtime and Chromium (decision 22: no Node, Playwright, or Chromium is bundled). Migrations add permission and automation-run tables (`0016`, `0017`). Windows and macOS means isolated browser launch and pause pass on both.
+
 ### 0.6 gate record
 
 Details and the full lists are in [release 0.6.0](releases/0.6.0.md). Rows marked `PLACEHOLDER_TASK_14_*` are filled by the controller after a real run on a temporary root, and a row that still shows a placeholder was not run.
@@ -236,6 +237,7 @@ Exit tests not proven end to end:
 - Manual and Copilot once each in the real window: `PLACEHOLDER_TASK_14_MODES`.
 - No real site was opened, in any form. Applying on a real site is the owner's act, after release. Pause detection on real CAPTCHA, MFA, and legal pages is unproven.
 - "The permissions engine allows Autonomous submission only for connectors with verified permission and explicit user authorization" is proven with a test-only verified list; no site is verified, so no Autonomous run has submitted anywhere but a fake server.
+
 ## Release 1.0: Stable open-source distribution
 
 Scope: signing and notarization, auto-update, security review, public docs. FR-1.8 installers were first delivered unsigned in 0.1; 1.0 signs them.

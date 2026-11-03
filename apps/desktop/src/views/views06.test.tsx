@@ -122,6 +122,19 @@ describe("apply run", () => {
     expect(asked?.args).toEqual({ applicationIds: ["a1"] });
   });
 
+  it("an application submitted before shows why it is blocked, not its code", async () => {
+    const blocked = check({ application_id: "a1", blocks: ["already_submitted"] });
+    await openPreflight({ apply_preflight: () => preflight({ items: [blocked] }) });
+
+    const table = await screen.findByRole("table", { name: "Preflight" });
+    const row = within(table).getAllByRole("row")[1];
+    expect(row).toHaveTextContent(
+      "This application was already submitted, or may have been. Record its outcome first.",
+    );
+    expect(row).not.toHaveTextContent("Refused: already_submitted");
+    expect(screen.getByRole("button", { name: "Start run" })).toBeDisabled();
+  });
+
   it("Start is disabled while a block stands", async () => {
     let blocks = ["not_saved"];
     const { api, user } = await openPreflight({

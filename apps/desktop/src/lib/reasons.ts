@@ -137,6 +137,7 @@ const BLOCKS: Record<string, string> = {
   already_in_a_run: "It is already in a run that has not ended.",
   resume_blocked: "The resume has a claim to fix before it can be exported.",
   letter_blocked: "The cover letter has a claim to fix before it can be exported.",
+  already_submitted: "This application was already submitted, or may have been. Record its outcome first.",
 };
 
 export function blockText(code: string): string {
