@@ -23,7 +23,8 @@ use jobpilot_core::browser::sweep::kill_marked;
 use jobpilot_core::{AppPaths, Error, Result, apply};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tauri::{
-    Emitter, EventTarget, Listener, Manager, Runtime, State, WebviewWindow, Window, WindowEvent,
+    AppHandle, Emitter, EventTarget, Listener, Manager, Runtime, State, WebviewWindow, Window,
+    WindowEvent,
 };
 
 use crate::state::AppState;
@@ -69,10 +70,16 @@ pub enum Launch {
     Apply(String),
 }
 
+/// The apply run a session hosts: its id, and its folder, which every process of the run
+/// names on its command line.
+struct Hosted {
+    id: String,
+    dir: PathBuf,
+}
+
 pub struct Session {
     id: u64,
-    /// The apply run this session hosts, if any.
-    apply: Option<String>,
+    apply: Option<Hosted>,
     master: Box<dyn MasterPty + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     input: SyncSender<Vec<u8>>,
@@ -84,17 +91,43 @@ pub struct Session {
 impl Session {
     /// Ends the child and whatever it runs. Blocks for up to the grace period, and on Windows
     /// until the pseudoconsole has closed: that close is what ends the attached processes,
-    /// and the reader keeps draining meanwhile. A failed kill means the child has gone.
+    /// and the reader keeps draining meanwhile. A failed kill means the child has gone. An
+    /// apply host's browser runs in a group of its own, so its run folder is swept after.
     fn end(mut self) {
         self.output.silence();
         #[cfg(unix)]
-        let groups = [
-            self.master.process_group_leader(),
-            self.pid.and_then(|pid| libc::pid_t::try_from(pid).ok()),
-        ];
+        let groups = self.groups();
         let _ = self.killer.kill();
         #[cfg(unix)]
         kill_groups_after_grace(groups);
+        if let Some(hosted) = &self.apply {
+            kill_marked(&hosted.dir);
+        }
+    }
+
+    /// The emergency pause's end: no hangup and no grace, so the host cannot write a state of
+    /// its own before the pause row lands, then the run folder's processes.
+    fn kill_now(mut self) {
+        self.output.silence();
+        #[cfg(unix)]
+        let groups = self.groups();
+        #[cfg(unix)]
+        for group in groups.iter().flatten().copied().filter(|group| *group > 1) {
+            // SAFETY: `kill` takes plain integers and touches no memory; never 0 or 1.
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+        }
+        let _ = self.killer.kill();
+        if let Some(hosted) = &self.apply {
+            kill_marked(&hosted.dir);
+        }
+    }
+
+    #[cfg(unix)]
+    fn groups(&self) -> [Option<libc::pid_t>; 2] {
+        [
+            self.master.process_group_leader(),
+            self.pid.and_then(|pid| libc::pid_t::try_from(pid).ok()),
+        ]
     }
 }
 
@@ -196,33 +229,37 @@ impl PtyState {
     }
 
     /// For the main thread: stops the output now and leaves the grace period to a thread.
-    fn close_soon(&self) {
-        let session = self.slot().take();
-        if let Some(session) = session {
-            session.output.silence();
-            self.ending().push(thread::spawn(move || session.end()));
-        }
+    /// For an apply session, the run's id and word of when the end is done.
+    fn close_soon(&self) -> Option<(String, mpsc::Receiver<()>)> {
+        let session = self.slot().take()?;
+        session.output.silence();
+        let hosted = session.apply.as_ref().map(|hosted| hosted.id.clone());
+        let (done, ended) = mpsc::channel();
+        self.ending().push(thread::spawn(move || {
+            session.end();
+            let _ = done.send(());
+        }));
+        hosted.map(|id| (id, ended))
     }
 
     fn ending(&self) -> MutexGuard<'_, Vec<JoinHandle<()>>> {
         self.ending.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// For the emergency pause: ends an apply session at once, and then everything its run
-    /// folder names, the browser included, which runs in a process group of its own. A plain
-    /// shell session is left alone: what the owner runs there is the owner's (M-14).
-    pub fn close_apply(&self, paths: &AppPaths) {
-        let mut slot = self.slot();
-        let Some(apply_id) = slot.as_ref().and_then(|session| session.apply.clone()) else {
-            return;
+    /// For the emergency pause: ends an apply session at once, off the async runtime, with
+    /// everything its run folder names, the browser included, which runs in a process group
+    /// of its own. Returns once they are signalled, with the run's id. A plain shell session
+    /// is left alone: what the owner runs there is the owner's (M-14).
+    pub async fn close_apply(&self) -> Option<String> {
+        let session = {
+            let mut slot = self.slot();
+            slot.as_ref()?.apply.as_ref()?;
+            slot.take()?
         };
-        let session = slot.take();
-        drop(slot);
-        if let Some(session) = session {
-            session.output.silence();
-            self.ending().push(thread::spawn(move || session.end()));
-        }
-        kill_marked(&paths.apply().join(apply_id));
+        session.output.silence();
+        let id = session.apply.as_ref()?.id.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || session.kill_now()).await;
+        Some(id)
     }
 
     #[cfg(test)]
@@ -231,10 +268,13 @@ impl PtyState {
     }
 
     /// Stands an open shell session in for an apply session, as a real one needs a browser.
-    #[cfg(all(test, unix))]
-    pub fn mark_apply(&self, apply_id: &str) {
+    #[cfg(test)]
+    pub fn mark_apply(&self, paths: &AppPaths, apply_id: &str) {
         if let Some(session) = self.slot().as_mut() {
-            session.apply = Some(apply_id.to_owned());
+            session.apply = Some(Hosted {
+                id: apply_id.to_owned(),
+                dir: paths.apply().join(apply_id),
+            });
         }
     }
 }
@@ -428,9 +468,13 @@ fn open_session<R: Runtime>(
         window.unlisten(acks);
     });
 
+    let apply = apply_id.map(|id| Hosted {
+        dir: AppPaths::new(&root).apply().join(&id),
+        id,
+    });
     *slot = Some(Session {
         id,
-        apply: apply_id,
+        apply,
         master: pair.master,
         killer,
         input,
@@ -510,22 +554,44 @@ pub fn pty_resize(state: State<'_, PtyState>, cols: u16, rows: u16) -> Result<()
 }
 
 /// Fine with no session: the panel calls this before every open, to clear one a page
-/// reload left behind with nobody listening.
+/// reload left behind with nobody listening. Closing an apply run's session is a person's
+/// act: once the host and its browser are gone, the run is ended and wound up, so nothing
+/// waits for a heartbeat to go stale.
 #[tauri::command]
-pub fn pty_close(state: State<'_, PtyState>) -> Result<()> {
-    state.close_soon();
+pub fn pty_close<R: Runtime>(app: AppHandle<R>, state: State<'_, PtyState>) -> Result<()> {
+    if let Some((apply_id, ended)) = state.close_soon() {
+        tauri::async_runtime::spawn(async move {
+            let _ =
+                tauri::async_runtime::spawn_blocking(move || ended.recv_timeout(END_WAIT)).await;
+            let state = app.state::<AppState>();
+            if let Ok(db) = state.work().await {
+                end_closed_run(&db, &apply_id).await;
+            }
+        });
+    }
     Ok(())
 }
 
+/// How long a closed session's end may take before its run is ended anyway.
+const END_WAIT: Duration = Duration::from_secs(5);
+
+/// The host is gone: its agent run is halted, then the person's close cancels what is left.
+async fn end_closed_run(db: &jobpilot_core::Db, apply_id: &str) {
+    if let Ok(false) = apply::host_gone(db, apply_id, "closed").await {
+        let _ = apply::cancel(db, "gui", apply_id).await;
+    }
+}
+
 /// A browser as Playwright starts one, for tests: the run folder on its command line, and
-/// deaf to SIGTERM.
-#[cfg(all(test, unix))]
+/// on Unix deaf to SIGTERM.
+#[cfg(test)]
 pub mod test_support {
     use std::path::Path;
     use std::process::{Child, Command};
     use std::thread;
     use std::time::{Duration, Instant};
 
+    #[cfg(unix)]
     pub fn marked_browser(dir: &Path) -> Child {
         let flag = format!("--user-data-dir={}", dir.join("profile").display());
         let child = Command::new("/bin/sh")
@@ -539,6 +605,18 @@ pub mod test_support {
             .unwrap();
         // Until the shell has read its trap and the system shows its arguments.
         thread::sleep(Duration::from_millis(200));
+        child
+    }
+
+    /// `rem` ends the line, so the folder is an argument and nothing reads it.
+    #[cfg(windows)]
+    pub fn marked_browser(dir: &Path) -> Child {
+        let flag = format!("--user-data-dir={}", dir.join("profile").display());
+        let child = Command::new("cmd")
+            .args(["/c", "ping -n 30 127.0.0.1 >nul & rem", &flag])
+            .spawn()
+            .unwrap();
+        thread::sleep(Duration::from_millis(500));
         child
     }
 
@@ -845,7 +923,7 @@ mod tests {
     fn close_waits_for_a_pty_close_still_under_way() {
         let session = Stubborn::start();
         let started = std::time::Instant::now();
-        pty_close(session.app.state()).unwrap();
+        pty_close(session.app.handle().clone(), session.app.state()).unwrap();
         session.app.state::<PtyState>().close();
         assert!(started.elapsed() >= HANGUP_GRACE, "close did not wait");
         session.assert_gone();
@@ -866,11 +944,12 @@ mod tests {
         let state = session.app.state::<PtyState>();
         let paths = AppPaths::new(session._tmp.path().join("data"));
         let id = "0123abcd";
-        state.mark_apply(id);
+        state.mark_apply(&paths, id);
         let mut browser = marked_browser(&paths.apply().join(id));
 
-        state.close_apply(&paths);
+        let closed = tauri::async_runtime::block_on(state.close_apply());
 
+        assert_eq!(closed.as_deref(), Some(id));
         assert!(state.pid().is_none());
         session.assert_gone();
         gone_within_two_seconds(&mut browser);
@@ -881,10 +960,9 @@ mod tests {
     fn close_apply_leaves_a_plain_shell_session_alone() {
         let session = Stubborn::start();
         let state = session.app.state::<PtyState>();
-        let paths = AppPaths::new(session._tmp.path().join("data"));
         let pid = state.pid();
 
-        state.close_apply(&paths);
+        assert!(tauri::async_runtime::block_on(state.close_apply()).is_none());
 
         thread::sleep(HANGUP_GRACE * 2);
         assert_eq!(state.pid(), pid);

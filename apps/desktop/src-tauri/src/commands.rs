@@ -1594,29 +1594,46 @@ pub async fn ai_cancel(state: State<'_, AppState>) -> Result<()> {
 /// after, so a running task stops even with no data open. The write goes through the `db`
 /// read lock and not [`AppState::work`]: it must not queue behind a task holding the gate.
 /// An apply session in the panel is closed, with its browser, before the row: the row can
-/// fail, and the session must not outlive the press.
+/// fail, and the session must not outlive the press. Once the row is in, the run the session
+/// hosted is ended `halted`, off this path.
 pub async fn pause_now(state: &AppState, pty: &PtyState) -> Result<PauseState> {
     // Before the tokens, so a run that ends on its token knows why while the row is pending.
     pause::announce(&state.paths);
     state.ai.cancel();
-    pty.close_apply(&state.paths);
+    let closed = pty.close_apply().await;
     state.pull.cancel();
-    let slot = state.db.read().await;
-    pause::set(ready(&slot)?, ACTOR).await
+    let db = state.db.read().await.clone().ok_or(Error::Unavailable)?;
+    let set = pause::set(&db, ACTOR).await?;
+    if let Some(apply_id) = closed {
+        halt_hosted(db, apply_id);
+    }
+    Ok(set)
+}
+
+/// The host the pause killed cannot write its own end: its agent run is halted with reason
+/// `paused`, and the run is wound up. Spawned, as a purge can wait.
+fn halt_hosted(db: Arc<Db>, apply_id: String) {
+    tauri::async_runtime::spawn(async move {
+        let _ = apply::host_gone(&db, &apply_id, "paused").await;
+    });
 }
 
 /// For a pause set by another process, such as `jobpilot pause set`: its running tasks are
 /// not this app's to find, but a download or an index started here is, and so is an apply
 /// session in the panel. True when it is on.
 pub async fn stop_if_paused(state: &AppState, pty: &PtyState) -> bool {
-    let on = match state.db.read().await.as_deref() {
+    let db = state.db.read().await.clone();
+    let on = match &db {
         Some(db) => pause::is_set(db).await.unwrap_or(false),
         None => false,
     };
     if on {
         state.ai.cancel();
-        pty.close_apply(&state.paths);
+        let closed = pty.close_apply().await;
         state.pull.cancel();
+        if let (Some(db), Some(apply_id)) = (db, closed) {
+            halt_hosted(db, apply_id);
+        }
     }
     on
 }
@@ -1835,43 +1852,60 @@ pub async fn apply_preflight(
     state: State<'_, AppState>,
     application_ids: Vec<String>,
 ) -> Result<Preflight> {
-    apply::preflight(&*state.work().await?, &application_ids).await
+    apply_preflight_of(&*state.work().await?, &application_ids).await
 }
 
 /// Whether sealed values go to this run is asked here, in Rust's own dialog, and nowhere
-/// else: the webview has no argument that releases them. Either answer starts the run.
+/// else: the webview has no argument that releases them. `Leave them out` starts the run with
+/// nothing released; closing the dialog starts nothing. With no consent for `Sensitive`
+/// nothing sealed can go, so nothing is asked. Core counts again, and refuses a release whose
+/// count moved while the dialog was open.
 #[tauri::command]
 pub async fn apply_start<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, AppState>,
     application_ids: Vec<String>,
 ) -> Result<String> {
-    let checked = apply::preflight(&*state.work().await?, &application_ids).await?;
-    let release_sealed = match checked.sealed_total {
-        0 => false,
-        sealed => {
-            let applications = checked.items.iter().filter(|item| item.sealed > 0).count();
-            let message = format!(
-                "Release {sealed} sensitive answers and work-authorization rows to this run \
-                 for {applications} applications?"
-            );
-            native::ask(
-                &app,
-                "Sealed answers",
-                message,
-                "Release to this run",
-                "Leave them out",
-            )
+    let checked = apply_preflight_of(&*state.work().await?, &application_ids).await?;
+    let sealed = checked.sealed_total;
+    let release_sealed = if sealed == 0 || !checked.sensitive_consent {
+        false
+    } else {
+        let applications = checked.items.iter().filter(|item| item.sealed > 0).count();
+        let what = match sealed {
+            1 => "1 sensitive answer or work-authorization row".to_owned(),
+            n => format!("{n} sensitive answers and work-authorization rows"),
+        };
+        let whom = match applications {
+            1 => "1 application".to_owned(),
+            n => format!("{n} applications"),
+        };
+        let message = format!("Release {what} to this run for {whom}?");
+        let release = "Release to this run";
+        let leave = "Leave them out";
+        native::choose(&app, "Sealed answers", message, release, leave)
             .await?
-        }
+            .ok_or(Error::Cancelled)?
     };
-    apply::start(
+    apply::start_confirmed(
         &*state.work().await?,
         ACTOR,
         &application_ids,
         release_sealed,
+        sealed,
     )
     .await
+}
+
+/// At most a run's worth: each application renders two documents.
+async fn apply_preflight_of(db: &Db, application_ids: &[String]) -> Result<Preflight> {
+    if application_ids.len() > apply::MAX_RUN_ITEMS {
+        return Err(Error::Validation(format!(
+            "a run takes at most {} applications",
+            apply::MAX_RUN_ITEMS
+        )));
+    }
+    apply::preflight(db, application_ids).await
 }
 
 #[tauri::command]
@@ -5749,6 +5783,11 @@ mod tests {
     /// A saved application with a resume and a letter, and the consent a run needs. Returns
     /// the application's id.
     fn apply_ready(h: &Harness) -> String {
+        apply_ready_with(h, true)
+    }
+
+    /// As [`apply_ready`], with consent for `Sensitive` only when `sensitive`.
+    fn apply_ready_with(h: &Harness, sensitive: bool) -> String {
         use jobpilot_core::ai::claude_code::PROVIDER;
         use jobpilot_core::ai::{DataCategory, consent};
         use jobpilot_core::applications::{self, ApplicationInput};
@@ -5794,12 +5833,14 @@ mod tests {
                 ..ApplicationInput::default()
             };
             let app = applications::add(&db, "gui", input).await.unwrap().id;
-            let categories = [
+            let mut categories = vec![
                 DataCategory::JobText,
                 DataCategory::ProfileBasic,
                 DataCategory::CareerMemory,
-                DataCategory::Sensitive,
             ];
+            if sensitive {
+                categories.push(DataCategory::Sensitive);
+            }
             consent::give(&db, PROVIDER, &categories, "2026-11-01", "gui")
                 .await
                 .unwrap();
@@ -5846,7 +5887,15 @@ mod tests {
         assert_eq!(code_of(open("0123abcd")), "not_found");
         let run = ready_run(&h);
         h.ok("apply_cancel", json!({ "id": run }));
-        assert_eq!(code_of(open(&run)), "refused");
+        let refused = open(&run).unwrap_err();
+        assert_eq!(refused["code"], "refused");
+        assert!(
+            refused["message"]
+                .as_str()
+                .unwrap()
+                .contains("apply_run_not_ready"),
+            "{refused}"
+        );
         assert!(h.app.state::<PtyState>().pid().is_none());
         let refused = invoke(
             &h.window,
@@ -5878,7 +5927,6 @@ mod tests {
     }
 
     /// In recovery the row cannot be written, and the session still goes: it is closed first.
-    #[cfg(unix)]
     #[test]
     fn pause_set_closes_the_apply_session_before_the_row() {
         use crate::pty::test_support::{gone_within_two_seconds, marked_browser};
@@ -5886,7 +5934,7 @@ mod tests {
         let panel = Panel::open(&h);
         let pty = h.app.state::<PtyState>();
         let pid = pty.pid().unwrap();
-        pty.mark_apply("0123abcd");
+        pty.mark_apply(&h.paths, "0123abcd");
         let mut browser = marked_browser(&h.paths.apply().join("0123abcd"));
 
         assert_eq!(h.code("pause_set", json!({})), "unavailable");
@@ -5901,14 +5949,13 @@ mod tests {
         let panel = Panel::open(&h);
         let pty = h.app.state::<PtyState>();
         let pid = pty.pid().unwrap();
-        pty.mark_apply("0123abcd");
+        pty.mark_apply(&h.paths, "0123abcd");
         assert_eq!(h.ok("pause_set", json!({}))["paused"], true);
         assert!(pty.pid().is_none());
         wait_gone(pid);
         drop(panel);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_pause_set_by_another_process_closes_the_apply_session() {
         use crate::pty::test_support::{gone_within_two_seconds, marked_browser};
@@ -5917,7 +5964,7 @@ mod tests {
         let state = h.app.state::<AppState>();
         let pty = h.app.state::<PtyState>();
         let pid = pty.pid().unwrap();
-        pty.mark_apply("0123abcd");
+        pty.mark_apply(&h.paths, "0123abcd");
         let mut browser = marked_browser(&h.paths.apply().join("0123abcd"));
         assert!(!block_on(super::stop_if_paused(&state, &pty)));
         assert_eq!(pty.pid(), Some(pid));
@@ -5979,8 +6026,16 @@ mod tests {
         let asked = h.asked();
         assert_eq!(
             asked.last().unwrap(),
-            "Sealed answers: Release 1 sensitive answers and work-authorization rows to this \
-             run for 1 applications?"
+            "Sealed answers: Release 1 sensitive answer or work-authorization row to this run \
+             for 1 application?"
+        );
+        let hook = h.app.state::<NativeHook>();
+        assert_eq!(
+            hook.buttons.lock().unwrap().last().unwrap(),
+            &(
+                "Release to this run".to_owned(),
+                "Leave them out".to_owned()
+            )
         );
         let shown = h.ok("apply_view", json!({ "id": run }));
         assert_eq!(shown["items"][0]["released_answers"], json!([]), "{shown}");
@@ -6044,6 +6099,215 @@ mod tests {
         assert_eq!(audited(&h, "apply_pause_resolved"), ["gui"]);
         let shown = h.ok("apply_view", json!({ "id": run }));
         assert!(shown["active_pause"].is_null(), "{shown}");
+    }
+
+    /// Esc or the close button is not an answer: nothing starts, and the screen stays put.
+    #[test]
+    fn dismissing_the_release_dialog_starts_nothing() {
+        let h = ready();
+        let app = apply_ready(&h);
+        sealed_answer(&h);
+        let hook = h.app.state::<NativeHook>();
+        hook.dismiss.store(true, Ordering::SeqCst);
+        assert_eq!(
+            h.code("apply_start", json!({ "applicationIds": [app] })),
+            "cancelled"
+        );
+        assert_eq!(h.ok("apply_latest", json!({})), Value::Null);
+    }
+
+    /// With no consent for `Sensitive` nothing sealed can go, so nothing is asked.
+    #[test]
+    fn with_no_sensitive_consent_the_release_is_not_asked() {
+        let h = ready();
+        let app = apply_ready_with(&h, false);
+        sealed_answer(&h);
+        let preflight = h.ok("apply_preflight", json!({ "applicationIds": [app] }));
+        assert_eq!(preflight["sensitive_consent"], false, "{preflight}");
+        let run = h.ok("apply_start", json!({ "applicationIds": [app] }));
+        assert!(h.asked().is_empty(), "{:?}", h.asked());
+        let shown = h.ok("apply_view", json!({ "id": run }));
+        assert_eq!(shown["items"][0]["released_answers"], json!([]));
+    }
+
+    /// An answer approved while the dialog is open is not released uncounted.
+    #[test]
+    fn a_release_whose_count_moved_under_the_dialog_is_refused() {
+        let h = ready();
+        let app = apply_ready(&h);
+        sealed_answer(&h);
+        let paths = h.paths.clone();
+        let hook = h.app.state::<NativeHook>();
+        *hook.on_ask.lock().unwrap() = Some(Box::new(move || {
+            let paths = paths.clone();
+            Box::pin(async move {
+                let db = Db::open(&paths).await.unwrap();
+                use jobpilot_core::memory;
+                let question = memory::add_question(&db, "Notice period?", None)
+                    .await
+                    .unwrap();
+                let answer = memory::add_answer(&db, &question.id, "Thirty", None)
+                    .await
+                    .unwrap();
+                memory::approve(&db, "cli", &answer.id, true).await.unwrap();
+                sqlx::query("UPDATE memory_questions SET class = 'sensitive' WHERE id = ?")
+                    .bind(&question.id)
+                    .execute(&db.pool)
+                    .await
+                    .unwrap();
+                db.close().await;
+            })
+        }));
+        h.answer(true);
+        let refused = h.call("apply_start", json!({ "applicationIds": [app] }));
+        let refused = refused.unwrap_err();
+        assert_eq!(refused["code"], "refused");
+        assert!(
+            refused["message"]
+                .as_str()
+                .unwrap()
+                .contains("release_changed")
+        );
+        assert_eq!(h.ok("apply_latest", json!({})), Value::Null);
+    }
+
+    #[test]
+    fn apply_preflight_takes_at_most_a_run() {
+        let h = ready();
+        let ids: Vec<String> = (0..26).map(|n| format!("a{n}")).collect();
+        assert_eq!(
+            h.code("apply_preflight", json!({ "applicationIds": ids })),
+            "validation"
+        );
+    }
+
+    /// On every system, ConPTY included: the pause leaves the owner's own shell running.
+    #[test]
+    fn close_apply_leaves_a_plain_shell_session_alone_in_the_panel() {
+        let h = ready();
+        let panel = Panel::open(&h);
+        let pty = h.app.state::<PtyState>();
+        let pid = pty.pid().unwrap();
+        assert!(block_on(pty.close_apply()).is_none());
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(pty.pid(), Some(pid));
+        assert!(running(pid));
+        drop(panel);
+    }
+
+    /// Closing the panel is a person's act: the browser goes at once and the run ends.
+    #[test]
+    fn closing_the_panel_ends_the_apply_run_and_its_browser() {
+        use crate::pty::test_support::{gone_within_two_seconds, marked_browser};
+        let h = ready();
+        let run = ready_run(&h);
+        let panel = Panel::open(&h);
+        let pty = h.app.state::<PtyState>();
+        pty.mark_apply(&h.paths, &run);
+        let mut browser = marked_browser(&h.paths.apply().join(&run));
+
+        panel.close();
+
+        gone_within_two_seconds(&mut browser);
+        wait_until(|| h.ok("apply_view", json!({ "id": run }))["state"] == "ended");
+    }
+
+    /// The real host under the panel, with the fake `claude` and a fake browser runtime: the
+    /// pause kills it, and the run reads halted and ended without waiting for a stale heartbeat.
+    #[cfg(unix)]
+    #[test]
+    fn an_emergency_pause_ends_a_hosted_run_halted() {
+        let h = ready();
+        let run = ready_run(&h);
+        hosted_runtime(&h);
+        let panel = Panel::listening(&h);
+        let (cols, rows) = SIZE;
+        invoke(
+            &h.window,
+            "pty_open_apply",
+            json!({ "cols": cols, "rows": rows, "applyId": run }),
+        )
+        .expect("build the CLI first: cargo build -p jobpilot-cli");
+        let active = || {
+            let shown = h.ok("apply_view", json!({ "id": run }));
+            shown["state"] == "running" && shown["items"][0]["state"] == "active"
+        };
+        let until = Instant::now() + PTY_WAIT;
+        while !active() {
+            assert!(Instant::now() < until, "never active: {}", panel.text());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        h.ok("pause_set", json!({}));
+
+        let agent = || {
+            let id = run.clone();
+            with_db(&h, |db| async move {
+                sqlx::query_as::<_, (String, Option<String>)>(
+                    "SELECT a.state, a.reason FROM agent_runs a \
+                     JOIN apply_runs r ON r.agent_run_id = a.id WHERE r.id = ?",
+                )
+                .bind(&id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap()
+            })
+        };
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            let ended = h.ok("apply_view", json!({ "id": run }))["state"] == "ended";
+            if ended && agent().0 == "halted" {
+                break;
+            }
+            assert!(Instant::now() < until, "{:?}", agent());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(agent(), ("halted".to_owned(), Some("paused".to_owned())));
+        drop(panel);
+    }
+
+    /// An installed browser runtime as `runtime::state` reads one, whose server is the mock,
+    /// and `ai.claude_path` set to the scripted fake.
+    #[cfg(unix)]
+    fn hosted_runtime(h: &Harness) {
+        use jobpilot_core::browser::runtime::PLAYWRIGHT_MCP;
+        let core = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../crates/core/tests");
+        let core = core.canonicalize().unwrap();
+        let runtime = h.paths.root().join("browser-runtime");
+        let mcp = runtime.join("node_modules/@playwright/mcp");
+        fs::create_dir_all(&mcp).unwrap();
+        fs::create_dir_all(runtime.join("browsers")).unwrap();
+        let snapshot = h._tmp.path().join("snapshot.yml");
+        fs::copy(core.join("fixtures/forms/snapshots/form.yml"), &snapshot).unwrap();
+        let manifest =
+            json!({ "name": "@playwright/mcp", "version": PLAYWRIGHT_MCP, "type": "module" });
+        fs::write(mcp.join("package.json"), manifest.to_string()).unwrap();
+        let server = format!("file://{}", core.join("mock-mcp/server.mjs").display());
+        let script = format!(
+            "process.env.MOCK_SNAPSHOT = {};\nawait import({});\n",
+            json!(snapshot.display().to_string()),
+            json!(server),
+        );
+        fs::write(mcp.join("cli.js"), script).unwrap();
+        let scenario = h._tmp.path().join("scenario.json");
+        fs::write(
+            &scenario,
+            r#"[{"tool": "apply_next"}, {"tool": "browser_snapshot"}]"#,
+        )
+        .unwrap();
+        let node = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join("node"))
+            .find(|node| node.is_file())
+            .expect("node is needed for this test");
+        fake_claude(
+            h,
+            &format!(
+                "export JOBPILOT_FAKE_SCENARIO='{}'\nexec '{}' '{}' \"$@\"",
+                scenario.display(),
+                node.display(),
+                core.join("mock-claude-apply/claude").display()
+            ),
+        );
     }
 
     /// Startup ends a `ready` run nobody opened a session for, so the next can start.

@@ -645,6 +645,8 @@ export type Preflight = {
   claude: string | null;
   consent_missing: DataCategory[];
   sealed_total: number;
+  /** Without it nothing sealed can be released, so Rust does not ask. */
+  sensitive_consent: boolean;
 };
 export type ApplyItem = {
   id: string;

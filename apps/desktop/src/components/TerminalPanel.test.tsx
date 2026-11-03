@@ -263,4 +263,43 @@ describe("TerminalPanel", () => {
     await waitFor(() => expect(of("apply_cancel")).toHaveLength(1));
     expect(useUiStore.getState().applyRun).toBeNull();
   });
+
+  it("a hosted run is not opened again when the panel reopens", async () => {
+    const { of } = backend();
+    useUiStore.setState({ applyRun: "run1" });
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+    const ui = (open: boolean) => <TerminalPanel open={open} onClose={onClose} />;
+    const { rerender } = render(ui(true));
+    await waitFor(() => expect(of("pty_open_apply")).toHaveLength(1));
+
+    // Done on the run screen, then the panel closed and opened again.
+    act(() => useUiStore.getState().setApplyRun(null));
+    await user.click(screen.getByRole("button", { name: "Close panel" }));
+    rerender(ui(false));
+    rerender(ui(true));
+
+    await waitFor(() => expect(of("pty_open")).toHaveLength(1));
+    expect(of("pty_open_apply")).toHaveLength(1);
+    expect(of("apply_cancel")).toHaveLength(0);
+    expect(screen.getByText("jobpilot CLI only")).toBeInTheDocument();
+  });
+
+  it("reopening the panel during a run neither re-hosts nor cancels it", async () => {
+    const { of } = backend();
+    useUiStore.setState({ applyRun: "run1" });
+    const user = userEvent.setup();
+    const ui = (open: boolean) => <TerminalPanel open={open} onClose={vi.fn()} />;
+    const { rerender } = render(ui(true));
+    await waitFor(() => expect(of("pty_open_apply")).toHaveLength(1));
+
+    await user.click(screen.getByRole("button", { name: "Close panel" }));
+    rerender(ui(false));
+    rerender(ui(true));
+
+    await waitFor(() => expect(of("pty_open")).toHaveLength(1));
+    expect(of("pty_open_apply")).toHaveLength(1);
+    expect(of("apply_cancel")).toHaveLength(0);
+    expect(useUiStore.getState().applyRun).toBe("run1");
+  });
 });

@@ -132,6 +132,40 @@ pub(crate) async fn ask<R: Runtime>(
     off_the_main_thread(move || builder.blocking_show()).await
 }
 
+/// Three ways out: `yes`, `no`, or a dismissal (Esc, the close button, or Cancel), which is
+/// `None`: no answer at all.
+#[cfg(not(test))]
+pub(crate) async fn choose<R: Runtime>(
+    app: &AppHandle<R>,
+    title: &str,
+    message: String,
+    yes: &str,
+    no: &str,
+) -> Result<Option<bool>> {
+    use tauri_plugin_dialog::{
+        DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult,
+    };
+
+    let builder = app
+        .dialog()
+        .message(message)
+        .title(title)
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::YesNoCancelCustom(
+            yes.to_owned(),
+            no.to_owned(),
+            "Cancel".to_owned(),
+        ));
+    let chosen = off_the_main_thread(move || builder.blocking_show_with_result()).await?;
+    Ok(match chosen {
+        MessageDialogResult::Yes => Some(true),
+        MessageDialogResult::No => Some(false),
+        MessageDialogResult::Custom(label) if label == yes => Some(true),
+        MessageDialogResult::Custom(label) if label == no => Some(false),
+        _ => None,
+    })
+}
+
 #[cfg(not(test))]
 async fn pick<R: Runtime>(
     app: &AppHandle<R>,
@@ -174,6 +208,10 @@ pub struct NativeHook {
     pub opened: std::sync::Mutex<Vec<String>>,
     /// Every dialog opened, as title and message.
     pub asked: std::sync::Mutex<Vec<String>>,
+    /// Each confirmation's two button labels: the action, then the other way out.
+    pub buttons: std::sync::Mutex<Vec<(String, String)>>,
+    /// The next three-way dialogs are closed with no answer, as by Esc.
+    pub dismiss: std::sync::atomic::AtomicBool,
     /// For each confirmation, whether a `Work` was open while it waited.
     pub work_at_dialog: std::sync::Mutex<Vec<bool>>,
     /// Runs while a confirmation is open, as the world moving under the person's feet.
@@ -193,6 +231,8 @@ impl Default for NativeHook {
             clipboard_fails: false.into(),
             opened: Default::default(),
             asked: Default::default(),
+            buttons: Default::default(),
+            dismiss: false.into(),
             work_at_dialog: Default::default(),
             on_ask: Default::default(),
         }
@@ -240,8 +280,8 @@ pub(crate) async fn ask<R: Runtime>(
     app: &AppHandle<R>,
     title: &str,
     message: String,
-    _action: &str,
-    _cancel: &str,
+    action: &str,
+    cancel: &str,
 ) -> Result<bool> {
     use std::sync::atomic::Ordering;
     use tauri::Manager;
@@ -251,6 +291,10 @@ pub(crate) async fn ask<R: Runtime>(
         .lock()
         .unwrap()
         .push(format!("{title}: {message}"));
+    hook.buttons
+        .lock()
+        .unwrap()
+        .push((action.to_owned(), cancel.to_owned()));
     let work = app.state::<crate::state::AppState>().work_is_open();
     hook.work_at_dialog.lock().unwrap().push(work);
     let moving = hook.on_ask.lock().unwrap().as_ref().map(|change| change());
@@ -258,6 +302,22 @@ pub(crate) async fn ask<R: Runtime>(
         moving.await;
     }
     Ok(hook.confirm.load(Ordering::SeqCst))
+}
+
+#[cfg(test)]
+pub(crate) async fn choose<R: Runtime>(
+    app: &AppHandle<R>,
+    title: &str,
+    message: String,
+    yes: &str,
+    no: &str,
+) -> Result<Option<bool>> {
+    use std::sync::atomic::Ordering;
+    use tauri::Manager;
+
+    let answer = ask(app, title, message, yes, no).await?;
+    let dismissed = app.state::<NativeHook>().dismiss.load(Ordering::SeqCst);
+    Ok((!dismissed).then_some(answer))
 }
 
 #[cfg(test)]

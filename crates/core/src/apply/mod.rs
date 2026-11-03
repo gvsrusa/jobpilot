@@ -87,6 +87,8 @@ pub struct Preflight {
     pub claude: Option<String>,
     pub consent_missing: Vec<DataCategory>,
     pub sealed_total: i64,
+    /// Whether consent covers `Sensitive`, without which nothing sealed can be released.
+    pub sensitive_consent: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -177,6 +179,9 @@ pub async fn preflight(db: &Db, application_ids: &[String]) -> Result<Preflight>
     Ok(Preflight {
         sealed_total: items.iter().map(|item| item.sealed).sum(),
         consent_missing: consent_missing(db, &CATEGORIES).await?,
+        sensitive_consent: consent_missing(db, &[DataCategory::Sensitive])
+            .await?
+            .is_empty(),
         items,
         runtime,
         claude,
@@ -355,6 +360,29 @@ pub async fn start(
     application_ids: &[String],
     release_sealed: bool,
 ) -> Result<String> {
+    start_with(db, actor, application_ids, release_sealed, None).await
+}
+
+/// `start` after a person confirmed a release of `confirmed` sealed values in a dialog. The
+/// count is taken again here, and a release whose count moved while the dialog was open is
+/// refused with `release_changed`: what is released is what the person was told.
+pub async fn start_confirmed(
+    db: &Db,
+    actor: &str,
+    application_ids: &[String],
+    release_sealed: bool,
+    confirmed: i64,
+) -> Result<String> {
+    start_with(db, actor, application_ids, release_sealed, Some(confirmed)).await
+}
+
+async fn start_with(
+    db: &Db,
+    actor: &str,
+    application_ids: &[String],
+    release_sealed: bool,
+    confirmed: Option<i64>,
+) -> Result<String> {
     runner::person(actor)?;
     pause::ensure_off(db).await?;
     if application_ids.is_empty() || application_ids.len() > MAX_RUN_ITEMS {
@@ -385,6 +413,10 @@ pub async fn start(
             return Err(Error::Refused((*block).into()));
         }
         checked.push(item);
+    }
+    let fresh: i64 = checked.iter().map(|item| item.check.sealed).sum();
+    if release_sealed && confirmed.is_some_and(|confirmed| confirmed != fresh) {
+        return Err(Error::Refused("release_changed".into()));
     }
 
     // Legal answers are never released: each one stops for a person.
@@ -660,6 +692,28 @@ pub async fn cancel(db: &Db, actor: &str, id: &str) -> Result<()> {
     let detail = json!({ "skipped": skipped });
     audit::record(db, actor, "apply_run_cancelled", Some(id), detail).await?;
     Ok(())
+}
+
+/// The process hosting `apply_id` is known to be gone: the app closed its terminal, or the
+/// emergency pause killed it. Its agent run, if still active, is halted with `reason`, so no
+/// one waits for a heartbeat to go stale, and the sweep then winds the run up. Returns true
+/// when the run has ended.
+pub async fn host_gone(db: &Db, apply_id: &str, reason: &str) -> Result<bool> {
+    let agent_run: Option<String> =
+        sqlx::query_scalar("SELECT agent_run_id FROM apply_runs WHERE id = ?")
+            .bind(apply_id)
+            .fetch_optional(&db.pool)
+            .await?
+            .ok_or(Error::NotFound)?;
+    if let Some(agent_run) = agent_run {
+        runner::store::halt(db, &agent_run, reason).await?;
+    }
+    session::sweep_orphans(db).await?;
+    let state: String = sqlx::query_scalar("SELECT state FROM apply_runs WHERE id = ?")
+        .bind(apply_id)
+        .fetch_one(&db.pool)
+        .await?;
+    Ok(state == "ended")
 }
 
 /// Every end of a run comes through here, so `apply_run_active` never outlives one. An item

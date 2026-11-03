@@ -121,6 +121,10 @@ const REASONS: [word: string, text: string][] = [
   ["apply_run_not_ready", "This run has already started or ended. Start a new run with what is left."],
   ["consent_required", "Your Claude Code consent does not cover what this run sends. Review it on the AI screen."],
   [
+    "release_changed",
+    "Your sealed answers changed while the release was being asked, so nothing started. Check the preflight, then start again.",
+  ],
+  [
     "claude_exited",
     "Claude Code stopped with an error, so the run ended. It may be signed out: run it once in your own terminal, then start a new run.",
   ],

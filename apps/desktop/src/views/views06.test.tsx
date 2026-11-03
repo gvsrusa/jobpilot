@@ -49,6 +49,7 @@ const preflight = (over: Partial<Preflight> = {}): Preflight => ({
   claude: "/usr/local/bin/claude",
   consent_missing: [],
   sealed_total: 2,
+  sensitive_consent: true,
   ...over,
 });
 
@@ -252,5 +253,60 @@ describe("apply run", () => {
     expect(within(table).getAllByRole("row")).toHaveLength(3);
     expect(table).toHaveTextContent("jobs.example.com");
     await waitFor(() => expect(count(api, "apply_view")).toBeGreaterThan(1), { timeout: 3000 });
+  });
+
+  it("dismissing the release dialog stays on the preflight with no alert", async () => {
+    await openPreflight({
+      apply_preflight: () => preflight(),
+      apply_start: () => Promise.reject({ code: "cancelled", message: "cancelled" }),
+    });
+    const start = await screen.findByRole("button", { name: "Start run" });
+    start.click();
+    await waitFor(() => expect(start).toBeEnabled());
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(useUiStore.getState().applyRun).toBeNull();
+    expect(screen.getByRole("table", { name: "Preflight" })).toBeInTheDocument();
+  });
+
+  it("preflight names a missing consent for sensitive answers", async () => {
+    await openPreflight({ apply_preflight: () => preflight({ sensitive_consent: false }) });
+    expect(
+      await screen.findByText(
+        "Your Claude Code consent does not cover sensitive answers, so they stay held back and each such field stops for you. Review it on the AI screen.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start run" })).toBeEnabled();
+  });
+
+  it("a blocked document reads in words", async () => {
+    await openPreflight({
+      apply_preflight: () => preflight({ items: [check({ resume: { blocked: "claims_blocked" } })] }),
+    });
+    expect(await screen.findByText("Blocked: a claim to fix first")).toBeInTheDocument();
+  });
+
+  it("a run screen that cannot load still has a way back", async () => {
+    const { user } = showRun(run(), {
+      apply_view: () => Promise.reject({ code: "not_found", message: "not found" }),
+    });
+    expect(await screen.findByRole("alert")).toHaveTextContent("code: not_found");
+    await user.click(screen.getByRole("button", { name: "Back" }));
+    expect(useUiStore.getState().applyRun).toBeNull();
+  });
+
+  it("the last run with a status left to record is offered after a restart", async () => {
+    const last = run({
+      id: "run7",
+      state: "ended",
+      ended_at: "2026-11-02T11:00:00.000Z",
+      items: [item({ run_id: "run7", state: "submitted", status_written: false })],
+    });
+    backend({ app_list: () => APPS, resume_list: () => [], apply_latest: () => last, apply_view: () => last });
+    const { user } = renderApp();
+    await screen.findByRole("heading", { name: "Status" });
+    await user.click(screen.getByRole("button", { name: "Applications" }));
+    await user.click(await screen.findByRole("button", { name: "Show last run" }));
+    expect(useUiStore.getState().applyRun).toBe("run7");
+    expect(await screen.findByRole("button", { name: "Record status" })).toBeInTheDocument();
   });
 });

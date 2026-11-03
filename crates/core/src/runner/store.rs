@@ -456,6 +456,49 @@ pub(crate) async fn request_cancel(db: &Db, actor: &str, id: &str) -> Result<boo
     Ok(flagged.rows_affected() == 1)
 }
 
+/// One active run whose process is known to be gone moves to `halted` with `reason`, as
+/// `reap` moves a quiet one. False when it was no longer active.
+pub async fn halt(db: &Db, id: &str, reason: &str) -> Result<bool> {
+    let mut tx = db.pool.begin().await?;
+    let halted: Option<String> = sqlx::query_scalar(concat!(
+        "UPDATE agent_runs SET state = 'halted', reason = ?, heartbeat_at = ",
+        now!(),
+        " WHERE id = ? AND state IN ",
+        active!(),
+        " RETURNING agent"
+    ))
+    .bind(reason)
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(agent) = halted else {
+        return Ok(false);
+    };
+    log_row(
+        &mut tx,
+        &Change {
+            id,
+            agent: parsed(&agent)?,
+            from: RunState::Running,
+            to: RunState::Halted,
+            generation: 0,
+            bump: false,
+            step: 0,
+            step_name: RUN_STEP,
+            checkpoint: &Checkpoint::default(),
+            reason: Some(reason),
+            outcome: reason,
+            provider: None,
+            categories: &[],
+            duration_ms: 0,
+            dropped: 0,
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
 /// Active rows whose process has gone quiet move to `halted`. Reads first, so a list on an
 /// idle app takes no write lock.
 pub(super) async fn reap(db: &Db, stale: Duration) -> Result<usize> {

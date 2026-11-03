@@ -3,7 +3,7 @@ import { CancelRun, PausePanel } from "@/components/PausePanel";
 import { ErrorAlert } from "@/components/ErrorAlert";
 import { Button } from "@/components/ui/button";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { ipc, type ApplyItem, type AuthorizationState, type DocState, type Preflight } from "@/lib/ipc";
+import { ipc, toAppError, type ApplyItem, type AuthorizationState, type DocState, type Preflight } from "@/lib/ipc";
 import { blockText, itemReason } from "@/lib/reasons";
 import { useUiStore } from "@/lib/store";
 
@@ -35,11 +35,23 @@ const STATES: Record<string, string> = {
   manual_required: "Handed to you",
 };
 
+const DOC_BLOCKS: Record<string, string> = {
+  claims_blocked: "a claim to fix first",
+  locked: "the data key is locked",
+  key_missing: "the data key is missing",
+  key_mismatch: "the data key does not match",
+  key_unavailable: "the data key cannot be read",
+  not_found: "the draft is gone",
+};
+
 function doc(state: DocState): string {
   if (state === "ready") return "Ready";
   if (state === "missing") return "None";
-  return `Blocked: ${state.blocked}`;
+  return `Blocked: ${DOC_BLOCKS[state.blocked] ?? state.blocked}`;
 }
+
+/** Closing Rust's release dialog is no answer: the preflight stays, with no alert. */
+const dismissed = (error: unknown) => error !== null && toAppError(error).code === "cancelled";
 
 /**
  * Wireframe 19: a Claude Code apply run, from the checks before it to what each application
@@ -74,7 +86,7 @@ function PreflightScreen({ ids, onClose }: { ids: string[]; onClose(): void }) {
 
   return (
     <div className="grid gap-3">
-      <ErrorAlert error={checked.error ?? setup.error ?? start.error} />
+      <ErrorAlert error={checked.error ?? setup.error ?? (dismissed(start.error) ? null : start.error)} />
       {checked.isPending && <p className="text-sm text-muted-foreground">Checking...</p>}
       {needsSetup && (
         <div className="grid gap-2">
@@ -141,10 +153,16 @@ function PreflightScreen({ ids, onClose }: { ids: string[]; onClose(): void }) {
               ))}
             </TableBody>
           </Table>
-          {data.sealed_total > 0 && (
+          {data.sealed_total > 0 && data.sensitive_consent && (
             <p className="text-sm text-muted-foreground">
               Sensitive answers and work authorization stay held back unless you release them to this run, in the
               dialog that opens when you start it.
+            </p>
+          )}
+          {data.sealed_total > 0 && !data.sensitive_consent && (
+            <p className="text-sm">
+              Your Claude Code consent does not cover sensitive answers, so they stay held back and each such field
+              stops for you. Review it on the AI screen.
             </p>
           )}
           {data.consent_missing.length > 0 && (
@@ -191,7 +209,18 @@ function RunScreen({ id, onClose }: { id: string; onClose(): void }) {
 
   const run = view.data;
   if (!run) {
-    return <ErrorAlert error={view.error} />;
+    return (
+      <div className="grid gap-3">
+        <ErrorAlert error={view.error} />
+        {view.isError && (
+          <div>
+            <Button type="button" variant="outline" onClick={done}>
+              Back
+            </Button>
+          </div>
+        )}
+      </div>
+    );
   }
   const ended = run.state === "ended";
   return (

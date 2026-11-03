@@ -1219,3 +1219,53 @@ async fn answers_are_marked_used_only_after_the_files_are_staged() {
     );
     w.db.close().await;
 }
+
+/// What a person confirmed is what is released: a sealed answer approved while the dialog was
+/// open changes the count, and the start is refused.
+#[tokio::test]
+async fn a_release_counted_before_an_answer_was_approved_is_refused() {
+    let w = world().await;
+    consent_to(&w.db, &ALL).await;
+    answer(&w.db, "What is your salary?", Class::Sensitive, "Ninety").await;
+    let a = app(&w.db, "Acme").await;
+    let counted = apply::preflight(&w.db, &ids(&[&a]))
+        .await
+        .unwrap()
+        .sealed_total;
+    assert_eq!(counted, 1);
+    answer(
+        &w.db,
+        "Your notice period?",
+        Class::Sensitive,
+        "Thirty days",
+    )
+    .await;
+
+    refused(
+        apply::start_confirmed(&w.db, "gui", &ids(&[&a]), true, counted).await,
+        "release_changed",
+    );
+    // Leaving them out releases nothing, so a changed count does not matter.
+    let run = apply::start_confirmed(&w.db, "gui", &ids(&[&a]), false, counted)
+        .await
+        .unwrap();
+    apply::cancel(&w.db, "gui", &run).await.unwrap();
+    apply::start_confirmed(&w.db, "gui", &ids(&[&a]), true, 2)
+        .await
+        .unwrap();
+    w.db.close().await;
+}
+
+/// The preflight says whether sealed answers can be released at all.
+#[tokio::test]
+async fn preflight_says_when_sensitive_consent_is_missing() {
+    let w = world().await;
+    consent_to(&w.db, &BASE).await;
+    let a = app(&w.db, "Acme").await;
+    let check = apply::preflight(&w.db, &ids(&[&a])).await.unwrap();
+    assert!(!check.sensitive_consent);
+    consent_to(&w.db, &ALL).await;
+    let check = apply::preflight(&w.db, &ids(&[&a])).await.unwrap();
+    assert!(check.sensitive_consent);
+    w.db.close().await;
+}

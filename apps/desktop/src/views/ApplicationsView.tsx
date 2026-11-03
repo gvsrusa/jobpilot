@@ -343,6 +343,13 @@ export function ApplicationsView() {
   const [picked, setPicked] = useState<string[]>([]);
   const [applying, setApplying] = useState<string[] | null>(null);
   const applyRun = useUiStore((s) => s.applyRun);
+  const setApplyRun = useUiStore((s) => s.setApplyRun);
+  // After a restart the store holds no run: the last one is offered while a status it
+  // found is still to be recorded.
+  const latest = useQuery({ queryKey: ["apply", "latest"], queryFn: ipc.applyLatest });
+  const unrecorded =
+    latest.data?.state === "ended" &&
+    latest.data.items.some((item) => item.state === "submitted" && !item.status_written);
 
   const apps = useQuery({
     queryKey: ["applications", filter],
@@ -494,6 +501,14 @@ export function ApplicationsView() {
           <span className="text-sm text-muted-foreground">A run takes at most {MAX_RUN_ITEMS} applications.</span>
         )}
       </div>
+      {unrecorded && applyRun === null && applying === null && (
+        <p className="flex items-center gap-3 text-sm">
+          The last Claude Code run has a submitted application whose status is not recorded yet.
+          <Button variant="outline" size="sm" onClick={() => setApplyRun(latest.data!.id)}>
+            Show last run
+          </Button>
+        </p>
+      )}
       {(applying !== null || applyRun !== null) && (
         <ApplyRun
           applicationIds={applying ?? []}
@@ -501,6 +516,7 @@ export function ApplicationsView() {
             setApplying(null);
             if (applyRun) setPicked([]);
             void refresh();
+            void latest.refetch();
           }}
         />
       )}
