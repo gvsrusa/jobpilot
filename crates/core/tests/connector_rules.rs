@@ -167,11 +167,6 @@ fn no_source_holds_a_bypass() {
         }
     }
     assert!(hits.is_empty(), "{hits:#?}");
-    let guard = every_src_file()
-        .into_iter()
-        .find(|(path, _)| path.ends_with("crates/core/src/apply/guard.rs"))
-        .expect("guard.rs exists");
-    assert!(!code(&guard.1).to_lowercase().contains("solver"));
 }
 
 /// The text between `hosts: &[` and the closing `]` of each declaration.

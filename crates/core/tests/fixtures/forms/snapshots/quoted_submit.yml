@@ -1,0 +1,5 @@
+- generic [ref=e1]:
+  - 'button "Submit: final step" [ref=e7]'
+  - checkbox [ref=e8]
+  - radio "" [ref=e9]
+  - checkbox "Send me alerts" [ref=e10]

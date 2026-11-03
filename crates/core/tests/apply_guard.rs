@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use jobpilot_core::apply::brief::{AuthorizationFact, Brief, Fact};
+use jobpilot_core::apply::brief::{AuthorizationFact, Brief, BriefAnswer, Fact};
 use jobpilot_core::apply::guard::PauseKind::*;
 use jobpilot_core::apply::guard::*;
 use serde_json::json;
@@ -92,11 +92,62 @@ fn an_acknowledged_line_does_not_hit_and_another_does() {
 }
 
 #[test]
-fn legal_words_count_only_on_text_roles() {
-    let on = "- checkbox \"I agree to the terms\" [ref=e1]";
-    assert_eq!(scan(on, &HashSet::new()).unwrap().kind, Legal);
-    let off = "- heading \"I agree to the terms\" [ref=e1]";
-    assert!(scan(off, &HashSet::new()).is_none());
+fn legal_words_count_on_every_role() {
+    for role in ["checkbox", "generic", "listitem", "heading"] {
+        let line = format!("- {role} \"I agree to the terms\" [ref=e1]");
+        assert_eq!(scan(&line, &HashSet::new()).unwrap().kind, Legal, "{role}");
+    }
+    for word in ["I confirm", "I consent to", "I authorize"] {
+        let line = format!("- text: {word} the check");
+        assert_eq!(scan(&line, &HashSet::new()).unwrap().kind, Legal, "{word}");
+    }
+}
+
+#[test]
+fn quoted_keys_and_hidden_characters_are_seen() {
+    assert_eq!(
+        scan(&fixture("quoted_legal"), &HashSet::new())
+            .unwrap()
+            .kind,
+        Legal
+    );
+    assert_eq!(
+        scan(&fixture("quoted_login"), &HashSet::new())
+            .unwrap()
+            .kind,
+        Login
+    );
+    assert!(submit_target(&fixture("quoted_submit"), "e7"));
+    assert_eq!(
+        label_of(&fixture("quoted_submit"), "e7").as_deref(),
+        Some("Submit: final step")
+    );
+    let hidden = "- paragraph: I cer\u{200c}tify this";
+    assert_eq!(scan(hidden, &HashSet::new()).unwrap().kind, Legal);
+    let hidden = "- text: cap\u{2060}tcha";
+    assert_eq!(scan(hidden, &HashSet::new()).unwrap().kind, Captcha);
+}
+
+#[test]
+fn a_nameless_choice_is_found() {
+    let page = fixture("quoted_submit");
+    assert!(unnamed_choice(&page, "e8"));
+    assert!(unnamed_choice(&page, "e9"));
+    assert!(!unnamed_choice(&page, "e10"));
+    assert!(!unnamed_choice(&page, "e7"));
+    assert_eq!(role_of(&page, "e8").as_deref(), Some("checkbox"));
+}
+
+#[test]
+fn the_ack_key_holds_the_whole_line() {
+    let long = "x".repeat(400);
+    let a = format!("- checkbox \"Background {long}: I agree\" [ref=e6]");
+    let b = format!("- checkbox \"Arbitration {long}: I agree\" [ref=e6]");
+    let (a, b) = (
+        scan(&a, &HashSet::new()).unwrap(),
+        scan(&b, &HashSet::new()).unwrap(),
+    );
+    assert_ne!(hit_key(&a), hit_key(&b));
 }
 
 #[test]
@@ -161,6 +212,11 @@ fn a_filename_or_a_file_url_is_refused() {
 
 #[test]
 fn isolation_and_submit_keys_are_refused() {
+    let nested = json!({"fields": [{"target": "e1", "filename": "x"}]});
+    assert_eq!(
+        refused_args("browser_fill_form", &nested, false),
+        Some("filename_refused")
+    );
     assert_eq!(
         refused_args("browser_tabs", &json!({"isolatedContext": true}), false),
         Some("isolated_context_refused")
@@ -230,6 +286,9 @@ fn a_value_must_be_a_fact() {
     assert!(value_ok("", &allowed));
     assert!(value_ok("4155550100", &["+1 415 555 0100".into()]));
     assert!(!value_ok("A", &allowed));
+    assert!(!value_ok("lex", &allowed));
+    assert!(!value_ok("10", &["+1 415 555 0100".into()]));
+    assert!(!value_ok("15", &["+1 415 555 0100".into()]));
     assert!(!value_ok("4155", &["+1 415 555 0100".into()]));
     assert!(!value_ok("Call 4155550100 now", &allowed));
     assert!(!value_ok("10 years of Kubernetes", &allowed));
@@ -334,6 +393,37 @@ fn a_legal_label_is_never_filled() {
 }
 
 #[test]
+fn a_sensitive_label_takes_only_the_released_answer_for_its_question() {
+    let mut b = brief(Some(("yes", "no")));
+    b.answers = vec![
+        BriefAnswer {
+            question: "Gender".into(),
+            answer: "Female".into(),
+        },
+        BriefAnswer {
+            question: "I am not a protected veteran".into(),
+            answer: "yes".into(),
+        },
+    ];
+    assert_eq!(field_guard("Gender", "Female", &b), Ok(()));
+    assert_eq!(field_guard("What is your gender?", "female", &b), Ok(()));
+    assert_eq!(field_guard("Gender", "male", &b), Err(Sensitive));
+    assert_eq!(field_guard("Gender", "no", &b), Err(Sensitive));
+    assert_eq!(
+        field_guard("Do you have a disability?", "no", &b),
+        Err(Sensitive)
+    );
+    assert_eq!(
+        field_guard("I am not a protected veteran", "a protected veteran", &b),
+        Err(Sensitive)
+    );
+    assert_eq!(
+        field_guard("I am not a protected veteran", "yes", &b),
+        Ok(())
+    );
+}
+
+#[test]
 fn a_sensitive_label_takes_only_an_approved_value() {
     let mut b = brief(None);
     b.facts.push(Fact {
@@ -344,6 +434,137 @@ fn a_sensitive_label_takes_only_an_approved_value() {
         field_guard("Date of birth", "1990-01-01", &b),
         Err(Sensitive)
     );
-    assert_eq!(field_guard("Gender", "alex doe", &b), Ok(()));
     assert_eq!(field_guard("Preferred name", "Anything", &b), Ok(()));
+}
+
+#[test]
+fn only_quiet_keys_are_pressed() {
+    for key in [
+        "Tab",
+        "Shift+Tab",
+        "Escape",
+        "ArrowDown",
+        "Backspace",
+        "PageUp",
+        " Tab ",
+    ] {
+        assert_eq!(
+            refused_args("browser_press_key", &json!({"key": key}), false),
+            None,
+            "{key}"
+        );
+    }
+    for key in ["Enter", "a", "1", "Space", "Control+a", "tab", ""] {
+        assert_eq!(
+            refused_args("browser_press_key", &json!({"key": key}), false),
+            Some("key_refused"),
+            "{key}"
+        );
+    }
+    assert_eq!(
+        refused_args("browser_press_key", &json!({}), false),
+        Some("key_refused")
+    );
+}
+
+#[test]
+fn a_slider_is_value_checked() {
+    let fill = json!({"fields": [
+        {"target": "e4", "type": "slider", "value": "20 years of Kubernetes"},
+    ]});
+    assert_eq!(
+        values_in("browser_fill_form", &fill),
+        vec!["20 years of Kubernetes".to_string()]
+    );
+}
+
+#[test]
+fn a_target_is_a_ref_the_snapshot_holds() {
+    let page = fixture("form");
+    assert!(target_known(&page, "e4"));
+    assert!(!target_known(&page, "e44"));
+    assert!(!target_known(&page, "e"));
+    assert!(!target_known(&page, ""));
+    assert!(!target_known(&page, "button[type=submit]"));
+    assert!(!target_known(
+        &page,
+        "internal:role=button[name=\"Submit application\"]"
+    ));
+    assert!(!target_known(&page, "e4]: x [ref=e4"));
+    let click = json!({"target": "button[type=submit]"});
+    assert_eq!(
+        targets_in("browser_click", &click),
+        vec!["button[type=submit]".to_string()]
+    );
+    let fill =
+        json!({"fields": [{"ref": "e3", "type": "textbox", "value": "a"}, {"target": "e8"}]});
+    assert_eq!(
+        targets_in("browser_fill_form", &fill),
+        vec!["e3".to_string(), "e8".to_string()]
+    );
+    assert_eq!(
+        targets_in("browser_select_option", &json!({"target": "e8"})),
+        vec!["e8".to_string()]
+    );
+    assert!(targets_in("browser_navigate", &json!({"url": "https://a.test"})).is_empty());
+    assert_eq!(
+        targets_in("browser_hover", &json!({"target": 5})),
+        vec!["".to_string()]
+    );
+}
+
+#[test]
+fn authorization_polarity_and_country_are_checked() {
+    let us = brief(Some(("yes", "no")));
+    let mixed = "Are you legally authorized to work in the United States without sponsorship?";
+    assert_eq!(field_guard(mixed, "yes", &us), Err(Sensitive));
+    assert_eq!(field_guard(mixed, "no", &us), Err(Sensitive));
+    assert_eq!(
+        field_guard("Are you authorized to work in the US?", "yes", &us),
+        Ok(())
+    );
+    assert_eq!(
+        field_guard(
+            "Are you authorized to work in the United States?",
+            "yes",
+            &us
+        ),
+        Ok(())
+    );
+    let canada = "Are you authorized to work in Canada?";
+    assert_eq!(field_guard(canada, "yes", &us), Err(Sensitive));
+    let mut ca = brief(Some(("yes", "no")));
+    ca.work_authorization.as_mut().unwrap().country = "CA".into();
+    assert_eq!(field_guard(canada, "yes", &ca), Ok(()));
+}
+
+#[test]
+fn legal_is_checked_before_authorization() {
+    let b = brief(Some(("yes", "no")));
+    assert_eq!(
+        field_guard("I certify I am authorized to work", "yes", &b),
+        Err(Legal)
+    );
+}
+
+#[test]
+fn urls_with_userinfo_and_relative_uploads_are_refused() {
+    for url in [
+        "https://user:pass@x.test/",
+        "https://jobs.example.com@evil.test/",
+    ] {
+        assert_eq!(
+            refused_args("browser_navigate", &json!({"url": url}), false),
+            Some("url_refused")
+        );
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let files = tmp.path().join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    std::fs::write(files.join("resume.pdf"), b"r").unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&files).unwrap();
+    let relative = upload_ok(&["resume.pdf".into()], &files);
+    std::env::set_current_dir(cwd).unwrap();
+    assert!(!relative);
 }
