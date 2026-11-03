@@ -666,17 +666,34 @@ fn a_choice_is_judged_by_its_question() {
     }];
     assert_eq!(choice_guard(&groups(), "e3", &b), Err(Sensitive));
     assert_eq!(choice_guard(&groups(), "e4", &b), Ok(()));
-    assert_eq!(choice_guard(&groups(), "e6", &b), Ok(()));
+    // Every line before a choice inside the form is its question, so "Gender" and the
+    // authorization question above weigh on every later choice: they pause (round 4, D2).
+    assert_eq!(choice_guard(&groups(), "e6", &b), Err(Sensitive));
     assert_eq!(choice_guard(&groups(), "e7", &b), Err(Sensitive));
-    assert_eq!(choice_guard(&groups(), "e9", &b), Ok(()));
-    assert_eq!(choice_guard(&groups(), "e10", &b), Err(Legal));
+    assert_eq!(choice_guard(&groups(), "e9", &b), Err(Sensitive));
+    assert_eq!(choice_guard(&groups(), "e10", &b), Err(Sensitive));
     assert_eq!(choice_guard(&groups(), "e11", &b), Err(Legal));
-    assert_eq!(choice_guard(&groups(), "e12", &b), Err(Legal));
+    assert_eq!(choice_guard(&groups(), "e12", &b), Err(Sensitive));
     assert_eq!(choice_guard(&groups(), "e13", &b), Err(Legal));
     assert_eq!(choice_guard(&groups(), "e14", &b), Ok(()));
     assert_eq!(choice_guard(&groups(), "e2", &b), Err(Sensitive));
+    let alone = |lines: &[&str]| page(lines);
+    let authorized = alone(&[
+        "- radiogroup \"Are you authorized to work in the US?\" [ref=e5]:",
+        "  - radio \"Yes\" [ref=e6]",
+        "  - radio \"No\" [ref=e7]",
+    ]);
+    assert_eq!(choice_guard(&authorized, "e6", &b), Ok(()));
+    assert_eq!(choice_guard(&authorized, "e7", &b), Err(Sensitive));
     let none = brief(None);
-    assert_eq!(choice_guard(&groups(), "e6", &none), Err(Sensitive));
+    assert_eq!(choice_guard(&authorized, "e6", &none), Err(Sensitive));
+    let shift = alone(&[
+        "- radiogroup \"Preferred shift\" [ref=e8]:",
+        "  - radio \"Night\" [ref=e9]",
+        "  - radio [ref=e10]",
+    ]);
+    assert_eq!(choice_guard(&shift, "e9", &b), Ok(()));
+    assert_eq!(choice_guard(&shift, "e10", &b), Err(Legal));
 }
 
 #[test]
@@ -955,10 +972,245 @@ fn authorization_uses_a_strict_form() {
     );
     assert_eq!(
         field_guard("Are you authorized to work in Britain?", "yes", &gb),
-        Ok(())
+        Err(Sensitive)
     );
     assert_eq!(
         field_guard("Are you authorized to work in the U.K.?", "yes", &gb),
         Ok(())
     );
+}
+
+fn released() -> Brief {
+    let mut b = brief(Some(("yes", "no")));
+    b.answers = vec![
+        BriefAnswer {
+            question: "What is your gender?".into(),
+            answer: "Female".into(),
+        },
+        BriefAnswer {
+            question: "Are you a protected veteran?".into(),
+            answer: "No".into(),
+        },
+    ];
+    b
+}
+
+#[test]
+fn work_authorization_off_the_templates_pauses() {
+    let us = brief(Some(("yes", "no")));
+    for label in [
+        "Are you authorized to work in the US? (No sponsorship)",
+        "Are you legally authorized to work in the U.S. with no sponsorship required?",
+        "Are you legally authorized to work in the United States, excluding sponsorship?",
+        "Are you authorized to work in the United States without the need for sponsorship?",
+        "Are you authorized to work in the U.S. free of sponsorship?",
+        "Are you eligible to work in the US with sponsorship?",
+        "Are you authorized to work in the U.S. unless sponsored?",
+        "Can you work in the US with no visa sponsorship?",
+        "Is sponsorship unnecessary for you to work in the US?",
+        "Would you need us to sponsor you to work in the U.S.?",
+        "Are you currently authorized to work in the U.S. on an H-1B?",
+        "Are you authorized to work in the United States on OPT?",
+        "Are you authorized to work in the US only with an EAD?",
+        "Have you ever been denied authorization to work in the US?",
+        "Are you authorized to work in the US for the next 12 months?",
+        "Are you authorized to work in the US but require sponsorship later?",
+        "Are you authorized to work in the us?",
+        "Are you authorized to work in the Us?",
+        "Are you authorized to work in Britain?",
+    ] {
+        for value in ["yes", "no"] {
+            assert_eq!(
+                field_guard(label, value, &us),
+                Err(Sensitive),
+                "{label} {value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_work_authorization_template_takes_its_stated_value() {
+    let fact = brief(Some(("yes", "no")));
+    let authorized = [
+        "Are you legally authorized to work in {C}?",
+        "Are you authorized to work in {C}?",
+        "Are you legally eligible to work in {C}?",
+        "Are you eligible to work in {C}?",
+        "Are you legally permitted to work in {C}?",
+        "Are you authorized to work in {C} for any employer?",
+        "* Are you legally permitted to work in {C} for any employer?",
+        "Required: Are you eligible to work in {C}?",
+    ];
+    let mut sponsorship = Vec::new();
+    for verb in ["require", "need"] {
+        for form in [
+            "Will you {V} sponsorship to work in {C}?",
+            "Will you {V} visa sponsorship to work in {C}?",
+            "Will you {V} sponsorship for employment visa status in {C}?",
+            "Will you now or in the future {V} sponsorship for employment visa status (e.g., H-1B visa status) in {C}?",
+            "Do you {V} sponsorship to work in {C}?",
+            "Do you {V} visa sponsorship to work in {C}?",
+            "Will you {V} immigration sponsorship to work in {C}?",
+        ] {
+            sponsorship.push(form.replace("{V}", verb));
+        }
+    }
+    for country in [
+        "the United States",
+        "United States",
+        "the United States of America",
+        "the US",
+        "the U.S.",
+        "the USA",
+        "the U.S.A.",
+    ] {
+        for form in authorized {
+            let label = form.replace("{C}", country);
+            assert_eq!(field_guard(&label, "Yes", &fact), Ok(()), "{label}");
+            assert_eq!(field_guard(&label, "no", &fact), Err(Sensitive), "{label}");
+        }
+        for form in &sponsorship {
+            let label = form.replace("{C}", country);
+            assert_eq!(field_guard(&label, "No", &fact), Ok(()), "{label}");
+            assert_eq!(field_guard(&label, "yes", &fact), Err(Sensitive), "{label}");
+        }
+    }
+    let mut gb = brief(Some(("yes", "no")));
+    gb.work_authorization.as_mut().unwrap().country = "GB".into();
+    for country in ["the United Kingdom", "the UK", "the U.K.", "Great Britain"] {
+        let label = format!("Are you authorized to work in {country}?");
+        assert_eq!(field_guard(&label, "yes", &gb), Ok(()), "{label}");
+        assert_eq!(field_guard(&label, "no", &gb), Err(Sensitive), "{label}");
+    }
+}
+
+#[test]
+fn every_line_before_a_choice_is_its_question() {
+    let b = released();
+    for (layout, snap) in [
+        (
+            "label nested with asterisk",
+            "- generic [ref=e0]:\n  - generic [ref=e1]:\n    - text: Gender\n    - generic [ref=e9]: \"*\"\n  - radiogroup [ref=e4]:\n    - radio \"Male\" [ref=e2]",
+        ),
+        (
+            "help text between",
+            "- generic [ref=e0]:\n  - generic [ref=e1]: Gender\n  - paragraph [ref=e8]: Select the option that best describes you\n  - radiogroup [ref=e4]:\n    - radio \"Male\" [ref=e2]",
+        ),
+        (
+            "label as strong child",
+            "- generic [ref=e0]:\n  - paragraph [ref=e1]:\n    - strong [ref=e7]: Gender\n  - radiogroup [ref=e4]:\n    - radio \"Male\" [ref=e2]",
+        ),
+        (
+            "label after group",
+            "- generic [ref=e0]:\n  - radiogroup [ref=e4]:\n    - radio \"Male\" [ref=e2]\n  - text: Gender",
+        ),
+        (
+            "heading in a sibling container",
+            "- generic [ref=e0]:\n  - generic [ref=e1]:\n    - heading \"Gender\" [level=3] [ref=e3]\n  - radio \"Male\" [ref=e2]",
+        ),
+        (
+            "generic name at the root",
+            "- generic \"Gender\" [ref=e1]\n- radio \"Male\" [ref=e2]",
+        ),
+        (
+            "table cell",
+            "- row [ref=e0]:\n  - cell \"Gender\" [ref=e1]\n  - cell [ref=e5]:\n    - radio \"Male\" [ref=e2]",
+        ),
+        (
+            "strong sibling",
+            "- generic [ref=e0]:\n  - strong [ref=e1]: Gender\n  - radio \"Male\" [ref=e2]",
+        ),
+        (
+            "img sibling",
+            "- generic [ref=e0]:\n  - img \"Gender\" [ref=e1]\n  - radio \"Male\" [ref=e2]",
+        ),
+        (
+            "plain checkbox named Female",
+            "- checkbox \"Female\" [ref=e2]",
+        ),
+        (
+            "label after the group, Female",
+            "- generic [ref=e0]:\n  - radiogroup [ref=e4]:\n    - radio \"Female\" [ref=e2]\n  - text: Gender",
+        ),
+    ] {
+        assert!(is_choice(snap, "e2"), "{layout}");
+        assert_eq!(choice_guard(snap, "e2", &b), Err(Sensitive), "{layout}");
+    }
+    let happy = "- group \"Gender\" [ref=e1]:\n  - radio \"Female\" [ref=e2]";
+    assert_eq!(choice_guard(happy, "e2", &b), Ok(()));
+    let help = "- generic [ref=e0]:\n  - generic [ref=e1]: Gender\n  - paragraph [ref=e8]: Select the option that best describes you\n  - radiogroup [ref=e4]:\n    - radio \"Female\" [ref=e2]";
+    assert_eq!(choice_guard(help, "e2", &b), Ok(()));
+    let far = page(&[
+        "- text: Are you a protected veteran?",
+        "- text: one",
+        "- text: two",
+        "- text: three",
+        "- text: four",
+        "- text: five",
+        "- text: six",
+        "- text: seven",
+        "- text: eight",
+        "- radio \"Yes\" [ref=e2]",
+    ]);
+    assert_eq!(choice_guard(&far, "e2", &b), Ok(()));
+    let near = page(&[
+        "- text: Are you a protected veteran?",
+        "- text: one",
+        "- radio \"Yes\" [ref=e2]",
+    ]);
+    assert_eq!(choice_guard(&near, "e2", &b), Err(Sensitive));
+    let stopped = page(&[
+        "- text: Are you a protected veteran?",
+        "- radio \"No\" [ref=e1]",
+        "- radio \"Yes\" [ref=e2]",
+    ]);
+    assert_eq!(choice_guard(&stopped, "e2", &b), Ok(()));
+}
+
+#[test]
+fn a_sensitive_option_needs_one_sensitive_question() {
+    let b = released();
+    for option in [
+        "Male",
+        "Woman",
+        "Non-binary",
+        "Hispanic or Latino",
+        "Two or More Races",
+        "I don't wish to answer",
+        "Decline to self-identify",
+        "I am a disabled veteran",
+    ] {
+        let snap =
+            format!("- group \"Preferred shift\" [ref=e1]:\n  - radio \"{option}\" [ref=e2]");
+        assert_eq!(choice_guard(&snap, "e2", &b), Err(Sensitive), "{option}");
+    }
+    let two = "- group \"Gender\" [ref=e1]:\n  - group \"Sex\" [ref=e3]:\n    - radio \"Female\" [ref=e2]";
+    assert_eq!(choice_guard(two, "e2", &b), Err(Sensitive));
+    let plain = "- group \"Preferred shift\" [ref=e1]:\n  - radio \"Manager track\" [ref=e2]";
+    assert_eq!(choice_guard(plain, "e2", &b), Ok(()));
+}
+
+#[test]
+fn a_button_can_be_a_choice() {
+    let b = released();
+    let gender = "- group \"Gender\" [ref=e1]:\n  - button \"Male\" [ref=e2]";
+    assert!(is_choice(gender, "e2"));
+    assert_eq!(choice_guard(gender, "e2", &b), Err(Sensitive));
+    let veteran = "- generic [ref=e1]:\n  - text: Are you a protected veteran?\n  - button \"Yes\" [pressed] [ref=e2]\n  - button \"No\" [ref=e3]";
+    assert!(is_choice(veteran, "e2"));
+    assert_eq!(choice_guard(veteran, "e2", &b), Err(Sensitive));
+    assert_eq!(choice_guard(veteran, "e3", &b), Ok(()));
+    let bare = "- button \"Yes\" [ref=e2]";
+    assert!(is_choice(bare, "e2"));
+    let female = "- button \"Female\" [ref=e2]";
+    assert!(is_choice(female, "e2"));
+    assert_eq!(choice_guard(female, "e2", &b), Err(Sensitive));
+    let submit = "- form \"Voluntary self-identification\" [ref=e1]:\n  - text: Gender\n  - button \"Submit application\" [ref=e2]";
+    assert!(!is_choice(submit, "e2"));
+    assert_eq!(choice_guard(submit, "e2", &b), Ok(()));
+    let next =
+        "- form \"Apply\" [ref=e1]:\n  - textbox \"Name\" [ref=e3]\n  - button \"Next\" [ref=e2]";
+    assert!(!is_choice(next, "e2"));
+    assert_eq!(choice_guard(next, "e2", &b), Ok(()));
 }

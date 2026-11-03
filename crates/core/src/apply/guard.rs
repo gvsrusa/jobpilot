@@ -581,100 +581,122 @@ fn label_words(label: &str) -> Vec<String> {
         .collect()
 }
 
-/// Words that make a work authorization question something other than "authorized?".
-const REFUSED_WORDS: [&str; 15] = [
-    "citizen",
-    "citizenship",
-    "resident",
-    "residency",
-    "permit",
-    "unauthorized",
-    "not",
-    "never",
-    "without",
-    "and",
-    "or",
-    "either",
-    "other",
-    "any",
-    "outside",
-];
-/// A label naming any of these is about a place beyond the one country.
-const OTHER_PLACES: [&str; 9] = [
-    "europe", "european", "eu", "virgin", "latin", "south", "north", "new", "territor",
-];
-
-fn has_phrase(padded: &str, phrase: &str) -> bool {
-    padded.contains(&format!(" {} ", label_words(phrase).join(" ")))
+/// The words of a label as written, with case kept, split at anything that is not a letter or
+/// digit, without hidden characters.
+fn cased_words(label: &str) -> Vec<String> {
+    label
+        .chars()
+        .filter(|c| !hidden(*c))
+        .collect::<String>()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
-/// True when the label names the country: a table name, or an alias from the short table. `us`
-/// counts only as `US` or `U.S.` in capitals.
-fn names_country(label: &str, padded: &str, own: &str) -> bool {
-    let aliases: &[&str] = match own {
+const AUTHORIZED_FORMS: [&str; 5] = [
+    "are you legally authorized to work in",
+    "are you authorized to work in",
+    "are you legally eligible to work in",
+    "are you eligible to work in",
+    "are you legally permitted to work in",
+];
+/// `{V}` is `require` or `need`.
+const SPONSORSHIP_FORMS: [&str; 7] = [
+    "will you {V} sponsorship to work in",
+    "will you {V} visa sponsorship to work in",
+    "will you {V} sponsorship for employment visa status in",
+    "will you {V} sponsorship for employment visa status e g h 1b visa status in",
+    "do you {V} sponsorship to work in",
+    "do you {V} visa sponsorship to work in",
+    "will you {V} immigration sponsorship to work in",
+];
+/// US forms that count only when the label writes them in capitals.
+const CAPITAL_ALIASES: [&str; 4] = ["us", "u s", "usa", "u s a"];
+
+/// The country's names, folded: the short table for US and GB, else the geo.rs name.
+fn aliases(own: &str) -> Vec<String> {
+    let fixed: &[&str] = match own {
         "US" => &[
             "united states",
             "united states of america",
-            "usa",
+            "the united states",
+            "us",
             "u s",
+            "usa",
             "u s a",
         ],
-        "GB" => &["united kingdom", "uk", "u k", "great britain", "britain"],
+        "GB" => &[
+            "united kingdom",
+            "the united kingdom",
+            "uk",
+            "u k",
+            "great britain",
+        ],
         _ => &[],
     };
-    let capitals = label.contains("U.S.")
-        || label
-            .split(|c: char| !c.is_alphanumeric())
-            .any(|w| w == "US");
-    if own == "US" && capitals && has_phrase(padded, "us") {
-        return true;
+    if !fixed.is_empty() {
+        return fixed.iter().map(|a| (*a).to_owned()).collect();
     }
-    let table = geo::countries()
+    geo::countries()
         .iter()
         .filter(|country| country.code == own)
-        .map(|country| country.name.trim_end_matches(" (country)"));
-    aliases
-        .iter()
-        .copied()
-        .chain(table)
-        .any(|name| has_phrase(padded, name))
+        .map(|country| label_words(country.name.trim_end_matches(" (country)")).join(" "))
+        .filter(|name| !name.is_empty())
+        .collect()
 }
 
-/// The stated yes or no for a plainly worded question, compared to the value. Nothing is
-/// inferred: a label that is about citizenship, status, a visa, more than one place, or a
-/// place other than the fact's country has no answer here.
+/// The stated yes or no for a label that is exactly one known form naming the fact's country.
+/// Nothing is inferred: any other wording has no answer here.
 pub fn authorization_ok(label: &str, value: &str, fact: &AuthorizationFact) -> bool {
-    let folded = clean(label).replace("now or in the future", " ");
-    if folded.contains("n't") || folded.contains("n\u{2019}t") || folded.contains("green card") {
-        return false;
+    let mut cased = cased_words(label);
+    let mut lower: Vec<String> = cased.iter().map(|w| w.to_lowercase()).collect();
+    while lower.first().is_some_and(|w| w == "required") {
+        lower.remove(0);
+        cased.remove(0);
     }
-    let sponsor = folded.contains("sponsor");
-    let padded = format!(" {} ", label_words(&folded).join(" "));
-    let word = |w: &str| padded.contains(&format!(" {w} "));
-    if REFUSED_WORDS.iter().any(|w| word(w)) {
-        return false;
-    }
-    if word("visa") && !sponsor {
-        return false;
-    }
-    if !names_country(label, &padded, &fact.country) {
-        return false;
-    }
-    let other_country = geo::countries().iter().any(|country| {
-        country.code != fact.country
-            && has_phrase(&padded, country.name.trim_end_matches(" (country)"))
-    });
-    if other_country
-        || OTHER_PLACES
-            .iter()
-            .any(|w| word(w) || *w == "territor" && folded.contains(w))
+    let phrase = ["now", "or", "in", "the", "future"];
+    while let Some(at) = lower
+        .windows(phrase.len())
+        .position(|run| run.iter().zip(phrase).all(|(a, b)| a == b))
     {
-        return false;
+        lower.drain(at..at + phrase.len());
+        cased.drain(at..at + phrase.len());
     }
-    let stated = if sponsor {
+    let mut ends = lower.clone();
+    let suffix = ["for", "any", "employer"];
+    if ends.ends_with(&suffix.map(str::to_owned)) {
+        ends.truncate(ends.len() - suffix.len());
+    }
+    let folded = ends.join(" ");
+    let names_country = |form: &str| {
+        let Some(rest) = folded.strip_prefix(form).and_then(|r| r.strip_prefix(' ')) else {
+            return false;
+        };
+        let rest = rest.strip_prefix("the ").unwrap_or(rest);
+        aliases(&fact.country).iter().any(|alias| {
+            if rest != alias {
+                return false;
+            }
+            if fact.country != "US" || !CAPITAL_ALIASES.contains(&alias.as_str()) {
+                return true;
+            }
+            let n = alias.split(' ').count();
+            cased[ends.len() - n..ends.len()]
+                .iter()
+                .all(|w| w.chars().all(|c| !c.is_lowercase()))
+        })
+    };
+    let stated = if AUTHORIZED_FORMS.iter().any(|form| names_country(form)) {
+        &fact.authorized
+    } else if SPONSORSHIP_FORMS.iter().any(|form| {
+        ["require", "need"]
+            .iter()
+            .any(|verb| names_country(&form.replace("{V}", verb)))
+    }) {
         &fact.needs_sponsorship
     } else {
-        &fact.authorized
+        return false;
     };
     (stated == "yes" || stated == "no") && fold(value) == *stated
 }
@@ -724,18 +746,60 @@ fn indent_of(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
-/// Roles whose click is not the choice of an answer. Every other role is judged.
+/// Roles whose click is not the choice of an answer. Every other role is judged, and a button
+/// is judged when [`is_choice`] says so.
 const PLAIN_ROLES: [&str; 6] = ["button", "link", "tab", "combobox", "textbox", "searchbox"];
-/// Roles that carry the text of a question beside a group.
-const LABEL_ROLES: [&str; 6] = ["text", "heading", "paragraph", "label", "legend", "generic"];
+/// Roles whose text is never a candidate question. They are still walked over.
+const NOT_QUESTIONS: [&str; 7] = [
+    "button", "link", "img", "option", "radio", "checkbox", "switch",
+];
+/// Roles that pick an answer: the walk before a top-level ancestor stops at one.
+const CHOICE_ROLES: [&str; 4] = ["option", "radio", "checkbox", "switch"];
+/// How many lines before the top-level ancestor are read at the root.
+const ROOT_LINES: usize = 8;
+/// An option naming any of these, as whole words, needs exactly one Sensitive question whose
+/// released answer it is.
+pub const SENSITIVE_OPTIONS: [&str; 25] = [
+    "male",
+    "female",
+    "man",
+    "woman",
+    "non binary",
+    "nonbinary",
+    "transgender",
+    "veteran",
+    "disability",
+    "disabled",
+    "hispanic",
+    "latino",
+    "latina",
+    "latinx",
+    "white",
+    "black",
+    "african american",
+    "asian",
+    "native american",
+    "alaska native",
+    "pacific islander",
+    "two or more races",
+    "decline to self identify",
+    "prefer not to say",
+    "i don t wish to answer",
+];
 
-/// True when a click on the target picks an answer, so `choice_guard` must pass first. An
-/// unknown target counts as a choice.
-pub fn is_choice(snapshot: &str, target: &str) -> bool {
-    match role_of(snapshot, target) {
-        Some(role) => !PLAIN_ROLES.contains(&role.as_str()),
-        None => true,
-    }
+fn role_in(role: &str, roles: &[&str]) -> bool {
+    roles.contains(&role) || role.starts_with("menuitem")
+}
+
+fn holds_term(text: &str, terms: &[&str]) -> bool {
+    let padded = format!(" {} ", label_words(text).join(" "));
+    terms
+        .iter()
+        .any(|term| padded.contains(&format!(" {term} ")))
+}
+
+fn sensitive_option(name: &str) -> bool {
+    holds_term(name, &SENSITIVE_OPTIONS)
 }
 
 /// The text a line carries: its name, or else its inline text.
@@ -745,29 +809,6 @@ fn text_of_line(line: &str) -> String {
     text.chars().filter(|c| !hidden(*c)).collect()
 }
 
-/// The nearest earlier line at this line's indentation that is a text, heading, paragraph,
-/// label, legend, or generic with text.
-fn label_before(lines: &[&str], index: usize) -> Option<String> {
-    let indent = indent_of(lines[index]);
-    for line in lines[..index].iter().rev() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let here = indent_of(line);
-        if here < indent {
-            return None;
-        }
-        if here == indent {
-            let (role, _, _) = split_line(line);
-            let text = text_of_line(line);
-            if LABEL_ROLES.contains(&role.to_lowercase().as_str()) && !text.is_empty() {
-                return Some(text);
-            }
-        }
-    }
-    None
-}
-
 fn class_of(text: &str) -> Class {
     if LEGAL.iter().any(|word| clean(text).contains(word)) {
         return Class::Legal;
@@ -775,23 +816,12 @@ fn class_of(text: &str) -> Class {
     classify(text)
 }
 
-/// A choice is judged by every question around it: each named ancestor, and the label text
-/// before the option and before each ancestor. The option's own name counts too. A Legal one
-/// pauses `Legal`; a Sensitive or work authorization one needs the released answer. An unnamed
-/// checkbox or radio is a `Legal` pause. A role that is not a choice passes.
-pub fn choice_guard(snapshot: &str, target: &str, brief: &Brief) -> Result<(), PauseKind> {
-    let Some(index) = index_of(snapshot, target) else {
-        return Err(PauseKind::Legal);
-    };
-    let lines: Vec<&str> = snapshot.lines().collect();
-    let (role, name) = parts(lines[index]);
-    let role = role.to_lowercase();
-    if PLAIN_ROLES.contains(&role.as_str()) {
-        return Ok(());
-    }
-    let option: String = name.chars().filter(|c| !hidden(*c)).collect();
-    let mut questions: Vec<String> = Vec::new();
-    questions.extend(label_before(&lines, index));
+/// Every question a choice may answer: each named ancestor up to the root, every line between
+/// the top-level ancestor and the target at any depth, and up to eight lines before the
+/// top-level ancestor, stopping at an earlier choice. Lines of a [`NOT_QUESTIONS`] role are
+/// walked over. The same text, folded, counts once.
+fn questions(lines: &[&str], index: usize) -> Vec<String> {
+    let mut ancestors = Vec::new();
     let mut limit = indent_of(lines[index]);
     for at in (0..index).rev() {
         let line = lines[at];
@@ -799,12 +829,86 @@ pub fn choice_guard(snapshot: &str, target: &str, brief: &Brief) -> Result<(), P
             continue;
         }
         limit = indent_of(line);
-        let (_, ancestor) = parts(line);
-        if !ancestor.is_empty() {
-            questions.push(ancestor);
-        }
-        questions.extend(label_before(&lines, at));
+        ancestors.push(at);
     }
+    let top = ancestors.last().copied().unwrap_or(index);
+    let candidate = |line: &str| {
+        let (role, _, _) = split_line(line);
+        if role_in(&role.to_lowercase(), &NOT_QUESTIONS) {
+            return None;
+        }
+        Some(text_of_line(line)).filter(|text| !text.is_empty())
+    };
+    let mut found: Vec<String> = (top..index)
+        .filter_map(|at| {
+            if ancestors.contains(&at) {
+                Some(text_of_line(lines[at])).filter(|text| !text.is_empty())
+            } else {
+                candidate(lines[at])
+            }
+        })
+        .collect();
+    let mut taken = 0;
+    for line in lines[..top].iter().rev() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if taken == ROOT_LINES {
+            break;
+        }
+        let (role, _, _) = split_line(line);
+        if role_in(&role.to_lowercase(), &CHOICE_ROLES) {
+            break;
+        }
+        taken += 1;
+        found.extend(candidate(line));
+    }
+    let mut seen = HashSet::new();
+    found.retain(|text| seen.insert(label_words(text).join(" ")));
+    found
+}
+
+/// True when a click on the target picks an answer, so `choice_guard` must pass first. An
+/// unknown target counts as a choice. A button that is not a submit is a choice when its name
+/// is yes, no, or a sensitive option, or when a question around it is not Normal.
+pub fn is_choice(snapshot: &str, target: &str) -> bool {
+    let Some(index) = index_of(snapshot, target) else {
+        return true;
+    };
+    let lines: Vec<&str> = snapshot.lines().collect();
+    let (role, name) = parts(lines[index]);
+    let role = role.to_lowercase();
+    if role != "button" {
+        return !PLAIN_ROLES.contains(&role.as_str());
+    }
+    if submit_target(snapshot, target) {
+        return false;
+    }
+    let folded = label_words(&name).join(" ");
+    sensitive_option(&name)
+        || folded == "yes"
+        || folded == "no"
+        || questions(&lines, index)
+            .iter()
+            .any(|question| class_of(question) != Class::Normal)
+}
+
+/// A choice is judged by every question around it (see [`questions`]), and by its own name.
+/// A Legal one pauses `Legal`; a Sensitive or work authorization one needs the released answer.
+/// A sensitive option needs exactly one Sensitive question. An unnamed checkbox or radio is a
+/// `Legal` pause. A target that is not a choice passes.
+pub fn choice_guard(snapshot: &str, target: &str, brief: &Brief) -> Result<(), PauseKind> {
+    let Some(index) = index_of(snapshot, target) else {
+        return Err(PauseKind::Legal);
+    };
+    if !is_choice(snapshot, target) {
+        return Ok(());
+    }
+    let lines: Vec<&str> = snapshot.lines().collect();
+    let (role, name) = parts(lines[index]);
+    let role = role.to_lowercase();
+    let option: String = name.chars().filter(|c| !hidden(*c)).collect();
+    let questions = questions(&lines, index);
     let own = class_of(&option);
     let classes: Vec<Class> = questions.iter().map(|q| class_of(q)).collect();
     if own == Class::Legal || classes.contains(&Class::Legal) {
@@ -817,6 +921,10 @@ pub fn choice_guard(snapshot: &str, target: &str, brief: &Brief) -> Result<(), P
         if matches!(class, Class::Sensitive | Class::WorkAuthorization) {
             field_guard(question, &option, brief)?;
         }
+    }
+    let sensitive = classes.iter().filter(|c| **c == Class::Sensitive).count();
+    if sensitive_option(&option) && sensitive != 1 {
+        return Err(PauseKind::Sensitive);
     }
     if option.is_empty() && matches!(role.as_str(), "checkbox" | "radio") {
         return Err(PauseKind::Legal);
