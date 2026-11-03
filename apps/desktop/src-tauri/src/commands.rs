@@ -1919,12 +1919,12 @@ async fn apply_preflight_of(db: &Db, application_ids: &[String]) -> Result<Prefl
 
 #[tauri::command]
 pub async fn apply_view(state: State<'_, AppState>, id: String) -> Result<RunView> {
-    apply::view(&*state.work().await?, &id).await
+    apply::view_swept(&*state.work().await?, &id).await
 }
 
 #[tauri::command]
 pub async fn apply_latest(state: State<'_, AppState>) -> Result<Option<RunView>> {
-    apply::latest(&*state.work().await?).await
+    apply::latest_swept(&*state.work().await?).await
 }
 
 /// A person's act, from the pause panel's buttons. Page text never reaches this.

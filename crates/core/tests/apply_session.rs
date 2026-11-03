@@ -951,6 +951,83 @@ async fn orphans_are_swept_on_the_next_start() {
     assert_eq!(session::sweep_orphans(&w.db).await.unwrap(), 0);
 }
 
+/// A crashed host's run, its folder with a marked browser, and a `claude purge` that takes
+/// 5 s. What a person does next (`look`) must end the run and remove the folder without
+/// waiting for that purge, which is started and left to finish on its own.
+async fn a_look_after_a_host_crash_ends_the_run(look: impl AsyncFnOnce(&World, &[String])) {
+    let w = world().await;
+    let (run, apps) = run_of(&w, &["Acme", "Globex"]).await;
+    crashed_host(&w.db, &run, 600).await;
+    let dir = apply::run_dir(&w.db, &run);
+    std::fs::create_dir_all(dir.join("profile")).unwrap();
+    std::fs::create_dir_all(session_cwd(w.db.paths())).unwrap();
+    let mut marked = Killed(browser(&dir));
+    let f = fake(&w, json!([]), &[("JOBPILOT_FAKE_PURGE_SLEEP_MS", "5000")]).await;
+
+    let begun = Instant::now();
+    look(&w, &apps).await;
+    let took = begun.elapsed();
+
+    assert!(took < Duration::from_secs(2), "the look took {took:?}");
+    assert_eq!(run_state(&w.db, &run).await, "ended");
+    assert_eq!(agent_state(&w.db, &run).await.0, "halted");
+    assert!(!dir.exists());
+    let begun = Instant::now();
+    while !gone(&mut marked.0) {
+        assert!(begun.elapsed() < KILL, "the marked process is gone");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    eventually("the purge is started", WAIT, async || f.purges().len() == 1).await;
+}
+
+/// A stand-in that a failed test does not leave running.
+struct Killed(Child);
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[tokio::test]
+async fn a_status_read_after_a_host_crash_ends_the_run_and_removes_its_folder() {
+    a_look_after_a_host_crash_ends_the_run(async |w, _| {
+        let seen = apply::latest_swept(&w.db).await.unwrap().unwrap();
+        assert_eq!(seen.state, "ended");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_show_after_a_host_crash_ends_the_run_and_removes_its_folder() {
+    a_look_after_a_host_crash_ends_the_run(async |w, _| {
+        let id = apply::latest(&w.db).await.unwrap().unwrap().id;
+        let seen = apply::view_swept(&w.db, &id).await.unwrap();
+        assert_eq!(seen.state, "ended");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_manual_record_after_a_host_crash_does_not_wait_for_the_purge() {
+    a_look_after_a_host_crash_ends_the_run(async |w, apps| {
+        let saved = apply::record_outcome(
+            &w.db,
+            "cli",
+            &apps[1],
+            "applied",
+            None,
+            "",
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.status, "applied");
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_live_run_and_a_new_ready_run_are_not_orphans() {
     let w = world().await;

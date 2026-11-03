@@ -120,7 +120,7 @@ pub async fn apply(db: &Db, command: ApplyCommand) -> Result<Output> {
             host(db, &id).await
         }
         ApplyCommand::Session { id } => host(db, &id).await,
-        ApplyCommand::Status => match apply::latest(db).await? {
+        ApplyCommand::Status => match apply::latest_swept(db).await? {
             Some(run) => {
                 let text = summary(&run);
                 out(run, text)
@@ -128,7 +128,7 @@ pub async fn apply(db: &Db, command: ApplyCommand) -> Result<Output> {
             None => out(json!(null), "no apply run yet".to_owned()),
         },
         ApplyCommand::Show { id } => {
-            let run = apply::view(db, &id).await?;
+            let run = apply::view_swept(db, &id).await?;
             let text = summary(&run);
             out(run, text)
         }

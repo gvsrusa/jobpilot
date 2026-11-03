@@ -632,6 +632,21 @@ pub async fn latest(db: &Db) -> Result<Option<RunView>> {
     }
 }
 
+/// `view`, for a person's look (`apply show`, the run screen): a run whose host died is
+/// ended first, its processes and folder gone, so the look does not show it `running` with a
+/// signed-in browser profile left on disk. The purge is not waited for. A failed sweep still
+/// reads.
+pub async fn view_swept(db: &Db, id: &str) -> Result<RunView> {
+    let _ = session::sweep_orphans_quickly(db).await;
+    view(db, id).await
+}
+
+/// `latest`, for a person's look (`apply status`, the Copilot stop), swept as `view_swept`.
+pub async fn latest_swept(db: &Db) -> Result<Option<RunView>> {
+    let _ = session::sweep_orphans_quickly(db).await;
+    latest(db).await
+}
+
 /// Only a person ends a pause: page text and the session cannot.
 pub async fn resolve_pause(
     db: &Db,
@@ -1401,8 +1416,9 @@ pub async fn record_outcome(
 
 /// A run's own proxy writes this application's status: a second writer would race it. A run
 /// whose host died is swept first, as `start` does, so it does not block a record for ever.
+/// The sweep does not wait for `claude purge`, so a record never stalls on it.
 pub(crate) async fn refuse_in_a_run(db: &Db, application_id: &str) -> Result<()> {
-    session::sweep_orphans(db).await?;
+    session::sweep_orphans_quickly(db).await?;
     match in_a_run(db, application_id).await? {
         true => Err(Error::Refused("in_active_run".into())),
         false => Ok(()),

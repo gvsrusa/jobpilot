@@ -389,6 +389,14 @@ async fn purge(bin: &Path, session: &Path) -> bool {
     )
 }
 
+/// `sweep_orphans` for a path a person waits on: a status read, a show, a Manual record.
+/// The same runs end and the same folders go, but `claude purge` is started and not waited
+/// for (it can take up to `PURGE_TIMEOUT`), and the binary is looked up without a login
+/// shell. The purge outlives this process if it must; a failure to start it is logged.
+pub async fn sweep_orphans_quickly(db: &Db) -> Result<usize> {
+    sweep(db, Purge::Detached).await
+}
+
 /// Ends what a dead host left: first `runner::reap_stale`, so its agent run reads `halted`.
 /// A run is active while its host lives (an agent run neither terminal nor halted), or while
 /// it is `ready`, unclaimed, and younger than `READY_STALE`. A host that died in `prepare`
@@ -396,6 +404,16 @@ async fn purge(bin: &Path, session: &Path) -> bool {
 /// ended gets what a host does at its end. Then a folder under `<root>/apply/` whose run is
 /// gone or ended is cleaned. The session folder stays. Returns how many runs it ended.
 pub async fn sweep_orphans(db: &Db) -> Result<usize> {
+    sweep(db, Purge::Wait).await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Purge {
+    Wait,
+    Detached,
+}
+
+async fn sweep(db: &Db, purge: Purge) -> Result<usize> {
     runner::reap_stale(db).await?;
     let orphans: Vec<String> = sqlx::query_scalar(
         "SELECT r.id FROM apply_runs r LEFT JOIN agent_runs a ON a.id = r.agent_run_id \
@@ -434,15 +452,41 @@ pub async fn sweep_orphans(db: &Db) -> Result<usize> {
     }
 
     // Looked up only when something is left to purge for.
-    let bin = match session_cwd(db.paths()).is_dir() {
-        true => claude_code::find_binary(Some(db)).await.ok(),
-        false => None,
+    let session = session_cwd(db.paths());
+    let bin = match (session.is_dir(), purge) {
+        (false, _) => None,
+        (true, Purge::Wait) => claude_code::find_binary(Some(db)).await.ok(),
+        (true, Purge::Detached) => claude_code::find_binary_quietly(Some(db))
+            .await
+            .ok()
+            .flatten(),
     };
+    let inline = bin.as_deref().filter(|_| purge == Purge::Wait);
     for id in &orphans {
-        wind_up(db, id, bin.as_deref(), None).await?;
+        wind_up(db, id, inline, None).await?;
     }
     for id in &leftovers {
-        cleanup(db, id, bin.as_deref()).await?;
+        cleanup(db, id, inline).await?;
+    }
+    if purge == Purge::Detached
+        && let Some(bin) = &bin
+        && !purge_detached(bin, &session)
+    {
+        let detail = json!({ "folder": session.display().to_string() });
+        let first = orphans.iter().chain(&leftovers).next().map(String::as_str);
+        audit::record(db, "system", "purge_failed", first, detail).await?;
     }
     Ok(orphans.len())
+}
+
+/// `claude purge <session> --yes`, started and left to run: nobody waits for it, and it is
+/// not killed when this process ends. False when it could not be started.
+fn purge_detached(bin: &Path, session: &Path) -> bool {
+    let mut command = child::command(bin, &child_env(), session);
+    command
+        .arg("purge")
+        .arg(session)
+        .arg("--yes")
+        .kill_on_drop(false);
+    command.spawn().is_ok()
 }
