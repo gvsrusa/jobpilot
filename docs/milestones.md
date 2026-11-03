@@ -220,14 +220,14 @@ Gates: all five apply. Build includes the pinned runtime manifest; `browser setu
 
 ### 0.6 gate record
 
-Details and the full lists are in [release 0.6.0](releases/0.6.0.md). Rows marked `PLACEHOLDER_TASK_14_*` are filled by the controller after a real run on a temporary root, and a row that still shows a placeholder was not run.
+Details and the full lists are in [release 0.6.0](releases/0.6.0.md). The Task 14 rows were filled by the controller from real runs on a temporary root and from CI run 41719036785.
 
 | Gate | Result |
 |---|---|
 | 1. Build | `scripts/ci-local.sh --fast` passed at the Task 13 commit (figures in the [release note](releases/0.6.0.md#tests)). `pnpm tauri build --no-bundle` and the launched debug app: passed at d30e69d (`pnpm --filter desktop sidecar`, then `tauri build --debug --no-bundle`; a 111 MB debug binary). The window was not launched. |
-| 2. Tests | Local macOS: see [release 0.6.0](releases/0.6.0.md#tests). The `browser_e2e_*` suite in real Chromium: `PLACEHOLDER_TASK_14_E2E`. Keychain suites: 91 passed, 0 failed, run one thread at a time as `ci-local.sh` does, at d30e69d. |
+| 2. Tests | Local macOS: see [release 0.6.0](releases/0.6.0.md#tests). The `browser_e2e_*` suite in real Chromium: passed in real Chromium on macOS and Windows in CI run 41719036785, and locally 11 of 11. Keychain suites: 91 passed, 0 failed, run one thread at a time as `ci-local.sh` does, at d30e69d. |
 | 3. Migrations | `a_fresh_database_is_schema_17` and `a_0_5_database_upgrades_to_0_6` (figures in the release note). An upgrade of a database made by the real 0.5 binary: passed: a home made by the 0.5.0 CLI (802df62, schema 15) opened at schema 17 under the 0.6 CLI, with its application and question unchanged. |
-| 4. Windows and macOS | `PLACEHOLDER_TASK_14_CI`. The CI `Browser end to end` step is the first run of headed Chromium, the sweep, and the `.cmd` shims on Windows. ConPTY with a real `claude`, and a person on Windows, are not run by anyone. |
+| 4. Windows and macOS | run 41719036785 at 2a6a3ab: macOS and Windows green, including Browser end to end, keychain, TLS handshake, and the tauri build. This is the first run of the 0.6 tree on Windows.. The CI `Browser end to end` step is the first run of headed Chromium, the sweep, and the `.cmd` shims on Windows. ConPTY with a real `claude`, and a person on Windows, are not run by anyone. |
 | 5. Docs and risks | Updated: policy register (prose and site-row consequences only; no AI provider row, no owner decision table row, no verdict), agents, architecture, database schema, AI providers, threat model, wireframes (screens 11, 12, and 19), development guide, PRD, README, changelog, and the release note. Risks are in the release note. |
 
 Exit tests not proven end to end:
