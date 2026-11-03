@@ -3,7 +3,7 @@
 ## Prerequisites
 
 - Rust 1.99.1. `rust-toolchain.toml` pins it, so `rustup` installs it on first use. It includes `clippy` and `rustfmt`.
-- Node 24 and pnpm 12.16.1 (`packageManager` in `package.json`; enable with `corepack enable`).
+- Node 24 and pnpm 12.16.1 (`packageManager` in `package.json`; enable with `corepack enable`). The browser runtime (release 0.6) runs on the Node it finds, and needs 20 or later: the strictest `engines.node` in its lockfile (`NODE_MIN`). A Node that does not answer `--version` reads as too old, with its version shown as `unknown`.
 - Tauri 2 system requirements: Xcode command line tools on macOS; WebView2 and the MSVC build tools on Windows.
 
 ## Setup
@@ -47,6 +47,18 @@ JOBPILOT_SECRET_SERVICE=jobpilot-test cargo test --workspace -- --ignored --test
 Release 0.3 adds sealed answers (`memory_answers.body_enc`), so `memory`, `memory_use`, and `crypto` hold the tests that touch the keychain for them. Read paths never ask it: `plain_work_makes_no_keychain_call` in `crypto.rs` is the one test that may read the call count.
 
 `real_claude_has_no_tools_smoke`, `real_gemini_has_no_tools_smoke`, `real_tls_handshake`, and `make_fixtures` are also ignored, and are skipped by name (`real_claude`, `real_gemini`, `real_tls`, `make_fixtures`), so CI never calls the real `claude` or `gemini` or rewrites the committed resume fixtures, and the keychain steps never open the TLS check. The `browser_e2e_*` tests and `serve_fixtures` are skipped by name too: they have their own step, below. `locked_keychain_is_unavailable_not_missing` swaps the default macOS keychain for a throwaway one, so it runs only with `JOBPILOT_ALLOW_KEYCHAIN_SWAP=1` and is not run in CI.
+
+### The browser runtime (release 0.6)
+
+The apply modes drive Chromium through the Playwright MCP server, which is not bundled. `jobpilot browser setup` installs it into `<root>/browser-runtime`: it finds Node and npm (`JOBPILOT_NODE_BIN` in a debug build only, then `PATH`, the usual folders, then one login-shell lookup), runs `npm ci --ignore-scripts` on the committed `crates/core/assets/browser-runtime/package.json` and `package-lock.json`, then `node node_modules/playwright/cli.js install chromium` with `PLAYWRIGHT_BROWSERS_PATH` inside that folder. `jobpilot browser status` reads the state: `no_node`, `node_too_old`, `not_installed`, `wrong_version`, or `ready`. Setup is refused while the emergency pause is on, and in the terminal panel. Backup and export skip `browser-runtime/` and `apply/`; delete-all removes them. Never run either command without a temporary `JOBPILOT_HOME`.
+
+**Fakes.** No test starts the real `claude`. `crates/core/tests/mock-claude-apply/claude` (Node, with a `claude.cmd` twin) is a scripted fake: it starts the `jobpilot` server named in its `--mcp-config` (the real `jobpilot apply-mcp`), runs the steps of `JOBPILOT_FAKE_SCENARIO` (`{"tool", "args"}`, `{"sleep_ms"}`, `{"exit"}`), and appends every reply to `JOBPILOT_FAKE_REPLIES`, so a test can check what the proxy refused. It records `purge` calls too, and ignores SIGTERM and SIGHUP, as a stubborn session would. In step arguments, `"@ref:<name>"` resolves to the ref of the control with exactly that name in the last snapshot, and `"@brief:<path>"` reads a field of the last `apply_next` reply. `crates/core/tests/mock-mcp/server.mjs` is a fake Playwright MCP server on stdio: it answers `tools/list` with a fixed list, serves the snapshot in `MOCK_SNAPSHOT` (read on every call), and has hooks for the edge cases (`MOCK_EXIT_AFTER`, `MOCK_BIG`, `MOCK_NOISE`, `MOCK_AFTER_FILL`, `MOCK_CLICK_REF`, `MOCK_AFTER_CLICK`, `MOCK_DIE_ON_CLICK`, and a `slow` call that never answers). The proxy, session, Copilot, and Autonomous suites (`apply_proxy`, `apply_session`, `copilot`, `autonomous`) use these; `apply_session` needs the sidecar built, which `cargo test --workspace` does.
+
+**Bumping the pin.** The pin is `@playwright/mcp` 0.0.84 with `playwright` `1.65.0-alpha-2026-10-30`.
+1. Change the version in `crates/core/assets/browser-runtime/package.json`, regenerate the lock with `npm install --package-lock-only` in that folder, and update `PLAYWRIGHT_MCP`, `PLAYWRIGHT`, and, if the lock's strictest `engines.node` moved, `NODE_MIN` in `crates/core/src/browser/runtime.rs`. `the_pin_matches_the_committed_lock` and `the_node_floor_is_the_strictest_engine_in_the_lock` check them.
+2. Re-run the `tools/list` check against the new server: run `jobpilot browser setup` on a temporary root, start `node <root>/browser-runtime/node_modules/@playwright/mcp/cli.js --config <a playwright.json>`, send `initialize` and `tools/list` as newline JSON, and compare the names and input schemas with the 13 tools in `guard::BROWSER_TOOLS`. A new tool stays out by itself; a changed argument (a new path or code argument on a forwarded tool) needs a guard first. Check that the server still adds `--disable-blink-features=AutomationControlled` only when no `--disable-blink-features` argument is given.
+3. Run the `browser_e2e_*` suite below.
+4. Update the Vendor facts of the release plan and the threat model's pin residual with what you read and the date.
 
 ### Apply mode in a real browser (release 0.6)
 
@@ -146,7 +158,7 @@ JOBPILOT_HOME=/tmp/jobpilot-dev cargo run -p jobpilot-cli -- status
 
 Migrations live in `crates/core/migrations/` and run through `sqlx::migrate!`.
 
-1. Add the next file, for example `0006_<name>.sql` (the last shipped is `0015`, schema version 15). Number sequentially.
+1. Add the next file, for example `0006_<name>.sql` (the last shipped is `0017`, schema version 17). Number sequentially.
 2. Never edit a migration that has shipped. SQLx stores a hash of each applied file; a change breaks every existing database. Fix forward with a new file.
 3. Keep line endings LF. `.gitattributes` forces `*.sql text eol=lf`, since CRLF changes the hash.
 4. Use runtime `sqlx::query`, not `query!`, so builds need no `DATABASE_URL` or `sqlx-cli`.

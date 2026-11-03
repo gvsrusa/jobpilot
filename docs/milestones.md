@@ -1,6 +1,6 @@
 # JobPilot AI: Milestone Plan
 
-Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) and [PRD](prd.md). Requirement IDs are `FR-<section>.<n>` from the PRD. Releases 0.1 to 0.5 are built; 0.6 onward are plans.
+Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) and [PRD](prd.md). Requirement IDs are `FR-<section>.<n>` from the PRD. Releases 0.1 to 0.6 are built; 1.0 is a plan.
 
 ## Process
 
@@ -192,9 +192,9 @@ Exit tests not proven end to end:
 
 ## Release 0.6: Browser automation
 
-Scope: Playwright runtime, permissions engine, Manual and Copilot modes, and the Claude Code apply mode (owner decision of 2026-11-01, below). Per D2, Copilot runs on a site where no clause forbids it, recorded as "no clause found" (Greenhouse, Lever, Ashby); a site row that is `blocked` stays blocked. Autonomous mode is default-off and ships only for connectors that pass policy review.
+Scope: Playwright runtime, permissions engine, Manual and Copilot modes, the Autonomous gate, and the Claude Code apply mode (owner decision of 2026-11-01, below). **Built.** The gate record follows the exit tests. The runtime is `@playwright/mcp` 0.0.84 on the owner's own Node (20 or later), installed on request by `jobpilot browser setup` from a committed lockfile, with Chromium downloaded beside it. Per D2, Copilot runs on a site where no clause forbids it, recorded as "no clause found" (Greenhouse, Lever, Ashby); a site row that is `blocked` stays blocked. Autonomous ships as a gate: zero sites are verified (`permissions::VERIFIED` is empty), so nothing is eligible, and its run path (`jobpilot apply autonomous run <application>`, Tauri `autonomous_start`) is refused while no site is eligible.
 
-**Owner decision of 2026-11-01: Claude Code apply mode.** Release 0.6 also plans a mode in which the app starts the owner's own `claude` in its terminal panel with Playwright MCP and a visible browser, on all sites including Indeed, LinkedIn, and Workday. It overrides the `blocked` and `unknown` site rows and decision D2 for this mode only, on the owner's own accounts, and submits with no per-application check once the owner starts a run. These stay: only approved answers and profile facts; browser tools only, with files limited to the chosen resume and letter; stops for CAPTCHA, MFA, identity checks, and legal declarations, with no bypass; every application logged and tracked; and emergency pause stops the session. Stated risk: the site may restrict or ban the account. It is recorded in the [policy register](policy-register.md#owner-decision-2026-11-01-claude-code-apply-mode-release-06). **Planned, not built.** Its exit tests are written in the 0.6 plan.
+**Owner decision of 2026-11-01: Claude Code apply mode.** The app starts the owner's own `claude` in its terminal panel, or the CLI in a plain terminal, with JobPilot's `apply-mcp` proxy in front of the Playwright server and a visible Chromium, on all sites including Indeed, LinkedIn, and Workday. It overrides the `blocked` and `unknown` site rows and decision D2 for this mode only, on the owner's own accounts, and submits with no per-application check once the owner starts a run. These stay, with no setting that turns them off: only approved answers and profile facts, checked in Rust before any value is typed; browser tools only, through the proxy, with uploads limited to the chosen resume and letter; stops for sign-in, CAPTCHA, MFA, identity checks, and legal declarations, with no bypass; every application logged and tracked; and emergency pause kills every process of the run. Stated risk, accepted by the owner: a site may restrict or ban the account. It is recorded in the [policy register](policy-register.md#owner-decision-2026-11-01-claude-code-apply-mode-release-06). **Built in 0.6.**
 
 Requirements: FR-3.22, FR-9.1 to FR-9.21, FR-11.6, FR-12.4.
 
@@ -207,7 +207,35 @@ Exit tests:
 - Rule-based form mapping (FR-3.22) fills common fields with no AI backend.
 - Application status updates after submission, and each submission is audited.
 
-Gates: all five apply. Build includes the Playwright runtime and its browser binaries; migrations add permission and automation-run tables; Windows and macOS means isolated browser launch and pause pass on both.
+Apply mode exit tests (the Claude Code apply mode, owner decision of 2026-11-01). Each runs with the scripted fake `claude`, the real `apply-mcp`, and the pinned Playwright server on local fixture forms on `127.0.0.1`; no test reaches a real site or starts the real `claude`:
+- A run applies on every fixture site, including the Indeed-, LinkedIn-, and Workday-shaped forms, with no per-application check (`browser_e2e_fills_uploads_and_submits_on_each_fixture`, `a_scripted_session_applies_to_two_applications_and_ends`, `claude_code_is_allowed_on_every_site_and_every_action_once_started`).
+- Only the allowed tools reach the server: the proxy lists its 3 apply tools and 13 browser tools, and refuses any other name (`tools_list_is_three_plus_thirteen_and_a_new_upstream_tool_stays_out`, `a_denied_tool_never_reaches_the_server`, `argv_is_exactly_the_verified_list`, `playwright_is_never_in_the_session_config`).
+- Only the two files upload: the chosen resume and cover letter, staged per application (`only_the_two_files_upload`, `a_symlink_inside_files_pointing_out_is_refused`, `browser_e2e_a_hostile_page_changes_nothing`).
+- A value that is not an approved answer or profile fact is refused (`a_value_must_be_a_fact`, `a_fully_steered_session_gets_nowhere`, `work_authorization_needs_the_stated_value_and_never_infers`).
+- Every stop holds until a person acts, and no tool or page ends one (`browser_e2e_each_stop_holds_until_a_person_continues`, `a_captcha_page_holds_the_reply_until_a_person_continues`, `no_tool_ends_a_pause`, `every_snapshot_is_scanned_with_no_exception`).
+- Every application is logged and tracked: an audit row, a note, and the status through the tracking agent, with no page text in the run log (`a_submission_is_logged_tracked_and_audited`, `nothing_from_a_page_lands_in_the_run_log`).
+- Emergency pause kills every process of the run, `claude`, `apply-mcp`, the Playwright server, and Chromium, within 2 s (`browser_e2e_emergency_pause_closes_the_browser_and_deletes_the_profile`, `emergency_pause_kills_claude_the_server_and_the_browser_marker`, desktop `pause_set_closes_the_apply_session_before_the_row`).
+
+Gates: all five apply. Build includes the pinned runtime manifest; `browser setup` downloads the runtime and Chromium (decision 22: no Node, Playwright, or Chromium is bundled). Migrations add permission and automation-run tables (`0016`, `0017`). Windows and macOS means isolated browser launch and pause pass on both.
+### 0.6 gate record
+
+Details and the full lists are in [release 0.6.0](releases/0.6.0.md). Rows marked `PLACEHOLDER_TASK_14_*` are filled by the controller after a real run on a temporary root, and a row that still shows a placeholder was not run.
+
+| Gate | Result |
+|---|---|
+| 1. Build | `scripts/ci-local.sh --fast` passed at the Task 13 commit (figures in the [release note](releases/0.6.0.md#tests)). `pnpm tauri build --no-bundle` and the launched debug app: `PLACEHOLDER_TASK_14_BUILD`. |
+| 2. Tests | Local macOS: see [release 0.6.0](releases/0.6.0.md#tests). The `browser_e2e_*` suite in real Chromium: `PLACEHOLDER_TASK_14_E2E`. Keychain suites: `PLACEHOLDER_TASK_14_KEYCHAIN`. |
+| 3. Migrations | `a_fresh_database_is_schema_17` and `a_0_5_database_upgrades_to_0_6` (figures in the release note). An upgrade of a database made by the real 0.5 binary: `PLACEHOLDER_TASK_14_UPGRADE`. |
+| 4. Windows and macOS | `PLACEHOLDER_TASK_14_CI`. The CI `Browser end to end` step is the first run of headed Chromium, the sweep, and the `.cmd` shims on Windows. ConPTY with a real `claude`, and a person on Windows, are not run by anyone. |
+| 5. Docs and risks | Updated: policy register (prose and site-row consequences only; no AI provider row, no owner decision table row, no verdict), agents, architecture, database schema, AI providers, threat model, wireframes (screens 11, 12, and 19), development guide, PRD, README, changelog, and the release note. Risks are in the release note. |
+
+Exit tests not proven end to end:
+- Every apply mode exit test above ran against a scripted fake `claude` and fixture forms. A real `claude` session: `PLACEHOLDER_TASK_14_REAL_CLAUDE`. Whether `--tools ""` leaves the MCP tools reachable in an interactive session, and whether the trust dialog shows, are read off that run.
+- Emergency pause from the native menu and from `jobpilot pause set` in a second terminal, with a real session: `PLACEHOLDER_TASK_14_PAUSE`.
+- A crash of the desktop mid-run, then a relaunch: `PLACEHOLDER_TASK_14_CRASH`.
+- Manual and Copilot once each in the real window: `PLACEHOLDER_TASK_14_MODES`.
+- No real site was opened, in any form. Applying on a real site is the owner's act, after release. Pause detection on real CAPTCHA, MFA, and legal pages is unproven.
+- "The permissions engine allows Autonomous submission only for connectors with verified permission and explicit user authorization" is proven with a test-only verified list; no site is verified, so no Autonomous run has submitted anywhere but a fake server.
 ## Release 1.0: Stable open-source distribution
 
 Scope: signing and notarization, auto-update, security review, public docs. FR-1.8 installers were first delivered unsigned in 0.1; 1.0 signs them.

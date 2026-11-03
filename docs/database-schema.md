@@ -1,6 +1,6 @@
 # JobPilot AI: Database Schema
 
-Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md), [PRD](prd.md), [architecture](architecture.md). Requirement IDs (`FR-<section>.<n>`) come from the PRD. Sections 1 (release 0.1), 2 (release 0.2), 3 (release 0.3), 3a (release 0.4), and 3b (release 0.5) are implemented; section 5 is still a proposal. `schema_version` is 15 on a fresh database, and migration `0015` is the last.
+Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md), [PRD](prd.md), [architecture](architecture.md). Requirement IDs (`FR-<section>.<n>`) come from the PRD. Sections 1 (release 0.1), 2 (release 0.2), 3 (release 0.3), 3a (release 0.4), 3b (release 0.5), and 3c (release 0.6) are implemented; section 5 is still a proposal. `schema_version` is 17 on a fresh database, and migration `0017` is the last.
 
 The database is SQLite accessed through SQLx (FR-2.1) and managed by versioned migrations (FR-2.5). It lives at `<data root>/jobpilot.db`, in WAL mode with foreign keys on. Full-text search uses FTS5 (FR-2.2).
 
@@ -272,6 +272,23 @@ Rows of note:
 - `match_results.score` is rules only. `semantic` holds the model's separate evaluation and never changes the score. An unknown value is never a mismatch: the criterion is not compared.
 - `company_notes.origin` is `pasted` (a person's) or `model` (a summarized fact whose source id is in `source_ref`).
 - `connector_limits` is keyed by `(connector, host)`. It is what makes a rate limit survive a restart and apply to the GUI and CLI together.
+
+## 3c. Release 0.6 tables (decided, shipped)
+
+Migrations `0016` and `0017` add browser automation, on top of the 0.5 tables. Each file opens with its rule 7 note. `schema_version` is 17 on a fresh database, and a 0.5 database (version 15) opens at 17 after a `pre-migrate-15-*` snapshot (`a_fresh_database_is_schema_17` and `a_0_5_database_upgrades_to_0_6` in `crates/core/tests/db.rs`). The 0.6 plan named schema 16; `0017` was added during the build so each item records its own release.
+
+| Migration | Tables | Class and handling (rule 7) |
+|---|---|---|
+| `0016_automation.sql` | `apply_runs`, `apply_items`, `apply_pauses`, `autonomous_grants` | The file's note: "apply_items and apply_pauses hold Untrusted excerpts and Personal paths, plain. Backup copies them with the database, export writes them, and delete-all removes them with the root. No table here holds a value of a sealed answer or a work-authorization row. autonomous_grants holds a connector name, who granted, and when: no text." |
+| `0017_apply_release.sql` | `apply_items.released_answers` | Ids only: the sealed answers a person released for one item at start, as a JSON array of answer ids. No text, and `apply_items` is already in backup, export, and delete-all. |
+
+Rows of note:
+
+- `apply_runs.mode` is `copilot`, `autonomous`, or `claude_code`; Manual makes no run. `state` is `ready`, `running`, or `ended`, and every ending of a run (finish, halt, cancel, crash, early exit) reaches `ended`, so a new run can always start. At most one run is `ready` or `running` at a time. `agent_run_id` links the runner's row once a host claims the run.
+- `apply_items` has one row per application in a run (at most 25). `state` is `queued`, `active`, `filled`, `submitted`, `uncertain`, `skipped`, `manual_required`, or `failed`. `submit_clicks` is counted by Rust from its own snapshot, never from the model. `confirmation_text` (the last 2,000 normalized characters of the page after a submission) and `confirmation_url` are the page's claim, Untrusted, and never logged. `reason` is a snake_case code or null, never page text. `status_written` makes `settle` write each status once. `auth_released` and `released_answers` are what the owner released for this item at start.
+- `apply_pauses.kind` is `legal`, `sensitive`, `identity`, `captcha`, `mfa`, `login`, or `other`; `origin` is `page` (the scan), `model` (`apply_pause`), or `guard` (a refused value or choice, a second submit click). `excerpt` is Untrusted page text, cut to 300 characters, shown inert. `resolved_by` is `gui` or `cli` for a person, or `system` only for `timeout` and `stopped`. `resolution` is `continue`, `take_over`, `timeout`, or `stopped`.
+- `autonomous_grants` holds a person's grant for one connector. A grant alone makes nothing eligible while the verified list is empty.
+- Execution logs and the audit log hold ids, codes, counts, and durations for these runs, never page text, answers, or values (M-26).
 
 ## 4. Migration rules
 

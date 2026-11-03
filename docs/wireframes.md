@@ -1,6 +1,6 @@
 # JobPilot AI: UI Wireframes
 
-Status: draft for owner approval. Date: 2026-11-02. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) section 9 (UI wireframes), [PRD](prd.md), [milestones](milestones.md), [architecture](architecture.md#64-appsdesktopsrc-react-frontend), [policy register](policy-register.md), [AI providers](ai-providers.md), [agents](agents.md), and [threat model](security/threat-model.md). Requirement IDs (`FR-<section>.<n>`) come from the PRD. Screens 2 to 7, 10, 12 to 14, and 16 to 18 are built (through release 0.3). Screens 8, 9, and 11 are proposals for 0.5 and 0.6.
+Status: draft for owner approval. Date: 2026-11-02. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md) section 9 (UI wireframes), [PRD](prd.md), [milestones](milestones.md), [architecture](architecture.md#64-appsdesktopsrc-react-frontend), [policy register](policy-register.md), [AI providers](ai-providers.md), [agents](agents.md), and [threat model](security/threat-model.md). Requirement IDs (`FR-<section>.<n>`) come from the PRD. Screens 2 to 14 and 16 to 19 are built (through release 0.6). Screens 8 and 9 shipped in 0.5, and screens 11 and 19 in 0.6.
 
 These are layout sketches, not visual design. They fix what each screen shows, what it refuses to show, and how a keyboard user moves through it. Colours, type, and spacing belong to the shadcn/ui theme.
 
@@ -8,7 +8,7 @@ These are layout sketches, not visual design. They fix what each screen shows, w
 
 ### Release map
 
-Only the first five screens (shell, recovery, status, documents, data) belong to release 0.1, and screens 16 to 18 belong to 0.3. They match plan Task B8: three views (`status`, `documents`, `data`) plus the recovery screen. Every later screen is a proposal for the release named, and a release plan may change it.
+Only the first five screens (shell, recovery, status, documents, data) belong to release 0.1, and screens 16 to 18 belong to 0.3. They match plan Task B8: three views (`status`, `documents`, `data`) plus the recovery screen. Every screen in the table is built in the release named; a section marked "as built" records where the build moved from the sketch.
 
 | # | Screen | Release | Requirements |
 |---|---|---|---|
@@ -21,17 +21,18 @@ Only the first five screens (shell, recovery, status, documents, data) belong to
 | 8 | Job list | 0.5 | FR-5.1, FR-5.11 to FR-5.14, FR-6.3, FR-6.11 |
 | 9 | Job detail with score explanation | 0.5 | FR-6.1, FR-6.4 to FR-6.10 |
 | 10 | Resume compare with evidence | 0.2 | FR-7.9 to FR-7.12 |
-| 11 | Application review and pause state | 0.6 | FR-9.2 to FR-9.6, FR-9.16 to FR-9.21 |
-| 12 | Terminal panel | 0.2 | FR-10.1, FR-10.2, FR-12.5 |
+| 11 | Application review and pause state | **0.6** (four modes: Manual, Copilot, Autonomous, Claude Code apply) | FR-9.2 to FR-9.6, FR-9.16 to FR-9.21 |
+| 12 | Terminal panel | 0.2 (header label for an apply run added 0.6) | FR-10.1, FR-10.2, FR-12.5 |
 | 13 | AI provider consent | 0.2 (Claude Code row), 0.4 (other providers) | FR-3.12, FR-3.30 |
 | 14 | AI providers: Ollama and models | 0.2 | FR-2.13, FR-3.2 to FR-3.8 |
 | 16 | Applications | 0.3 | FR-2.12, FR-8.8, FR-10.9, FR-10.11 |
 | 17 | Career memory | 0.3 | FR-8.1 to FR-8.8, FR-10.10 |
 | 18 | Agents | 0.3 | FR-11.12, FR-11.15, FR-11.16, FR-10.12, FR-12.8 |
+| 19 | Claude Code apply run | **0.6** | FR-9.7 to FR-9.21, FR-12.8 |
 
 ### Rules every screen follows
 
-- **Policy reality, not aspiration.** Screens show what the [policy register](policy-register.md) allows today, with the owner decisions of 2026-11-01 applied to AI providers. For site rows, `unknown` behaves as `blocked`, except Copilot fill on a row recording "no clause found" (D2). A control that is forbidden is shown disabled with its reason, or is absent when it must not exist (a Claude login button). No setting overrides a site verdict.
+- **Policy reality, not aspiration.** Screens show what the [policy register](policy-register.md) allows today, with the owner decisions of 2026-11-01 applied to AI providers. For site rows, `unknown` behaves as `blocked`, except Copilot fill on a row recording "no clause found" (D2), and the Claude Code apply mode, which the owner's decision of 2026-11-01 opens on every site. A control that is forbidden is shown disabled with its reason, or is absent when it must not exist (a Claude login button). No setting overrides a site verdict.
 - **Secrets are never displayed.** Entry fields for secrets are write-only and cleared after save. The list shows names only (FR-12.2, M-03). There is no reveal button anywhere.
 - **Untrusted text is inert.** Job, company, and page text renders as plain text with no HTML, no remote images, and no live links (M-04, FR-12.3). It carries an "untrusted" label.
 - **Authorization values are user-entered only.** No screen pre-fills, suggests, defaults, infers, or autocompletes work authorization or sponsorship (FR-4.9, FR-4.10). The empty state is "Not stated".
@@ -465,6 +466,17 @@ Built in `JobDetail.tsx`.
 
 ## 11. Application review and pause state (release 0.6)
 
+**As built in 0.6.** `Review and apply...` on the selected application opens this screen in place of the Applications list. The heading is "Review application: {role}, {company}" with `Back`, then "Site: {host}". The site-rule block of the sketch below is reduced to the host: the material carries no register rows. The mode group lists **four** modes, each with Rust's fixed note (from `apply::material`), and a mode that is not available is `aria-disabled`, focusable, and described by "Not available. {note}":
+
+| Mode | Note when available | Note when not |
+|---|---|---|
+| Manual | "You fill and submit in your own browser. JobPilot opens the link, gives you files and answers, and records what happened." | (always available) |
+| Copilot | "No clause found for this site. You review and submit." (Greenhouse, Lever, Ashby, and their fixtures) | "The site's terms forbid this. JobPilot will not do it, even if you ask." (Indeed), or "The site has not said whether tools may do this. Treated as blocked until it answers." (Workday, LinkedIn, any other) |
+| Autonomous | (no site today) | "No site or connector qualifies today. Needs a site rule of allowed, verified permission, and your explicit authorization.", or the blocked text on Indeed; below it, "Connectors you authorized for Autonomous: {list or none}." as plain text with no control |
+| Claude Code apply | "Fills and submits with Claude Code in a visible browser. Add it to a run from Applications." | "Needs the browser runtime and Claude Code set up first. Add it to a run from Applications to see what is missing." |
+
+Choosing Copilot shows `Start Copilot` and its live pause panel (`CopilotRun`). Choosing Claude Code apply shows "Select this application on Applications, then press Apply with Claude Code...": a run is started from screen 19, never from here. Answers are copied by Rust: `Copy` for a Normal answer, and `Confirm and copy` for every sealed one, which always asks the native dialog first; the text never reaches the screen, and Rust clears the clipboard after 60 s. Files show with `Copy path`, or "Nothing prepared." with `Prepare documents`. Work authorization shows "stated by you" with `Show what I stated`, or "not stated by you" with `Enter it yourself` (to Profile). `Open the form in my browser` is disabled with "The posting link is not https, so JobPilot will not open it." when it is not. `Record outcome...` opens Outcome, Applied on (optional), Note (optional), and `Save outcome`. The original sketch follows.
+
 The review screen shows one application before anything happens on the site. Manual mode is always available on a `user-assisted` row. Copilot is available on sites whose register row records "no clause found" (Greenhouse, Lever, Ashby; decision D2). The mode choice shows each mode's status and the register reason when a mode is not available.
 
 ```text
@@ -510,6 +522,8 @@ Why a mode is unavailable comes from the site's register row and the mode rules.
 Copilot becomes selectable for a site with its own `allowed` row or a row recording "no clause found", and for local fixture forms during development. Autonomous stays default-off and needs verified permission and explicit authorization. No test or setting turns a disabled mode on for a site whose row is `blocked`.
 
 ### Pause state
+
+**As built in 0.6** (`PausePanel`, shared by Copilot and screen 19): the heading is "Run paused: waiting for you", then "The run waits 30 minutes, then stops this application and hands it over to you." The six rows are listed with the active one marked `[>] ... ACTIVE` (`aria-current="step"`), the page's excerpt as inert text in a quote, and the row's fixed note. A `login` pause shows under "Other step that needs a person" with "Sign in, in the browser window." The buttons are `I did this in the browser: continue`, `Take over by hand`, and `Cancel run` (behind a confirmation). There is no Esc handler.
 
 When a Copilot or Autonomous run reaches a mandatory pause, the review screen is replaced by the pause panel. This appears on any Copilot run, including Greenhouse, Lever, and Ashby forms, and CAPTCHA, MFA, identity verification, and legal declarations always trigger it. The six pauses from the agent specification are listed so the user always sees the full set, with the active one marked.
 
@@ -572,6 +586,7 @@ A bottom panel running xterm.js over a Rust PTY. It is a restricted terminal, no
 +-------------+----------------------------------------------------------------+
 ```
 
+- **0.6: the apply run label.** While the panel hosts a Claude Code apply run (screen 19), the header reads `Terminal   Claude Code apply run` in place of `jobpilot CLI only`. The session is `jobpilot apply session <id>`, chosen by Rust (`pty_open_apply`); the webview sends only the run id and the size. If a session is already open, a confirmation asks first: "This ends the terminal session." with `End session` and Cancel; declining, or a failed open, cancels the run. Restart goes back to the plain CLI. Nothing reads the session's output.
 - Commands that need a native confirmation, and the recovery-key commands, are refused here: "Run this in an ordinary terminal, or use the app." The panel shows that line when the PTY layer rejects a command. No command prints a secret value.
 - Scrollback is not stored and is never read into a workflow. Agents have no terminal access.
 - **Release:** 0.2.
@@ -729,8 +744,9 @@ Model rows and the status line change with what JobPilot finds:
 | Applications | Screen 16 |
 | Career memory | Screen 17 |
 | Agents | Screen 18 |
+| Claude Code apply run | Screen 19 |
 
-Open items for the owner: the pause-panel `{timeout}` (proposed as 30 minutes in [agents](agents.md#4-the-nine-agents)) and the Ctrl+` and F6 keys are proposals; the Sign in with ChatGPT row is optional under decision D1.
+Open items for the owner: the pause-panel `{timeout}` is built as 30 minutes ([agents](agents.md#4-the-nine-agents)), and the Ctrl+` and F6 keys are proposals; the Sign in with ChatGPT row is optional under decision D1.
 
 ## 16. Applications (release 0.3)
 
@@ -839,3 +855,99 @@ Every run of the resume, cover letter, career memory, tracking, and analytics ag
 - **Focus order:** Emergency pause, navigation, heading, the run list, then the selected run's buttons and log table.
 - **Empty state:** "No agent has run yet."
 - **Error state:** an alert with the code, such as `paused` on a resume while the pause is on.
+
+## 19. Claude Code apply run (release 0.6)
+
+A run of the Claude Code apply mode, from the checks before it to what each application ended as (owner decision of 2026-11-01). It opens from Applications: each `saved` row has a `Select` checkbox in a "Run" column, and `Apply with Claude Code...` takes 1 to 25 selected applications. The heading is "Apply with Claude Code". It has four states.
+
+**Setup needed**, when the browser runtime or `claude` is missing:
+
+```text
++-------------+----------------------------------------------------------------+
+| ...         | Apply with Claude Code                                         |
+| Applications+----------------------------------------------------------------+
+|             | Setup needed                                                   |
+|             | {why: "The browser runtime is not installed.", or "Node is     |
+|             |  not installed. Install Node, then set up the browser.", or    |
+|             |  "The installed Node is too old. Update it, then set up the    |
+|             |  browser."}                                                    |
+|             | [Set up browser]                                               |
+|             | Claude Code was not found. Install it, or choose its program   |
+|             | on the AI screen.                                              |
+|             +----------------------------------------------------------------+
+|             | [Check again]  [Back]                                          |
++-------------+----------------------------------------------------------------+
+```
+
+**Preflight**, with the fixed copy verbatim:
+
+```text
++-------------+----------------------------------------------------------------+
+| ...         | Apply with Claude Code                                         |
+| Applications+----------------------------------------------------------------+
+|             | Preflight                                                      |
+|             | Runs on your own accounts, in a visible browser. Once started, |
+|             | it submits with no check per application. It stops for         |
+|             | sign-in, CAPTCHA, codes, identity checks, and legal            |
+|             | declarations. A site may restrict an account that uses         |
+|             | automation.                                                    |
+|             | Company Host Resume Letter Answers Sensitive Work    Blocks    |
+|             |                            ready   held back auth.             |
+|             | Beta    {h}  Ready  Ready  4       1         Stated  None      |
+|             | Acme    {h}  None   Ready  2       0         Not     {why}     |
+|             |                                              stated            |
+|             | Sensitive answers and work authorization stay held back unless |
+|             | you release them to this run, in the dialog that opens when    |
+|             | you start it.                                                  |
+|             +----------------------------------------------------------------+
+|             | [Start run]  [Check again]  [Back]                             |
++-------------+----------------------------------------------------------------+
+```
+
+**Running**, polled every second, with the session in the terminal panel (screen 12), which opens by itself:
+
+```text
++-------------+----------------------------------------------------------------+
+| ...         | Apply with Claude Code                                         |
+| Applications+----------------------------------------------------------------+
+|             | Running in the terminal panel and a visible browser.           |
+|             | #  Site            State         Result                        |
+|             | 1  {host}          Submitted     Status recorded as applied.   |
+|             | 2  {host}          In progress                                 |
+|             | 3  {host}          Queued                                      |
+|             +----------------------------------------------------------------+
+|             | (the pause panel of screen 11 when a stop is open)             |
+|             | [Cancel run]   (when no stop is open)                          |
++-------------+----------------------------------------------------------------+
+```
+
+**Ended**:
+
+```text
++-------------+----------------------------------------------------------------+
+| ...         | Apply with Claude Code                                         |
+| Applications+----------------------------------------------------------------+
+|             | Run ended.                                                     |
+|             | #  Site     State         Result                               |
+|             | 1  {host}   Submitted     The page said                        |
+|             |                           > {confirmation text, inert}         |
+|             |                           Status recorded as applied.          |
+|             | 2  {host}   Uncertain     Check the site. JobPilot will not    |
+|             |                           try again.                           |
+|             | 3  {host}   Submitted     [Record status]                      |
+|             | 4  {host}   Handed to you {reason}                             |
+|             +----------------------------------------------------------------+
+|             | [Done]                                                         |
++-------------+----------------------------------------------------------------+
+```
+
+- **Start run** is disabled while any application has a block or the Claude Code consent misses a category ("Your Claude Code consent does not cover: {list}. Review it on the AI screen."). When anything is sealed, Rust asks in a native dialog titled "Sealed answers": "Release {n} sensitive answers and work-authorization rows to this run for {m} applications?" with `Release to this run` and `Leave them out`. Closing the dialog starts no run. The webview cannot release anything. If the consent does not cover `sensitive`, the screen says so and those fields stop for you.
+- Blocks are shown as text, one per line: "Only an application with status Saved can go in a run.", "The posting link is not https.", "It is already in a run that has not ended.", "The resume has a claim to fix before it can be exported.", "The cover letter has a claim to fix before it can be exported.", or "Refused: {code}". The Resume and Letter cells read Ready, None, or Blocked with the reason (a claim to fix first, or a data key that is locked, missing, mismatched, or unreadable).
+- **Record status** shows on an ended run for a submitted item whose status was not written (a pause landed between the click and the result); it calls `apply settle`.
+- "The page said" is the page's claim, recorded as such, not as proof.
+- Item states read: Queued, In progress, Filled, Submitted, Uncertain, Skipped, Handed to you.
+- **Release:** 0.6.
+- **Keyboard:** Tab moves through the table and the buttons. The Select checkboxes on Applications take Space. Esc does not cancel a run; Cancel run is a button and asks to confirm.
+- **Focus order:** Emergency pause, navigation, heading, the state's content, then its buttons in the order shown.
+- **Empty state:** Running with no item yet reads "Starting the session in the terminal panel."
+- **Error state:** an alert with the code: `no_browser_runtime`, `claude_not_found`, `apply_run_active` (another run is open), `apply_run_not_ready`, `consent_required`, `paused`. The emergency pause ends the run `halted`; a halted run does not resume, and you start a new one with what is left.

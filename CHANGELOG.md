@@ -4,6 +4,27 @@ Format follows Keep a Changelog. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.6.0] - unreleased
+
+Browser automation. See `docs/releases/0.6.0.md` for what was and was not exercised.
+
+### Added
+- The browser runtime: `@playwright/mcp` 0.0.84 pinned by a committed lockfile, installed on request by `jobpilot browser setup` (or Set up browser) with the owner's Node 20 or later, and Chromium downloaded beside it. Nothing is bundled. A visible browser, a fresh profile per run deleted at the end, downloads off, and no anti-detection flag.
+- A permissions engine (`permissions`) that decides each browser action by mode, site, register row, verified list, and grant, and refuses by default.
+- Manual mode on every site: a review screen and `jobpilot apply material` and `apply record`, with answers copied by Rust (a sealed one only after a native confirmation) and cleared from the clipboard after 60 s.
+- Copilot mode on Greenhouse, Lever, and Ashby hosted forms (decision D2, recorded as "no clause found"): form parsing from the accessibility snapshot, rule mapping, the `map_form_field` task for the rest, fill and upload, then a review stop where the person submits. `jobpilot apply copilot`.
+- The Autonomous gate: grants (`jobpilot apply autonomous list|grant|revoke`), and a run path (`apply autonomous run`, Tauri `autonomous_start`) refused while no site is verified, which is today. One submission per application, and no model call.
+- The Claude Code apply mode (owner decision of 2026-11-01): `Apply with Claude Code...` on Applications, or `jobpilot apply preflight|start|status|show|resolve|settle|cancel`. The owner's own `claude` runs in the terminal panel behind JobPilot's `apply-mcp` proxy, on all sites, with no per-application check once a run starts. Approved facts only, checked in Rust; browser tools only; the two chosen files only; stops for sign-in, CAPTCHA, MFA, identity, and legal declarations that only a person ends; every application logged and tracked; emergency pause kills every process of the run.
+- A sealed-answer release asked once per run in a native dialog (CLI `--release-sealed`).
+- Screens: the application review (wireframe 11, four modes), the apply run (wireframe 19), and the pause panel. The terminal panel header reads `Claude Code apply run` while it hosts one.
+- Migrations 0016 and 0017. Schema version 17.
+- Tests on a scripted fake `claude`, a fake Playwright server, and, in the `Browser end to end` CI step, the real server and Chromium on fixture forms. No test reaches a site.
+
+### Changed
+- Emergency pause also kills an apply session and its browser, from the desktop or the CLI, and the startup sweeps orphans of a crashed run.
+- An apply run does not resume; the owner starts a new run.
+- Version 0.6.0.
+
 ## [0.5.0] - unreleased
 
 Job discovery and job intelligence. See `docs/releases/0.5.0.md` for what was and was not exercised.
