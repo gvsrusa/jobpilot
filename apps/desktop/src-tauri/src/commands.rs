@@ -2107,13 +2107,16 @@ pub struct Copied {
     pub stale: bool,
 }
 
+/// What a task refused while Copilot runs is told.
+const COPILOT_HOLDS: &str = "a Copilot run holds this until you end its review stop";
+
 /// Copilot on one application: the webview names it, and Rust reads its link, decides, starts
 /// the browser, and fills. The run holds in the AI slot until the person ends its review stop
 /// on the pause panel, so Cancel, the emergency pause, and app exit all reach it. It never
 /// clicks submit.
 #[tauri::command]
 pub async fn copilot_start(state: State<'_, AppState>, application_id: String) -> Result<RunView> {
-    let running = state.ai.begin()?;
+    let running = state.ai.begin_as(Some(COPILOT_HOLDS))?;
     let db = state.work().await?;
     let router = Router::from_settings(&db).await?;
     agents::copilot(&db, &router, ACTOR, &application_id, running.token.clone()).await
@@ -7096,6 +7099,23 @@ mod tests {
                 .unwrap()
         });
         assert_eq!(started, 0);
+    }
+
+    #[test]
+    fn a_task_refused_while_copilot_runs_says_so() {
+        let slot = crate::state::InFlight::default();
+        let held = slot.begin_as(Some(super::COPILOT_HOLDS)).unwrap();
+        let refused = slot.begin().err().unwrap();
+        assert!(
+            matches!(&refused, Error::Refused(why)
+                if why.starts_with("another_task_is_running: a Copilot run holds")),
+            "{refused:?}"
+        );
+        drop(held);
+        let plain = slot.begin().unwrap();
+        let refused = slot.begin().err().unwrap();
+        assert!(matches!(&refused, Error::Refused(why) if why == "another_task_is_running"));
+        drop(plain);
     }
 
     // ---- Autonomous ----

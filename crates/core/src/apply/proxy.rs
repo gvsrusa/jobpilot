@@ -238,6 +238,32 @@ fn picks_options(tool: &str, args: &Value) -> HashSet<String> {
     }
 }
 
+/// Every guard a typed or selected value passes, the same for apply-mcp and Copilot: the
+/// field's label (`field_guard`), then the option a selection names (`option_guard`) or the
+/// choice the target is (`choice_guard`). `picks` says the value selects an option. `None` is
+/// a field with no label that is not a choice: it cannot be judged. `Err` is the pause a
+/// person answers instead.
+pub(crate) fn judge_field(
+    snapshot: &str,
+    target: &str,
+    value: &str,
+    picks: bool,
+    brief: &Brief,
+) -> Option<std::result::Result<(), PauseKind>> {
+    let label = guard::label_of(snapshot, target);
+    let choice = guard::is_choice(snapshot, target);
+    let checked = match &label {
+        Some(label) => guard::field_guard(label, value, brief),
+        None if choice => Ok(()),
+        None => return None,
+    };
+    Some(match (checked, picks, choice) {
+        (Ok(()), true, _) => option_guard(snapshot, target, value, brief),
+        (Ok(()), false, true) => guard::choice_guard(snapshot, target, brief),
+        (checked, _, _) => checked,
+    })
+}
+
 /// Judges the real option a value selects. The value must name, after folding, exactly one
 /// option line in the target's subtree on the last snapshot; `choice_guard` then judges that
 /// option. A value that names none or several, or holds a control character, is a pause:
@@ -617,20 +643,14 @@ impl Session<'_> {
         // itself judged as an option.
         let picked = picks_options(name, &args);
         for (target, value) in guard::fields_in(name, &args) {
-            let label = guard::label_of(&last, &target);
-            let choice = guard::is_choice(&last, &target);
-            let checked = match &label {
-                Some(label) => guard::field_guard(label, &value, &brief),
-                None if choice => Ok(()),
-                None => return Ok(refusal(UNLABELED)),
-            };
-            let checked = match (checked, picked.contains(&target), choice) {
-                (Ok(()), true, _) => option_guard(&last, &target, &value, &brief),
-                (Ok(()), false, true) => guard::choice_guard(&last, &target, &brief),
-                (checked, _, _) => checked,
+            let Some(checked) =
+                judge_field(&last, &target, &value, picked.contains(&target), &brief)
+            else {
+                return Ok(refusal(UNLABELED));
             };
             if let Err(kind) = checked {
-                return self.by_person(kind, &label.unwrap_or_default()).await;
+                let label = guard::label_of(&last, &target).unwrap_or_default();
+                return self.by_person(kind, &label).await;
             }
         }
         if name == "browser_click" {

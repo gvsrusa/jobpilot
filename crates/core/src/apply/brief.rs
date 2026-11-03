@@ -68,29 +68,7 @@ pub async fn build(db: &Db, actor: &str, item: &Item, files: &Path) -> Result<Br
     }
 
     let staged = stage_files(item, files)?;
-    let basic = profile::basic(db).await?;
-    let mut facts = Vec::new();
-    for (name, value) in [("name", &basic.name), ("email", &basic.email)] {
-        if !value.trim().is_empty() {
-            facts.push(Fact {
-                name,
-                value: value.trim().to_owned(),
-            });
-        }
-    }
-    for (name, list) in [
-        ("cities", &basic.cities),
-        ("regions", &basic.regions),
-        ("countries", &basic.countries),
-        ("languages", &basic.languages),
-    ] {
-        if !list.is_empty() {
-            facts.push(Fact {
-                name,
-                value: list.join(", "),
-            });
-        }
-    }
+    let facts = facts_of(&profile::basic(db).await?);
 
     let mut answers = Vec::new();
     for row in usage::approved_for(db).await? {
@@ -139,6 +117,33 @@ pub async fn build(db: &Db, actor: &str, item: &Item, files: &Path) -> Result<Br
         answers,
         work_authorization,
     })
+}
+
+/// The profile facts a form may take: name, email, and each list joined.
+pub(crate) fn facts_of(basic: &profile::ProfileBasic) -> Vec<Fact> {
+    let mut facts = Vec::new();
+    for (name, value) in [("name", &basic.name), ("email", &basic.email)] {
+        if !value.trim().is_empty() {
+            facts.push(Fact {
+                name,
+                value: value.trim().to_owned(),
+            });
+        }
+    }
+    for (name, list) in [
+        ("cities", &basic.cities),
+        ("regions", &basic.regions),
+        ("countries", &basic.countries),
+        ("languages", &basic.languages),
+    ] {
+        if !list.is_empty() {
+            facts.push(Fact {
+                name,
+                value: list.join(", "),
+            });
+        }
+    }
+    facts
 }
 
 fn stated_text(value: &Stated) -> &'static str {

@@ -98,9 +98,13 @@ describe("copilot", () => {
         created_at: "2026-11-03T10:00:01.000Z",
       },
     });
+    let started = false;
     const { api, user } = await openReview({
-      copilot_start: () => new Promise<ApplyRunView>((resolve) => (finish = resolve)),
-      apply_latest: () => latest,
+      copilot_start: () => {
+        started = true;
+        return new Promise<ApplyRunView>((resolve) => (finish = resolve));
+      },
+      apply_latest: () => (started ? latest : null),
       apply_resolve_pause: () => undefined,
     });
     expect(screen.queryByText(/not built yet/)).not.toBeInTheDocument();
@@ -109,7 +113,9 @@ describe("copilot", () => {
     expect(await screen.findByRole("button", { name: "Copilot is running..." })).toBeDisabled();
 
     // The stop is the pause panel's: the page's words as text, and only its buttons end it.
-    expect(await screen.findByRole("heading", { name: "Run paused: waiting for you" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "Run paused: waiting for you" }, { timeout: 3000 }),
+    ).toBeInTheDocument();
     expect(screen.getByText(`${REVIEW} Left for you: Phone.`)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "I did this in the browser: continue" }));
     await waitFor(() => expect(count(api, "apply_resolve_pause")).toBe(1));
@@ -118,7 +124,9 @@ describe("copilot", () => {
       resolution: "continue",
     });
 
-    finish(run({ state: "ended", items: [item("submitted")], ended_at: "2026-11-03T10:05:00.000Z" }));
+    const done = run({ state: "ended", items: [item("submitted")], ended_at: "2026-11-03T10:05:00.000Z" });
+    started = false;
+    finish(done);
     expect(await screen.findByText(/It is recorded as applied/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Start Copilot" })).toBeEnabled();
   });
@@ -132,5 +140,55 @@ describe("copilot", () => {
     });
     await screen.getByRole("button", { name: "Start Copilot" }).click();
     expect(await screen.findByRole("alert")).toHaveTextContent("policy_blocked");
+  });
+
+  it("its stop shows in the app whatever view is open, and leaving the review loses nothing", async () => {
+    let latest: ApplyRunView | null = null;
+    const live = run({
+      active_pause: {
+        id: "p1",
+        item_id: "i1",
+        kind: "other",
+        origin: "guard",
+        excerpt: REVIEW,
+        created_at: "2026-11-03T10:00:01.000Z",
+      },
+    });
+    const { api, user } = await openReview({
+      copilot_start: () => {
+        latest = live;
+        return new Promise<ApplyRunView>(() => {});
+      },
+      apply_latest: () => latest,
+      apply_resolve_pause: () => undefined,
+    });
+    await user.click(screen.getByRole("button", { name: "Start Copilot" }));
+    expect(
+      await screen.findByRole("heading", { name: "Run paused: waiting for you" }, { timeout: 3000 }),
+    ).toBeInTheDocument();
+
+    // Another view: the stop is still there to answer.
+    await user.click(screen.getByRole("button", { name: "Status" }));
+    expect(
+      await screen.findByRole("heading", { name: "Run paused: waiting for you" }, { timeout: 3000 }),
+    ).toBeInTheDocument();
+
+    // Back on the review: Start stays refused while the run lives, and the stop is shown once.
+    await user.click(screen.getByRole("button", { name: "Applications" }));
+    await user.click(await screen.findByRole("button", { name: "Acme" }));
+    await user.click(await screen.findByRole("button", { name: "Review and apply..." }));
+    const group = await screen.findByRole("radiogroup", { name: "How do you want to apply?" });
+    await user.click(within(group).getByRole("radio", { name: "Copilot" }));
+    expect(await screen.findByRole("button", { name: "Copilot is running..." })).toBeDisabled();
+    expect(screen.getAllByRole("heading", { name: "Run paused: waiting for you" })).toHaveLength(1);
+    await user.click(screen.getByRole("button", { name: "I did this in the browser: continue" }));
+    await waitFor(() => expect(count(api, "apply_resolve_pause")).toBe(1));
+
+    latest = run({ state: "ended", items: [item("submitted")], ended_at: "2026-11-03T10:05:00.000Z" });
+    await waitFor(
+      () => expect(screen.queryByRole("heading", { name: "Run paused: waiting for you" })).not.toBeInTheDocument(),
+      { timeout: 3000 },
+    );
+    expect(await screen.findByRole("button", { name: "Start Copilot" }, { timeout: 3000 })).toBeEnabled();
   });
 });

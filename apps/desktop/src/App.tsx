@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { CopilotStop } from "@/components/CopilotStop";
 import { ErrorAlert } from "@/components/ErrorAlert";
 import { TerminalPanel } from "@/components/TerminalPanel";
 import { TitleBar } from "@/components/TitleBar";
@@ -123,6 +124,7 @@ function Shell({ root }: { root: string }) {
           ))}
         </nav>
         <main ref={main} className="flex-1 p-6">
+          <CopilotStop />
           {view === "status" && <StatusView />}
           {view === "documents" && <DocumentsView />}
           {view === "data" && <DataView />}

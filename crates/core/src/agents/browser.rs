@@ -21,8 +21,10 @@ use crate::ai::register::REGISTER;
 use crate::ai::router::Router;
 use crate::ai::{BoxFuture, CancellationToken, ProviderId, TaskType, spec};
 use crate::applications::{self, Application};
+use crate::apply::brief::{Brief, BriefAnswer};
 use crate::apply::guard::{self, PauseKind};
 use crate::apply::proxy::Knobs;
+use crate::apply::proxy::judge_field;
 use crate::apply::{self, Held, Item, PAUSE_HOLD, RunView, Submitter, session};
 use crate::browser::mcp::{McpClient, ToolReply};
 use crate::browser::runtime::{self, BrowserSpec, RuntimeState};
@@ -42,8 +44,7 @@ use Permission::*;
 
 /// The review stop's text: the run fills and stops here, and the person submits.
 pub const REVIEW: &str = "Review the form in the browser and click submit yourself.";
-const NO_FORM: &str =
-    "No form fields found on this page. Open the form in the browser, then continue.";
+const NO_FORM: &str = "Open the application form, then press Continue.";
 /// Autonomous: fields the rules left, before anything is submitted.
 const LEFT: &str = "JobPilot will not submit with these empty. Fill them in the browser, then \
                     continue:";
@@ -52,7 +53,7 @@ const CHANGED: &str = "The form changed after JobPilot filled it. Check it in th
                        Continue submits the form as it is now.";
 const OFF_ORIGIN: &str = "This page is not on the posting's site. Go back to the form in the \
                           browser, then continue.";
-/// A landing page's own way to its form. Not a submit: these words never send anything.
+/// A landing page's own way to its form, followed only as a link.
 const OPENERS: [&str; 3] = ["apply", "apply now", "apply for this job"];
 
 static COPILOT_STEPS: &[StepDef] = &[
@@ -463,8 +464,11 @@ impl BrowserWorkflow<'_> {
     }
 
     /// Reads the form on the page: a snapshot, scanned, then parsed. A landing page with no
-    /// field gets one click on its own "Apply" button; after that, a page with no field waits
-    /// for a person to open the form. Returns false when the item left the run.
+    /// field gets one click on its own "Apply" link; after that, or with only a button, a page
+    /// with no field waits for a person to open the form. Returns false when the item left the
+    /// run.
+    // ponytail: one page. Copilot fills the page the form opens on; a later page of a
+    // multi-page form is the person's, after the review stop.
     async fn read_form(&self, ctx: &Ctx<'_>, driver: &mut Driver) -> Result<bool> {
         let mut opened = false;
         loop {
@@ -537,7 +541,11 @@ impl BrowserWorkflow<'_> {
     }
 
     /// Rules first; then, for an ordinary field nothing filled, `map_form_field` when a model
-    /// is set up. Answer text comes from `use_answer` only for an answer a field needs.
+    /// is set up. Every field passes the guards apply-mcp runs (`proxy::judge_field`, and
+    /// `guard::value_ok`), judged on the snapshot whose refs the fill uses: a field they hold for
+    /// a person is the person's, whatever a rule, an answer, or a model would put there, and a
+    /// legal stop a person answered never opens its field to Copilot. Answer text comes from
+    /// `use_answer` only for a field that will take it.
     async fn map(&self, ctx: &Ctx<'_>, driver: &mut Driver) -> Result<Option<ProviderId>> {
         let db = ctx.db;
         let basic = profile::basic(db).await?;
@@ -548,15 +556,34 @@ impl BrowserWorkflow<'_> {
             .filter(|row| row.serves(&driver.app.country) && !row.stale)
             .filter(|row| matches!(row.class, Class::Normal | Class::Sensitive))
             .collect();
-        let labels: HashSet<String> = driver
+
+        // Fields the guards hold whatever value would go in: a legal one, by its label or the
+        // questions around it.
+        let bare = self.brief(driver, &basic, Vec::new());
+        let held: HashMap<String, &'static str> = driver
             .form
             .fields
             .iter()
-            .map(|field| forms::fold_label(&field.label))
+            .filter_map(|field| {
+                held_back(&driver.last, field, &bare).map(|why| (field.target.clone(), why))
+            })
             .collect();
+
+        // The rules alone show which fields are still open; only those read an answer.
+        let mut open: HashSet<String> = HashSet::new();
+        for mapped in map_rules(&driver.form, &basic, &[]) {
+            if let Mapped::Person {
+                field,
+                why: "unmapped" | "sensitive",
+            } = &mapped
+                && !held.contains_key(&field.target)
+            {
+                open.insert(forms::fold_label(&field.label));
+            }
+        }
         let mut answers = Vec::new();
         for row in &serving {
-            if !labels.contains(&forms::fold_label(&row.question)) {
+            if !open.contains(&forms::fold_label(&row.question)) {
                 continue;
             }
             if let Some(text) =
@@ -570,7 +597,9 @@ impl BrowserWorkflow<'_> {
             }
         }
         driver.mapped = map_rules(&driver.form, &basic, &answers);
+        hold_back_all(&mut driver.mapped, &held);
 
+        // Only ordinary answers are offered to a model, by id and question.
         let candidates: Vec<Candidate> = serving
             .iter()
             .filter(|row| row.class == Class::Normal)
@@ -579,61 +608,123 @@ impl BrowserWorkflow<'_> {
                 question: row.question.clone(),
             })
             .collect();
-        let Some(router) = self.router else {
-            return Ok(None);
-        };
-        if candidates.is_empty() || router.declarations().is_empty() {
-            return Ok(None);
-        }
         let mut provider = None;
-        let mut asked = 0;
+        // Autonomous has no router: rules mapping only, and no model is ever called.
+        if let Some(router) = self.router
+            && !candidates.is_empty()
+            && !router.declarations().is_empty()
+        {
+            let mut asked = 0;
+            for mapped in driver.mapped.iter_mut() {
+                let Mapped::Person {
+                    field,
+                    why: "unmapped",
+                } = mapped
+                else {
+                    continue;
+                };
+                if !matches!(field.role.as_str(), "textbox" | "combobox")
+                    || field.label.trim().is_empty()
+                {
+                    continue;
+                }
+                if asked == MAX_MODEL_FIELDS {
+                    break;
+                }
+                asked += 1;
+                ctx.stop_point()?;
+                let (pick, by) = map_field(
+                    db,
+                    router,
+                    ctx.actor,
+                    &field.label,
+                    &candidates,
+                    ctx.cancel.clone(),
+                )
+                .await?;
+                provider = by.or(provider);
+                let id = match pick {
+                    Pick::Answer(id) => id,
+                    Pick::None => continue,
+                    // No model took it: the rest would fare no better.
+                    Pick::Unavailable => break,
+                };
+                let Some(text) =
+                    answer_text(db, ctx.actor, &id, &application, Class::Normal).await?
+                else {
+                    continue;
+                };
+                if let Some(text) = fits(field, &text) {
+                    answers.push(AnswerText {
+                        answer_id: id.clone(),
+                        question: candidates
+                            .iter()
+                            .find(|c| c.answer_id == id)
+                            .map(|c| c.question.clone())
+                            .unwrap_or_default(),
+                        text: text.clone(),
+                    });
+                    *mapped = Mapped::Value {
+                        field: field.clone(),
+                        text,
+                        source: ValueSource::Answer(id),
+                    };
+                }
+            }
+        }
+
+        // Each value, as it will be typed or selected, through every guard.
+        let brief = self.brief(driver, &basic, answers);
+        let allowed = apply::brief::allowed_values(&brief);
         for mapped in driver.mapped.iter_mut() {
-            let Mapped::Person {
-                field,
-                why: "unmapped",
-            } = mapped
-            else {
+            let Mapped::Value { field, text, .. } = mapped else {
                 continue;
             };
-            if !matches!(field.role.as_str(), "textbox" | "combobox")
-                || field.label.trim().is_empty()
-            {
-                continue;
-            }
-            if asked == MAX_MODEL_FIELDS {
-                break;
-            }
-            asked += 1;
-            ctx.stop_point()?;
-            let (pick, by) = map_field(
-                db,
-                router,
-                ctx.actor,
-                &field.label,
-                &candidates,
-                ctx.cancel.clone(),
-            )
-            .await?;
-            provider = by.or(provider);
-            let id = match pick {
-                Pick::Answer(id) => id,
-                Pick::None => continue,
-                // No model took it: the rest would fare no better.
-                Pick::Unavailable => break,
+            let why = if !guard::value_ok(text, &allowed) {
+                Some("unapproved")
+            } else {
+                let picks = field.role == "combobox";
+                match judge_field(&driver.last, &field.target, text, picks, &brief) {
+                    None => Some("unlabeled"),
+                    Some(Ok(())) => None,
+                    Some(Err(kind)) => Some(person_why(kind)),
+                }
             };
-            let Some(text) = answer_text(db, ctx.actor, &id, &application, Class::Normal).await?
-            else {
-                continue;
-            };
-            if let Some(text) = fits(field, &text) {
-                *mapped = Mapped::Value {
+            if let Some(why) = why {
+                *mapped = Mapped::Person {
                     field: field.clone(),
-                    text,
-                    source: ValueSource::Answer(id),
+                    why,
                 };
             }
         }
         Ok(provider)
+    }
+
+    /// What the guards judge a value against: the profile's facts and the answers read for
+    /// this form. No work authorization: Copilot never fills it.
+    fn brief(
+        &self,
+        driver: &Driver,
+        basic: &profile::ProfileBasic,
+        answers: Vec<AnswerText>,
+    ) -> Brief {
+        Brief {
+            application_id: driver.app.id.clone(),
+            company: driver.app.company.clone(),
+            role: driver.app.role.clone(),
+            link: driver.app.link.clone(),
+            country: driver.app.country.clone(),
+            facts: apply::brief::facts_of(basic),
+            answers: answers
+                .into_iter()
+                .map(|answer| BriefAnswer {
+                    question: answer.question,
+                    answer: answer.text,
+                })
+                .collect(),
+            work_authorization: None,
+            files: Vec::new(),
+        }
     }
 
     async fn fill(&self, ctx: &Ctx<'_>, driver: &mut Driver) -> Result<StepOutput> {
@@ -769,7 +860,9 @@ impl BrowserWorkflow<'_> {
 
     /// The person reviews and submits in the browser. Continue is their word that it was
     /// submitted: the page then is captured as the page's claim, and the status is written at
-    /// the run's end, by `settle`.
+    /// the run's end, by `settle`. A pause or cancel that lands after Continue, before the
+    /// record, leaves a submission that may have happened: the item ends `uncertain`. One
+    /// before Continue leaves it `filled`, which ends `skipped`: nothing was sent.
     async fn review(&self, ctx: &Ctx<'_>, driver: &mut Driver) -> Result<StepOutput> {
         self.decided(ctx.db, Action::Drive).await?;
         let left = left_for_person(driver);
@@ -783,7 +876,18 @@ impl BrowserWorkflow<'_> {
         {
             return Ok(StepOutput::default());
         }
-        let capture = self.snapshot(ctx, driver).await?;
+        // Not scanned: the item is the person's submission, and this run has no next item
+        // for a stop to protect.
+        let capture = match self.snapshot(ctx, driver).await {
+            Ok(capture) => capture,
+            Err(error @ (Error::Paused | Error::Cancelled)) => {
+                self.end_item(ctx, driver, "uncertain", "stopped_after_review")
+                    .await?;
+                return Err(error);
+            }
+            // The browser is gone: the person's word stands, with no page.
+            Err(_) => None,
+        };
         let by = Submitter {
             agent: "browser_application",
             mode: "copilot",
@@ -929,7 +1033,7 @@ impl BrowserWorkflow<'_> {
     }
 }
 
-/// The labels a person fills: fields the rules left, and fields the browser refused.
+/// The labels a person fills, quoted: fields the rules left, and fields the browser refused.
 fn left_for_person(driver: &Driver) -> Vec<String> {
     driver
         .mapped
@@ -941,6 +1045,7 @@ fn left_for_person(driver: &Driver) -> Vec<String> {
             _ => None,
         })
         .chain(driver.left.iter().cloned())
+        .map(|label| quoted(&label))
         .collect()
 }
 
@@ -1013,12 +1118,64 @@ async fn answer_text(
     }
 }
 
-/// The ref of a button or link whose whole name is a landing page's way to its form.
+/// The guards' word on a field before any value: a legal label, or a combobox whose
+/// questions around it are legal. `None` lets the field be mapped; its value is judged again.
+fn held_back(snapshot: &str, field: &forms::FormField, bare: &Brief) -> Option<&'static str> {
+    let legal = |checked: Option<std::result::Result<(), PauseKind>>| {
+        matches!(checked, Some(Err(PauseKind::Legal)))
+    };
+    match field.role.as_str() {
+        "textbox" => {
+            legal(judge_field(snapshot, &field.target, "", false, bare)).then_some("legal")
+        }
+        "combobox" => field
+            .options
+            .iter()
+            .any(|option| legal(judge_field(snapshot, &field.target, option, true, bare)))
+            .then_some("legal"),
+        _ => None,
+    }
+}
+
+fn hold_back_all(mapped: &mut [Mapped], held: &HashMap<String, &'static str>) {
+    for entry in mapped.iter_mut() {
+        if matches!(entry, Mapped::File { .. }) {
+            continue;
+        }
+        if let Some(why) = held.get(&entry.field().target) {
+            *entry = Mapped::Person {
+                field: entry.field().clone(),
+                why,
+            };
+        }
+    }
+}
+
+fn person_why(kind: PauseKind) -> &'static str {
+    match kind {
+        PauseKind::Legal => "legal",
+        PauseKind::Sensitive => "sensitive",
+        _ => "guard",
+    }
+}
+
+/// A label as the review stop lists it: quoted and cut, so page text reads as a name.
+fn quoted(label: &str) -> String {
+    const LONGEST: usize = 60;
+    let label = label.split_whitespace().collect::<Vec<_>>().join(" ");
+    match label.chars().count() > LONGEST {
+        true => format!("\"{}...\"", label.chars().take(LONGEST).collect::<String>()),
+        false => format!("\"{label}\""),
+    }
+}
+
+/// The ref of a link whose whole name is a landing page's way to its form. Never a button: a
+/// button named "Apply" may send the application (decision 3), so only a person presses one.
 fn opener(snapshot: &str) -> Option<String> {
     snapshot.lines().find_map(|line| {
         let (role, name, _) = guard::split_line(line);
         let target = guard::ref_of(line)?;
-        (matches!(role.as_str(), "button" | "link")
+        (role == "link"
             && OPENERS.contains(&forms::fold_label(&name).as_str())
             && !guard::submit_target(snapshot, &target))
         .then_some(target)

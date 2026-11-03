@@ -1173,10 +1173,11 @@ async fn browser_e2e_copilot_on_the_greenhouse_lever_and_ashby_fixtures() {
         for value in typed {
             assert!(seen.contains(value), "{page}: {value} not in {seen}");
         }
-        assert_eq!(
-            done.confirmation_url.as_deref(),
-            Some(format!("{}/{page}", w.site.url).as_str()),
-            "{page}"
+        // The landing page's link adds a fragment; the page is the fixture's.
+        let url = done.confirmation_url.clone().unwrap_or_default();
+        assert!(
+            url.starts_with(&format!("{}/{page}", w.site.url)),
+            "{page}: {url}"
         );
         assert_eq!(
             applications::get(&w.db, &app).await.unwrap().status,

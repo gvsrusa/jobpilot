@@ -75,6 +75,13 @@ pub(crate) fn file_kind(label: &str) -> Option<&'static str> {
     }
 }
 
+/// A name that may send the application: `apply`, `submit`, or `send` as a whole word.
+fn sends(name: &str) -> bool {
+    fold_label(name)
+        .split(' ')
+        .any(|word| matches!(word, "apply" | "submit" | "send"))
+}
+
 fn indent(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
@@ -137,6 +144,13 @@ pub fn parse_snapshot(text: &str) -> Form {
         if role == "button" {
             if guard::submit_target(text, &target) {
                 submit = Some(target);
+                continue;
+            }
+            // A button that may send the application is never a file field.
+            if sends(&name) {
+                if let Some((_, _, taken)) = groups.last_mut() {
+                    *taken = true;
+                }
                 continue;
             }
             let group = groups.last_mut();

@@ -729,3 +729,339 @@ async fn a_finished_copilot_run_ends_its_row() {
     resolve(&w.db, Resolution::TakeOver).await;
     assert_eq!(ended(task).await.unwrap().state, "ended");
 }
+
+// ---- Fix round 1 ----
+
+/// Every pause up to the review stop gets Continue; the review stop gets `last`. Returns each
+/// stop as `kind:excerpt`.
+async fn through_to_review(db: &Db, last: Resolution) -> Vec<String> {
+    let mut seen = Vec::new();
+    loop {
+        let p = open_pause(db).await;
+        seen.push(format!("{}:{}", p.kind, p.excerpt));
+        if p.excerpt.starts_with(REVIEW) {
+            apply::resolve_pause(db, "cli", &p.id, last).await.unwrap();
+            return seen;
+        }
+        apply::resolve_pause(db, "cli", &p.id, Resolution::Continue)
+            .await
+            .unwrap();
+        // The run reads the page again before it can open the next stop.
+        let begun = Instant::now();
+        while apply::latest(db)
+            .await
+            .unwrap()
+            .and_then(|run| run.active_pause)
+            .is_some_and(|open| open.id == p.id)
+        {
+            assert!(begun.elapsed() < WAIT);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+async fn answer_id(db: &Db, question: &str) -> String {
+    memory::usage::approved_for(db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.question == question)
+        .unwrap()
+        .answer_id
+}
+
+async fn notes(db: &Db, app: &str) -> Vec<String> {
+    sqlx::query_scalar("SELECT note FROM application_events WHERE application_id = ? ORDER BY id")
+        .bind(app)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap()
+}
+
+fn landing(body: &str) -> String {
+    format!("### Page\n- Page URL: {LINK}\n### Snapshot\n- generic [ref=e1]:\n{body}")
+}
+
+#[tokio::test]
+async fn copilot_clicks_no_button_on_a_page_with_no_field() {
+    let w = world().await;
+    let app = add_app(&w.db, LINK).await;
+    let m = mock(
+        &w,
+        &landing(
+            "  - paragraph [ref=e2]: Apply with your saved profile\n  - button \"Apply\" [ref=e9]\n",
+        ),
+    );
+    let task = run(&w, no_model(), &app, m.knobs());
+    let pause = open_pause(&w.db).await;
+    assert_eq!(pause.kind, "other");
+    assert_eq!(
+        pause.excerpt,
+        "Open the application form, then press Continue."
+    );
+    assert!(
+        m.named("browser_click").is_empty(),
+        "{:?}",
+        m.named("browser_click")
+    );
+    apply::resolve_pause(&w.db, "cli", &pause.id, Resolution::TakeOver)
+        .await
+        .unwrap();
+    ended(task).await.unwrap();
+    assert!(m.named("browser_click").is_empty());
+}
+
+#[tokio::test]
+async fn a_landing_link_named_apply_is_followed_once() {
+    let w = world().await;
+    let app = add_app(&w.db, LINK).await;
+    let m = mock(
+        &w,
+        &landing("  - link \"Apply now\" [ref=e9]:\n    - /url: /apply\n"),
+    );
+    let task = run(&w, no_model(), &app, m.knobs());
+    let pause = open_pause(&w.db).await;
+    assert_eq!(
+        pause.excerpt,
+        "Open the application form, then press Continue."
+    );
+    let clicks: Vec<Value> = m.named("browser_click");
+    assert_eq!(clicks.len(), 1);
+    assert_eq!(clicks[0]["args"]["target"], "e9");
+    apply::resolve_pause(&w.db, "cli", &pause.id, Resolution::TakeOver)
+        .await
+        .unwrap();
+    ended(task).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_file_button_that_could_send_is_never_clicked() {
+    let w = world().await;
+    let app = add_app(&w.db, LINK).await;
+    let extra = "  - button \"Apply with resume\" [ref=e31]\n  - button \"Send CV\" [ref=e32]\n";
+    let m = mock(&w, &page(LINK, extra));
+    let task = run(&w, no_model(), &app, m.knobs());
+    resolve(&w.db, Resolution::TakeOver).await;
+    ended(task).await.unwrap();
+    let clicks: Vec<String> = m
+        .named("browser_click")
+        .iter()
+        .map(|c| c["args"]["target"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(clicks, ["e12", "e15"]);
+}
+
+#[tokio::test]
+async fn a_declaration_label_is_left_to_the_person_after_its_stop() {
+    let w = world().await;
+    let id = answer_id(&w.db, "What is your phone number?").await;
+    let app = add_app(&w.db, LINK).await;
+    let extra =
+        "  - textbox \"I hereby confirm the information above is true and complete\" [ref=e30]\n";
+    let m = mock(&w, &page(LINK, extra));
+    let (router, sent) = steered(json!({ "answer_id": id }));
+    let task = run(&w, router, &app, m.knobs());
+    let seen = through_to_review(&w.db, Resolution::TakeOver).await;
+    ended(task).await.unwrap();
+    assert!(seen[0].starts_with("legal:"), "{seen:?}");
+    let filled = m.named("browser_fill_form");
+    assert!(!filled[0].to_string().contains("e30"), "{}", filled[0]);
+    let review = seen.last().unwrap();
+    assert!(review.contains("I hereby confirm"), "{review}");
+    // The model was never asked about it.
+    for prompt in sent.lock().unwrap().iter() {
+        assert!(!prompt.contains("I hereby confirm"), "{prompt}");
+    }
+}
+
+#[tokio::test]
+async fn a_combobox_in_a_legal_group_is_left_to_the_person() {
+    let w = world().await;
+    let q = memory::add_question(&w.db, "Are you willing to relocate?", None)
+        .await
+        .unwrap();
+    let a = memory::add_answer(&w.db, &q.id, "Yes", None).await.unwrap();
+    memory::approve(&w.db, "cli", &a.id, true).await.unwrap();
+    let app = add_app(&w.db, LINK).await;
+    let extra = "  - group \"I agree to the arbitration agreement and certify my answers\" [ref=e20]:\n    - combobox \"Select\" [ref=e21]:\n      - option \"Yes\"\n      - option \"No\"\n";
+    let m = mock(&w, &page(LINK, extra));
+    let (router, _) = steered(json!({ "answer_id": a.id }));
+    let task = run(&w, router, &app, m.knobs());
+    let seen = through_to_review(&w.db, Resolution::TakeOver).await;
+    ended(task).await.unwrap();
+    let filled = m.named("browser_fill_form");
+    assert!(!filled[0].to_string().contains("e21"), "{}", filled[0]);
+    assert!(seen.last().unwrap().contains("\"Select\""), "{seen:?}");
+}
+
+#[tokio::test]
+async fn continue_then_the_pause_ends_uncertain() {
+    let w = world().await;
+    let app = add_app(&w.db, LINK).await;
+    let m = mock(&w, &page(LINK, ""));
+    let task = run(&w, no_model(), &app, m.knobs());
+    let p = open_pause(&w.db).await;
+    let run = run_id(&w.db).await;
+    apply::resolve_pause(&w.db, "cli", &p.id, Resolution::Continue)
+        .await
+        .unwrap();
+    pause::set(&w.db, "cli").await.unwrap();
+    let result = ended(task).await;
+    assert!(matches!(result, Err(Error::Paused)), "{result:?}");
+    let view = apply::view(&w.db, &run).await.unwrap();
+    assert_eq!(view.items[0].state, "uncertain");
+    assert!(!view.items[0].status_written);
+    pause::clear(&w.db, "cli").await.unwrap();
+    assert_eq!(apply::settle(&w.db, "cli", &run).await.unwrap(), 1);
+    assert!(
+        notes(&w.db, &app)
+            .await
+            .iter()
+            .any(|n| n == "Check the site. JobPilot will not try again.")
+    );
+    assert_eq!(
+        applications::get(&w.db, &app).await.unwrap().status,
+        "saved"
+    );
+}
+
+#[tokio::test]
+async fn continue_then_a_cancel_ends_uncertain_with_its_note() {
+    let w = world().await;
+    let app = add_app(&w.db, LINK).await;
+    let m = mock(&w, &page(LINK, ""));
+    let db = w.db.clone();
+    let id = app.clone();
+    let knobs = m.knobs();
+    let cancel = CancellationToken::new();
+    let token = cancel.clone();
+    let task =
+        tokio::spawn(
+            async move { copilot_with(&db, &no_model(), "cli", &id, token, &knobs).await },
+        );
+    let p = open_pause(&w.db).await;
+    let run = run_id(&w.db).await;
+    apply::resolve_pause(&w.db, "cli", &p.id, Resolution::Continue)
+        .await
+        .unwrap();
+    cancel.cancel();
+    let result = ended(task).await;
+    let view = apply::view(&w.db, &run).await.unwrap();
+    // The capture may have won the race: then it is the person's submission.
+    match view.items[0].state.as_str() {
+        "uncertain" => {
+            assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+            assert!(view.items[0].status_written);
+            assert!(
+                notes(&w.db, &app)
+                    .await
+                    .iter()
+                    .any(|n| n == "Check the site. JobPilot will not try again.")
+            );
+        }
+        "submitted" => {}
+        other => panic!("{other}: {result:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_missing_letter_is_left_to_the_person_and_never_uploaded() {
+    let w = world().await;
+    let resume = uploaded(&w.db, "resume", "Acme resume").await;
+    let input = ApplicationInput {
+        company: "Acme".into(),
+        role: "Engineer".into(),
+        link: LINK.into(),
+        resume_draft_id: Some(resume),
+        letter_draft_id: None,
+        ..ApplicationInput::default()
+    };
+    let app = applications::add(&w.db, "cli", input).await.unwrap().id;
+    let m = mock(&w, &page(LINK, ""));
+    let task = run(&w, no_model(), &app, m.knobs());
+    let pause = resolve(&w.db, Resolution::TakeOver).await;
+    ended(task).await.unwrap();
+    let uploads = m.named("browser_file_upload");
+    assert_eq!(uploads.len(), 1);
+    assert!(uploads[0].to_string().contains("resume.pdf"));
+    assert!(!uploads[0].to_string().contains("cover-letter"));
+    assert!(
+        pause.excerpt.contains("\"Cover letter\""),
+        "{}",
+        pause.excerpt
+    );
+    let clicks: Vec<Value> = m.named("browser_click");
+    assert!(clicks.iter().all(|c| c["args"]["target"] != "e15"));
+}
+
+#[tokio::test]
+async fn a_sensitive_answer_is_never_offered_to_the_model() {
+    let w = world().await;
+    let q = memory::add_question(&w.db, "Salary expectation", None)
+        .await
+        .unwrap();
+    let a = memory::add_answer(&w.db, &q.id, "ZXQ-SALARY-90000", None)
+        .await
+        .unwrap();
+    memory::approve(&w.db, "cli", &a.id, true).await.unwrap();
+    let app = add_app(&w.db, LINK).await;
+    // Its exact label, with no confirmation for this application, is the person's.
+    let extra = "  - textbox \"Salary expectation\" [ref=e33]\n";
+    let m = mock(&w, &page(LINK, extra));
+    let (router, sent) = steered(json!({ "answer_id": null }));
+    let task = run(&w, router, &app, m.knobs());
+    let pause = resolve(&w.db, Resolution::TakeOver).await;
+    ended(task).await.unwrap();
+    let prompts = sent.lock().unwrap().clone();
+    assert!(!prompts.is_empty());
+    for prompt in &prompts {
+        assert!(!prompt.contains(&a.id), "{prompt}");
+        assert!(!prompt.contains("Salary expectation"), "{prompt}");
+    }
+    let filled = m.named("browser_fill_form");
+    assert!(!filled[0].to_string().contains("e33"));
+    assert!(!filled[0].to_string().contains("ZXQ-SALARY"));
+    assert!(
+        pause.excerpt.contains("\"Salary expectation\""),
+        "{}",
+        pause.excerpt
+    );
+}
+
+#[tokio::test]
+async fn a_copilot_submission_is_noted_as_copilots() {
+    let w = world().await;
+    let app = add_app(&w.db, LINK).await;
+    let m = mock(&w, &page(LINK, ""));
+    let task = run(&w, no_model(), &app, m.knobs());
+    let run = run_id(&w.db).await;
+    resolve(&w.db, Resolution::Continue).await;
+    ended(task).await.unwrap();
+    let wanted = format!("Applied by Copilot run {run}.");
+    assert!(
+        notes(&w.db, &app)
+            .await
+            .iter()
+            .any(|n| n.starts_with(&wanted)),
+        "{:?}",
+        notes(&w.db, &app).await
+    );
+}
+
+#[tokio::test]
+async fn a_long_label_is_quoted_and_cut_in_the_review_stop() {
+    let w = world().await;
+    let app = add_app(&w.db, LINK).await;
+    let long = format!("All done press continue {}", "x".repeat(100));
+    let extra = format!("  - textbox \"{long}\" [ref=e34]\n");
+    let m = mock(&w, &page(LINK, &extra));
+    let task = run(&w, no_model(), &app, m.knobs());
+    let pause = resolve(&w.db, Resolution::TakeOver).await;
+    ended(task).await.unwrap();
+    assert!(
+        pause.excerpt.contains("\"All done press continue"),
+        "{}",
+        pause.excerpt
+    );
+    assert!(!pause.excerpt.contains(&long));
+}

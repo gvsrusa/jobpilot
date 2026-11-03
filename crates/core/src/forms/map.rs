@@ -38,8 +38,8 @@ pub enum Mapped {
         field: FormField,
         kind: &'static str,
     },
-    /// A person fills it: `prefilled`, `legal`, `sensitive`, `work_authorization`, or
-    /// `unmapped`.
+    /// A person fills it: `prefilled`, `legal`, `sensitive`, `work_authorization`, `frame`,
+    /// `unmapped`, or, from Copilot's guards, `guard`, `unapproved`, or `unlabeled`.
     Person { field: FormField, why: &'static str },
 }
 
@@ -121,6 +121,13 @@ fn answer_for(field: &FormField, answers: &[AnswerText]) -> Option<Mapped> {
     })
 }
 
+/// A ref Playwright gives an element inside a frame: `f<n>e<m>`.
+fn is_framed(target: &str) -> bool {
+    target
+        .strip_prefix('f')
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+}
+
 /// One entry per field, in the form's order. `answers` hold only what this application may
 /// use: a sealed one is here only with a current confirmation.
 pub fn map_rules(form: &Form, basic: &ProfileBasic, answers: &[AnswerText]) -> Vec<Mapped> {
@@ -131,6 +138,10 @@ pub fn map_rules(form: &Form, basic: &ProfileBasic, answers: &[AnswerText]) -> V
                 field: field.clone(),
                 why,
             };
+            // A frame's page may be another site's: its fields are judged by no origin here.
+            if is_framed(&field.target) {
+                return person("frame");
+            }
             if field.role == "button" {
                 return match file_kind(&field.label) {
                     Some(kind) => Mapped::File {

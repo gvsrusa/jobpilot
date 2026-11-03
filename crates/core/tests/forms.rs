@@ -300,3 +300,41 @@ fn a_prefilled_sensitive_value_goes_to_a_person() {
     assert_eq!(person(&mapped, "Gender"), Some("prefilled"));
     assert_eq!(person(&mapped, "Ethnicity"), Some("sensitive"));
 }
+
+#[test]
+fn a_submit_inside_a_file_group_is_not_a_field() {
+    let form = parse_snapshot(
+        "- group [ref=e21]:
+  - paragraph [ref=e22]: Resume
+  - button \"Submit application\" [ref=e23]
+- button \"Upload resume and apply\" [ref=e24]
+- button \"Send your CV\" [ref=e25]
+- button \"Resume\" [ref=e26]",
+    );
+    let found: Vec<&str> = form.fields.iter().map(|f| f.target.as_str()).collect();
+    assert_eq!(found, ["e26"]);
+    assert_eq!(form.submit.as_deref(), Some("e23"));
+}
+
+#[test]
+fn a_field_inside_a_frame_is_left_to_the_person() {
+    let form = parse_snapshot(
+        "- textbox \"Email\" [ref=e1]
+- iframe [ref=e2]:
+  - textbox \"Email\" [ref=f1e3]
+  - button \"Resume\" [ref=f1e4]",
+    );
+    let mapped = map_rules(&form, &basic(), &[]);
+    assert_eq!(
+        value_of(&mapped, "Email").map(|(text, _)| text),
+        Some("ada@example.com".into())
+    );
+    let framed: Vec<&'static str> = mapped
+        .iter()
+        .filter_map(|m| match m {
+            Mapped::Person { field, why } if field.target.starts_with('f') => Some(*why),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(framed, ["frame", "frame"]);
+}

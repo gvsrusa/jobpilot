@@ -12,7 +12,7 @@
 <h1>Platform Engineer</h1>
 <p>Quillfeather Systems. Remote, full time.</p>
 <p>You will build the services our small teams depend on.</p>
-<button type="button" id="apply">Apply now</button>
+<a href="#application" id="apply">Apply now</a>
 </section>
 <section id="application" hidden>
 <h2>Apply for Platform Engineer</h2>
@@ -40,6 +40,7 @@
 for (const button of document.querySelectorAll("button[data-for]")) {
   button.addEventListener("click", () => document.getElementById(button.dataset.for).click());
 }
+// A link to the form on the same page, as a job board's landing page has.
 document.getElementById("apply").addEventListener("click", () => {
   document.getElementById("landing").hidden = true;
   document.getElementById("application").hidden = false;
