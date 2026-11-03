@@ -749,14 +749,28 @@ fn indent_of(line: &str) -> usize {
 /// Roles whose click is not the choice of an answer. Every other role is judged, and a button
 /// is judged when [`is_choice`] says so.
 const PLAIN_ROLES: [&str; 6] = ["button", "link", "tab", "combobox", "textbox", "searchbox"];
-/// Roles whose text is never a candidate question. They are still walked over.
-const NOT_QUESTIONS: [&str; 7] = [
-    "button", "link", "img", "option", "radio", "checkbox", "switch",
+/// Ancestors that hold one field's options. Only these ancestors are candidate questions.
+const GROUP_ROLES: [&str; 10] = [
+    "group",
+    "radiogroup",
+    "listbox",
+    "menu",
+    "menubar",
+    "combobox",
+    "tablist",
+    "tree",
+    "toolbar",
+    "row",
 ];
-/// Roles that pick an answer: the walk before a top-level ancestor stops at one.
+/// Fields of another question: the walk back stops at one.
+const FIELD_ROLES: [&str; 5] = ["textbox", "searchbox", "combobox", "spinbutton", "slider"];
+/// Roles that pick an answer (and every `menuitem*`): outside the target's own group, the walk
+/// back stops at one.
 const CHOICE_ROLES: [&str; 4] = ["option", "radio", "checkbox", "switch"];
-/// How many lines before the top-level ancestor are read at the root.
-const ROOT_LINES: usize = 8;
+/// Roles walked over without being a candidate.
+const NOT_QUESTIONS: [&str; 2] = ["link", "img"];
+/// The walk back stops after this many candidate texts.
+const MAX_BEFORE: usize = 8;
 /// An option naming any of these, as whole words, needs exactly one Sensitive question whose
 /// released answer it is.
 pub const SENSITIVE_OPTIONS: [&str; 25] = [
@@ -816,11 +830,23 @@ fn class_of(text: &str) -> Class {
     classify(text)
 }
 
-/// Every question a choice may answer: each named ancestor up to the root, every line between
-/// the top-level ancestor and the target at any depth, and up to eight lines before the
-/// top-level ancestor, stopping at an earlier choice. Lines of a [`NOT_QUESTIONS`] role are
-/// walked over. The same text, folded, counts once.
-fn questions(lines: &[&str], index: usize) -> Vec<String> {
+/// The questions of one field.
+struct Questions {
+    texts: Vec<String>,
+    /// The target sits inside an option-group ancestor.
+    grouped: bool,
+}
+
+fn role_at(line: &str) -> String {
+    split_line(line).0.to_lowercase()
+}
+
+/// Every question a choice may answer, within its own field: the name of each option-group
+/// ancestor ([`GROUP_ROLES`]), and the text of lines before the target at any depth. The walk
+/// back passes over the target's ancestors, its group's own options, links, and images, and
+/// stops at another field, another group's choice, a button, or after 8 texts. The same text,
+/// folded, counts once.
+fn questions(lines: &[&str], index: usize) -> Questions {
     let mut ancestors = Vec::new();
     let mut limit = indent_of(lines[index]);
     for at in (0..index).rev() {
@@ -831,46 +857,58 @@ fn questions(lines: &[&str], index: usize) -> Vec<String> {
         limit = indent_of(line);
         ancestors.push(at);
     }
-    let top = ancestors.last().copied().unwrap_or(index);
-    let candidate = |line: &str| {
-        let (role, _, _) = split_line(line);
-        if role_in(&role.to_lowercase(), &NOT_QUESTIONS) {
-            return None;
-        }
-        Some(text_of_line(line)).filter(|text| !text.is_empty())
-    };
-    let mut found: Vec<String> = (top..index)
-        .filter_map(|at| {
-            if ancestors.contains(&at) {
-                Some(text_of_line(lines[at])).filter(|text| !text.is_empty())
-            } else {
-                candidate(lines[at])
-            }
-        })
+    let groups: Vec<usize> = ancestors
+        .iter()
+        .copied()
+        .filter(|at| GROUP_ROLES.contains(&role_at(lines[*at]).as_str()))
         .collect();
-    let mut taken = 0;
-    for line in lines[..top].iter().rev() {
-        if line.trim().is_empty() {
+    let own_group = groups.first().copied();
+    let mut texts: Vec<String> = groups
+        .iter()
+        .map(|at| text_of_line(lines[*at]))
+        .filter(|text| !text.is_empty())
+        .collect();
+    let mut before = 0;
+    for at in (0..index).rev() {
+        let line = lines[at];
+        if line.trim().is_empty() || ancestors.contains(&at) {
             continue;
         }
-        if taken == ROOT_LINES {
+        if before == MAX_BEFORE {
             break;
         }
-        let (role, _, _) = split_line(line);
-        if role_in(&role.to_lowercase(), &CHOICE_ROLES) {
+        let role = role_at(line);
+        let same_group = own_group.is_some_and(|group| at > group);
+        if FIELD_ROLES.contains(&role.as_str()) || role == "button" {
             break;
         }
-        taken += 1;
-        found.extend(candidate(line));
+        if role_in(&role, &CHOICE_ROLES) {
+            if same_group {
+                continue;
+            }
+            break;
+        }
+        if NOT_QUESTIONS.contains(&role.as_str()) {
+            continue;
+        }
+        let text = text_of_line(line);
+        if !text.is_empty() {
+            texts.push(text);
+            before += 1;
+        }
     }
     let mut seen = HashSet::new();
-    found.retain(|text| seen.insert(label_words(text).join(" ")));
-    found
+    texts.retain(|text| seen.insert(label_words(text).join(" ")));
+    Questions {
+        texts,
+        grouped: own_group.is_some(),
+    }
 }
 
 /// True when a click on the target picks an answer, so `choice_guard` must pass first. An
 /// unknown target counts as a choice. A button that is not a submit is a choice when its name
-/// is yes, no, or a sensitive option, or when a question around it is not Normal.
+/// is yes, no, or a sensitive option, or when it sits in an option group whose questions are
+/// not all Normal.
 pub fn is_choice(snapshot: &str, target: &str) -> bool {
     let Some(index) = index_of(snapshot, target) else {
         return true;
@@ -885,10 +923,13 @@ pub fn is_choice(snapshot: &str, target: &str) -> bool {
         return false;
     }
     let folded = label_words(&name).join(" ");
-    sensitive_option(&name)
-        || folded == "yes"
-        || folded == "no"
-        || questions(&lines, index)
+    if sensitive_option(&name) || folded == "yes" || folded == "no" {
+        return true;
+    }
+    let questions = questions(&lines, index);
+    questions.grouped
+        && questions
+            .texts
             .iter()
             .any(|question| class_of(question) != Class::Normal)
 }
@@ -908,7 +949,7 @@ pub fn choice_guard(snapshot: &str, target: &str, brief: &Brief) -> Result<(), P
     let (role, name) = parts(lines[index]);
     let role = role.to_lowercase();
     let option: String = name.chars().filter(|c| !hidden(*c)).collect();
-    let questions = questions(&lines, index);
+    let questions = questions(&lines, index).texts;
     let own = class_of(&option);
     let classes: Vec<Class> = questions.iter().map(|q| class_of(q)).collect();
     if own == Class::Legal || classes.contains(&Class::Legal) {

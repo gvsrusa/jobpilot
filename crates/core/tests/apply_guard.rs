@@ -666,14 +666,14 @@ fn a_choice_is_judged_by_its_question() {
     }];
     assert_eq!(choice_guard(&groups(), "e3", &b), Err(Sensitive));
     assert_eq!(choice_guard(&groups(), "e4", &b), Ok(()));
-    // Every line before a choice inside the form is its question, so "Gender" and the
-    // authorization question above weigh on every later choice: they pause (round 4, D2).
-    assert_eq!(choice_guard(&groups(), "e6", &b), Err(Sensitive));
+    // The question is searched within the choice's own field (round 5), so the groups above
+    // do not weigh on later choices.
+    assert_eq!(choice_guard(&groups(), "e6", &b), Ok(()));
     assert_eq!(choice_guard(&groups(), "e7", &b), Err(Sensitive));
-    assert_eq!(choice_guard(&groups(), "e9", &b), Err(Sensitive));
-    assert_eq!(choice_guard(&groups(), "e10", &b), Err(Sensitive));
+    assert_eq!(choice_guard(&groups(), "e9", &b), Ok(()));
+    assert_eq!(choice_guard(&groups(), "e10", &b), Err(Legal));
     assert_eq!(choice_guard(&groups(), "e11", &b), Err(Legal));
-    assert_eq!(choice_guard(&groups(), "e12", &b), Err(Sensitive));
+    assert_eq!(choice_guard(&groups(), "e12", &b), Err(Legal));
     assert_eq!(choice_guard(&groups(), "e13", &b), Err(Legal));
     assert_eq!(choice_guard(&groups(), "e14", &b), Ok(()));
     assert_eq!(choice_guard(&groups(), "e2", &b), Err(Sensitive));
@@ -1213,4 +1213,62 @@ fn a_button_can_be_a_choice() {
         "- form \"Apply\" [ref=e1]:\n  - textbox \"Name\" [ref=e3]\n  - button \"Next\" [ref=e2]";
     assert!(!is_choice(next, "e2"));
     assert_eq!(choice_guard(next, "e2", &b), Ok(()));
+}
+
+fn application_form() -> String {
+    page(&[
+        "- main [ref=e1]:",
+        "  - form \"Application for Engineer\" [ref=e2]:",
+        "    - heading \"Apply for Engineer\" [level=1] [ref=e3]",
+        "    - text: Full name",
+        "    - textbox \"Full name\" [ref=e4]",
+        "    - radiogroup \"Are you legally authorized to work in the United States?\" [ref=e10]:",
+        "      - radio \"Yes\" [ref=e11]",
+        "      - radio \"No\" [ref=e12]",
+        "    - radiogroup \"Will you now or in the future require sponsorship to work in the United States?\" [ref=e13]:",
+        "      - radio \"Yes\" [ref=e14]",
+        "      - radio \"No\" [ref=e15]",
+        "    - heading \"Voluntary self-identification\" [level=2] [ref=e16]",
+        "    - group \"Gender\" [ref=e17]:",
+        "      - radio \"Male\" [ref=e18]",
+        "      - radio \"Female\" [ref=e19]",
+        "    - text: Shifts are scheduled weekly",
+        "    - group \"Preferred shift\" [ref=e20]:",
+        "      - radio \"Morning\" [ref=e21]",
+        "      - radio \"Night\" [ref=e22]",
+        "    - combobox \"How did you hear about us?\" [ref=e30]",
+        "    - checkbox \"I certify that the information above is true\" [ref=e31]",
+        "    - button \"Next\" [ref=e32]",
+        "    - button \"Submit application\" [ref=e33]",
+    ])
+}
+
+#[test]
+fn a_realistic_form_pauses_only_where_it_must() {
+    let form = application_form();
+    let b = gender_brief();
+    for (target, expected) in [
+        ("e11", Ok(())),
+        ("e12", Err(Sensitive)),
+        ("e14", Err(Sensitive)),
+        ("e15", Ok(())),
+        ("e18", Err(Sensitive)),
+        ("e19", Ok(())),
+        ("e21", Ok(())),
+        ("e22", Ok(())),
+        ("e30", Ok(())),
+        ("e31", Err(Legal)),
+        ("e32", Ok(())),
+        ("e33", Ok(())),
+    ] {
+        assert_eq!(choice_guard(&form, target, &b), expected, "{target}");
+    }
+    for plain in ["e4", "e30", "e32", "e33"] {
+        assert!(!is_choice(&form, plain), "{plain}");
+    }
+    for choice in [
+        "e11", "e12", "e14", "e15", "e18", "e19", "e21", "e22", "e31",
+    ] {
+        assert!(is_choice(&form, choice), "{choice}");
+    }
 }
