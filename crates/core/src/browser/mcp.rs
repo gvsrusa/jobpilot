@@ -106,7 +106,10 @@ impl McpClient {
             Err(_) => return Err(Error::Failed("browser_start_timeout".into())),
         }
         client
-            .send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .send(
+                &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+                &never,
+            )
             .await?;
         Ok(client)
     }
@@ -155,15 +158,21 @@ impl McpClient {
         let _ = self.child.kill().await;
     }
 
-    async fn send(&mut self, message: &Value) -> Result<()> {
+    async fn send(&mut self, message: &Value, cancel: &CancellationToken) -> Result<()> {
         let mut line = message.to_string();
         line.push('\n');
-        if self.stdin.write_all(line.as_bytes()).await.is_err() || self.stdin.flush().await.is_err()
-        {
+        let write = async {
+            self.stdin.write_all(line.as_bytes()).await?;
+            self.stdin.flush().await
+        };
+        let outcome = tokio::select! {
+            written = write => written.map_err(|_| gone()),
+            () = wait_cancelled(cancel) => Err(Error::Cancelled),
+        };
+        if outcome.is_err() {
             self.broken = true;
-            return Err(gone());
         }
-        Ok(())
+        outcome
     }
 
     /// The answer to one request. A cancel, a refused line or a lost server leaves an answer
@@ -179,8 +188,8 @@ impl McpClient {
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
-            .await?;
+        let message = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        self.send(&message, cancel).await?;
         let outcome = self.answer(id, cancel).await;
         if outcome
             .as_ref()
@@ -203,7 +212,18 @@ impl McpClient {
             let Ok(message) = serde_json::from_slice::<Value>(&line) else {
                 continue;
             };
-            if message.get("id") != Some(&json!(id)) || message.get("method").is_some() {
+            if message.get("method").is_some() {
+                // A request from the server (`ping`) gets an empty answer; a notification none.
+                if let Some(theirs) = message.get("id") {
+                    self.send(
+                        &json!({"jsonrpc": "2.0", "id": theirs, "result": {}}),
+                        cancel,
+                    )
+                    .await?;
+                }
+                continue;
+            }
+            if message.get("id") != Some(&json!(id)) {
                 continue;
             }
             if message.get("error").is_some() {

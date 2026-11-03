@@ -1,7 +1,8 @@
 // Stands in for the Playwright MCP server in tests: newline JSON-RPC on stdio, no browser.
 // MOCK_SNAPSHOT: file that browser_snapshot answers with. MOCK_CALLS: file each call is
 // appended to. MOCK_EXIT_AFTER=n: exit after the nth reply to a tool call. MOCK_BIG=1: answer
-// browser_snapshot with a line over the cap.
+// browser_snapshot with a line over the cap. MOCK_NOISE=1: before each tool reply, send a
+// notification, a ping, and a stray reply with a string id; an answer to the ping is logged.
 import fs from "node:fs";
 import readline from "node:readline";
 
@@ -23,6 +24,10 @@ lines.on("line", (line) => {
   const message = JSON.parse(line);
   const { id, method, params } = message;
   if (id === undefined) return;
+  if (method === undefined) {
+    if (process.env.MOCK_CALLS) fs.appendFileSync(process.env.MOCK_CALLS, JSON.stringify({ pong: id }) + "\n");
+    return;
+  }
   if (method === "initialize") {
     send({
       jsonrpc: "2.0", id,
@@ -45,6 +50,11 @@ lines.on("line", (line) => {
       text = "x".repeat(9 * 1024 * 1024);
     } else if (name === "browser_snapshot" && process.env.MOCK_SNAPSHOT) {
       text = fs.readFileSync(process.env.MOCK_SNAPSHOT, "utf8");
+    }
+    if (process.env.MOCK_NOISE) {
+      send({ jsonrpc: "2.0", method: "notifications/message", params: { level: "info" } });
+      send({ jsonrpc: "2.0", id: "p-1", method: "ping" });
+      send({ jsonrpc: "2.0", id: String(id), result: { content: [{ type: "text", text: "stray" }] } });
     }
     send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text }], isError: name === "fail" } });
     calls += 1;

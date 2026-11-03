@@ -13,7 +13,7 @@ use jobpilot_core::ai::CancellationToken;
 use jobpilot_core::browser::mcp::{
     Incoming, McpClient, error_reply, read_message, reply, tool_text,
 };
-use jobpilot_core::browser::sweep::kill_marked;
+use jobpilot_core::browser::sweep::{kill_marked, windows_fold};
 use serde_json::{Value, json};
 
 fn node() -> PathBuf {
@@ -254,4 +254,60 @@ fn sweep_never_kills_its_caller() {
     let _ = bystander.kill();
     let _ = bystander.wait();
     drop(tmp);
+}
+
+#[test]
+fn sweep_matches_a_whole_folder_and_refuses_a_shallow_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let apply = tmp.path().join("apply");
+    let mut sibling = stubborn(&apply.join("abcd").display().to_string());
+    let mut inside = stubborn(&format!("out={}/shots", apply.join("abc").display()));
+
+    assert_eq!(kill_marked(&apply.join("abc")), 1);
+    assert!(gone_within(&mut inside, Duration::from_secs(2)));
+    assert!(!gone_within(&mut sibling, Duration::from_millis(300)));
+
+    assert_eq!(kill_marked(Path::new("/Users/x")), 0);
+    assert_eq!(kill_marked(Path::new("relative/dir/with/parts")), 0);
+    assert!(!gone_within(&mut sibling, Duration::from_millis(300)));
+    let _ = sibling.kill();
+    let _ = sibling.wait();
+}
+
+#[test]
+fn windows_paths_fold_to_one_form() {
+    assert_eq!(windows_fold(r"C:\Users\Me\Run-A"), "c:/users/me/run-a");
+    assert_eq!(windows_fold("c:/USERS/me/run-a"), "c:/users/me/run-a");
+}
+
+#[tokio::test]
+async fn the_client_answers_a_ping_and_skips_noise_and_a_stray_string_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let calls = tmp.path().join("calls.jsonl");
+    let mut client = McpClient::start(
+        &node(),
+        &[server()],
+        &[
+            ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
+            ("MOCK_NOISE".into(), "1".into()),
+            ("MOCK_CALLS".into(), calls.display().to_string()),
+        ],
+        tmp.path(),
+    )
+    .await
+    .unwrap();
+    let cancel = CancellationToken::new();
+    let seen = client
+        .call("browser_tabs", json!({}), &cancel)
+        .await
+        .unwrap();
+    assert_eq!(seen.text, "ok browser_tabs");
+    // The next call gives the server time to log the pong it was sent.
+    client
+        .call("browser_tabs", json!({}), &cancel)
+        .await
+        .unwrap();
+    let log = fs::read_to_string(&calls).unwrap();
+    assert!(log.contains(r#"{"pong":"p-1"}"#), "{log}");
+    client.close().await;
 }
