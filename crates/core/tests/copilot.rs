@@ -958,6 +958,41 @@ async fn continue_then_the_pause_ends_uncertain() {
     );
 }
 
+/// The person's Continue commits between the hold's read of the pause and its stop under the
+/// emergency pause (task 11 m-B). A trigger plays that race: the stop finds the pause already
+/// resolved. Continue was first, so it stands: the item is `uncertain`, not `skipped`.
+#[tokio::test]
+async fn a_continue_that_lands_as_the_pause_stops_the_hold_is_kept() {
+    let w = world().await;
+    let app = add_app(&w.db, LINK).await;
+    let m = mock(&w, &page(LINK, ""));
+    let task = run(&w, no_model(), &app, m.knobs());
+    let p = open_pause(&w.db).await;
+    let run = run_id(&w.db).await;
+    sqlx::query(
+        "CREATE TRIGGER continue_first BEFORE UPDATE OF resolution ON apply_pauses \
+         WHEN NEW.resolution = 'stopped' AND OLD.resolved_at IS NULL BEGIN \
+           UPDATE apply_pauses SET resolution = 'continue', resolved_by = 'cli', \
+             resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = OLD.id; \
+           SELECT RAISE(IGNORE); \
+         END",
+    )
+    .execute(&w.db.pool)
+    .await
+    .unwrap();
+    pause::set(&w.db, "cli").await.unwrap();
+    let result = ended(task).await;
+    assert!(matches!(result, Err(Error::Paused)), "{result:?}");
+    let pause: String = sqlx::query_scalar("SELECT resolution FROM apply_pauses WHERE id = ?")
+        .bind(&p.id)
+        .fetch_one(&w.db.pool)
+        .await
+        .unwrap();
+    assert_eq!(pause, "continue");
+    let view = apply::view(&w.db, &run).await.unwrap();
+    assert_eq!(view.items[0].state, "uncertain");
+}
+
 #[tokio::test]
 async fn continue_then_a_cancel_ends_uncertain_with_its_note() {
     let w = world().await;

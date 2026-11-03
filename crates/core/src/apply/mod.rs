@@ -1189,12 +1189,18 @@ async fn wait(
             Some(_) => return Err(Error::Cancelled),
             None => {}
         }
+        // A stop that finds the pause already resolved lost a race to the person: the
+        // person's word came first, so it is read again at the top and stands.
         if pause::is_set(db).await? {
-            stop(db, pause_id).await?;
+            if !stop(db, pause_id).await? {
+                continue;
+            }
             return Err(Error::Paused);
         }
         if cancel.is_cancelled() || run_cancelled(db, run_id).await? {
-            stop(db, pause_id).await?;
+            if !stop(db, pause_id).await? {
+                continue;
+            }
             return Err(Error::Cancelled);
         }
         if begun.elapsed() >= limit {
@@ -1218,8 +1224,9 @@ async fn wait(
     }
 }
 
-async fn stop(db: &Db, pause_id: &str) -> Result<()> {
-    sqlx::query(concat!(
+/// True when this stop ended the pause; false when someone had resolved it first.
+async fn stop(db: &Db, pause_id: &str) -> Result<bool> {
+    let stopped = sqlx::query(concat!(
         "UPDATE apply_pauses SET resolved_by = 'system', resolution = 'stopped', resolved_at = ",
         now!(),
         " WHERE id = ? AND resolved_at IS NULL"
@@ -1227,7 +1234,7 @@ async fn stop(db: &Db, pause_id: &str) -> Result<()> {
     .bind(pause_id)
     .execute(&db.pool)
     .await?;
-    Ok(())
+    Ok(stopped.rows_affected() == 1)
 }
 
 /// The run has ended, a person asked its agent run to stop, or its host is gone: the agent
