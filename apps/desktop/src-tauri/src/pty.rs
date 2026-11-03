@@ -1,5 +1,7 @@
-//! The terminal panel's PTY: one session of the bundled `jobpilot shell`, never a system
-//! shell. `pty_open` takes a size and nothing else, so the webview cannot choose what runs.
+//! The terminal panel's PTY: one session of the bundled `jobpilot shell`, or of `jobpilot apply
+//! session <id>` for a `ready` apply run, never a system shell. `pty_open` takes a size and
+//! nothing else, and `pty_open_apply` a size and a run id, so the webview cannot choose what
+//! runs.
 //! Keystrokes are bytes on a queue, because a write can block for as long as the child
 //! ignores its input and commands run on the main thread. Output and the exit code go out
 //! as events to the window that opened the session, and output is paced by acks from the
@@ -17,7 +19,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use jobpilot_core::ai::claude_code::ClaudeCode;
-use jobpilot_core::{Error, Result};
+use jobpilot_core::browser::sweep::kill_marked;
+use jobpilot_core::{AppPaths, Error, Result, apply};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tauri::{
     Emitter, EventTarget, Listener, Manager, Runtime, State, WebviewWindow, Window, WindowEvent,
@@ -43,7 +46,8 @@ const DRAIN: Duration = Duration::from_millis(500);
 
 /// What the panel's child inherits beyond the headless adapter's list: an interactive
 /// session and the login-shell lookup for `claude` want them. Still no API keys or tokens.
-const PANEL_ENV: &[&str] = &["SHELL", "LOGNAME", "USERNAME", "PATHEXT"];
+/// One list, the apply host's own.
+const PANEL_ENV: &[&str] = jobpilot_core::apply::session::TERMINAL_ENV;
 /// A Finder launch has only the system folders on `PATH`. Besides `claude`, which the shell
 /// also finds through `ai.claude_path`, a session needs what `claude` itself runs.
 #[cfg(unix)]
@@ -58,8 +62,17 @@ pub struct PtyState {
     ending: Mutex<Vec<JoinHandle<()>>>,
 }
 
+/// What the session runs. The webview names at most a run id; Rust builds the command.
+pub enum Launch {
+    Shell,
+    /// `jobpilot apply session <id>`, for a run checked `ready` first.
+    Apply(String),
+}
+
 pub struct Session {
     id: u64,
+    /// The apply run this session hosts, if any.
+    apply: Option<String>,
     master: Box<dyn MasterPty + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     input: SyncSender<Vec<u8>>,
@@ -195,9 +208,34 @@ impl PtyState {
         self.ending.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// For the emergency pause: ends an apply session at once, and then everything its run
+    /// folder names, the browser included, which runs in a process group of its own. A plain
+    /// shell session is left alone: what the owner runs there is the owner's (M-14).
+    pub fn close_apply(&self, paths: &AppPaths) {
+        let mut slot = self.slot();
+        let Some(apply_id) = slot.as_ref().and_then(|session| session.apply.clone()) else {
+            return;
+        };
+        let session = slot.take();
+        drop(slot);
+        if let Some(session) = session {
+            session.output.silence();
+            self.ending().push(thread::spawn(move || session.end()));
+        }
+        kill_marked(&paths.apply().join(apply_id));
+    }
+
     #[cfg(test)]
     pub fn pid(&self) -> Option<u32> {
         self.slot().as_ref()?.pid
+    }
+
+    /// Stands an open shell session in for an apply session, as a real one needs a browser.
+    #[cfg(all(test, unix))]
+    pub fn mark_apply(&self, apply_id: &str) {
+        if let Some(session) = self.slot().as_mut() {
+            session.apply = Some(apply_id.to_owned());
+        }
     }
 }
 
@@ -219,11 +257,13 @@ fn find_sidecar(exe: &Path, debug: bool) -> Result<PathBuf> {
 }
 
 /// The child's whole environment. `base` is the allow-list, so the app's own variables
-/// stay behind; `service` is the debug-only test keychain.
+/// stay behind; `service` is the debug-only test keychain. `marker` sets `JOBPILOT_PANEL`,
+/// which an apply host must not have: the CLI refuses `apply session` under it.
 fn panel_env(
     base: Vec<(String, String)>,
     root: &Path,
     service: Option<String>,
+    marker: bool,
 ) -> BTreeMap<String, String> {
     let mut env: BTreeMap<_, _> = base.into_iter().collect();
     #[cfg(unix)]
@@ -234,7 +274,9 @@ fn panel_env(
         "JOBPILOT_HOME".to_owned(),
         root.to_string_lossy().into_owned(),
     );
-    env.insert("JOBPILOT_PANEL".to_owned(), "1".to_owned());
+    if marker {
+        env.insert("JOBPILOT_PANEL".to_owned(), "1".to_owned());
+    }
     env.insert("TERM".to_owned(), "xterm-256color".to_owned());
     if let Some(service) = service {
         env.insert("JOBPILOT_SECRET_SERVICE".to_owned(), service);
@@ -291,6 +333,35 @@ pub async fn pty_open<R: Runtime>(
     rows: u16,
 ) -> Result<()> {
     let size = checked_size(cols, rows)?;
+    open_session(window, &app, &state, size, Launch::Shell)
+}
+
+/// Hosts a `ready` apply run's session. The id is checked against the store here, and the
+/// command line is Rust's: the webview names the run and the size, and nothing else.
+#[tauri::command]
+pub async fn pty_open_apply<R: Runtime>(
+    window: WebviewWindow<R>,
+    app: State<'_, AppState>,
+    state: State<'_, PtyState>,
+    cols: u16,
+    rows: u16,
+    apply_id: String,
+) -> Result<()> {
+    let size = checked_size(cols, rows)?;
+    let run = apply::view(&*app.work().await?, &apply_id).await?;
+    if run.state != "ready" {
+        return Err(Error::Refused("apply_run_not_ready".into()));
+    }
+    open_session(window, &app, &state, size, Launch::Apply(run.id))
+}
+
+fn open_session<R: Runtime>(
+    window: WebviewWindow<R>,
+    app: &AppState,
+    state: &PtyState,
+    size: PtySize,
+    launch: Launch,
+) -> Result<()> {
     let root = app.known_root()?.root().to_path_buf();
     let sidecar = sidecar_path()?;
     let mut slot = state.slot();
@@ -300,7 +371,16 @@ pub async fn pty_open<R: Runtime>(
 
     let pair = native_pty_system().openpty(size).map_err(pty_error)?;
     let mut command = CommandBuilder::new(sidecar);
-    command.arg("shell");
+    let apply_id = match launch {
+        Launch::Shell => {
+            command.arg("shell");
+            None
+        }
+        Launch::Apply(id) => {
+            command.args(["apply", "session", id.as_str()]);
+            Some(id)
+        }
+    };
     command.env_clear();
     let mut base = ClaudeCode::child_env();
     base.extend(
@@ -311,7 +391,7 @@ pub async fn pty_open<R: Runtime>(
     let service = std::env::var("JOBPILOT_SECRET_SERVICE")
         .ok()
         .filter(|_| cfg!(debug_assertions));
-    for (name, value) in panel_env(base, &root, service) {
+    for (name, value) in panel_env(base, &root, service, apply_id.is_none()) {
         command.env(name, value);
     }
     let mut child = pair.slave.spawn_command(command).map_err(pty_error)?;
@@ -350,6 +430,7 @@ pub async fn pty_open<R: Runtime>(
 
     *slot = Some(Session {
         id,
+        apply: apply_id,
         master: pair.master,
         killer,
         input,
@@ -436,6 +517,40 @@ pub fn pty_close(state: State<'_, PtyState>) -> Result<()> {
     Ok(())
 }
 
+/// A browser as Playwright starts one, for tests: the run folder on its command line, and
+/// deaf to SIGTERM.
+#[cfg(all(test, unix))]
+pub mod test_support {
+    use std::path::Path;
+    use std::process::{Child, Command};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    pub fn marked_browser(dir: &Path) -> Child {
+        let flag = format!("--user-data-dir={}", dir.join("profile").display());
+        let child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "trap '' TERM; while :; do sleep 1; done",
+                "browser",
+                &flag,
+            ])
+            .spawn()
+            .unwrap();
+        // Until the shell has read its trap and the system shows its arguments.
+        thread::sleep(Duration::from_millis(200));
+        child
+    }
+
+    pub fn gone_within_two_seconds(child: &mut Child) {
+        let until = Instant::now() + Duration::from_secs(2);
+        while child.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < until, "process {} survived", child.id());
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
@@ -443,6 +558,8 @@ mod tests {
     use tauri::test::MockRuntime;
     use tauri::{App, WebviewWindowBuilder};
 
+    #[cfg(unix)]
+    use super::test_support::{gone_within_two_seconds, marked_browser};
     use super::*;
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -452,7 +569,7 @@ mod tests {
 
     #[test]
     fn panel_env_carries_the_marker_root_and_terminal() {
-        let found = panel_env(env(&[("TERM", "dumb")]), Path::new("/data"), None);
+        let found = panel_env(env(&[("TERM", "dumb")]), Path::new("/data"), None, true);
         assert_eq!(found["JOBPILOT_PANEL"], "1");
         assert_eq!(found["JOBPILOT_HOME"], "/data");
         assert_eq!(found["TERM"], "xterm-256color");
@@ -461,7 +578,12 @@ mod tests {
 
     #[test]
     fn panel_env_passes_only_what_it_was_given() {
-        let found = panel_env(env(&[("USER", "me")]), Path::new("/data"), Some("t".into()));
+        let found = panel_env(
+            env(&[("USER", "me")]),
+            Path::new("/data"),
+            Some("t".into()),
+            true,
+        );
         assert_eq!(found["USER"], "me");
         assert_eq!(found["JOBPILOT_SECRET_SERVICE"], "t");
         assert!(!found.contains_key("ANTHROPIC_API_KEY"));
@@ -472,7 +594,7 @@ mod tests {
     #[test]
     fn panel_path_reaches_the_usual_tools_on_a_finder_launch() {
         let base = env(&[("PATH", "/usr/bin:/bin"), ("HOME", "/Users/me")]);
-        let path = panel_env(base, Path::new("/data"), None)["PATH"].clone();
+        let path = panel_env(base, Path::new("/data"), None, true)["PATH"].clone();
         assert!(path.starts_with("/usr/bin:/bin:"), "{path}");
         for dir in [
             "/opt/homebrew/bin",
@@ -487,7 +609,7 @@ mod tests {
     #[test]
     fn panel_path_adds_nothing_twice() {
         let base = env(&[("PATH", "/opt/homebrew/bin:/usr/local/bin")]);
-        let path = panel_env(base, Path::new("/data"), None)["PATH"].clone();
+        let path = panel_env(base, Path::new("/data"), None, true)["PATH"].clone();
         assert_eq!(path, "/opt/homebrew/bin:/usr/local/bin");
     }
 
@@ -726,6 +848,53 @@ mod tests {
         pty_close(session.app.state()).unwrap();
         session.app.state::<PtyState>().close();
         assert!(started.elapsed() >= HANGUP_GRACE, "close did not wait");
+        session.assert_gone();
+    }
+
+    #[test]
+    fn panel_env_leaves_the_marker_out_for_an_apply_host() {
+        let found = panel_env(env(&[("USER", "me")]), Path::new("/data"), None, false);
+        assert!(!found.contains_key("JOBPILOT_PANEL"));
+        assert_eq!(found["JOBPILOT_HOME"], "/data");
+        assert_eq!(PANEL_ENV, jobpilot_core::apply::session::TERMINAL_ENV);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn close_apply_kills_a_fake_claude_and_a_marked_browser() {
+        let session = Stubborn::start();
+        let state = session.app.state::<PtyState>();
+        let paths = AppPaths::new(session._tmp.path().join("data"));
+        let id = "0123abcd";
+        state.mark_apply(id);
+        let mut browser = marked_browser(&paths.apply().join(id));
+
+        state.close_apply(&paths);
+
+        assert!(state.pid().is_none());
+        session.assert_gone();
+        gone_within_two_seconds(&mut browser);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn close_apply_leaves_a_plain_shell_session_alone() {
+        let session = Stubborn::start();
+        let state = session.app.state::<PtyState>();
+        let paths = AppPaths::new(session._tmp.path().join("data"));
+        let pid = state.pid();
+
+        state.close_apply(&paths);
+
+        thread::sleep(HANGUP_GRACE * 2);
+        assert_eq!(state.pid(), pid);
+        // SAFETY: `kill` takes plain integers; signal 0 only asks if the process exists.
+        assert_eq!(
+            unsafe { libc::kill(session.pid, 0) },
+            0,
+            "claude must still run"
+        );
+        state.close();
         session.assert_gone();
     }
 

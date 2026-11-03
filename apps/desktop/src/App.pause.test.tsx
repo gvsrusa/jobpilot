@@ -1,7 +1,8 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import type { PauseState } from "./lib/ipc";
+import type { ApplyRunView, PauseState } from "./lib/ipc";
 import { isPauseKey } from "./lib/pause";
+import { useUiStore } from "./lib/store";
 import { backend, count, READY, recovery, renderApp } from "./test-utils";
 
 const VIEWS = ["Status", "Documents", "Data", "Profile", "Resumes", "AI", "Applications", "Memory", "Agents"];
@@ -232,4 +233,37 @@ describe("emergency pause", () => {
     );
     expect(screen.getByRole("button", { name: "Emergency pause" })).toBeInTheDocument();
   }, 8000);
+
+  it("Esc does not cancel a run", async () => {
+    const run: ApplyRunView = {
+      id: "run1",
+      mode: "claude_code",
+      state: "running",
+      items: [],
+      active_pause: {
+        id: "p1",
+        item_id: "i1",
+        kind: "captcha",
+        origin: "page",
+        excerpt: "Prove you are human",
+        created_at: "2026-11-02T10:00:00.000Z",
+      },
+      created_at: "2026-11-02T10:00:00.000Z",
+      ended_at: null,
+    };
+    const api = backend({ apply_view: () => run });
+    const { user } = renderApp();
+    await openView(user, "Applications");
+    act(() => useUiStore.setState({ applyRun: "run1" }));
+    await screen.findByText("Run paused: waiting for you");
+
+    await user.keyboard("{Escape}");
+    await user.click(screen.getByRole("button", { name: "Cancel run" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(dialog).not.toBeInTheDocument());
+
+    expect(count(api, "apply_cancel")).toBe(0);
+    expect(screen.getByText("Run paused: waiting for you")).toBeInTheDocument();
+  });
 });

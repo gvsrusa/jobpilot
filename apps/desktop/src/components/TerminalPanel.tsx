@@ -2,9 +2,11 @@ import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ErrorAlert } from "@/components/ErrorAlert";
 import { Button } from "@/components/ui/button";
-import { onPtyData, onPtyExit, ptyAck, ptyClose, ptyOpen, ptyResize, ptyWrite } from "@/lib/ipc";
+import { ipc, onPtyData, onPtyExit, ptyAck, ptyClose, ptyOpen, ptyOpenApply, ptyResize, ptyWrite } from "@/lib/ipc";
+import { useUiStore } from "@/lib/store";
 import { cn } from "@/lib/utils";
 
 /** Output is untrusted, so a link in it (OSC 8) must never open anything. */
@@ -14,10 +16,20 @@ export const TERMINAL_OPTIONS = {
   linkHandler: { activate: () => undefined },
 };
 
+/** A run left `ready` with no session would block the next one: end it. */
+function dropRun(id: string) {
+  void ipc.applyCancel(id).catch(() => undefined);
+  if (useUiStore.getState().applyRun === id) useUiStore.getState().setApplyRun(null);
+}
+
 /**
  * The bottom panel. A session starts when the panel first opens and lives until Close panel,
  * Restart, or unmount: hiding the panel keeps it, so Ctrl+` cannot end a Claude session.
  * Scrollback lives in this memory only and is never stored.
+ *
+ * With `applyRun` set, the session is that run's host, opened by `ptyOpenApply` with the run
+ * id alone. A shell already open is ended only after the owner says so. Nothing reads the
+ * output: the run reports through its own rows.
  */
 export function TerminalPanel({ open, onClose }: { open: boolean; onClose(): void }) {
   const host = useRef<HTMLDivElement>(null);
@@ -32,6 +44,24 @@ export function TerminalPanel({ open, onClose }: { open: boolean; onClose(): voi
   const [writeError, setWriteError] = useState<unknown>(null);
   const [ended, setEnded] = useState(false);
   const [typed, setTyped] = useState(false);
+  const applyRun = useUiStore((s) => s.applyRun);
+  // The run the current session hosts, or null for the shell.
+  const [launch, setLaunch] = useState<string | null>(null);
+  // A run waiting for the owner to end the open session.
+  const [asking, setAsking] = useState<string | null>(null);
+  // A session is open and has not ended.
+  const live = useRef(false);
+
+  useEffect(() => {
+    if (!applyRun || applyRun === launch) return;
+    if (live.current) {
+      setAsking(applyRun);
+    } else {
+      setLaunch(applyRun);
+      setWanted(true);
+    }
+    // Only a new run asks: `launch` changes when it is taken.
+  }, [applyRun]);
 
   useEffect(() => {
     if (!open) return;
@@ -60,11 +90,23 @@ export function TerminalPanel({ open, onClose }: { open: boolean; onClose(): voi
         await onPtyData((bytes) => term.write(bytes, () => void ptyAck(bytes.length))),
         await onPtyExit(() => {
           finished = true;
+          live.current = false;
           setEnded(true);
         }),
       );
       await ptyClose();
-      if (!stopped) await ptyOpen(term.cols, term.rows);
+      if (stopped) return;
+      if (launch) {
+        try {
+          await ptyOpenApply(term.cols, term.rows, launch);
+        } catch (error) {
+          dropRun(launch);
+          throw error;
+        }
+      } else {
+        await ptyOpen(term.cols, term.rows);
+      }
+      if (!stopped && !finished) live.current = true;
     });
     opened.catch((error: unknown) => {
       finished = true;
@@ -88,6 +130,7 @@ export function TerminalPanel({ open, onClose }: { open: boolean; onClose(): voi
 
     return () => {
       stopped = true;
+      live.current = false;
       window.removeEventListener("resize", refit);
       key.dispose();
       input.dispose();
@@ -106,7 +149,7 @@ export function TerminalPanel({ open, onClose }: { open: boolean; onClose(): voi
         })
         .catch(() => undefined);
     };
-  }, [wanted, run]);
+  }, [wanted, run, launch]);
 
   // Capture: xterm.js must not see F6, or it would go to the shell as a keystroke.
   const leaveOnF6 = (e: KeyboardEvent<HTMLElement>) => {
@@ -121,6 +164,12 @@ export function TerminalPanel({ open, onClose }: { open: boolean; onClose(): voi
     onClose();
   };
 
+  // A run's host cannot be opened again once it has started: Restart goes back to the shell.
+  const restart = () => {
+    setLaunch(null);
+    setRun((n) => n + 1);
+  };
+
   return (
     <section
       aria-label="Terminal"
@@ -131,12 +180,12 @@ export function TerminalPanel({ open, onClose }: { open: boolean; onClose(): voi
       <header className="flex items-center justify-between gap-4 border-b px-4 py-1">
         <span className="flex items-baseline gap-3">
           <span className="font-semibold">Terminal</span>
-          <span className="text-sm text-muted-foreground">jobpilot CLI only</span>
+          <span className="text-sm text-muted-foreground">{launch ? "Claude Code apply run" : "jobpilot CLI only"}</span>
         </span>
         <span className="flex items-center gap-2">
           {ended && <span role="status" className="text-sm text-muted-foreground">Session ended.</span>}
           {(failure || ended) && (
-            <Button size="sm" onClick={() => setRun((n) => n + 1)}>
+            <Button size="sm" onClick={restart}>
               Restart
             </Button>
           )}
@@ -160,6 +209,26 @@ export function TerminalPanel({ open, onClose }: { open: boolean; onClose(): voi
       <footer className="border-t px-4 py-1 text-sm text-muted-foreground">
         Runs the same services as the app. Output is not saved.
       </footer>
+      {asking && (
+        <ConfirmDialog
+          title="Start the apply run here?"
+          confirmLabel="End session"
+          busyLabel="Ending..."
+          confirmVariant="default"
+          pending={false}
+          onConfirm={() => {
+            setAsking(null);
+            setLaunch(asking);
+            setWanted(true);
+          }}
+          onCancel={() => {
+            setAsking(null);
+            dropRun(asking);
+          }}
+        >
+          <p>This ends the terminal session.</p>
+        </ConfirmDialog>
+      )}
     </section>
   );
 }

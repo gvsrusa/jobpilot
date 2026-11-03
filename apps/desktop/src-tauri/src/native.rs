@@ -26,7 +26,7 @@ pub async fn confirmed<R: Runtime>(
     message: String,
     action: &str,
 ) -> Result<()> {
-    match ask(app, title, message, action).await? {
+    match ask(app, title, message, action, "Cancel").await? {
         true => Ok(()),
         false => Err(Error::ConfirmationRequired),
     }
@@ -109,12 +109,14 @@ async fn off_the_main_thread<T: Send + 'static>(
         .map_err(|_| Error::Failed("the dialog stopped unexpectedly".into()))
 }
 
+/// True for `action`, false for `cancel` or a closed dialog. Both answers are the person's.
 #[cfg(not(test))]
-async fn ask<R: Runtime>(
+pub(crate) async fn ask<R: Runtime>(
     app: &AppHandle<R>,
     title: &str,
     message: String,
     action: &str,
+    cancel: &str,
 ) -> Result<bool> {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
@@ -125,7 +127,7 @@ async fn ask<R: Runtime>(
         .kind(MessageDialogKind::Warning)
         .buttons(MessageDialogButtons::OkCancelCustom(
             action.to_owned(),
-            "Cancel".to_owned(),
+            cancel.to_owned(),
         ));
     off_the_main_thread(move || builder.blocking_show()).await
 }
@@ -234,11 +236,12 @@ async fn wipe_clipboard<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
 }
 
 #[cfg(test)]
-async fn ask<R: Runtime>(
+pub(crate) async fn ask<R: Runtime>(
     app: &AppHandle<R>,
     title: &str,
     message: String,
     _action: &str,
+    _cancel: &str,
 ) -> Result<bool> {
     use std::sync::atomic::Ordering;
     use tauri::Manager;

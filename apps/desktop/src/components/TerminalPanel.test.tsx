@@ -1,9 +1,10 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { emit, listen } from "@tauri-apps/api/event";
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ptyWrite } from "@/lib/ipc";
+import { useUiStore } from "@/lib/store";
 import { TERMINAL_OPTIONS, TerminalPanel } from "./TerminalPanel";
 
 type Call = { cmd: string; args: Record<string, unknown> };
@@ -40,6 +41,8 @@ function panel(onClose = vi.fn()) {
 }
 
 describe("TerminalPanel", () => {
+  beforeEach(() => useUiStore.setState({ applyRun: null }));
+
   it("renders_header_footer_and_empty_hint", async () => {
     const { of } = backend();
     panel();
@@ -203,5 +206,61 @@ describe("TerminalPanel", () => {
     const before = of("pty_close").length;
     unmount();
     await waitFor(() => expect(of("pty_close").length).toBeGreaterThan(before));
+  });
+
+  it("the panel opens the apply session only with a run id", async () => {
+    const { of } = backend();
+    useUiStore.setState({ applyRun: "run1" });
+    panel();
+    await waitFor(() => expect(of("pty_open_apply")).toHaveLength(1));
+    expect(Object.keys(of("pty_open_apply")[0].args).sort()).toEqual(["applyId", "cols", "rows"]);
+    expect(of("pty_open_apply")[0].args.applyId).toBe("run1");
+    expect(of("pty_open")).toHaveLength(0);
+    expect(screen.getByText("Claude Code apply run")).toBeInTheDocument();
+    expect(screen.queryByText("jobpilot CLI only")).not.toBeInTheDocument();
+  });
+
+  it("declining the end-session dialog cancels the ready run", async () => {
+    const { of } = backend();
+    const { user } = panel();
+    await waitFor(() => expect(of("pty_open")).toHaveLength(1));
+
+    act(() => useUiStore.getState().setApplyRun("run1"));
+
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent("This ends the terminal session.");
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(of("apply_cancel")).toHaveLength(1));
+    expect(of("apply_cancel")[0].args).toEqual({ id: "run1" });
+    expect(useUiStore.getState().applyRun).toBeNull();
+    expect(of("pty_open_apply")).toHaveLength(0);
+    expect(screen.getByText("jobpilot CLI only")).toBeInTheDocument();
+  });
+
+  it("confirming the end-session dialog opens the apply session", async () => {
+    const { of } = backend();
+    const { user } = panel();
+    await waitFor(() => expect(of("pty_open")).toHaveLength(1));
+
+    act(() => useUiStore.getState().setApplyRun("run1"));
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: "End session" }));
+
+    await waitFor(() => expect(of("pty_open_apply")).toHaveLength(1));
+    expect(of("apply_cancel")).toHaveLength(0);
+    expect(screen.getByText("Claude Code apply run")).toBeInTheDocument();
+  });
+
+  it("a failed apply open cancels the ready run", async () => {
+    const { of } = backend({
+      pty_open_apply: () => {
+        throw { code: "refused", message: "refused: apply_run_not_ready" };
+      },
+    });
+    useUiStore.setState({ applyRun: "run1" });
+    panel();
+    expect(await screen.findByRole("alert")).toHaveTextContent("code: refused");
+    await waitFor(() => expect(of("apply_cancel")).toHaveLength(1));
+    expect(useUiStore.getState().applyRun).toBeNull();
   });
 });

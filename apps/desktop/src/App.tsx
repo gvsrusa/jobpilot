@@ -37,6 +37,11 @@ function Shell({ root }: { root: string }) {
   const nav = useRef<HTMLElement>(null);
   const main = useRef<HTMLElement>(null);
   const [terminal, setTerminal] = useState(false);
+  // A run started from the screen is hosted in the panel, so the panel opens for it.
+  const applyRun = useUiStore((s) => s.applyRun);
+  useEffect(() => {
+    if (applyRun) setTerminal(true);
+  }, [applyRun]);
 
   // On a view change, focus moves to the main view heading. Not on launch: that would put
   // the first tab stop past Emergency pause.

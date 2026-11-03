@@ -22,6 +22,10 @@ import {
   type Question,
 } from "@/lib/ipc";
 import { formatDate, formatDateTime, formatDay } from "@/lib/utils";
+import { ApplyRun } from "@/views/ApplyRun";
+
+/** Core's `apply::MAX_RUN_ITEMS`. */
+const MAX_RUN_ITEMS = 25;
 
 const NEW = "new";
 const EMPTY: ApplicationInput = {
@@ -335,6 +339,10 @@ export function ApplicationsView() {
   const [on, setOn] = useState("");
   const [statusNote, setStatusNote] = useState("");
   const [note, setNote] = useState("");
+  // Saved applications picked for a Claude Code run, and whether the run screen is open.
+  const [picked, setPicked] = useState<string[]>([]);
+  const [applying, setApplying] = useState<string[] | null>(null);
+  const applyRun = useUiStore((s) => s.applyRun);
 
   const apps = useQuery({
     queryKey: ["applications", filter],
@@ -475,7 +483,27 @@ export function ApplicationsView() {
           ))}
         </select>
         <Button onClick={startNew}>Add application</Button>
+        <Button
+          variant="outline"
+          disabled={picked.length === 0 || picked.length > MAX_RUN_ITEMS || applyRun !== null}
+          onClick={() => setApplying(picked)}
+        >
+          Apply with Claude Code...
+        </Button>
+        {picked.length > MAX_RUN_ITEMS && (
+          <span className="text-sm text-muted-foreground">A run takes at most {MAX_RUN_ITEMS} applications.</span>
+        )}
       </div>
+      {(applying !== null || applyRun !== null) && (
+        <ApplyRun
+          applicationIds={applying ?? []}
+          onClose={() => {
+            setApplying(null);
+            if (applyRun) setPicked([]);
+            void refresh();
+          }}
+        />
+      )}
       <div className="grid grid-cols-[minmax(0,3fr)_minmax(0,2fr)] gap-6">
         <div onKeyDown={onListKey}>
           {apps.isSuccess && rows.length === 0 ? (
@@ -486,6 +514,7 @@ export function ApplicationsView() {
             <Table>
               <TableHeader>
                 <TableRow>
+                  <TableHead>Run</TableHead>
                   <TableHead>Company</TableHead>
                   <TableHead>Role</TableHead>
                   <TableHead>Status</TableHead>
@@ -496,6 +525,21 @@ export function ApplicationsView() {
               <TableBody>
                 {rows.map((a) => (
                   <TableRow key={a.id} data-state={a.id === selected ? "selected" : undefined}>
+                    <TableCell>
+                      {a.status === "saved" && (
+                        <label className="flex items-center gap-1 text-sm">
+                          <input
+                            type="checkbox"
+                            aria-label={`Select ${a.company}`}
+                            checked={picked.includes(a.id)}
+                            onChange={(e) =>
+                              setPicked(e.target.checked ? [...picked, a.id] : picked.filter((id) => id !== a.id))
+                            }
+                          />
+                          Select
+                        </label>
+                      )}
+                    </TableCell>
                     <TableCell className="whitespace-normal">
                       <button
                         type="button"

@@ -115,7 +115,40 @@ const REASONS: [word: string, text: string][] = [
   ["company_gone", "This company no longer exists, so nothing was saved."],
   ["no_ai", "No AI provider could take this task, so nothing was generated"],
   ["no_embedding_model", "No embedding model is set on the AI screen"],
+  ["no_browser_runtime", "The browser runtime is not set up. Press Set up browser, then start the run again."],
+  ["claude_not_found", "Claude Code was not found. Install it, or choose its program on the AI screen."],
+  ["apply_run_active", "Another apply run is still open. Let it end, or cancel it, then start this one."],
+  ["apply_run_not_ready", "This run has already started or ended. Start a new run with what is left."],
+  ["consent_required", "Your Claude Code consent does not cover what this run sends. Review it on the AI screen."],
+  [
+    "claude_exited",
+    "Claude Code stopped with an error, so the run ended. It may be signed out: run it once in your own terminal, then start a new run.",
+  ],
 ];
+
+/** Why an application cannot go in a run, from the preflight's block codes. */
+const BLOCKS: Record<string, string> = {
+  not_saved: "Only an application with status Saved can go in a run.",
+  link_not_https: "The posting link is not https.",
+  already_in_a_run: "It is already in a run that has not ended.",
+  resume_blocked: "The resume has a claim to fix before it can be exported.",
+  letter_blocked: "The cover letter has a claim to fix before it can be exported.",
+};
+
+export function blockText(code: string): string {
+  return BLOCKS[code] ?? `Refused: ${code}`;
+}
+
+/** Why an item ended where it did, from its reason code. */
+const ITEM_REASONS: Record<string, string> = {
+  session_ended: "The session ended while this application was open.",
+  run_ended: "The run ended before this application was reached.",
+  claude_exited: "Claude Code stopped with an error while this application was open.",
+};
+
+export function itemReason(code: string): string {
+  return ITEM_REASONS[code] ?? code;
+}
 
 /** A plain-words hint for a failure reason, or null when the error holds none we know. */
 export function explainReason(error: unknown): string | null {
