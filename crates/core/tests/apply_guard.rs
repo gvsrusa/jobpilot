@@ -674,7 +674,7 @@ fn a_choice_is_judged_by_its_question() {
     assert_eq!(choice_guard(&groups(), "e12", &b), Err(Legal));
     assert_eq!(choice_guard(&groups(), "e13", &b), Err(Legal));
     assert_eq!(choice_guard(&groups(), "e14", &b), Ok(()));
-    assert_eq!(choice_guard(&groups(), "e2", &b), Ok(()));
+    assert_eq!(choice_guard(&groups(), "e2", &b), Err(Sensitive));
     let none = brief(None);
     assert_eq!(choice_guard(&groups(), "e6", &none), Err(Sensitive));
 }
@@ -735,8 +735,6 @@ fn authorization_must_name_the_facts_country() {
         "Are you authorized to work in the United States of America?",
         "Are you authorized to work in the U.S.?",
         "Are you authorized to work in the USA?",
-        "Are you authorized to work in America?",
-        "Are you authorized to work in New Jersey, US?",
     ] {
         assert_eq!(field_guard(label, "yes", &us), Ok(()), "{label}");
     }
@@ -747,6 +745,8 @@ fn authorization_must_name_the_facts_country() {
         "Are you authorized to work?",
         "Are you authorized to work in England?",
         "Are you authorized to work in New Jersey?",
+        "Are you authorized to work in New Jersey, US?",
+        "Are you authorized to work in America?",
     ] {
         assert_eq!(field_guard(label, "yes", &us), Err(Sensitive), "{label}");
     }
@@ -790,4 +790,175 @@ fn an_ack_survives_a_state_change() {
         assert!(scan(after, &acked).is_none(), "{after}");
     }
     assert!(scan("- checkbox \"I certify that\" [ref=e6]", &acked).is_some());
+}
+
+fn page(lines: &[&str]) -> String {
+    lines.join("\n")
+}
+
+fn gender_brief() -> Brief {
+    let mut b = brief(Some(("yes", "no")));
+    b.answers = vec![BriefAnswer {
+        question: "Gender".into(),
+        answer: "Female".into(),
+    }];
+    b
+}
+
+#[test]
+fn every_choice_role_is_judged() {
+    let b = gender_brief();
+    let list = page(&[
+        "- listbox \"Gender\" [ref=e1]:",
+        "  - option \"Male\" [ref=e2]",
+        "  - option \"Female\" [ref=e3]",
+        "- menu \"Gender\" [ref=e4]:",
+        "  - menuitemradio \"Male\" [ref=e5]",
+        "- switch \"I am a protected veteran\" [ref=e6]",
+        "- button \"Next\" [ref=e7]",
+        "- generic [ref=e8]",
+    ]);
+    assert_eq!(choice_guard(&list, "e2", &b), Err(Sensitive));
+    assert_eq!(choice_guard(&list, "e3", &b), Ok(()));
+    assert_eq!(choice_guard(&list, "e5", &b), Err(Sensitive));
+    assert_eq!(choice_guard(&list, "e6", &b), Err(Sensitive));
+    for (target, choice) in [
+        ("e2", true),
+        ("e6", true),
+        ("e7", false),
+        ("e8", true),
+        ("e99", true),
+    ] {
+        assert_eq!(is_choice(&list, target), choice, "{target}");
+    }
+    for role in ["button", "link", "tab", "combobox", "textbox", "searchbox"] {
+        let one = format!("- {role} \"x\" [ref=e1]");
+        assert!(!is_choice(&one, "e1"), "{role}");
+    }
+}
+
+#[test]
+fn the_options_own_class_counts() {
+    let b = gender_brief();
+    let steps = page(&[
+        "- group \"Step 4 of 5\" [ref=e1]:",
+        "  - radio \"I am a protected veteran\" [ref=e2]",
+        "  - checkbox \"I require visa sponsorship\" [ref=e3]",
+        "  - checkbox \"I agree to arbitration\" [ref=e4]",
+        "  - radio \"Morning\" [ref=e5]",
+    ]);
+    assert_eq!(choice_guard(&steps, "e2", &b), Err(Sensitive));
+    assert_eq!(choice_guard(&steps, "e3", &b), Err(Sensitive));
+    assert_eq!(choice_guard(&steps, "e4", &b), Err(Legal));
+    assert_eq!(choice_guard(&steps, "e5", &b), Ok(()));
+}
+
+#[test]
+fn a_sibling_label_and_every_ancestor_are_questions() {
+    let b = gender_brief();
+    let sibling = page(&[
+        "- generic [ref=e1]:",
+        "  - text: Gender",
+        "  - radiogroup [ref=e2]:",
+        "    - radio \"Male\" [ref=e3]",
+        "    - radio \"Female\" [ref=e4]",
+    ]);
+    assert_eq!(choice_guard(&sibling, "e3", &b), Err(Sensitive));
+    assert_eq!(choice_guard(&sibling, "e4", &b), Ok(()));
+    let heading = page(&[
+        "- form \"Apply for Engineer\" [ref=e1]:",
+        "  - heading \"Gender\" [level=3] [ref=e5]",
+        "  - radiogroup [ref=e2]:",
+        "    - radio \"Male\" [ref=e3]",
+    ]);
+    assert_eq!(choice_guard(&heading, "e3", &b), Err(Sensitive));
+    let hostile = page(&[
+        "- radiogroup \"Gender\" [ref=e1]:",
+        "  - listitem \"Shift A\" [ref=e2]:",
+        "    - radio \"Male\" [ref=e3]",
+    ]);
+    assert_eq!(choice_guard(&hostile, "e3", &b), Err(Sensitive));
+    let legal = page(&[
+        "- paragraph: I certify the above is true",
+        "- checkbox \"Yes\" [ref=e1]",
+    ]);
+    assert_eq!(choice_guard(&legal, "e1", &b), Err(Legal));
+}
+
+#[test]
+fn one_label_matching_two_answers_pauses() {
+    let mut b = brief(None);
+    b.answers = vec![
+        BriefAnswer {
+            question: "Gender".into(),
+            answer: "Female".into(),
+        },
+        BriefAnswer {
+            question: "Is your gender identity the same as assigned at birth?".into(),
+            answer: "Yes".into(),
+        },
+    ];
+    assert_eq!(field_guard("Gender", "Yes", &b), Err(Sensitive));
+    assert_eq!(field_guard("Gender", "Female", &b), Err(Sensitive));
+}
+
+#[test]
+fn authorization_uses_a_strict_form() {
+    let us = brief(Some(("yes", "no")));
+    let sponsor = brief(Some(("yes", "yes")));
+    assert_eq!(
+        field_guard(
+            "Are you legally authorized to work in the United States?",
+            "yes",
+            &us
+        ),
+        Ok(())
+    );
+    let future =
+        "Will you now or in the future require sponsorship for employment visa status in the U.S.?";
+    assert_eq!(field_guard(future, "yes", &sponsor), Ok(()));
+    assert_eq!(field_guard(future, "no", &sponsor), Err(Sensitive));
+    for label in [
+        "Are you a U.S. citizen?",
+        "Are you a permanent resident of the United States?",
+        "Do you hold a green card for the US?",
+        "Do you need a work permit to work in the US?",
+        "Are you unauthorized to work in the US?",
+        "Are you authorized to work in the US and Canada?",
+        "Are you authorized to work in the United States or the United Kingdom?",
+        "Are you authorized to work in Latin America?",
+        "Are you authorized to work in the U.S. Virgin Islands?",
+        "Are you authorized to work for us in Canada?",
+        "Are you authorized to work in Europe?",
+        "Are you authorized to work in the EU?",
+        "Are you authorized to work in the US, either now or later?",
+        "Do you require a visa to work in the US?",
+        "Are you authorized to work in the US or any territory?",
+    ] {
+        assert_eq!(field_guard(label, "yes", &us), Err(Sensitive), "{label}");
+    }
+    let mut india = brief(Some(("yes", "no")));
+    india.work_authorization.as_mut().unwrap().country = "IN".into();
+    assert_eq!(
+        field_guard("ARE YOU AUTHORIZED TO WORK IN CANADA?", "yes", &india),
+        Err(Sensitive)
+    );
+    assert_eq!(
+        field_guard("Are you authorized to work in India?", "yes", &india),
+        Ok(())
+    );
+    let mut gb = brief(Some(("yes", "no")));
+    gb.work_authorization.as_mut().unwrap().country = "GB".into();
+    assert_eq!(
+        field_guard("Are you authorized to work in New South Wales?", "yes", &gb),
+        Err(Sensitive)
+    );
+    assert_eq!(
+        field_guard("Are you authorized to work in Britain?", "yes", &gb),
+        Ok(())
+    );
+    assert_eq!(
+        field_guard("Are you authorized to work in the U.K.?", "yes", &gb),
+        Ok(())
+    );
 }
