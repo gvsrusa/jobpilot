@@ -142,15 +142,36 @@ describe("copilot", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("policy_blocked");
   });
 
-  it("a run that ends uncertain on an error shows what to do beside the error", async () => {
-    let started = false;
+  it("a start refused before any run shows no earlier run's outcome", async () => {
+    const earlier = run({
+      state: "ended",
+      items: [item("uncertain")],
+      created_at: "2026-11-02T10:00:00.000Z",
+      ended_at: "2026-11-02T10:05:00.000Z",
+    });
     await openReview({
       copilot_start: () => {
-        started = true;
+        throw { code: "manual_required", message: "no_browser_runtime" };
+      },
+      apply_latest: () => earlier,
+    });
+    await screen.getByRole("button", { name: "Start Copilot" }).click();
+    expect(await screen.findByRole("alert")).toHaveTextContent("no_browser_runtime");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(screen.queryByText(/Check the site/)).not.toBeInTheDocument();
+  });
+
+  it("a run that ends uncertain on an error shows what to do beside the error", async () => {
+    let started: string | null = null;
+    await openReview({
+      copilot_start: () => {
+        started = new Date().toISOString();
         throw { code: "paused", message: "paused" };
       },
       apply_latest: () =>
-        started ? run({ state: "ended", items: [item("uncertain")], ended_at: "2026-11-03T10:05:00.000Z" }) : null,
+        started
+          ? run({ state: "ended", items: [item("uncertain")], created_at: started, ended_at: started })
+          : null,
     });
     await screen.getByRole("button", { name: "Start Copilot" }).click();
     expect(await screen.findByRole("alert")).toHaveTextContent("paused");

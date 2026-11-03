@@ -35,11 +35,12 @@ export function CopilotRun({ applicationId }: { applicationId: string }) {
   const busy = start.isPending || running !== null;
   const ended = start.data?.items[0]?.state;
   // A run that ends on an error (a pause or a cancel after Continue) returns no view: its end
-  // is read from the run itself, so "Check the site" still shows beside the error.
+  // is read from the run itself, so "Check the site" still shows beside the error. Only a run
+  // this start created counts: a start refused before any run shows no earlier run's end.
   const lastRun = live.data && live.data.mode === "copilot" && live.data.state === "ended" ? live.data : null;
-  const endedOnError = start.isError
-    ? lastRun?.items.find((item) => item.application_id === applicationId)?.state
-    : undefined;
+  const thisStart = lastRun !== null && start.submittedAt > 0 && Date.parse(lastRun.created_at) >= start.submittedAt;
+  const endedOnError =
+    start.isError && thisStart ? lastRun?.items.find((item) => item.application_id === applicationId)?.state : undefined;
 
   return (
     <div className="grid gap-2">
