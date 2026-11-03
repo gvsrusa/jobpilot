@@ -630,6 +630,39 @@ async fn a_redirect_off_origin_pauses_before_any_fill() {
     ended(task).await.unwrap();
 }
 
+/// An off-origin page's labels never reach career memory; the posting's own form's do.
+#[tokio::test]
+async fn an_off_origin_page_adds_no_form_question() {
+    let w = world().await;
+    let app = add_app(&w.db, LINK).await;
+    let extra = "  - textbox \"Favourite colour\" [ref=e7]\n";
+    let m = mock(&w, &page("https://login.example.net/sso?next=apply", extra));
+    let task = run(&w, no_model(), &app, m.knobs());
+    let pause = open_pause(&w.db).await;
+    assert!(pause.excerpt.contains("not on the posting's site"));
+    let asked = async || -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM memory_questions WHERE source = 'form'")
+            .fetch_one(&w.db.pool)
+            .await
+            .unwrap()
+    };
+    assert_eq!(asked().await, 0);
+
+    std::fs::write(&m.snapshot, page(LINK, extra)).unwrap();
+    apply::resolve_pause(&w.db, "cli", &pause.id, Resolution::Continue)
+        .await
+        .unwrap();
+    resolve(&w.db, Resolution::TakeOver).await;
+    ended(task).await.unwrap();
+    let colour: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM memory_questions WHERE source = 'form' AND text = 'Favourite colour'",
+    )
+    .fetch_one(&w.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(colour, 1);
+}
+
 #[tokio::test]
 async fn a_captcha_mid_form_pauses_and_a_page_cannot_end_it() {
     let w = world().await;

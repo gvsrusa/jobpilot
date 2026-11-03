@@ -516,6 +516,11 @@ impl BrowserWorkflow<'_> {
         if !self.read_form(ctx, driver).await? {
             return Ok(StepOutput::default());
         }
+        // Off the posting's site a person decides first (M-37), before anything on that page
+        // is mapped or kept: an off-origin page's labels never reach career memory.
+        if !self.on_origin(ctx, driver).await? {
+            return Ok(StepOutput::default());
+        }
         let provider = self.map(ctx, driver).await?;
         // Questions the form asked that nothing answered, kept with form provenance and no
         // answer, so the owner can answer them for next time (decision 25).
@@ -730,18 +735,30 @@ impl BrowserWorkflow<'_> {
         }
     }
 
-    async fn fill(&self, ctx: &Ctx<'_>, driver: &mut Driver) -> Result<StepOutput> {
-        self.decided(ctx.db, Action::Fill).await?;
-        // The page the form is on must be the posting's site (M-37). Off it, a person decides.
+    /// Holds while the form read last is off the posting's site, reading it again after each
+    /// Continue. False when the hold ended the item or the read found no form.
+    async fn on_origin(&self, ctx: &Ctx<'_>, driver: &mut Driver) -> Result<bool> {
         let home = forms::origin_of(&driver.app.link);
         while driver.form.origin.is_empty() || driver.form.origin != home {
             if let Step::Stopped = self
                 .hold(ctx, driver, PauseKind::Other, "guard", OFF_ORIGIN)
                 .await?
             {
-                return Ok(StepOutput::default());
+                return Ok(false);
             }
             if !self.read_form(ctx, driver).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    async fn fill(&self, ctx: &Ctx<'_>, driver: &mut Driver) -> Result<StepOutput> {
+        self.decided(ctx.db, Action::Fill).await?;
+        // The page the form is on must be the posting's site (M-37). Off it, a person decides.
+        let home = forms::origin_of(&driver.app.link);
+        while driver.form.origin.is_empty() || driver.form.origin != home {
+            if !self.on_origin(ctx, driver).await? {
                 return Ok(StepOutput::default());
             }
             self.map(ctx, driver).await?;
