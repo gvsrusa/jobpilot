@@ -25,7 +25,7 @@ use crate::drafts::{self, ExportFormat};
 use crate::error::{Error, Result};
 use crate::memory::Class;
 use crate::memory::usage::{self, ApprovedRow};
-use crate::permissions::{self, Action, Decision, Grant, Mode};
+use crate::permissions::{self, Action, Decision, Grant, Mode, Site};
 use crate::render::Template;
 use crate::{agents, audit, pause, runner};
 
@@ -1058,4 +1058,176 @@ fn ended() -> Error {
 /// `<root>/apply/<id>`: the run's browser profile, staged files, and config.
 pub fn run_dir(db: &Db, id: &str) -> PathBuf {
     db.paths().apply().join(id)
+}
+
+// ---- Manual mode: the review screen's material and the outcome a person records ----
+
+/// Wireframe 11's fixed text, by decision.
+const MANUAL_NOTE: &str = "You fill and submit in your own browser. JobPilot opens the link, \
+                           gives you files and answers, and records what happened.";
+const BLOCKED_NOTE: &str =
+    "The site's terms forbid this. JobPilot will not do it, even if you ask.";
+const UNKNOWN_NOTE: &str =
+    "The site has not said whether tools may do this. Treated as blocked until it answers.";
+const NO_CLAUSE_NOTE: &str = "No clause found for this site. You review and submit.";
+const ALLOWED_NOTE: &str = "The site's own rule allows this. You review and submit.";
+const NO_AUTONOMOUS_NOTE: &str = "No site or connector qualifies today. Needs a site rule of \
+                                  allowed, verified permission, and your explicit authorization.";
+const AUTONOMOUS_NOTE: &str = "Fills and submits on this site, and stops at every mandatory pause.";
+pub const CLAUDE_CODE_NOTE: &str = "Fills and submits with Claude Code in a visible browser. Add \
+                                    it to a run from Applications.";
+pub const CLAUDE_CODE_SETUP_NOTE: &str = "Needs the browser runtime and Claude Code set up first. \
+                                          Add it to a run from Applications to see what is missing.";
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModeChoice {
+    pub mode: &'static str,
+    pub available: bool,
+    pub note: String,
+}
+
+/// An approved answer this application can use, with no text.
+#[derive(Debug, Clone, Serialize)]
+pub struct MaterialRow {
+    pub answer_id: String,
+    pub question: String,
+    pub class: String,
+    pub stale: bool,
+    /// A sealed class with no current confirmation for this application.
+    pub needs_confirmation: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Material {
+    pub modes: Vec<ModeChoice>,
+    pub resume: Option<PathBuf>,
+    pub letter: Option<PathBuf>,
+    pub answers: Vec<MaterialRow>,
+    pub authorization: usage::AuthorizationAnswer,
+}
+
+/// What Manual mode hands a person for one application, and how each mode stands on its
+/// site. Reads and exports only: no answer text, no request to the site, no run.
+pub async fn material(db: &Db, application_id: &str) -> Result<Material> {
+    let app = applications::get(db, application_id).await?;
+    // A link that is not https, or names no site, reads as a page with no register row.
+    let site = match permissions::link_allowed(&app.link) {
+        true => permissions::site_of(&app.link).unwrap_or(Site::CompanyPage),
+        false => Site::CompanyPage,
+    };
+    let grant = Grant {
+        owner_started: true,
+        // ponytail: no site is in `permissions::VERIFIED`, so a grant changes no decision
+        // yet. Task 12 reads the stored grant for the site's connector.
+        authorized: false,
+    };
+    let decide = |mode, action| permissions::decide(mode, site, action, &grant);
+    let manual = matches!(
+        decide(Mode::Manual, Action::OpenLink),
+        Decision::Allow { .. }
+    );
+    let copilot = match decide(Mode::Copilot, Action::Fill) {
+        Decision::Allow { note: Some(_) } => (true, NO_CLAUSE_NOTE),
+        Decision::Allow { note: None } => (true, ALLOWED_NOTE),
+        Decision::Refuse("policy_blocked") => (false, BLOCKED_NOTE),
+        Decision::Refuse(_) => (false, UNKNOWN_NOTE),
+    };
+    let autonomous = match decide(Mode::Autonomous, Action::Submit) {
+        Decision::Allow { .. } => (true, AUTONOMOUS_NOTE),
+        Decision::Refuse("policy_blocked") => (false, BLOCKED_NOTE),
+        Decision::Refuse(_) => (false, NO_AUTONOMOUS_NOTE),
+    };
+    let set_up = matches!(runtime::state(db).await?, RuntimeState::Ready(_))
+        && claude_code::find_binary(Some(db)).await.is_ok();
+    let claude = match set_up {
+        true => (true, CLAUDE_CODE_NOTE),
+        false => (false, CLAUDE_CODE_SETUP_NOTE),
+    };
+    let choice = |mode, (available, note): (bool, &str)| ModeChoice {
+        mode,
+        available,
+        note: note.to_owned(),
+    };
+    let modes = vec![
+        choice("manual", (manual, MANUAL_NOTE)),
+        choice("copilot", copilot),
+        choice("autonomous", autonomous),
+        choice("claude_code", claude),
+    ];
+
+    // As the preflight renders them, so every claim guard holds. A blocked document is none.
+    let (_, resume) =
+        export_doc(db, "system", &app, app.resume_draft_id.as_deref(), "resume").await?;
+    let (_, letter) = export_doc(
+        db,
+        "system",
+        &app,
+        app.letter_draft_id.as_deref(),
+        "cover_letter",
+    )
+    .await?;
+
+    let confirmed: HashSet<String> = usage::application_answers(db, &app.id)
+        .await?
+        .into_iter()
+        .filter(|used| used.current)
+        .map(|used| used.answer_id)
+        .collect();
+    let answers = usage::approved_for(db)
+        .await?
+        .into_iter()
+        .filter(|row| row.class != Class::WorkAuthorization && row.serves(&app.country))
+        .map(|row| MaterialRow {
+            needs_confirmation: row.class.sealed() && !confirmed.contains(&row.answer_id),
+            class: row.class.as_str().to_owned(),
+            answer_id: row.answer_id,
+            question: row.question,
+            stale: row.stale,
+        })
+        .collect();
+
+    // Only the exact country's row. A blank country reads "not stated", as no row does.
+    let authorization = match app.country.trim().is_empty() {
+        true => usage::AuthorizationAnswer {
+            country: String::new(),
+            authorized: crate::profile::Stated::NotStated,
+            needs_sponsorship: crate::profile::Stated::NotStated,
+            note: String::new(),
+            stated: false,
+        },
+        false => usage::authorization_for(db, &app.country).await?,
+    };
+    Ok(Material {
+        modes,
+        resume,
+        letter,
+        answers,
+        authorization,
+    })
+}
+
+/// A person records what happened after applying by hand. The status goes through the
+/// tracking agent, and `applied` also audits the submission as Manual mode's.
+pub async fn record_outcome(
+    db: &Db,
+    actor: &str,
+    application_id: &str,
+    outcome: &str,
+    on: Option<&str>,
+    note: &str,
+    cancel: CancellationToken,
+) -> Result<Application> {
+    runner::person(actor)?;
+    let app = applications::get(db, application_id).await?;
+    let saved = agents::set_status(db, actor, &app.id, outcome, on, note, cancel).await?;
+    if outcome == "applied" {
+        let detail = json!({
+            "agent": "browser_application",
+            "mode": "manual",
+            "application": app.id,
+            "host": host_of(&app.link),
+        });
+        audit::record(db, actor, "application_submitted", Some(&app.id), detail).await?;
+    }
+    Ok(saved)
 }

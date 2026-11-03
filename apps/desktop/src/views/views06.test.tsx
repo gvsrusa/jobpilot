@@ -1,6 +1,6 @@
 import { screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import type { Application, ApplyItem, ApplyRunView, ItemCheck, Preflight } from "../lib/ipc";
+import type { Application, ApplyItem, ApplyRunView, ItemCheck, Material, Preflight } from "../lib/ipc";
 import { useUiStore } from "../lib/store";
 import { ApplyRun } from "./ApplyRun";
 import { backend, count, renderApp } from "../test-utils";
@@ -335,5 +335,131 @@ describe("apply run", () => {
     expect(count(api, "apply_cancel")).toBe(0);
     expect(useUiStore.getState().applyRun).toBe("run7");
     expect(screen.getByRole("button", { name: "Record status" })).toBeInTheDocument();
+  });
+});
+
+const BLOCKED = "The site's terms forbid this. JobPilot will not do it, even if you ask.";
+
+const material = (over: Partial<Material> = {}): Material => ({
+  modes: [
+    {
+      mode: "manual",
+      available: true,
+      note: "You fill and submit in your own browser. JobPilot opens the link, gives you files and answers, and records what happened.",
+    },
+    { mode: "copilot", available: false, note: BLOCKED },
+    { mode: "autonomous", available: false, note: BLOCKED },
+    {
+      mode: "claude_code",
+      available: true,
+      note: "Fills and submits with Claude Code in a visible browser. Add it to a run from Applications.",
+    },
+  ],
+  resume: "/data/exports/apply/a1/resume/resume.pdf",
+  letter: null,
+  answers: [],
+  authorization: { country: "US", authorized: "not_stated", needs_sponsorship: "not_stated", note: "", stated: false },
+  ...over,
+});
+
+async function openReview(app: Application, overrides: Record<string, (args: Args) => unknown>) {
+  const api = backend({ app_list: () => [app], app_get: () => app, resume_list: () => [], ...overrides });
+  const { user } = renderApp();
+  await screen.findByRole("heading", { name: "Status" });
+  await user.click(screen.getByRole("button", { name: "Applications" }));
+  await user.click(await screen.findByRole("button", { name: app.company }));
+  await user.click(await screen.findByRole("button", { name: "Review and apply..." }));
+  await screen.findByRole("heading", { name: `Review application: ${app.role}, ${app.company}` });
+  return { api, user };
+}
+
+describe("application review", () => {
+  it("disabled modes read their reason and cannot be selected", async () => {
+    const { user } = await openReview(application({}), { apply_material: () => material() });
+    const group = await screen.findByRole("radiogroup", { name: "How do you want to apply?" });
+    const manual = within(group).getByRole("radio", { name: "Manual" });
+    const copilot = within(group).getByRole("radio", { name: "Copilot" });
+    expect(manual).toBeChecked();
+    expect(copilot).toHaveAttribute("aria-disabled", "true");
+    expect(copilot).toHaveAccessibleDescription(`Not available. ${BLOCKED}`);
+    expect(within(group).getByRole("radio", { name: "Autonomous" })).toHaveAccessibleDescription(
+      `Not available. ${BLOCKED}`,
+    );
+    await user.click(copilot);
+    expect(copilot).not.toBeChecked();
+    expect(manual).toBeChecked();
+  });
+
+  it("a sensitive answer shows Confirm and copy, never a plain copy", async () => {
+    const answers: Material["answers"] = [
+      { answer_id: "n1", question: "Notice period", class: "normal", stale: false, needs_confirmation: false },
+      { answer_id: "s1", question: "Salary expectation", class: "sensitive", stale: false, needs_confirmation: true },
+      // Confirmed already: still asked again, never a plain copy.
+      { answer_id: "s2", question: "Current salary", class: "sensitive", stale: false, needs_confirmation: false },
+    ];
+    const { api, user } = await openReview(application({}), {
+      apply_material: () => material({ answers }),
+      memory_confirm_use: () => undefined,
+      apply_copy: () => ({ stale: false }),
+    });
+    const list = await screen.findByRole("list", { name: "Answers you approved for this form" });
+    const row = (question: string) => within(list).getByText(question).closest("li")!;
+    expect(within(row("Notice period")).getByRole("button", { name: "Copy: Notice period" })).toBeInTheDocument();
+    for (const question of ["Salary expectation", "Current salary"]) {
+      expect(within(row(question)).queryByRole("button", { name: `Copy: ${question}` })).not.toBeInTheDocument();
+      expect(within(row(question)).getByRole("button", { name: `Confirm and copy: ${question}` })).toBeInTheDocument();
+    }
+    expect(row("Salary expectation")).toHaveTextContent("SENSITIVE: confirm");
+
+    await user.click(within(row("Salary expectation")).getByRole("button", { name: "Confirm and copy: Salary expectation" }));
+    await waitFor(() => expect(count(api, "apply_copy")).toBe(1));
+    const order = api.calls.map((c) => c.cmd).filter((cmd) => cmd === "memory_confirm_use" || cmd === "apply_copy");
+    expect(order).toEqual(["memory_confirm_use", "apply_copy"]);
+    expect(api.calls.find((c) => c.cmd === "apply_copy")?.args).toEqual({ applicationId: "a1", answerId: "s1" });
+    expect(await screen.findByText("Copied to the clipboard.")).toBeInTheDocument();
+    expect(count(api, "memory_use")).toBe(0);
+
+    await user.click(within(row("Notice period")).getByRole("button", { name: "Copy: Notice period" }));
+    await waitFor(() => expect(count(api, "apply_copy")).toBe(2));
+    expect(count(api, "memory_confirm_use")).toBe(1);
+  });
+
+  it("work authorization not stated reads so and offers Enter it yourself", async () => {
+    const { user } = await openReview(application({}), { apply_material: () => material() });
+    expect(await screen.findByText("Work authorization (US): not stated by you")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Enter it yourself" }));
+    expect(useUiStore.getState().view).toBe("profile");
+  });
+
+  it("Open the form is disabled with the reason when the link is not https", async () => {
+    await openReview(application({ link: "http://boards.greenhouse.io/acme/jobs/1" }), {
+      apply_material: () => material(),
+    });
+    const open = await screen.findByRole("button", { name: "Open the form in my browser" });
+    expect(open).toBeDisabled();
+    expect(open).toHaveAccessibleDescription("The posting link is not https, so JobPilot will not open it.");
+  });
+
+  it("Open the form sends only the application id, and Record outcome tracks the status", async () => {
+    const { api, user } = await openReview(application({}), {
+      apply_material: () => material(),
+      apply_open: () => undefined,
+      apply_record: () => application({ status: "applied", applied_on: "2026-11-02" }),
+    });
+    await user.click(await screen.findByRole("button", { name: "Open the form in my browser" }));
+    await waitFor(() => expect(count(api, "apply_open")).toBe(1));
+    expect(api.calls.find((c) => c.cmd === "apply_open")?.args).toEqual({ applicationId: "a1" });
+
+    await user.click(screen.getByRole("button", { name: "Record outcome..." }));
+    await user.selectOptions(screen.getByLabelText("Outcome"), "applied");
+    await user.type(screen.getByLabelText("Applied on (optional)"), "2026-11-02");
+    await user.click(screen.getByRole("button", { name: "Save outcome" }));
+    await waitFor(() => expect(count(api, "apply_record")).toBe(1));
+    expect(api.calls.find((c) => c.cmd === "apply_record")?.args).toEqual({
+      applicationId: "a1",
+      outcome: "applied",
+      on: "2026-11-02",
+      note: "",
+    });
   });
 });

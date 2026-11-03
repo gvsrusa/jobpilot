@@ -6,10 +6,11 @@ use std::path::Path;
 
 use clap::{Subcommand, ValueEnum};
 use jobpilot_core::ai::CancellationToken;
-use jobpilot_core::apply::{self, Preflight, Resolution, RunView};
+use jobpilot_core::apply::{self, Material, Preflight, Resolution, RunView};
 use jobpilot_core::{Db, Result, agents};
 use serde_json::json;
 
+use crate::ai::with_interrupts;
 use crate::{ACTOR, Output, out, text};
 
 #[derive(Subcommand)]
@@ -49,6 +50,23 @@ pub enum ApplyCommand {
     /// Stop a run.
     Cancel {
         id: String,
+    },
+    /// Manual mode: the files, approved answers, and mode notes for one application. No
+    /// answer text is shown; take one with `memory use`.
+    Material {
+        application: String,
+    },
+    /// Manual mode: record what happened after you applied by hand.
+    Record {
+        application: String,
+        /// saved, applied, screening, interviewing, offer, accepted, rejected, or withdrawn.
+        #[arg(long)]
+        outcome: String,
+        /// The day you applied, YYYY-MM-DD.
+        #[arg(long)]
+        on: Option<String>,
+        #[arg(long, default_value = "")]
+        note: String,
     },
 }
 
@@ -110,7 +128,73 @@ pub async fn apply(db: &Db, command: ApplyCommand) -> Result<Output> {
             apply::cancel(db, ACTOR, &id).await?;
             out(json!({"id": id}), format!("cancel asked for run {id}"))
         }
+        ApplyCommand::Material { application } => {
+            let material = apply::material(db, &application).await?;
+            let text = material_text(&material);
+            out(material, text)
+        }
+        ApplyCommand::Record {
+            application,
+            outcome,
+            on,
+            note,
+        } => {
+            let saved = with_interrupts(db, |cancel| {
+                apply::record_outcome(
+                    db,
+                    ACTOR,
+                    &application,
+                    &outcome,
+                    on.as_deref(),
+                    &note,
+                    cancel,
+                )
+            })
+            .await?;
+            out(&saved, format!("{} is {}", saved.id, saved.status))
+        }
     }
+}
+
+/// Names and states only: a sealed answer's text and the stated authorization values stay
+/// out, as the panel may show this.
+fn material_text(material: &Material) -> String {
+    let mut lines = Vec::new();
+    for mode in &material.modes {
+        let state = match mode.available {
+            true => "available",
+            false => "not available",
+        };
+        lines.push(format!("{}: {state}. {}", mode.mode, mode.note));
+    }
+    let file = |name: &str, path: &Option<std::path::PathBuf>| match path {
+        Some(path) => format!("{name}: {}", path.display()),
+        None => format!("{name}: nothing prepared"),
+    };
+    lines.push(file("resume", &material.resume));
+    lines.push(file("cover letter", &material.letter));
+    if material.answers.is_empty() {
+        lines.push("No approved answers for this form. You can fill it by hand.".into());
+    }
+    for row in &material.answers {
+        let mut state = match row.needs_confirmation {
+            true => format!("{}: confirm before use", row.class.to_uppercase()),
+            false => format!("{}, approved", row.class),
+        };
+        if row.stale {
+            state.push_str(", not reviewed for over 180 days");
+        }
+        lines.push(format!("{}  {}  {state}", row.answer_id, row.question));
+    }
+    let authorization = &material.authorization;
+    lines.push(match (authorization.country.as_str(), authorization.stated) {
+        ("", _) => "work authorization: not stated by you (no country)".into(),
+        (country, true) => format!(
+            "work authorization ({country}): stated on your profile; `memory authorization {country}` shows it"
+        ),
+        (country, false) => format!("work authorization ({country}): not stated by you"),
+    });
+    lines.join("\n")
 }
 
 /// Runs the session on this terminal, then prints one line per item, however it ended. Ctrl-C,

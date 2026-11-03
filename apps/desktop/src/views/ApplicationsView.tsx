@@ -22,6 +22,7 @@ import {
   type Question,
 } from "@/lib/ipc";
 import { formatDate, formatDateTime, formatDay } from "@/lib/utils";
+import { ApplicationReview } from "@/views/ApplicationReview";
 import { ApplyRun } from "@/views/ApplyRun";
 
 /** Core's `apply::MAX_RUN_ITEMS`. */
@@ -342,6 +343,8 @@ export function ApplicationsView() {
   // Saved applications picked for a Claude Code run, and whether the run screen is open.
   const [picked, setPicked] = useState<string[]>([]);
   const [applying, setApplying] = useState<string[] | null>(null);
+  // Manual mode's review screen for the selected application.
+  const [reviewing, setReviewing] = useState(false);
   const applyRun = useUiStore((s) => s.applyRun);
   const setApplyRun = useUiStore((s) => s.setApplyRun);
   // After a restart the store holds no run: the last one is offered while a status it
@@ -382,6 +385,7 @@ export function ApplicationsView() {
       client.invalidateQueries({ queryKey: ["analytics", "latest"] }),
     ]);
   const open = (app: Application) => {
+    setReviewing(false);
     setSelected(app.id);
     setForm(inputOf(app));
     setNext(app.status);
@@ -520,194 +524,210 @@ export function ApplicationsView() {
           }}
         />
       )}
-      <div className="grid grid-cols-[minmax(0,3fr)_minmax(0,2fr)] gap-6">
-        <div onKeyDown={onListKey}>
-          {apps.isSuccess && rows.length === 0 ? (
-            <p className="text-sm text-muted-foreground">
-              {filter ? "No applications with this status." : "No applications yet. Add the first one."}
-            </p>
-          ) : (
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Run</TableHead>
-                  <TableHead>Company</TableHead>
-                  <TableHead>Role</TableHead>
-                  <TableHead>Status</TableHead>
-                  <TableHead>Applied</TableHead>
-                  <TableHead>Updated</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {rows.map((a) => (
-                  <TableRow key={a.id} data-state={a.id === selected ? "selected" : undefined}>
-                    <TableCell>
-                      {a.status === "saved" && (
-                        <label className="flex items-center gap-1 text-sm">
-                          <input
-                            type="checkbox"
-                            aria-label={`Select ${a.company}`}
-                            checked={picked.includes(a.id)}
-                            onChange={(e) =>
-                              setPicked(e.target.checked ? [...picked, a.id] : picked.filter((id) => id !== a.id))
-                            }
-                          />
-                          Select
-                        </label>
-                      )}
-                    </TableCell>
-                    <TableCell className="whitespace-normal">
-                      <button
-                        type="button"
-                        data-row
-                        tabIndex={a.id === tabStop ? 0 : -1}
-                        aria-current={a.id === selected ? "true" : undefined}
-                        className="text-left font-medium underline-offset-4 hover:underline focus-visible:underline"
-                        onClick={() => open(a)}
-                      >
-                        {a.company}
-                      </button>
-                    </TableCell>
-                    <TableCell className="whitespace-normal">{a.role}</TableCell>
-                    <TableCell>{label(a.status)}</TableCell>
-                    <TableCell>{a.applied_on ? formatDay(a.applied_on) : ""}</TableCell>
-                    <TableCell className="text-muted-foreground">{formatDate(a.updated_at)}</TableCell>
+      {reviewing && current ? (
+        <ApplicationReview
+          key={current.id}
+          application={current}
+          onClose={() => {
+            setReviewing(false);
+            void refresh();
+          }}
+        />
+      ) : (
+        <div className="grid grid-cols-[minmax(0,3fr)_minmax(0,2fr)] gap-6">
+          <div onKeyDown={onListKey}>
+            {apps.isSuccess && rows.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                {filter ? "No applications with this status." : "No applications yet. Add the first one."}
+              </p>
+            ) : (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Run</TableHead>
+                    <TableHead>Company</TableHead>
+                    <TableHead>Role</TableHead>
+                    <TableHead>Status</TableHead>
+                    <TableHead>Applied</TableHead>
+                    <TableHead>Updated</TableHead>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          )}
-        </div>
-        {selected === null ? (
-          <p className="text-sm text-muted-foreground">Select an application, or add one.</p>
-        ) : (
-          <div className="grid content-start gap-5">
-            <form
-              className="grid gap-3"
-              onSubmit={(e) => {
-                e.preventDefault();
-                if (canSave) save.mutate();
-              }}
-            >
-              <div className="grid gap-1.5">
-                <Label htmlFor="app-company">Company</Label>
-                <Input id="app-company" value={form.company} onChange={(e) => set("company", e.target.value)} />
-              </div>
-              <div className="grid gap-1.5">
-                <Label htmlFor="app-role">Role</Label>
-                <Input id="app-role" value={form.role} onChange={(e) => set("role", e.target.value)} />
-              </div>
-              {choose("app-job", "Job posting", form.job_text_id, "job_text_id", [...(jobs.data ?? []), ...(older.data ? [older.data] : [])])}
-              {choose("app-resume", "Resume draft", form.resume_draft_id, "resume_draft_id", resumes)}
-              {choose("app-letter", "Cover letter draft", form.letter_draft_id, "letter_draft_id", letters)}
-              <div className="grid gap-1.5">
-                {/* Text from outside the app: shown as text to select and copy, never a link. */}
-                <Label htmlFor="app-link">Link (untrusted text, not clickable)</Label>
-                <Input id="app-link" className="select-text" value={form.link} onChange={(e) => set("link", e.target.value)} />
-              </div>
-              <div className="grid gap-1.5">
-                <Label htmlFor="app-country">Country (two letters)</Label>
-                <Input id="app-country" className="max-w-24" value={form.country} onChange={(e) => set("country", e.target.value)} />
-              </div>
-              <div className="grid gap-1.5">
-                <Label htmlFor="app-notes">Notes</Label>
-                <Textarea id="app-notes" rows={4} value={form.notes} onChange={(e) => set("notes", e.target.value)} />
-              </div>
-              <ErrorAlert error={save.error} />
-              <div>
-                <Button type="submit" disabled={!canSave}>
-                  {save.isPending ? "Saving..." : "Save"}
-                </Button>
-              </div>
-            </form>
-            {selected !== NEW && current && (
-              <>
-                <form
-                  className="grid gap-3"
-                  aria-label="Change status"
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    if (!move.isPending) move.mutate();
-                  }}
-                >
-                  <p className="text-sm">
-                    Status: <span className="font-medium">{label(current.status)}</span>
-                  </p>
-                  <div className="grid gap-1.5">
-                    <Label htmlFor="app-next">New status</Label>
-                    <select
-                      id="app-next"
-                      className={selectClass}
-                      value={next}
-                      onChange={(e) => setNext(e.target.value as ApplicationStatus)}
-                    >
-                      {STATUSES.map((s) => (
-                        <option key={s} value={s}>
-                          {label(s)}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div className="grid gap-1.5">
-                    <Label htmlFor="app-on">Applied on (optional)</Label>
-                    <Input id="app-on" placeholder="YYYY-MM-DD" className="max-w-40" value={on} onChange={(e) => setOn(e.target.value)} />
-                  </div>
-                  <div className="grid gap-1.5">
-                    <Label htmlFor="app-status-note">Status note (optional)</Label>
-                    <Input id="app-status-note" value={statusNote} onChange={(e) => setStatusNote(e.target.value)} />
-                  </div>
-                  <ErrorAlert error={move.error} />
-                  <div>
-                    <Button
-                      type="submit"
-                      disabled={move.isPending || (next === current.status && !statusNote.trim())}
-                    >
-                      {move.isPending ? "Saving..." : "Set status"}
-                    </Button>
-                  </div>
-                </form>
-                <form
-                  className="grid gap-3"
-                  aria-label="Add a note"
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    if (note.trim() && !addNote.isPending) addNote.mutate();
-                  }}
-                >
-                  <div className="grid gap-1.5">
-                    <Label htmlFor="app-note">Add note</Label>
-                    <Input id="app-note" value={note} onChange={(e) => setNote(e.target.value)} />
-                  </div>
-                  <ErrorAlert error={addNote.error} />
-                  <div>
-                    <Button type="submit" variant="outline" disabled={!note.trim() || addNote.isPending}>
-                      Add note
-                    </Button>
-                  </div>
-                </form>
-                <ApplicationAnswers key={current.id} application={current} />
-                <section className="grid gap-2">
-                  <h2 className="text-sm font-semibold">History</h2>
-                  <ErrorAlert error={history.error} />
-                  <ul aria-label="History" className="grid gap-1 text-sm">
-                    {(history.data ?? []).map((e) => (
-                      <li key={e.id}>
-                        <span className="text-muted-foreground">{formatDate(e.at)}</span> {describe(e)}
-                        {e.note && <span className="block select-text">{e.note}</span>}
-                      </li>
-                    ))}
-                  </ul>
-                </section>
-                <div>
-                  <Button type="button" variant="outline" onClick={() => setRemoving(true)}>
-                    Remove...
-                  </Button>
-                </div>
-              </>
+                </TableHeader>
+                <TableBody>
+                  {rows.map((a) => (
+                    <TableRow key={a.id} data-state={a.id === selected ? "selected" : undefined}>
+                      <TableCell>
+                        {a.status === "saved" && (
+                          <label className="flex items-center gap-1 text-sm">
+                            <input
+                              type="checkbox"
+                              aria-label={`Select ${a.company}`}
+                              checked={picked.includes(a.id)}
+                              onChange={(e) =>
+                                setPicked(e.target.checked ? [...picked, a.id] : picked.filter((id) => id !== a.id))
+                              }
+                            />
+                            Select
+                          </label>
+                        )}
+                      </TableCell>
+                      <TableCell className="whitespace-normal">
+                        <button
+                          type="button"
+                          data-row
+                          tabIndex={a.id === tabStop ? 0 : -1}
+                          aria-current={a.id === selected ? "true" : undefined}
+                          className="text-left font-medium underline-offset-4 hover:underline focus-visible:underline"
+                          onClick={() => open(a)}
+                        >
+                          {a.company}
+                        </button>
+                      </TableCell>
+                      <TableCell className="whitespace-normal">{a.role}</TableCell>
+                      <TableCell>{label(a.status)}</TableCell>
+                      <TableCell>{a.applied_on ? formatDay(a.applied_on) : ""}</TableCell>
+                      <TableCell className="text-muted-foreground">{formatDate(a.updated_at)}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
             )}
           </div>
-        )}
-      </div>
+          {selected === null ? (
+            <p className="text-sm text-muted-foreground">Select an application, or add one.</p>
+          ) : (
+            <div className="grid content-start gap-5">
+              <form
+                className="grid gap-3"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  if (canSave) save.mutate();
+                }}
+              >
+                <div className="grid gap-1.5">
+                  <Label htmlFor="app-company">Company</Label>
+                  <Input id="app-company" value={form.company} onChange={(e) => set("company", e.target.value)} />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="app-role">Role</Label>
+                  <Input id="app-role" value={form.role} onChange={(e) => set("role", e.target.value)} />
+                </div>
+                {choose("app-job", "Job posting", form.job_text_id, "job_text_id", [...(jobs.data ?? []), ...(older.data ? [older.data] : [])])}
+                {choose("app-resume", "Resume draft", form.resume_draft_id, "resume_draft_id", resumes)}
+                {choose("app-letter", "Cover letter draft", form.letter_draft_id, "letter_draft_id", letters)}
+                <div className="grid gap-1.5">
+                  {/* Text from outside the app: shown as text to select and copy, never a link. */}
+                  <Label htmlFor="app-link">Link (untrusted text, not clickable)</Label>
+                  <Input id="app-link" className="select-text" value={form.link} onChange={(e) => set("link", e.target.value)} />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="app-country">Country (two letters)</Label>
+                  <Input id="app-country" className="max-w-24" value={form.country} onChange={(e) => set("country", e.target.value)} />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="app-notes">Notes</Label>
+                  <Textarea id="app-notes" rows={4} value={form.notes} onChange={(e) => set("notes", e.target.value)} />
+                </div>
+                <ErrorAlert error={save.error} />
+                <div>
+                  <Button type="submit" disabled={!canSave}>
+                    {save.isPending ? "Saving..." : "Save"}
+                  </Button>
+                </div>
+              </form>
+              {selected !== NEW && current && (
+                <>
+                  <form
+                    className="grid gap-3"
+                    aria-label="Change status"
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      if (!move.isPending) move.mutate();
+                    }}
+                  >
+                    <p className="text-sm">
+                      Status: <span className="font-medium">{label(current.status)}</span>
+                    </p>
+                    <div className="grid gap-1.5">
+                      <Label htmlFor="app-next">New status</Label>
+                      <select
+                        id="app-next"
+                        className={selectClass}
+                        value={next}
+                        onChange={(e) => setNext(e.target.value as ApplicationStatus)}
+                      >
+                        {STATUSES.map((s) => (
+                          <option key={s} value={s}>
+                            {label(s)}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="grid gap-1.5">
+                      <Label htmlFor="app-on">Applied on (optional)</Label>
+                      <Input id="app-on" placeholder="YYYY-MM-DD" className="max-w-40" value={on} onChange={(e) => setOn(e.target.value)} />
+                    </div>
+                    <div className="grid gap-1.5">
+                      <Label htmlFor="app-status-note">Status note (optional)</Label>
+                      <Input id="app-status-note" value={statusNote} onChange={(e) => setStatusNote(e.target.value)} />
+                    </div>
+                    <ErrorAlert error={move.error} />
+                    <div>
+                      <Button
+                        type="submit"
+                        disabled={move.isPending || (next === current.status && !statusNote.trim())}
+                      >
+                        {move.isPending ? "Saving..." : "Set status"}
+                      </Button>
+                    </div>
+                  </form>
+                  <form
+                    className="grid gap-3"
+                    aria-label="Add a note"
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      if (note.trim() && !addNote.isPending) addNote.mutate();
+                    }}
+                  >
+                    <div className="grid gap-1.5">
+                      <Label htmlFor="app-note">Add note</Label>
+                      <Input id="app-note" value={note} onChange={(e) => setNote(e.target.value)} />
+                    </div>
+                    <ErrorAlert error={addNote.error} />
+                    <div>
+                      <Button type="submit" variant="outline" disabled={!note.trim() || addNote.isPending}>
+                        Add note
+                      </Button>
+                    </div>
+                  </form>
+                  <div>
+                    <Button type="button" variant="outline" onClick={() => setReviewing(true)}>
+                      Review and apply...
+                    </Button>
+                  </div>
+                  <ApplicationAnswers key={current.id} application={current} />
+                  <section className="grid gap-2">
+                    <h2 className="text-sm font-semibold">History</h2>
+                    <ErrorAlert error={history.error} />
+                    <ul aria-label="History" className="grid gap-1 text-sm">
+                      {(history.data ?? []).map((e) => (
+                        <li key={e.id}>
+                          <span className="text-muted-foreground">{formatDate(e.at)}</span> {describe(e)}
+                          {e.note && <span className="block select-text">{e.note}</span>}
+                        </li>
+                      ))}
+                    </ul>
+                  </section>
+                  <div>
+                    <Button type="button" variant="outline" onClick={() => setRemoving(true)}>
+                      Remove...
+                    </Button>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      )}
       {removing && (
         <ConfirmDialog
           title="Remove this application?"

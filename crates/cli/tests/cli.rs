@@ -3806,3 +3806,42 @@ async fn apply_start_winds_up_on_sighup() {
     let probe = Command::new("kill").args(["-0", &claude]).status().unwrap();
     assert!(!probe.success(), "claude is gone");
 }
+
+#[tokio::test]
+async fn apply_material_and_record_are_manual_mode_from_the_cli() {
+    let (_dir, home) = fresh_home();
+    let app = apply_ready_home(&home).await;
+
+    let text = stdout_of(&run(&home, &["apply", "material", &app]));
+    assert!(text.contains("manual: available."), "{text}");
+    assert!(
+        text.contains("copilot: available. No clause found for this site. You review and submit."),
+        "{text}"
+    );
+    assert!(text.contains("resume: "), "{text}");
+    assert!(
+        text.contains("work authorization: not stated by you (no country)"),
+        "{text}"
+    );
+    let json = stdout_json(&run(&home, &["apply", "material", &app, "--json"]));
+    assert_eq!(json["modes"].as_array().unwrap().len(), 4);
+    assert!(json["resume"].as_str().unwrap().ends_with(".pdf"));
+
+    let saved = stdout_json(&run(
+        &home,
+        &[
+            "apply",
+            "record",
+            &app,
+            "--outcome",
+            "applied",
+            "--on",
+            "2026-11-02",
+            "--json",
+        ],
+    ));
+    assert_eq!(saved["status"], "applied");
+    assert_eq!(saved["applied_on"], "2026-11-02");
+    let runs = stdout_json(&run(&home, &["apply", "status", "--json"]));
+    assert!(runs.is_null(), "Manual mode starts no run: {runs}");
+}

@@ -687,6 +687,29 @@ export type ApplyRunView = {
   ended_at: string | null;
 };
 
+/** One automation mode on this application's site. `note` is fixed copy from Rust. */
+export type ModeChoice = {
+  mode: "manual" | "copilot" | "autonomous" | "claude_code";
+  available: boolean;
+  note: string;
+};
+/** An approved answer this application can use. It never holds the answer's text. */
+export type MaterialRow = {
+  answer_id: string;
+  question: string;
+  class: MemoryClass;
+  stale: boolean;
+  needs_confirmation: boolean;
+};
+/** Manual mode's material for one application. No answer text. */
+export type Material = {
+  modes: ModeChoice[];
+  resume: string | null;
+  letter: string | null;
+  answers: MaterialRow[];
+  authorization: AuthorizationAnswer;
+};
+
 export const ipc = {
   status: () => invoke<Status>("status"),
   retryOpen: () => invoke<Status>("retry_open"),
@@ -901,6 +924,14 @@ export const ipc = {
     invoke<void>("apply_resolve_pause", { pauseId, resolution }),
   applySettle: (id: string) => invoke<number>("apply_settle", { id }),
   applyCancel: (id: string) => invoke<void>("apply_cancel", { id }),
+  applyMaterial: (applicationId: string) => invoke<Material>("apply_material", { applicationId }),
+  /** Rust reads the stored link, checks it, and opens it in the system browser. */
+  applyOpen: (applicationId: string) => invoke<void>("apply_open", { applicationId }),
+  applyRecord: (applicationId: string, outcome: ApplicationStatus, on: string | null, note: string) =>
+    invoke<Application>("apply_record", { applicationId, outcome, on, note }),
+  /** Rust puts the answer on the clipboard. The text never comes here. */
+  applyCopy: (applicationId: string, answerId: string) =>
+    invoke<{ stale: boolean }>("apply_copy", { applicationId, answerId }),
 };
 
 export function ptyOpen(cols: number, rows: number): Promise<void> {

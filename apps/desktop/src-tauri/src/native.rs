@@ -71,6 +71,23 @@ pub async fn clipboard_text<R: Runtime>(app: &AppHandle<R>) -> Result<Option<Str
     .await?
 }
 
+/// Puts text on the system clipboard, so an answer goes there from Rust and never through
+/// the webview.
+// ponytail: nothing clears it later. The person copied it to paste it, as a copy by hand would.
+#[cfg(not(test))]
+pub async fn write_clipboard<R: Runtime>(
+    app: &AppHandle<R>,
+    text: Zeroizing<String>,
+) -> Result<()> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+
+    let app = app.clone();
+    off_the_main_thread(move || app.clipboard().write_text(text.as_str()).is_ok())
+        .await?
+        .then_some(())
+        .ok_or_else(|| Error::Failed("the clipboard could not be written".into()))
+}
+
 /// The dialog promised a clear, and the key may still be on the clipboard.
 fn not_cleared() -> Error {
     Error::Failed(
@@ -264,6 +281,24 @@ pub async fn clipboard_text<R: Runtime>(app: &AppHandle<R>) -> Result<Option<Str
     }
     let text = hook.clipboard.lock().unwrap().clone();
     Ok(text)
+}
+
+#[cfg(test)]
+pub async fn write_clipboard<R: Runtime>(
+    app: &AppHandle<R>,
+    text: Zeroizing<String>,
+) -> Result<()> {
+    use tauri::Manager;
+
+    let hook = app.state::<NativeHook>();
+    if hook
+        .clipboard_fails
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(Error::Failed("the clipboard could not be written".into()));
+    }
+    *hook.clipboard.lock().unwrap() = Some(text.to_string());
+    Ok(())
 }
 
 #[cfg(test)]

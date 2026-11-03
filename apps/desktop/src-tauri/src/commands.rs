@@ -22,7 +22,7 @@ use jobpilot_core::ai::{
 use jobpilot_core::ai::{api, child, claude_code};
 use jobpilot_core::analytics::{self, Report};
 use jobpilot_core::applications::{self, Application, ApplicationEvent, ApplicationInput};
-use jobpilot_core::apply::{self, Preflight, Resolution, RunView};
+use jobpilot_core::apply::{self, Material, Preflight, Resolution, RunView};
 use jobpilot_core::audit::{self, AuditEntry};
 use jobpilot_core::backup::{self, BackupInfo};
 use jobpilot_core::browser::runtime::{self as browser_runtime, PLAYWRIGHT_MCP, RuntimeState};
@@ -47,7 +47,7 @@ use jobpilot_core::recovery::{self, RecoveryReceipt};
 use jobpilot_core::render::{ResumeDoc, Template};
 use jobpilot_core::runner::{self, ExportChoice, RunDetail, RunSummary};
 use jobpilot_core::secrets::Zeroizing;
-use jobpilot_core::{Db, Error, Result, agents, secrets, settings, transfer};
+use jobpilot_core::{Db, Error, Result, agents, permissions, secrets, settings, transfer};
 use serde_json::{Value, json};
 use tauri::ipc::Invoke;
 use tauri::{AppHandle, Runtime, State};
@@ -204,6 +204,10 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         apply_resolve_pause,
         apply_settle,
         apply_cancel,
+        apply_material,
+        apply_open,
+        apply_record,
+        apply_copy,
         crate::pty::pty_open,
         crate::pty::pty_open_apply,
         crate::pty::pty_write,
@@ -1947,6 +1951,91 @@ pub async fn apply_cancel(state: State<'_, AppState>, id: String) -> Result<()> 
     apply::cancel(&*state.work().await?, ACTOR, &id).await
 }
 
+/// Manual mode's review screen: files, approved answers with no text, and each mode's note.
+#[tauri::command]
+pub async fn apply_material(
+    state: State<'_, AppState>,
+    application_id: String,
+) -> Result<Material> {
+    apply::material(&*state.work().await?, &application_id).await
+}
+
+/// The webview names an application, never a link. Rust reads the stored one, opens it only
+/// when it passes `permissions::link_allowed` and Manual mode may open it, and hands it to the
+/// system browser. Nothing here requests it.
+#[tauri::command]
+pub async fn apply_open<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    application_id: String,
+) -> Result<()> {
+    let url = {
+        let db = state.work().await?;
+        applications::get(&db, &application_id).await?.link
+    };
+    let url = url.trim();
+    if !permissions::link_allowed(url) {
+        return Err(Error::Refused("link_not_https".into()));
+    }
+    let grant = permissions::Grant {
+        owner_started: true,
+        authorized: false,
+    };
+    let site = permissions::site_of(url)?;
+    if let permissions::Decision::Refuse(reason) = permissions::decide(
+        permissions::Mode::Manual,
+        site,
+        permissions::Action::OpenLink,
+        &grant,
+    ) {
+        return Err(Error::Refused(reason.into()));
+    }
+    native::open_url(&app, url).await
+}
+
+/// What a person did after applying by hand, through the tracking agent.
+#[tauri::command]
+pub async fn apply_record(
+    state: State<'_, AppState>,
+    application_id: String,
+    outcome: String,
+    on: Option<String>,
+    note: String,
+) -> Result<Application> {
+    apply::record_outcome(
+        &*state.work().await?,
+        ACTOR,
+        &application_id,
+        &outcome,
+        on.as_deref(),
+        &note,
+        CancellationToken::new(),
+    )
+    .await
+}
+
+/// Puts one answer's text on the system clipboard from Rust, so it never crosses into the
+/// webview. Core refuses a sealed class with no current confirmation, which only
+/// `memory_confirm_use`'s native dialog gives. The reply says only whether it is stale.
+#[tauri::command]
+pub async fn apply_copy<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    application_id: String,
+    answer_id: String,
+) -> Result<Copied> {
+    let used =
+        memory::use_answer(&*state.work().await?, ACTOR, &answer_id, &application_id).await?;
+    let stale = used.stale;
+    native::write_clipboard(&app, Zeroizing::new(used.text)).await?;
+    Ok(Copied { stale })
+}
+
+#[derive(serde::Serialize)]
+pub struct Copied {
+    pub stale: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -3220,6 +3309,10 @@ mod tests {
         "apply_resolve_pause",
         "apply_settle",
         "apply_cancel",
+        "apply_material",
+        "apply_open",
+        "apply_record",
+        "apply_copy",
         "pty_open",
         "pty_open_apply",
         "pty_write",
@@ -6677,5 +6770,128 @@ mod tests {
 
     fn code_of(result: Result<Value, Value>) -> String {
         result.unwrap_err()["code"].as_str().unwrap().to_owned()
+    }
+
+    // ---- Manual mode ----
+
+    fn arguments_of(signature: &str) -> Vec<String> {
+        let source = include_str!("commands.rs");
+        let (_, rest) = source.split_once(signature).unwrap();
+        let (arguments, _) = rest.split_once(") -> ").unwrap();
+        arguments
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, _)| name.trim().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn apply_open_takes_only_an_id_and_refuses_a_link_that_is_not_https() {
+        assert_eq!(
+            arguments_of("pub async fn apply_open<R: Runtime>("),
+            ["app", "state", "application_id"]
+        );
+        let h = ready();
+        let app = apply_ready(&h);
+        let hook = h.app.state::<NativeHook>();
+        for bad in [
+            "http://boards.greenhouse.io/acme/jobs/1",
+            "https://user@boards.greenhouse.io/acme/jobs/1",
+            "",
+        ] {
+            let link = bad.to_owned();
+            let id = app.clone();
+            with_db(&h, |db| async move {
+                sqlx::query("UPDATE applications SET link = ? WHERE id = ?")
+                    .bind(link)
+                    .bind(id)
+                    .execute(&db.pool)
+                    .await
+                    .unwrap();
+            });
+            let refused = h.call("apply_open", json!({ "applicationId": app }));
+            assert_eq!(
+                refused.unwrap_err()["message"],
+                "refused: link_not_https",
+                "{bad}"
+            );
+        }
+        assert!(hook.opened.lock().unwrap().is_empty());
+
+        let id = app.clone();
+        with_db(&h, |db| async move {
+            sqlx::query(
+                "UPDATE applications SET link = 'https://jobs.lever.co/acme/1' WHERE id = ?",
+            )
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        });
+        h.ok("apply_open", json!({ "applicationId": app }));
+        assert_eq!(
+            *hook.opened.lock().unwrap(),
+            ["https://jobs.lever.co/acme/1"]
+        );
+    }
+
+    #[test]
+    fn apply_material_shows_no_answer_text_and_apply_record_tracks_as_manual() {
+        let h = ready();
+        let (answer, app) = waiting_sensitive_answer(&h);
+        let material = h.ok("apply_material", json!({ "applicationId": app }));
+        assert_eq!(material["modes"].as_array().unwrap().len(), 4);
+        assert_eq!(material["answers"][0]["answer_id"], answer.as_str());
+        assert_eq!(material["answers"][0]["needs_confirmation"], true);
+        assert!(!material.to_string().contains("ZXQ-CANARY"));
+
+        let saved = h.ok(
+            "apply_record",
+            json!({ "applicationId": app, "outcome": "applied", "on": "2026-11-02", "note": "" }),
+        );
+        assert_eq!(saved["status"], "applied");
+        let log = h.ok("audit_recent", json!({ "limit": 20 }));
+        let submitted = log
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["action"] == "application_submitted")
+            .unwrap_or_else(|| panic!("{log}"));
+        assert_eq!(submitted["actor"], "gui");
+        assert!(
+            submitted["detail"].to_string().contains("manual"),
+            "{submitted}"
+        );
+    }
+
+    #[test]
+    fn apply_copy_puts_a_confirmed_answer_on_the_clipboard_and_never_in_the_reply() {
+        assert_eq!(
+            arguments_of("pub async fn apply_copy<R: Runtime>("),
+            ["app", "state", "application_id", "answer_id"]
+        );
+        let h = ready();
+        let (answer, app) = waiting_sensitive_answer(&h);
+        let args = json!({ "applicationId": app, "answerId": answer });
+        let hook = h.app.state::<NativeHook>();
+
+        assert_eq!(
+            code_of(h.call("apply_copy", args.clone())),
+            "confirmation_required"
+        );
+        assert!(hook.clipboard.lock().unwrap().is_none());
+
+        h.answer(true);
+        h.ok(
+            "memory_confirm_use",
+            json!({ "answerId": answer, "applicationId": app }),
+        );
+        let copied = h.ok("apply_copy", args);
+        assert!(!copied.to_string().contains("ZXQ-CANARY"), "{copied}");
+        assert_eq!(copied["stale"], false);
+        assert_eq!(
+            hook.clipboard.lock().unwrap().as_deref(),
+            Some("ZXQ-CANARY")
+        );
     }
 }

@@ -643,6 +643,12 @@ mod tests {
         ("apply resolve p take-over", false),
         ("apply settle r", false),
         ("apply cancel r", false),
+        ("apply material a", false),
+        ("apply record a --outcome applied", false),
+        (
+            "apply record a --outcome applied --on 2026-11-02 --note n",
+            false,
+        ),
         ("pause set", false),
         ("pause status", false),
         ("pause clear", true),
