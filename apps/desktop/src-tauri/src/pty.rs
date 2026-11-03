@@ -830,6 +830,19 @@ mod tests {
         pid: i32,
     }
 
+    /// The stand-in ignores SIGHUP, so nothing else ends it: a test that never closes its
+    /// session, or panics before it does, would leave it running for ever. It also ends once
+    /// the test process is gone (it watches the test's pid, not its parent, so a regression in
+    /// `close` is still caught by `assert_gone`).
+    #[cfg(unix)]
+    impl Drop for Stubborn {
+        fn drop(&mut self) {
+            self.app.state::<PtyState>().close();
+            // SAFETY: `kill` takes plain integers; the pid is this test's own stand-in.
+            unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        }
+    }
+
     #[cfg(unix)]
     impl Stubborn {
         fn start() -> Self {
@@ -841,8 +854,9 @@ mod tests {
             let claude = bin.join("claude");
             let pid_file = tmp.path().join("claude.pid");
             let body = format!(
-                "#!/bin/sh\ntrap '' HUP\necho $$ > {}\necho claude-ready\nwhile :; do sleep 1; done\n",
-                pid_file.display()
+                "#!/bin/sh\ntrap '' HUP\necho $$ > {}\necho claude-ready\nwhile kill -0 {} 2>/dev/null; do sleep 1; done\n",
+                pid_file.display(),
+                std::process::id()
             );
             std::fs::write(&claude, body).unwrap();
             std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
