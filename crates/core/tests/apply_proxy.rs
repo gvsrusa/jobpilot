@@ -13,6 +13,7 @@ use jobpilot_core::apply::proxy::{self, Knobs};
 use jobpilot_core::apply::{self, PauseView, Resolution};
 use jobpilot_core::crypto::{self, KeyState};
 use jobpilot_core::drafts;
+use jobpilot_core::memory::{self, Class};
 use jobpilot_core::profile::{self, ProfileBasic};
 use jobpilot_core::render::{Entry, ResumeDoc, Section};
 use jobpilot_core::{AppPaths, Db, pause};
@@ -1454,5 +1455,116 @@ async fn a_new_session_ends_an_item_left_active() {
     assert_eq!(used(w.db.clone()).await, before, "no brief was built again");
     let brief = s.brief().await;
     assert_eq!(brief["application_id"], json!(apps[1]));
+    s.close().await.unwrap();
+}
+
+const SURVEY: &str = "- heading \"Survey\" [level=1] [ref=e2]\n- listbox [ref=e30]:\n  \
+    - option \"Hispanic or Latino\" [ref=e31]\n  - option \"Blue\" [ref=e32]\n\
+    - listbox \"Gender\" [ref=e33]:\n  - option \"Female\" [ref=e34]\n  \
+    - option \"Male\" [ref=e35]\n";
+
+/// A run whose one item holds the released Sensitive answer "Female" to "Gender".
+async fn released_run(w: &World) -> String {
+    let all = [
+        DataCategory::JobText,
+        DataCategory::ProfileBasic,
+        DataCategory::CareerMemory,
+        DataCategory::Sensitive,
+    ];
+    consent::give(&w.db, PROVIDER, &all, "2026-11-01", "cli")
+        .await
+        .unwrap();
+    let question = memory::add_question(&w.db, "Gender", None).await.unwrap();
+    sqlx::query("UPDATE memory_questions SET class = ?, class_source = 'user' WHERE id = ?")
+        .bind(Class::Sensitive.as_str())
+        .bind(&question.id)
+        .execute(&w.db.pool)
+        .await
+        .unwrap();
+    let answer = memory::add_answer(&w.db, &question.id, "Female", None)
+        .await
+        .unwrap();
+    memory::approve(&w.db, "cli", &answer.id, true)
+        .await
+        .unwrap();
+    let app = add_app(&w.db, "Acme").await;
+    apply::start(&w.db, "cli", &[app], true).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_selected_value_is_judged_as_an_option() {
+    let w = world().await;
+    let run = released_run(&w).await;
+    let m = mock(&w, SURVEY, None);
+    let mut s = open(&w, &run, &m, None).await;
+    let brief = s.brief().await;
+    assert!(brief["answers"].to_string().contains("Female"), "{brief}");
+    s.call("browser_snapshot", json!({})).await;
+
+    let sensitive = [
+        (
+            "browser_select_option",
+            json!({"target": "e30", "values": ["Hispanic or Latino"]}),
+        ),
+        (
+            "browser_fill_form",
+            json!({"fields": [
+                {"name": "x", "type": "combobox", "target": "e30", "value": "Hispanic or Latino"},
+            ]}),
+        ),
+        (
+            "browser_select_option",
+            json!({"target": "e33", "values": ["Male"]}),
+        ),
+    ];
+    for (name, args) in sensitive {
+        let id = s.tool(name, args).await;
+        let pause = open_pause(&w.db, &run).await;
+        assert_eq!(
+            (pause.kind.as_str(), pause.origin.as_str()),
+            ("sensitive", "guard"),
+            "{name}"
+        );
+        resolve(&w.db, &run, Resolution::Continue).await;
+        assert_eq!(s.next().await["id"], id);
+    }
+    assert!(m.named("browser_select_option").is_empty());
+    assert!(m.named("browser_fill_form").is_empty());
+
+    for values in [json!(["Blue"]), json!(["Female"])] {
+        let target = if values[0] == "Blue" { "e30" } else { "e33" };
+        let (text, error) = s
+            .call(
+                "browser_select_option",
+                json!({"target": target, "values": values}),
+            )
+            .await;
+        assert!(!error, "{values}: {text}");
+    }
+    assert_eq!(m.named("browser_select_option").len(), 2);
+    s.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_unlabeled_field_has_its_own_refusal() {
+    let w = world().await;
+    let (run, _) = run_of(&w, &["Acme"]).await;
+    let page = format!("{}  - combobox [ref=e40]\n", fixture("form.yml"));
+    let m = mock(&w, &page, None);
+    let mut s = open(&w, &run, &m, None).await;
+    s.brief().await;
+    s.call("browser_snapshot", json!({})).await;
+    let fields = json!({"fields": [
+        {"name": "x", "type": "combobox", "target": "e40", "value": "Canada"},
+    ]});
+    let (text, error) = s.call("browser_fill_form", fields).await;
+    assert!(error, "{text}");
+    assert!(text.starts_with("unlabeled_field"), "{text}");
+    assert!(
+        text.contains("apply_result") && text.contains("no_form"),
+        "{text}"
+    );
+    assert!(text.contains("apply_pause"), "{text}");
+    assert!(m.named("browser_fill_form").is_empty());
     s.close().await.unwrap();
 }

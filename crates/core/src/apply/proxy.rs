@@ -30,6 +30,8 @@ use crate::{audit, knowledge, pause};
 const HANDLED: &str = "A person handled this field. Take a snapshot and go on.";
 const STOPPED: &str = "Stopped for a person. Call apply_next.";
 const VALUE_REFUSED: &str = "not an approved answer or profile fact; call apply_pause";
+const UNLABELED: &str = "unlabeled_field: this field has no label, so it cannot be checked. \
+    Call apply_pause for a person, or apply_result with outcome skipped and reason no_form.";
 const SECOND_SUBMIT: &str = "A second submit click on this application.";
 const CONFIRMATION: usize = 2000;
 const PAUSE_KINDS: [&str; 7] = [
@@ -210,6 +212,69 @@ fn target_of(args: &Value) -> String {
         .find_map(|key| args.get(key).and_then(Value::as_str))
         .unwrap_or("")
         .to_owned()
+}
+
+/// Targets whose value the call selects as an option: every `browser_select_option` target,
+/// and each `browser_fill_form` field not declared as text or a checkbox or radio.
+fn picks_options(tool: &str, args: &Value) -> HashSet<String> {
+    match tool {
+        "browser_select_option" => guard::targets_in(tool, args).into_iter().collect(),
+        "browser_fill_form" => args
+            .get("fields")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|field| {
+                !matches!(
+                    field.get("type").and_then(Value::as_str),
+                    Some("textbox" | "slider" | "checkbox" | "radio")
+                )
+            })
+            .map(target_of)
+            .collect(),
+        _ => HashSet::new(),
+    }
+}
+
+/// Judges `value` as an option of the target, by `choice_guard`'s own rule: the snapshot gets
+/// one more line, an option named `value` under the target, and that option is judged. Its
+/// questions are the target's name and what stands around it.
+fn option_guard(
+    snapshot: &str,
+    target: &str,
+    value: &str,
+    brief: &Brief,
+) -> std::result::Result<(), PauseKind> {
+    let marker = format!("[ref={target}]");
+    // A marker quoted inside another line's name could point at the wrong line: a person decides.
+    if snapshot
+        .lines()
+        .filter(|line| line.contains(&marker))
+        .count()
+        != 1
+    {
+        return Err(PauseKind::Other);
+    }
+    let mut free = 900_000_000_u64;
+    while snapshot.contains(&format!("[ref=e{free}]")) {
+        free += 1;
+    }
+    let option = format!("e{free}");
+    let name = value.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut lines = Vec::new();
+    let mut placed = false;
+    for line in snapshot.lines() {
+        lines.push(line.to_owned());
+        if !placed && line.contains(&marker) {
+            let indent = &line[..line.len() - line.trim_start().len()];
+            lines.push(format!("{indent}  - option \"{name}\" [ref={option}]"));
+            placed = true;
+        }
+    }
+    if !placed {
+        return Err(PauseKind::Other);
+    }
+    guard::choice_guard(&lines.join("\n"), &option, brief)
 }
 
 /// The `Page URL` line Playwright puts on a snapshot, when it holds a web address.
@@ -502,18 +567,21 @@ impl Session<'_> {
             return Ok(refusal(VALUE_REFUSED));
         }
         // The page's role decides, never the type the session declares: every field passes
-        // `field_guard`, and a choice also passes `choice_guard`.
+        // `field_guard`, and a choice also passes `choice_guard`. A value the call selects is
+        // itself judged as an option.
+        let picked = picks_options(name, &args);
         for (target, value) in guard::fields_in(name, &args) {
             let label = guard::label_of(&last, &target);
             let choice = guard::is_choice(&last, &target);
             let checked = match &label {
                 Some(label) => guard::field_guard(label, &value, &brief),
                 None if choice => Ok(()),
-                None => return Ok(refusal("snapshot_first")),
+                None => return Ok(refusal(UNLABELED)),
             };
-            let checked = match (checked, choice) {
-                (Ok(()), true) => guard::choice_guard(&last, &target, &brief),
-                (checked, _) => checked,
+            let checked = match (checked, picked.contains(&target), choice) {
+                (Ok(()), true, _) => option_guard(&last, &target, &value, &brief),
+                (Ok(()), false, true) => guard::choice_guard(&last, &target, &brief),
+                (checked, _, _) => checked,
             };
             if let Err(kind) = checked {
                 return self.by_person(kind, &label.unwrap_or_default()).await;
