@@ -1098,7 +1098,7 @@ async fn browser_e2e_browser_is_visible_and_the_profile_is_the_runs() {
 #[tokio::test]
 #[ignore]
 async fn browser_e2e_copilot_on_the_greenhouse_lever_and_ashby_fixtures() {
-    const REVIEW: &str = "Review the form in the browser and click submit yourself.";
+    const REVIEW: &str = "Review the form in the browser and click submit yourself. Continue records it as submitted; Take over if you did not.";
     let w = world().await;
     for (posted, page) in ["greenhouse", "lever", "ashby"].into_iter().enumerate() {
         let app = add_app(&w, page).await;

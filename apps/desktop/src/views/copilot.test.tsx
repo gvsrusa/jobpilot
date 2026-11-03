@@ -6,7 +6,7 @@ import { backend, count, renderApp } from "../test-utils";
 type Args = Record<string, unknown>;
 
 const NO_CLAUSE = "No clause found for this site. You review and submit.";
-const REVIEW = "Review the form in the browser and click submit yourself.";
+const REVIEW = "Review the form in the browser and click submit yourself. Continue records it as submitted; Take over if you did not.";
 
 const application: Application = {
   id: "a1",

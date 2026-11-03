@@ -29,7 +29,7 @@ const WAIT: Duration = Duration::from_secs(30);
 const LINK: &str = "https://boards.greenhouse.io/acme/jobs/1";
 const WHY: &str = "I enjoy building reliable tools, and I agree with your mission.";
 const PHONE: &str = "+351 555 0100";
-const REVIEW: &str = "Review the form in the browser and click submit yourself.";
+const REVIEW: &str = "Review the form in the browser and click submit yourself. Continue records it as submitted; Take over if you did not.";
 
 fn mock_store() {
     static SET: Once = Once::new();

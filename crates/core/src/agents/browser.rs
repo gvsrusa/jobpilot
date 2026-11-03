@@ -43,7 +43,8 @@ use crate::{audit, pause, profile};
 use Permission::*;
 
 /// The review stop's text: the run fills and stops here, and the person submits.
-pub const REVIEW: &str = "Review the form in the browser and click submit yourself.";
+pub const REVIEW: &str = "Review the form in the browser and click submit yourself. Continue \
+                          records it as submitted; Take over if you did not.";
 const NO_FORM: &str = "Open the application form, then press Continue.";
 /// Autonomous: fields the rules left, before anything is submitted.
 const LEFT: &str = "JobPilot will not submit with these empty. Fill them in the browser, then \
