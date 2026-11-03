@@ -1461,7 +1461,7 @@ async fn a_new_session_ends_an_item_left_active() {
 const SURVEY: &str = "- heading \"Survey\" [level=1] [ref=e2]\n- listbox [ref=e30]:\n  \
     - option \"Hispanic or Latino\" [ref=e31]\n  - option \"Blue\" [ref=e32]\n\
     - listbox \"Gender\" [ref=e33]:\n  - option \"Female\" [ref=e34]\n  \
-    - option \"Male\" [ref=e35]\n";
+    - option \"Male\" [ref=e35]\n- combobox \"Country\" [ref=e36]\n";
 
 /// A run whose one item holds the released Sensitive answer "Female" to "Gender".
 async fn released_run(w: &World) -> String {
@@ -1524,6 +1524,33 @@ async fn a_selected_value_is_judged_as_an_option() {
             (pause.kind.as_str(), pause.origin.as_str()),
             ("sensitive", "guard"),
             "{name}"
+        );
+        resolve(&w.db, &run, Resolution::Continue).await;
+        assert_eq!(s.next().await["id"], id);
+    }
+    // A value that names no option under the target: a code, a crafted line, or an option
+    // the closed list does not show.
+    let unmatched = [
+        ("e30", "2"),
+        (
+            "e30",
+            "Hispanic or Latino\n- option \"Blue\" [ref=e900000000]",
+        ),
+        ("e30", "Blue\r"),
+        ("e36", "Canada"),
+    ];
+    for (target, value) in unmatched {
+        let id = s
+            .tool(
+                "browser_select_option",
+                json!({"target": target, "values": [value]}),
+            )
+            .await;
+        let pause = open_pause(&w.db, &run).await;
+        assert_eq!(
+            (pause.kind.as_str(), pause.origin.as_str()),
+            ("other", "guard"),
+            "{value:?}"
         );
         resolve(&w.db, &run, Resolution::Continue).await;
         assert_eq!(s.next().await["id"], id);

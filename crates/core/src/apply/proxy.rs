@@ -236,45 +236,84 @@ fn picks_options(tool: &str, args: &Value) -> HashSet<String> {
     }
 }
 
-/// Judges `value` as an option of the target, by `choice_guard`'s own rule: the snapshot gets
-/// one more line, an option named `value` under the target, and that option is judged. Its
-/// questions are the target's name and what stands around it.
+/// Judges the real option a value selects. The value must name, after folding, exactly one
+/// option line in the target's subtree on the last snapshot; `choice_guard` then judges that
+/// option. A value that names none or several, or holds a control character, is a pause:
+/// Playwright also selects by an option's value attribute, which the snapshot does not show.
 fn option_guard(
     snapshot: &str,
     target: &str,
     value: &str,
     brief: &Brief,
 ) -> std::result::Result<(), PauseKind> {
+    if value.chars().any(char::is_control) {
+        return Err(PauseKind::Other);
+    }
     let marker = format!("[ref={target}]");
+    let lines: Vec<&str> = snapshot.lines().collect();
     // A marker quoted inside another line's name could point at the wrong line: a person decides.
-    if snapshot
-        .lines()
-        .filter(|line| line.contains(&marker))
-        .count()
-        != 1
-    {
+    let mut at = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains(&marker));
+    let (Some((index, line)), None) = (at.next(), at.next()) else {
         return Err(PauseKind::Other);
-    }
+    };
+    let indent = |line: &str| line.len() - line.trim_start().len();
+    let depth = indent(line);
+    let subtree = lines[index + 1..]
+        .iter()
+        .take_while(|line| line.trim().is_empty() || indent(line) > depth)
+        .count();
+
+    // A copy where each line in the subtree has a ref, as Playwright prints options without
+    // one. Only the page's own lines are judged: the value is never written into the copy.
+    let mut copy: Vec<String> = lines.iter().map(|line| (*line).to_owned()).collect();
     let mut free = 900_000_000_u64;
-    while snapshot.contains(&format!("[ref=e{free}]")) {
-        free += 1;
-    }
-    let option = format!("e{free}");
-    let name = value.replace('\\', "\\\\").replace('"', "\\\"");
-    let mut lines = Vec::new();
-    let mut placed = false;
-    for line in snapshot.lines() {
-        lines.push(line.to_owned());
-        if !placed && line.contains(&marker) {
-            let indent = &line[..line.len() - line.trim_start().len()];
-            lines.push(format!("{indent}  - option \"{name}\" [ref={option}]"));
-            placed = true;
+    let mut refs = Vec::new();
+    for line in &mut copy[index + 1..index + 1 + subtree] {
+        if line.trim().is_empty() {
+            continue;
         }
+        if let Some(found) = ref_in(line) {
+            refs.push(found);
+            continue;
+        }
+        while snapshot.contains(&format!("[ref=e{free}]")) {
+            free += 1;
+        }
+        let tag = format!("e{free}");
+        free += 1;
+        *line = match line.strip_suffix(':') {
+            Some(head) => format!("{head} [ref={tag}]:"),
+            None => format!("{line} [ref={tag}]"),
+        };
+        refs.push(tag);
     }
-    if !placed {
-        return Err(PauseKind::Other);
+    let copy = copy.join("\n");
+    let wanted = fold(value);
+    let mut matching = refs.iter().filter(|r| {
+        guard::role_of(&copy, r).as_deref() == Some("option")
+            && guard::label_of(&copy, r).is_some_and(|name| fold(&name) == wanted)
+    });
+    match (matching.next(), matching.next()) {
+        (Some(option), None) => guard::choice_guard(&copy, option, brief),
+        _ => Err(PauseKind::Other),
     }
-    guard::choice_guard(&lines.join("\n"), &option, brief)
+}
+
+/// The ref a snapshot line names, if any.
+fn ref_in(line: &str) -> Option<String> {
+    let (_, rest) = line.split_once("[ref=")?;
+    let (found, _) = rest.split_once(']')?;
+    Some(found.to_owned())
+}
+
+fn fold(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// The `Page URL` line Playwright puts on a snapshot, when it holds a web address.
