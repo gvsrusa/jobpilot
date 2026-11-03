@@ -53,7 +53,7 @@ jobs:
       # Chromium, kept between runs. Setup still runs `npm ci`; the install skips a browser
       # already in place.
       - name: Browser cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/jobpilot-e2e/browser-runtime/browsers
           key: pw-${{ runner.os }}-${{ hashFiles('crates/core/assets/browser-runtime/package-lock.json') }}

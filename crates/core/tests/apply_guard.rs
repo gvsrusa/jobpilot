@@ -108,6 +108,65 @@ fn a_dialog_holding_a_form_is_no_stop() {
     assert_eq!(scan(alert, &HashSet::new()).unwrap().kind, Other);
 }
 
+/// A decoy control the person cannot use (aria-hidden, or too small to get a ref) does not
+/// make a dialog a form.
+#[test]
+fn a_decoy_control_does_not_make_a_dialog_a_form() {
+    for decoy in [
+        "- textbox [aria-hidden] [ref=e3]",
+        "- textbox \"x\"",
+        "- textbox \"x\" [aria-hidden] [ref=e3]",
+    ] {
+        let page = format!(
+            "- dialog \"Session expired\" [ref=e1]:\n  - paragraph [ref=e2]: Verify you are human\n  {decoy}\n  - button \"OK\" [ref=e4]"
+        );
+        let hits: Vec<PauseKind> = std::iter::successors(scan(&page, &HashSet::new()), |hit| {
+            let mut acked = HashSet::new();
+            acked.insert(hit_key(hit));
+            scan(&page, &acked)
+        })
+        .take(3)
+        .map(|hit| hit.kind)
+        .collect();
+        assert!(hits.contains(&Other), "{decoy}: {hits:?}");
+        let text_only =
+            format!("- dialog \"Notice\" [ref=e1]:\n  - paragraph [ref=e2]: Read this.\n  {decoy}");
+        assert_eq!(
+            scan(&text_only, &HashSet::new()).unwrap().kind,
+            Other,
+            "{decoy}"
+        );
+    }
+}
+
+/// The reply to `browser_type` and the snapshot after it, as Playwright MCP 0.0.84 prints
+/// them. An approved answer with a legal word is the owner's own text: echoed back, in the
+/// code the server ran or as the field's value, it is no stop.
+const TYPED: &str = "### Ran Playwright code\n```js\nawait page.getByRole('textbox', { name: 'Why this role?' }).fill('I agree with your mission');\n```";
+const AFTER_TYPING: &str = "### Ran Playwright code\n```js\nawait page.getByRole('button', { name: 'Go' }).click();\n```\n### Page\n- Page URL: http://127.0.0.1:51982/\n- Page Title: Probe\n### Snapshot\n```yaml\n- generic [ref=e1]:\n  - text: Why this role?\n  - textbox \"Why this role?\" [ref=e2]: I agree with your mission\n  - button \"Go\" [active] [ref=e3]\n```\n### Events\n- New console entries: .playwright-mcp/console.log#L1";
+const FAILED: &str = "### Error\nError: browserBackend.callTool: Error: Element is not an <input>\nCall log:\n  - fill(\"I agree with your mission\")";
+
+#[test]
+fn a_typed_answer_echoed_back_is_no_stop() {
+    for reply in [TYPED, AFTER_TYPING, FAILED] {
+        assert_eq!(scan(reply, &HashSet::new()), None, "{reply}");
+    }
+}
+
+/// The page itself is still read in a reply: its snapshot, its address and title.
+#[test]
+fn a_reply_whose_page_holds_a_stop_still_pauses() {
+    let page = "### Ran Playwright code\n```js\nawait page.goto('http://127.0.0.1:1/');\n```\n### Page\n- Page URL: http://127.0.0.1:1/\n- Page Title: Apply\n### Snapshot\n```yaml\n- generic [ref=e1]:\n  - checkbox \"I certify that my answers are true\" [ref=e2]\n```";
+    assert_eq!(scan(page, &HashSet::new()).unwrap().kind, Legal);
+    let titled = "### Page\n- Page URL: http://127.0.0.1:1/\n- Page Title: Verify you are human\n### Snapshot\n```yaml\n- generic [ref=e1]\n```";
+    assert_eq!(scan(titled, &HashSet::new()).unwrap().kind, Captcha);
+    // A text the page wrote into a field's name, or as its own text, still stops.
+    let named = "### Snapshot\n```yaml\n- textbox \"I agree to the terms\" [ref=e2]: x\n```";
+    assert_eq!(scan(named, &HashSet::new()).unwrap().kind, Legal);
+    let text = "### Snapshot\n```yaml\n- paragraph [ref=e2]: I agree to the terms\n```";
+    assert_eq!(scan(text, &HashSet::new()).unwrap().kind, Legal);
+}
+
 /// Every other stop is found inside a modal that holds a form.
 #[test]
 fn a_stop_inside_a_form_dialog_still_pauses() {

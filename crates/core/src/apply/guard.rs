@@ -219,7 +219,7 @@ const SCAN_ORDER: [PauseKind; 6] = [
 /// The first stop on the page that a person has not already acknowledged. The whole line is
 /// read; the excerpt is cut after the match starts.
 pub fn scan(snapshot: &str, acknowledged: &HashSet<String>) -> Option<Hit> {
-    let lines: Vec<String> = snapshot.lines().map(clean).collect();
+    let lines = page_lines(snapshot);
     for kind in SCAN_ORDER {
         for (index, folded) in lines.iter().enumerate() {
             let found = match kind {
@@ -240,7 +240,62 @@ pub fn scan(snapshot: &str, acknowledged: &HashSet<String>) -> Option<Hit> {
     None
 }
 
-/// An `alertdialog` always stops. A `dialog` stops unless its subtree holds a form control:
+/// The sections of a Playwright reply that show the page. The code the server ran, its
+/// errors, and its event list echo the session's own arguments, so they are not read.
+const PAGE_SECTIONS: [&str; 3] = ["### page", "### snapshot", "### modal state"];
+/// Roles whose inline text is the field's value, which the session typed or chose.
+const VALUE_ROLES: [&str; 5] = ["textbox", "searchbox", "spinbutton", "combobox", "slider"];
+
+/// The folded lines the stop scan reads. A reply with `### ` sections keeps only the page's
+/// sections; a bare snapshot is read whole. A field's value, and any continuation of it, is
+/// left out: an approved answer with a legal word, typed by the session, is no stop. The
+/// field's name, and every other line, is read.
+// ponytail: a value the page wrote into a field is not read either; its label and the
+// text around it are (Task 13 threat model).
+fn page_lines(text: &str) -> Vec<String> {
+    let lines: Vec<String> = text.lines().map(clean).collect();
+    let sectioned = lines.iter().any(|line| line.starts_with("### "));
+    let mut keep = !sectioned;
+    let mut value_depth: Option<usize> = None;
+    let mut out = Vec::new();
+    for line in lines {
+        if sectioned && line.starts_with("### ") {
+            keep = PAGE_SECTIONS.contains(&line.trim_end());
+            value_depth = None;
+            continue;
+        }
+        if !keep {
+            continue;
+        }
+        if let Some(depth) = value_depth {
+            if indent_of(&line) > depth && !line.trim_start().starts_with("- ") {
+                continue;
+            }
+            value_depth = None;
+        }
+        if VALUE_ROLES.contains(&parts(&line).0.as_str()) {
+            value_depth = Some(indent_of(&line));
+            out.push(without_value(&line));
+        } else {
+            out.push(line);
+        }
+    }
+    out
+}
+
+/// A field's line up to the `:` that starts its value.
+fn without_value(line: &str) -> String {
+    match line
+        .match_indices(':')
+        .find(|(at, _)| outside_quotes(line, *at))
+    {
+        Some((at, _)) => line[..at].to_owned(),
+        None => line.to_owned(),
+    }
+}
+
+/// An `alertdialog` always stops. A `dialog` stops unless its subtree holds a usable form
+/// control:
 /// a quick-apply modal is the form the owner's run fills. Every other stop is still found on
 /// its own line inside it.
 // ponytail: a page can wrap any text in a dialog with one textbox to skip this stop; the
@@ -254,7 +309,13 @@ fn dialog_stop(lines: &[String], index: usize) -> Option<usize> {
             let holds_form = lines[index + 1..]
                 .iter()
                 .take_while(|line| line.trim().is_empty() || indent_of(line) > depth)
-                .any(|line| FORM_CONTROLS.contains(&parts(line).0.as_str()));
+                .any(|line| {
+                    // A control the person can use: Playwright gives it a ref, and the page
+                    // has not hidden it from assistive technology.
+                    FORM_CONTROLS.contains(&parts(line).0.as_str())
+                        && line.contains("[ref=")
+                        && !line.contains("[aria-hidden]")
+                });
             (!holds_form).then_some(0)
         }
         _ => None,

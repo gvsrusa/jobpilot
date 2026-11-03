@@ -41,7 +41,9 @@ const BASE: [DataCategory; 3] = [
 ];
 const NAME: &str = "Ada Lovelace";
 const EMAIL: &str = "ada@example.com";
-const WHY: &str = "I enjoy building reliable tools for small teams.";
+/// The approved answer holds a legal phrase on purpose: typed and echoed back, the owner's
+/// own words must not stop every application.
+const WHY: &str = "I agree with your mission and enjoy building reliable tools.";
 /// What the done page says, after a form posts.
 const RECEIVED: &str = "Your application was received.";
 /// Every form's send button.

@@ -46,7 +46,8 @@ fn holds(arg: &str, marker: &str) -> bool {
 /// least three parts is a marker; anything else kills nothing. A SIGTERM-proof process is ended
 /// too: `Process::kill` is SIGKILL on Unix. After a pass that killed something it looks again,
 /// so a process started meanwhile is killed too, until a pass finds nothing new or `SETTLE`
-/// has passed. It blocks for that long at most. Returns how many processes were signalled.
+/// has passed. It blocks for about that long at most: `SETTLE` plus one look at the process
+/// table. Returns how many processes were signalled.
 pub fn kill_marked(marker: &Path) -> usize {
     let normal = marker
         .components()
