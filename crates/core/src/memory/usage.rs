@@ -55,13 +55,25 @@ pub struct ApprovedRow {
     pub question: String,
     pub class: Class,
     pub stale: bool,
+    /// The question's country, when the owner scoped it to one.
+    pub country: Option<String>,
+}
+
+impl ApprovedRow {
+    /// A scoped answer serves only its own country; a blank country takes only unscoped ones.
+    pub fn serves(&self, country: &str) -> bool {
+        match &self.country {
+            None => true,
+            Some(own) => !country.is_empty() && own.eq_ignore_ascii_case(country.trim()),
+        }
+    }
 }
 
 /// Every approved answer that still has text, oldest first. Asks the keychain nothing.
 pub async fn approved_for(db: &Db) -> Result<Vec<ApprovedRow>> {
-    let rows: Vec<(String, String, String, bool)> = sqlx::query_as(
+    let rows: Vec<(String, String, String, bool, Option<String>)> = sqlx::query_as(
         "SELECT a.id, q.text, q.class, \
-         coalesce(julianday('now') - julianday(a.reviewed_at) > ?1, 1) \
+         coalesce(julianday('now') - julianday(a.reviewed_at) > ?1, 1), q.country \
          FROM memory_answers a JOIN memory_questions q ON q.id = a.question_id \
          WHERE a.approved = 1 AND (a.body <> '' OR a.body_enc IS NOT NULL) ORDER BY a.seq",
     )
@@ -69,12 +81,13 @@ pub async fn approved_for(db: &Db) -> Result<Vec<ApprovedRow>> {
     .fetch_all(&db.pool)
     .await?;
     rows.into_iter()
-        .map(|(answer_id, question, class, stale)| {
+        .map(|(answer_id, question, class, stale, country)| {
             Ok(ApprovedRow {
                 answer_id,
                 question,
                 class: class.parse()?,
                 stale,
+                country,
             })
         })
         .collect()
@@ -160,10 +173,37 @@ pub async fn use_answer(
     answer_id: &str,
     application_id: &str,
 ) -> Result<UsedAnswer> {
+    take(db, actor, answer_id, application_id, false).await
+}
+
+/// A `Sensitive` answer a person released for this application at an apply run's start, in
+/// place of a confirmation. It must still be approved, `Sensitive`, and fresh; anything else
+/// is `ConfirmationRequired`. The caller holds the release.
+pub(crate) async fn use_released(
+    db: &Db,
+    actor: &str,
+    answer_id: &str,
+    application_id: &str,
+) -> Result<UsedAnswer> {
+    take(db, actor, answer_id, application_id, true).await
+}
+
+async fn take(
+    db: &Db,
+    actor: &str,
+    answer_id: &str,
+    application_id: &str,
+    released: bool,
+) -> Result<UsedAnswer> {
     let (row, class) = checked(db, actor, answer_id, application_id).await?;
-    if class.sealed() && !confirmed_now(db, &row, application_id).await? {
+    if released {
+        if class != Class::Sensitive || row.stale {
+            return Err(Error::ConfirmationRequired);
+        }
+    } else if class.sealed() && !confirmed_now(db, &row, application_id).await? {
         return Err(Error::ConfirmationRequired);
     }
+    let confirmed = class.sealed() && !released;
     if is_cleared(&row) {
         return Err(bad(
             "this text was cleared when its key was given up; remove the answer",
@@ -173,7 +213,7 @@ pub async fn use_answer(
 
     // The write re-checks the version and approval, so an edit during the decrypt wins.
     let mut write = db.pool.begin().await?;
-    let marked = if class.sealed() {
+    let marked = if confirmed {
         sqlx::query(concat!(
             "UPDATE application_answers SET used_at = ",
             now!(),
@@ -192,11 +232,13 @@ pub async fn use_answer(
              used_at) SELECT ?, id, version, ",
             now!(),
             " FROM memory_answers WHERE id = ? AND version = ? AND approved = 1 \
+             AND (SELECT class FROM memory_questions WHERE id = question_id) = ? \
              ON CONFLICT(application_id, answer_id) DO UPDATE SET used_at = excluded.used_at"
         ))
         .bind(application_id)
         .bind(answer_id)
         .bind(row.version)
+        .bind(class.as_str())
     }
     .execute(&mut *write)
     .await?
@@ -208,14 +250,11 @@ pub async fn use_answer(
             super::changed()
         });
     }
-    audit::record_to(
-        &mut *write,
-        actor,
-        "answer_used",
-        Some(answer_id),
-        json!({ "application": application_id, "class": class.as_str() }),
-    )
-    .await?;
+    let mut detail = json!({ "application": application_id, "class": class.as_str() });
+    if released {
+        detail["released"] = json!(true);
+    }
+    audit::record_to(&mut *write, actor, "answer_used", Some(answer_id), detail).await?;
     write.commit().await?;
     Ok(UsedAnswer {
         application_id: application_id.to_owned(),

@@ -157,7 +157,18 @@ async fn app(db: &Db, company: &str) -> String {
 
 /// An approved answer of `class` to a new question.
 async fn answer(db: &Db, question: &str, class: Class, text: &str) -> String {
-    let question = memory::add_question(db, question, None).await.unwrap();
+    scoped_answer(db, question, None, class, text).await
+}
+
+/// As [`answer`], with the question scoped to `country`.
+async fn scoped_answer(
+    db: &Db,
+    question: &str,
+    country: Option<&str>,
+    class: Class,
+    text: &str,
+) -> String {
+    let question = memory::add_question(db, question, country).await.unwrap();
     sqlx::query("UPDATE memory_questions SET class = ?, class_source = 'user' WHERE id = ?")
         .bind(class.as_str())
         .bind(&question.id)
@@ -883,5 +894,282 @@ async fn a_form_question_keeps_form_provenance_and_is_unapproved() {
     assert_eq!(approved[0].class, Class::Normal);
     assert!(!approved[0].stale);
     assert!(!format!("{approved:?}").contains("ZXQ-ANSWER"));
+    w.db.close().await;
+}
+
+async fn audit_count(db: &Db, action: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = ?")
+        .bind(action)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_release_over_two_applications_puts_the_answer_in_each_brief() {
+    let w = world().await;
+    consent_to(&w.db, &ALL).await;
+    let salary = "ZXQ-SALARY-ANSWER";
+    let sealed = answer(&w.db, "What is your salary?", Class::Sensitive, salary).await;
+    let apps = [
+        app(&w.db, "Acme").await,
+        app(&w.db, "Globex").await,
+        app(&w.db, "Initech").await,
+    ];
+
+    let run = apply::start(&w.db, "cli", &apps, true).await.unwrap();
+
+    for application in &apps {
+        let item = item_of(&w.db, &run, application).await;
+        assert_eq!(item.released_answers, std::slice::from_ref(&sealed));
+        let brief = brief_for(&w, &run, application).await;
+        assert_eq!(brief.answers.len(), 1, "{application}");
+        assert_eq!(brief.answers[0].answer, salary);
+    }
+    assert_eq!(audit_count(&w.db, "sensitive_released").await, 1);
+    assert_eq!(
+        audit_count(&w.db, "answer_confirmed").await,
+        0,
+        "no confirmation is written"
+    );
+    let log = jobpilot_core::audit::recent(&w.db, 50).await.unwrap();
+    let row = log
+        .iter()
+        .find(|row| row.action == "sensitive_released")
+        .unwrap();
+    assert_eq!(row.detail["applications"], serde_json::json!(apps));
+    assert_eq!(row.detail["answers"], 3);
+    assert!(!row.detail.to_string().contains(salary));
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn a_run_with_no_release_holds_no_sensitive_answer_even_when_confirmed() {
+    let w = world().await;
+    consent_to(&w.db, &ALL).await;
+    let salary = "ZXQ-SALARY-ANSWER";
+    let sealed = answer(&w.db, "What is your salary?", Class::Sensitive, salary).await;
+    let a = app(&w.db, "Acme").await;
+    memory::confirm_use(&w.db, "cli", &sealed, &a)
+        .await
+        .unwrap();
+
+    let first = apply::start(&w.db, "cli", &ids(&[&a]), true).await.unwrap();
+    apply::cancel(&w.db, "cli", &first).await.unwrap();
+    let run = apply::start(&w.db, "cli", &ids(&[&a]), false)
+        .await
+        .unwrap();
+
+    let item = item_of(&w.db, &run, &a).await;
+    assert!(item.released_answers.is_empty());
+    let brief = brief_for(&w, &run, &a).await;
+    assert!(brief.answers.is_empty());
+    assert!(!json(&brief).contains(salary));
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn a_failed_start_releases_nothing() {
+    let w = world().await;
+    consent_to(&w.db, &ALL).await;
+    answer(
+        &w.db,
+        "What is your salary?",
+        Class::Sensitive,
+        "ZXQ-SALARY",
+    )
+    .await;
+    let a = app(&w.db, "Acme").await;
+    let b = app(&w.db, "Globex").await;
+
+    // The second item's insert fails inside the transaction, after the release is computed.
+    sqlx::query(
+        "CREATE TRIGGER fail_second BEFORE INSERT ON apply_items WHEN NEW.position = 1 \
+         BEGIN SELECT RAISE(ABORT, 'refused by the test'); END",
+    )
+    .execute(&w.db.pool)
+    .await
+    .unwrap();
+    assert!(
+        apply::start(&w.db, "cli", &ids(&[&a, &b]), true)
+            .await
+            .is_err()
+    );
+    sqlx::query("DROP TRIGGER fail_second")
+        .execute(&w.db.pool)
+        .await
+        .unwrap();
+
+    // The second-run refusal.
+    let run = apply::start(&w.db, "cli", &ids(&[&a]), false)
+        .await
+        .unwrap();
+    refused(
+        apply::start(&w.db, "cli", &ids(&[&b]), true).await,
+        "apply_run_active",
+    );
+
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM apply_runs")
+        .fetch_one(&w.db.pool)
+        .await
+        .unwrap();
+    assert_eq!(runs, 1, "only the run with no release");
+    let released: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM apply_items WHERE released_answers <> '[]'")
+            .fetch_one(&w.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(released, 0);
+    assert_eq!(audit_count(&w.db, "sensitive_released").await, 0);
+    assert_eq!(audit_count(&w.db, "apply_run_created").await, 1);
+    for application in [&a, &b] {
+        assert!(
+            memory::application_answers(&w.db, application)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    assert!(item_of(&w.db, &run, &a).await.released_answers.is_empty());
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn an_answer_scoped_to_a_country_serves_only_that_country() {
+    let w = world().await;
+    consent_to(&w.db, &ALL).await;
+    let us_text = "ZXQ-US-ANSWER";
+    let sealed_text = "ZXQ-US-SALARY";
+    scoped_answer(&w.db, "Why this job?", Some("US"), Class::Normal, us_text).await;
+    let sealed = scoped_answer(
+        &w.db,
+        "What is your salary?",
+        Some("us"),
+        Class::Sensitive,
+        sealed_text,
+    )
+    .await;
+    let us = add_app(
+        &w.db,
+        App {
+            country: "US",
+            ..App::new("Acme")
+        },
+    )
+    .await;
+    let ca = add_app(
+        &w.db,
+        App {
+            country: "CA",
+            ..App::new("Globex")
+        },
+    )
+    .await;
+    let blank = app(&w.db, "Initech").await;
+
+    let check = apply::preflight(&w.db, &ids(&[&us, &ca, &blank]))
+        .await
+        .unwrap();
+    assert_eq!((check.items[0].answers, check.items[0].sealed), (1, 1));
+    assert_eq!((check.items[1].answers, check.items[1].sealed), (0, 0));
+    assert_eq!((check.items[2].answers, check.items[2].sealed), (0, 0));
+
+    let run = apply::start(&w.db, "cli", &ids(&[&us, &ca, &blank]), true)
+        .await
+        .unwrap();
+    assert_eq!(item_of(&w.db, &run, &us).await.released_answers, [sealed]);
+    assert!(item_of(&w.db, &run, &ca).await.released_answers.is_empty());
+
+    let brief = json(&brief_for(&w, &run, &us).await);
+    assert!(
+        brief.contains(us_text) && brief.contains(sealed_text),
+        "{brief}"
+    );
+    for other in [&ca, &blank] {
+        let brief = json(&brief_for(&w, &run, other).await);
+        assert!(
+            !brief.contains(us_text) && !brief.contains(sealed_text),
+            "{brief}"
+        );
+    }
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn a_stale_sensitive_answer_is_never_released() {
+    let w = world().await;
+    consent_to(&w.db, &ALL).await;
+    let salary = "ZXQ-SALARY-ANSWER";
+    let sealed = answer(&w.db, "What is your salary?", Class::Sensitive, salary).await;
+    reviewed_days_ago(&w.db, &sealed, FRESH_DAYS + 1).await;
+    let a = app(&w.db, "Acme").await;
+
+    let check = apply::preflight(&w.db, std::slice::from_ref(&a))
+        .await
+        .unwrap();
+    assert_eq!(check.items[0].sealed, 0);
+    assert_eq!(check.items[0].stale_left_out, 1);
+
+    let run = apply::start(&w.db, "cli", &ids(&[&a]), true).await.unwrap();
+    assert!(item_of(&w.db, &run, &a).await.released_answers.is_empty());
+    assert!(!json(&brief_for(&w, &run, &a).await).contains(salary));
+    assert!(
+        memory::find_answer(&w.db, &sealed).await.unwrap().1.stale,
+        "the release does not refresh it"
+    );
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn a_file_outside_the_root_or_unresolved_is_refused() {
+    let w = world().await;
+    consent_to(&w.db, &BASE).await;
+    let a = app(&w.db, "Acme").await;
+    let run = apply::start(&w.db, "cli", &ids(&[&a]), false)
+        .await
+        .unwrap();
+    let item = item_of(&w.db, &run, &a).await;
+    let outside = w.tmp.path().join("outside.pdf");
+    std::fs::write(&outside, "x").unwrap();
+
+    for path in [outside, w.tmp.path().join("no-such-folder/resume.pdf")] {
+        let mut moved = item.clone();
+        moved.resume_path = Some(path);
+        refused(
+            brief::build(&w.db, "cli", &moved, &files_dir(&w)).await,
+            "file_outside_root",
+        );
+    }
+    w.db.close().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn answers_are_marked_used_only_after_the_files_are_staged() {
+    let w = world().await;
+    consent_to(&w.db, &BASE).await;
+    answer(&w.db, "Why this job?", Class::Normal, "ZXQ-ANSWER").await;
+    let a = app(&w.db, "Acme").await;
+    let run = apply::start(&w.db, "cli", &ids(&[&a]), false)
+        .await
+        .unwrap();
+    let mut item = item_of(&w.db, &run, &a).await;
+    let link = w.db.paths().root().join("linked.pdf");
+    std::os::unix::fs::symlink(item.resume_path.as_ref().unwrap(), &link).unwrap();
+    item.resume_path = Some(link);
+
+    assert!(
+        brief::build(&w.db, "cli", &item, &files_dir(&w))
+            .await
+            .is_err()
+    );
+
+    assert_eq!(audit_count(&w.db, "answer_used").await, 0);
+    assert!(
+        memory::application_answers(&w.db, &a)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     w.db.close().await;
 }

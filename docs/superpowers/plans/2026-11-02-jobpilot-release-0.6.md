@@ -1416,7 +1416,7 @@ git commit -m "feat: Autonomous gate with zero eligible sites and one submission
 
 Run: `scripts/ci-local.sh --fast`
 Then: `pnpm --filter desktop sidecar && pnpm tauri build --no-bundle`
-Expected: all steps `ok`, exit 0. The controller runs the full `scripts/ci-local.sh` after this task. Migration gate: `a_fresh_database_is_schema_16` and `a_0_5_database_upgrades_to_0_6` pass. Record the test counts in the release note.
+Expected: all steps `ok`, exit 0. The controller runs the full `scripts/ci-local.sh` after this task. Migration gate: `a_fresh_database_is_schema_17` and `a_0_5_database_upgrades_to_0_6` pass. Record the test counts in the release note.
 
 - [ ] **Step 4: Sweep for the hard rules**
 
@@ -1456,7 +1456,7 @@ JP="$PWD/target/debug/jobpilot"
 $JP status; $JP browser status; $JP browser setup; $JP browser status
 ```
 
-Expected: schema 16, version 0.6.0, `not installed`, then `ready` with `@playwright/mcp 0.0.84`.
+Expected: schema 17, version 0.6.0, `not installed`, then `ready` with `@playwright/mcp 0.0.84`.
 
 - [ ] **Step 3: Prepare data**
 

@@ -103,6 +103,8 @@ pub struct Item {
     pub confirmation_url: Option<String>,
     pub status_written: bool,
     pub reason: Option<String>,
+    /// The `Sensitive` answers a person released for this item at start.
+    pub released_answers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -147,6 +149,8 @@ struct Checked {
     check: ItemCheck,
     resume_path: Option<PathBuf>,
     letter_path: Option<PathBuf>,
+    /// Approved, fresh `Sensitive` answers that serve this application's country.
+    sealed_ids: Vec<String>,
 }
 
 /// Reads and exports only: it releases nothing and writes no run.
@@ -234,8 +238,17 @@ async fn check_item(
     if matches!(letter, DocState::Blocked(_)) {
         blocks.push("letter_blocked");
     }
+    let serving: Vec<&ApprovedRow> = approved
+        .iter()
+        .filter(|row| row.serves(&app.country))
+        .collect();
     let count =
-        |keep: &dyn Fn(&ApprovedRow) -> bool| approved.iter().filter(|r| keep(r)).count() as i64;
+        |keep: &dyn Fn(&ApprovedRow) -> bool| serving.iter().filter(|r| keep(r)).count() as i64;
+    let sealed_ids: Vec<String> = serving
+        .iter()
+        .filter(|row| row.class == Class::Sensitive && !row.stale)
+        .map(|row| row.answer_id.clone())
+        .collect();
     let authorization = if app.country.is_empty() {
         AuthorizationState::NoCountry
     } else if usage::authorization_for(db, &app.country).await?.stated {
@@ -243,13 +256,14 @@ async fn check_item(
     } else {
         AuthorizationState::NotStated
     };
-    let sealed = count(&|row| row.class == Class::Sensitive)
-        + i64::from(authorization == AuthorizationState::Stated);
+    let sealed = sealed_ids.len() as i64 + i64::from(authorization == AuthorizationState::Stated);
     Ok(Checked {
         check: ItemCheck {
             host: host_of(&app.link),
             answers: count(&|row| row.class == Class::Normal && !row.stale),
-            stale_left_out: count(&|row| row.class == Class::Normal && row.stale),
+            stale_left_out: count(&|row| {
+                matches!(row.class, Class::Normal | Class::Sensitive) && row.stale
+            }),
             sealed,
             authorization,
             resume,
@@ -262,6 +276,7 @@ async fn check_item(
         },
         resume_path,
         letter_path,
+        sealed_ids,
     })
 }
 
@@ -328,8 +343,9 @@ async fn run_active(db: &Db) -> Result<bool> {
     .await?)
 }
 
-/// A person's act. With `release_sealed`, each approved sensitive answer is confirmed for each
-/// application of this run, and each item whose exact country has a stated row is released.
+/// A person's act. With `release_sealed`, each item records the fresh `Sensitive` answers that
+/// serve its country, and is released for authorization when its exact country has a stated
+/// row. Every row it writes lands in one transaction, so a failed start releases nothing.
 pub async fn start(
     db: &Db,
     actor: &str,
@@ -366,16 +382,13 @@ pub async fn start(
         checked.push(item);
     }
 
-    let mut confirmed = 0;
-    if release_sealed {
-        // Legal answers are never confirmed here: each one stops for a person.
-        for row in approved.iter().filter(|row| row.class == Class::Sensitive) {
-            for item in &checked {
-                usage::confirm_use(db, actor, &row.answer_id, &item.check.application_id).await?;
-                confirmed += 1;
-            }
+    // Legal answers are never released: each one stops for a person.
+    let released_answers = |item: &Checked| -> Vec<String> {
+        match release_sealed {
+            true => item.sealed_ids.clone(),
+            false => Vec::new(),
         }
-    }
+    };
     let released =
         |item: &Checked| release_sealed && item.check.authorization == AuthorizationState::Stated;
 
@@ -400,8 +413,8 @@ pub async fn start(
     for (position, item) in checked.iter().enumerate() {
         sqlx::query(
             "INSERT INTO apply_items (id, apply_run_id, application_id, position, host, state, \
-             resume_path, letter_path, auth_released, policy_note) \
-             VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, 'queued', ?, ?, ?, ?)",
+             resume_path, letter_path, auth_released, policy_note, released_answers) \
+             VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(&item.check.application_id)
@@ -411,6 +424,7 @@ pub async fn start(
         .bind(path_text(item.letter_path.as_deref())?)
         .bind(released(item))
         .bind(POLICY_NOTE)
+        .bind(json!(released_answers(item)).to_string())
         .execute(&mut *tx)
         .await?;
     }
@@ -422,10 +436,20 @@ pub async fn start(
         "items": checked.len(),
         "hosts": hosts,
         "release_sealed": release_sealed,
-        "answers_confirmed": confirmed,
-        "authorization_released": checked.iter().filter(|item| released(item)).count(),
     });
     audit::record_to(&mut *tx, actor, "apply_run_created", Some(&id), detail).await?;
+    if release_sealed {
+        let applications: Vec<&str> = checked
+            .iter()
+            .map(|item| item.check.application_id.as_str())
+            .collect();
+        let detail = json!({
+            "applications": applications,
+            "answers": checked.iter().map(|item| item.sealed_ids.len()).sum::<usize>(),
+            "authorization": checked.iter().filter(|item| released(item)).count(),
+        });
+        audit::record_to(&mut *tx, actor, "sensitive_released", Some(&id), detail).await?;
+    }
     let detail = json!({ "provider": PROVIDER, "categories": categories });
     audit::record_to(&mut *tx, actor, "ai_external_call", Some(&id), detail).await?;
     tx.commit().await?;
@@ -457,11 +481,16 @@ struct ItemRow {
     confirmation_url: Option<String>,
     status_written: bool,
     reason: Option<String>,
+    released_answers: String,
 }
 
-impl From<ItemRow> for Item {
-    fn from(row: ItemRow) -> Item {
-        Item {
+impl TryFrom<ItemRow> for Item {
+    type Error = Error;
+
+    fn try_from(row: ItemRow) -> Result<Item> {
+        let released_answers = serde_json::from_str(&row.released_answers)
+            .map_err(|error| Error::Db(sqlx::Error::Decode(Box::new(error))))?;
+        Ok(Item {
             id: row.id,
             run_id: row.apply_run_id,
             application_id: row.application_id,
@@ -477,7 +506,8 @@ impl From<ItemRow> for Item {
             confirmation_url: row.confirmation_url,
             status_written: row.status_written,
             reason: row.reason,
-        }
+            released_answers,
+        })
     }
 }
 
@@ -491,7 +521,7 @@ pub async fn view(db: &Db, id: &str) -> Result<RunView> {
     let items: Vec<ItemRow> = sqlx::query_as(
         "SELECT id, apply_run_id, application_id, position, host, state, submit_clicks, \
          auth_released, resume_path, letter_path, policy_note, confirmation_text, \
-         confirmation_url, status_written, reason \
+         confirmation_url, status_written, reason, released_answers \
          FROM apply_items WHERE apply_run_id = ? ORDER BY position",
     )
     .bind(id)
@@ -509,7 +539,10 @@ pub async fn view(db: &Db, id: &str) -> Result<RunView> {
         id: id.to_owned(),
         mode,
         state,
-        items: items.into_iter().map(Item::from).collect(),
+        items: items
+            .into_iter()
+            .map(Item::try_from)
+            .collect::<Result<_>>()?,
         active_pause,
         created_at,
         ended_at,

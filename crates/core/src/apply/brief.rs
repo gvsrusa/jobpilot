@@ -11,7 +11,7 @@ use crate::applications;
 use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::memory::Class;
-use crate::memory::usage::{self, UsedAnswer};
+use crate::memory::usage;
 use crate::profile::{self, Stated};
 
 #[derive(Debug, Clone, Serialize)]
@@ -52,9 +52,9 @@ pub struct Brief {
     pub files: Vec<BriefFile>,
 }
 
-/// Stages the item's files into `files`, then reads what this application may use. Each
-/// answer goes through `use_answer`, so a sealed one comes only with this application's
-/// confirmation, and each use is audited.
+/// Stages the item's files into `files`, then reads what this application may use: fresh
+/// normal answers, and the `Sensitive` ones released on this item at start. An answer scoped
+/// to a country serves only that country. Each use is audited, after the files are staged.
 pub async fn build(db: &Db, actor: &str, item: &Item, files: &Path) -> Result<Brief> {
     let application_id = item
         .application_id
@@ -62,11 +62,12 @@ pub async fn build(db: &Db, actor: &str, item: &Item, files: &Path) -> Result<Br
         .ok_or_else(|| Error::Validation("this application was removed".into()))?;
     let app = applications::get(db, application_id).await?;
     for path in [&item.resume_path, &item.letter_path].into_iter().flatten() {
-        if !db.paths().is_inside_root(path) {
+        if !db.paths().is_surely_inside_root(path) {
             return Err(Error::Refused("file_outside_root".into()));
         }
     }
 
+    let staged = stage_files(item, files)?;
     let basic = profile::basic(db).await?;
     let mut facts = Vec::new();
     for (name, value) in [("name", &basic.name), ("email", &basic.email)] {
@@ -93,16 +94,19 @@ pub async fn build(db: &Db, actor: &str, item: &Item, files: &Path) -> Result<Br
 
     let mut answers = Vec::new();
     for row in usage::approved_for(db).await? {
-        let wanted = match row.class {
-            Class::Normal => !row.stale,
-            Class::Sensitive => true,
-            Class::Legal | Class::WorkAuthorization => false,
-        };
-        if !wanted {
+        if !row.serves(&app.country) || row.stale {
             continue;
         }
-        match usage::use_answer(db, actor, &row.answer_id, application_id).await {
-            Ok(used) if usable(&used) => answers.push(BriefAnswer {
+        let used = match row.class {
+            Class::Normal => usage::use_answer(db, actor, &row.answer_id, application_id).await,
+            Class::Sensitive if item.released_answers.contains(&row.answer_id) => {
+                usage::use_released(db, actor, &row.answer_id, application_id).await
+            }
+            Class::Sensitive | Class::Legal | Class::WorkAuthorization => continue,
+        };
+        match used {
+            // The class is read again with the text, so a change since the list keeps it out.
+            Ok(used) if used.class == row.class && !used.stale => answers.push(BriefAnswer {
                 question: row.question,
                 answer: used.text,
             }),
@@ -125,7 +129,7 @@ pub async fn build(db: &Db, actor: &str, item: &Item, files: &Path) -> Result<Br
     };
 
     Ok(Brief {
-        files: stage_files(item, files)?,
+        files: staged,
         application_id: app.id,
         company: app.company,
         role: app.role,
@@ -135,15 +139,6 @@ pub async fn build(db: &Db, actor: &str, item: &Item, files: &Path) -> Result<Br
         answers,
         work_authorization,
     })
-}
-
-/// The class is read again with the text, so a raise since the list keeps it out.
-fn usable(used: &UsedAnswer) -> bool {
-    match used.class {
-        Class::Normal => !used.stale,
-        Class::Sensitive => true,
-        Class::Legal | Class::WorkAuthorization => false,
-    }
 }
 
 fn stated_text(value: &Stated) -> &'static str {
