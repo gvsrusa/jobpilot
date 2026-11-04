@@ -12,7 +12,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { ipc, pickFolder, toAppError, type BackupInfo, type Status } from "@/lib/ipc";
+import { ipc, toAppError, type BackupInfo, type Status } from "@/lib/ipc";
 import { useApplyStatus } from "@/lib/status";
 import { baseName, formatDate } from "@/lib/utils";
 
@@ -78,10 +78,6 @@ function BackupPicker({
   onClose(): void;
 }) {
   const backups = useQuery({ queryKey: ["backups"], queryFn: ipc.backupList });
-  const folder = useMutation({
-    mutationFn: pickFolder,
-    onSuccess: (path) => path && onPick({ path }),
-  });
   const list = ordered(backups.data ?? [], code);
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
@@ -93,7 +89,7 @@ function BackupPicker({
             anywhere.
           </DialogDescription>
         </DialogHeader>
-        <ErrorAlert error={backups.error ?? folder.error} />
+        <ErrorAlert error={backups.error} />
         {backups.isSuccess && list.length === 0 && (
           <p className="text-sm text-muted-foreground">No backups found in the data folder.</p>
         )}
@@ -112,7 +108,7 @@ function BackupPicker({
           ))}
         </ul>
         <div className="flex justify-between">
-          <Button variant="outline" onClick={() => folder.mutate()}>
+          <Button variant="outline" onClick={() => onPick({})}>
             Choose another folder...
           </Button>
           <Button variant="outline" onClick={onClose}>

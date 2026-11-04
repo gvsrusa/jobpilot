@@ -2,7 +2,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { open } from "@tauri-apps/plugin-dialog";
 
 /** What every failed command rejects with (jobpilot-core `Error`). */
 export type AppError = { code: string; message: string };
@@ -726,7 +725,9 @@ export const ipc = {
   settingsSet: (key: string, value: unknown) => invoke<void>("settings_set", { key, value }),
   backupCreate: () => invoke<BackupInfo>("backup_create"),
   backupList: () => invoke<BackupInfo[]>("backup_list"),
-  backupRestore: (source: string) => invoke<Status>("backup_restore", { source }),
+  /** `snapshot` names one `backupList` gave; `null` has Rust open a folder picker, and the
+   * call rejects with `cancelled` when the user closes it. The webview names no path. */
+  backupRestore: (snapshot: string | null) => invoke<Status>("backup_restore", { snapshot }),
   dataExport: () => invoke<Exported>("data_export"),
   dataDelete: (confirm: string, includeBackups: boolean) =>
     invoke<Status>("data_delete", { confirm, includeBackups }),
@@ -995,12 +996,6 @@ export function onPtyExit(cb: (code: number | null) => void): Promise<() => void
 /** Frees output credit once xterm.js has parsed `bytes`, so the PTY paces the child. */
 export function ptyAck(bytes: number): Promise<void> {
   return getCurrentWebviewWindow().emit("pty:ack", bytes);
-}
-
-/** The folder picker for a backup. Returns null when the user cancels. */
-export async function pickFolder(): Promise<string | null> {
-  const chosen = await open({ directory: true, multiple: false });
-  return typeof chosen === "string" ? chosen : null;
 }
 
 /** Anything a command can reject with, as `{code, message}`. */

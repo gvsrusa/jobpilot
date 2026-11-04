@@ -47,6 +47,11 @@ pub async fn open_file<R: Runtime>(app: &AppHandle<R>, dialog: FileDialog<'_>) -
     pick(app, dialog, false).await?.ok_or(Error::Cancelled)
 }
 
+/// A folder picker. `Err(Cancelled)` when the user closes it.
+pub async fn open_dir<R: Runtime>(app: &AppHandle<R>, title: &str) -> Result<PathBuf> {
+    pick_dir(app, title).await?.ok_or(Error::Cancelled)
+}
+
 /// `Err(Cancelled)` when the user closes the picker.
 pub async fn save_file<R: Runtime>(app: &AppHandle<R>, dialog: FileDialog<'_>) -> Result<PathBuf> {
     pick(app, dialog, true).await?.ok_or(Error::Cancelled)
@@ -235,6 +240,20 @@ async fn pick<R: Runtime>(
         .transpose()
 }
 
+#[cfg(not(test))]
+async fn pick_dir<R: Runtime>(app: &AppHandle<R>, title: &str) -> Result<Option<PathBuf>> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let builder = app.dialog().file().set_title(title);
+    let picked = off_the_main_thread(move || builder.blocking_pick_folder()).await?;
+    picked
+        .map(|path| {
+            path.into_path()
+                .map_err(|_| Error::Validation("this is not a folder on this computer".into()))
+        })
+        .transpose()
+}
+
 /// `NATIVE_CONFIRM` and the picked path, per harness so parallel tests cannot race. It
 /// replaces only the dialog itself: the mock runtime has no window to show one in.
 #[cfg(test)]
@@ -396,5 +415,14 @@ async fn pick<R: Runtime>(
     } = dialog;
     let asked = format!("{title}: {filter} {extensions:?} {file_name:?}");
     hook.asked.lock().unwrap().push(asked);
+    Ok(hook.picked.lock().unwrap().take())
+}
+
+#[cfg(test)]
+async fn pick_dir<R: Runtime>(app: &AppHandle<R>, title: &str) -> Result<Option<PathBuf>> {
+    use tauri::Manager;
+
+    let hook = app.state::<NativeHook>();
+    hook.asked.lock().unwrap().push(format!("{title}: folder"));
     Ok(hook.picked.lock().unwrap().take())
 }

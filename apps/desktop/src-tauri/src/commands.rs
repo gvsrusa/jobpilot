@@ -47,7 +47,9 @@ use jobpilot_core::recovery::{self, RecoveryReceipt};
 use jobpilot_core::render::{ResumeDoc, Template};
 use jobpilot_core::runner::{self, ExportChoice, RunDetail, RunSummary};
 use jobpilot_core::secrets::Zeroizing;
-use jobpilot_core::{Db, Error, Result, agents, permissions, secrets, settings, transfer};
+use jobpilot_core::{
+    AppPaths, Db, Error, Result, agents, permissions, secrets, settings, transfer,
+};
 use serde_json::{Value, json};
 use tauri::ipc::Invoke;
 use tauri::{AppHandle, Manager, Runtime, State};
@@ -359,30 +361,48 @@ pub async fn backup_create(state: State<'_, AppState>) -> Result<BackupInfo> {
 
 /// Needs no handle: the recovery screen's Restore lists snapshots from here. The read
 /// lock keeps it clear of a restore or delete changing `backups/`.
+/// The snapshot in the backups folder whose folder name is `name`, as `backup_list` lists
+/// it. A name with a separator or `..` matches none, so nothing outside is reached.
+async fn listed_snapshot(state: &AppState, paths: &AppPaths, name: &str) -> Result<PathBuf> {
+    let _slot = state.db.read().await;
+    backup::list(paths)
+        .await?
+        .into_iter()
+        .map(|info| info.path)
+        .find(|path| path.file_name().is_some_and(|file| file == name))
+        .ok_or(Error::NotFound)
+}
+
 #[tauri::command]
 pub async fn backup_list(state: State<'_, AppState>) -> Result<Vec<BackupInfo>> {
     let _slot = state.db.read().await;
     backup::list(state.known_root()?).await
 }
 
+/// The webview names no path (M-02, review-1.0 S-6). `snapshot` is the name of one the
+/// backups folder lists, as `backup_list` gave it; without one, Rust opens a folder picker.
 #[tauri::command]
 pub async fn backup_restore<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, AppState>,
-    source: String,
+    snapshot: Option<String>,
 ) -> Result<Status> {
-    state.known_root()?;
+    let paths = state.known_root()?;
     if state.db.read().await.is_none() {
         state.check_offline_restore()?;
     }
+    let source = match snapshot {
+        Some(name) => listed_snapshot(&state, paths, &name).await?,
+        None => native::open_dir(&app, "Restore backup from a folder").await?,
+    };
     let message = format!(
-        "Replace all data in JobPilot with this backup?\n\n{source}\n\n\
-         Running AI work stops. A copy of the current data is kept in the backups folder."
+        "Replace all data in JobPilot with this backup?\n\n{}\n\n\
+         Running AI work stops. A copy of the current data is kept in the backups folder.",
+        source.display()
     );
     native::confirmed(&app, "Restore backup", message, "Restore").await?;
 
     let (_gate, mut slot) = state.exclusive().await;
-    let source = PathBuf::from(source);
     let restored = match take_db(&mut slot)? {
         Some(db) => match backup::restore(db, &source, ACTOR).await {
             Err(error) if !matches!(error, Error::RestoredButNotOpened(_)) => {
@@ -2414,8 +2434,10 @@ mod tests {
         lock
     }
 
-    fn restore(source: &Path) -> Value {
-        json!({ "source": source })
+    /// The user picks `source` in the folder dialog Rust opens; the call names no path.
+    fn restore(h: &Harness, source: &Path) -> Value {
+        h.pick(source);
+        json!({})
     }
 
     fn delete(confirm: &str, include_backups: bool) -> Value {
@@ -2569,7 +2591,7 @@ mod tests {
         h.ok("documents_create", json!({ "title": "later", "body": "" }));
         let source = Path::new(info["path"].as_str().unwrap());
 
-        let status = h.ok("backup_restore", restore(source));
+        let status = h.ok("backup_restore", restore(&h, source));
 
         assert_eq!(status["state"], "ready");
         h.assert_ready();
@@ -2580,13 +2602,91 @@ mod tests {
     }
 
     #[test]
+    fn restore_takes_no_path_from_the_webview() {
+        let h = ready();
+        h.ok("documents_create", json!({ "title": "kept", "body": "" }));
+        let info = h.ok("backup_create", json!({}));
+        h.ok("documents_create", json!({ "title": "later", "body": "" }));
+
+        // A path in the call is not read: Rust opens the picker, and closing it cancels.
+        let named = json!({ "source": info["path"] });
+        assert_eq!(h.code("backup_restore", named), "cancelled");
+
+        let mut titles = h.titles();
+        titles.sort();
+        assert_eq!(titles, ["kept", "later"]);
+        let asked = h.asked();
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(
+            asked[0].starts_with("Restore backup from a folder"),
+            "{asked:?}"
+        );
+    }
+
+    #[test]
+    fn restore_of_a_listed_snapshot_goes_by_its_name() {
+        let h = ready();
+        h.ok("documents_create", json!({ "title": "kept", "body": "" }));
+        let info = h.ok("backup_create", json!({}));
+        h.ok("documents_create", json!({ "title": "later", "body": "" }));
+        let name = Path::new(info["path"].as_str().unwrap())
+            .file_name()
+            .unwrap();
+
+        let status = h.ok("backup_restore", json!({ "snapshot": name.to_str() }));
+
+        assert_eq!(status["state"], "ready");
+        assert_eq!(h.titles(), ["kept"]);
+        let asked = h.asked();
+        assert_eq!(
+            asked.len(),
+            1,
+            "only the confirmation, no picker: {asked:?}"
+        );
+        assert!(asked[0].starts_with("Restore backup:"), "{asked:?}");
+    }
+
+    #[test]
+    fn a_snapshot_must_be_one_listed_in_the_backups_folder() {
+        let h = ready();
+        h.ok("documents_create", json!({ "title": "live", "body": "" }));
+        let info = h.ok("backup_create", json!({}));
+        let listed = info["path"].as_str().unwrap().to_owned();
+        let outside = backup_holding(&h._tmp, "outside");
+        let outside = outside.to_str().unwrap().to_owned();
+        let dotted = format!(
+            "../{}",
+            Path::new(&listed).file_name().unwrap().to_str().unwrap()
+        );
+
+        for name in [
+            listed.as_str(),
+            outside.as_str(),
+            dotted.as_str(),
+            "..",
+            "",
+            "no-such",
+        ] {
+            assert_eq!(
+                h.code("backup_restore", json!({ "snapshot": name })),
+                "not_found",
+                "{name}"
+            );
+        }
+
+        assert!(h.asked().is_empty(), "no dialog for a refused name");
+        h.assert_ready();
+        assert_eq!(h.titles(), ["live"]);
+    }
+
+    #[test]
     fn failed_restore_reopens_and_stays_ready() {
         let h = ready();
         h.ok("documents_create", json!({ "title": "live", "body": "" }));
         let missing = h.paths.root().join("no-such-backup");
 
         assert_eq!(
-            h.code("backup_restore", restore(&missing)),
+            h.code("backup_restore", restore(&h, &missing)),
             "invalid_backup"
         );
 
@@ -2601,7 +2701,7 @@ mod tests {
         let source = Path::new(info["path"].as_str().unwrap());
         let other = block_on(Db::open(&h.paths)).unwrap();
 
-        assert_eq!(h.code("backup_restore", restore(source)), "in_use");
+        assert_eq!(h.code("backup_restore", restore(&h, source)), "in_use");
 
         h.assert_ready();
         block_on(other.close());
@@ -2615,7 +2715,7 @@ mod tests {
         // The online path does not look at the marker, so only the reopen fails.
         fs::remove_file(h.paths.marker()).unwrap();
 
-        let status = h.ok("backup_restore", restore(&source));
+        let status = h.ok("backup_restore", restore(&h, &source));
 
         assert_eq!(status["state"], "recovery");
         assert_eq!(status["error"]["code"], "restored_not_opened");
@@ -2634,7 +2734,7 @@ mod tests {
         fs::remove_file(h.paths.marker()).unwrap();
         let missing = h.paths.root().join("no-such-backup");
 
-        let status = h.ok("backup_restore", restore(&missing));
+        let status = h.ok("backup_restore", restore(&h, &missing));
 
         assert_eq!(status["state"], "recovery");
         assert_eq!(status["error"]["code"], "root_not_owned");
@@ -2654,7 +2754,7 @@ mod tests {
             let h = recovery(code);
             let source = backup_holding(&h._tmp, "restored");
 
-            let status = h.ok("backup_restore", restore(&source));
+            let status = h.ok("backup_restore", restore(&h, &source));
 
             assert_eq!(status["state"], "ready", "{code}");
             h.assert_ready();
@@ -2673,7 +2773,7 @@ mod tests {
             let h = recovery(code);
             let source = backup_holding(&h._tmp, "restored");
 
-            assert_eq!(h.code("backup_restore", restore(&source)), expected);
+            assert_eq!(h.code("backup_restore", restore(&h, &source)), expected);
 
             h.assert_recovery(code);
             assert_eq!(h.snapshots(), 0, "nothing was written for {code}");
@@ -2685,7 +2785,7 @@ mod tests {
         let h = recovery("io");
         let source = backup_holding(&h._tmp, "restored");
 
-        let error = h.call("backup_restore", restore(&source)).unwrap_err();
+        let error = h.call("backup_restore", restore(&h, &source)).unwrap_err();
 
         assert_eq!(error["message"], "file error: stored io");
     }
@@ -2698,7 +2798,7 @@ mod tests {
         let missing = h.paths.root().join("no-such-backup");
 
         assert_eq!(
-            h.code("backup_restore", restore(&missing)),
+            h.code("backup_restore", restore(&h, &missing)),
             "invalid_backup"
         );
 
@@ -2711,7 +2811,7 @@ mod tests {
         let source = backup_holding(&h._tmp, "restored");
         let held = take_exclusive(&h.paths);
 
-        assert_eq!(h.code("backup_restore", restore(&source)), "in_use");
+        assert_eq!(h.code("backup_restore", restore(&h, &source)), "in_use");
 
         h.assert_recovery(OPENS);
         drop(held);
@@ -2734,7 +2834,7 @@ mod tests {
             })
         };
         for _ in 0..5 {
-            h.ok("backup_restore", restore(&source));
+            h.ok("backup_restore", restore(&h, &source));
         }
 
         reader.join().unwrap();
@@ -2864,7 +2964,10 @@ mod tests {
             "unavailable"
         );
         assert_eq!(h.code("backup_list", json!({})), "unavailable");
-        assert_eq!(h.code("backup_restore", restore(&source)), "unavailable");
+        assert_eq!(
+            h.code("backup_restore", restore(&h, &source)),
+            "unavailable"
+        );
         assert_eq!(h.code("data_delete", delete("DELETE", true)), "unavailable");
     }
 
@@ -3514,6 +3617,7 @@ mod tests {
         assert_eq!(fields, ["key_id", "path"]);
     }
 
+    /// Rust opens every dialog, the restore folder picker too (M-13, review-1.0 S-6).
     #[test]
     fn the_webview_gains_no_dialog_capability() {
         let capability: Value =
@@ -3525,7 +3629,7 @@ mod tests {
             .filter_map(Value::as_str)
             .filter(|name| name.starts_with("dialog:"))
             .collect();
-        assert_eq!(dialogs, ["dialog:allow-open"]);
+        assert!(dialogs.is_empty(), "{dialogs:?}");
     }
 
     /// Every capability file, as Tauri loads them all, and the config, which can hold one inline.
@@ -4659,14 +4763,19 @@ mod tests {
         h.answer(false);
 
         assert_eq!(
-            h.code("backup_restore", restore(&source)),
+            h.code("backup_restore", restore(&h, &source)),
             "confirmation_required"
         );
 
         h.assert_ready();
         assert_eq!(h.titles(), ["live"]);
         assert_eq!(h.snapshots(), 0, "no pre-restore snapshot was written");
-        assert!(h.asked()[0].contains(source.to_str().unwrap()));
+        let asked = h.asked();
+        assert!(
+            asked[0].starts_with("Restore backup from a folder"),
+            "{asked:?}"
+        );
+        assert!(asked[1].contains(source.to_str().unwrap()), "{asked:?}");
     }
 
     #[test]
@@ -4674,7 +4783,7 @@ mod tests {
         let h = recovery("in_use");
         let source = backup_holding(&h._tmp, "restored");
 
-        assert_eq!(h.code("backup_restore", restore(&source)), "in_use");
+        assert_eq!(h.code("backup_restore", restore(&h, &source)), "in_use");
 
         assert!(h.asked().is_empty());
     }
@@ -4696,7 +4805,7 @@ mod tests {
 
         // A backup with no key row reports nothing about a key.
         let source = backup_holding(&h._tmp, "restored");
-        let status = h.ok("backup_restore", restore(&source));
+        let status = h.ok("backup_restore", restore(&h, &source));
         assert_eq!(status["state"], "ready");
         assert_eq!(status["restored_key_state"], Value::Null);
 
@@ -4755,7 +4864,7 @@ mod tests {
         lose_a_key(&h);
         let info = h.ok("backup_create", json!({}));
         let source = PathBuf::from(info["path"].as_str().unwrap());
-        let restored = h.ok("backup_restore", restore(&source));
+        let restored = h.ok("backup_restore", restore(&h, &source));
         assert_eq!(restored["restored_key_state"]["state"], "key_missing");
 
         let state = h.ok("discard_locked_fields", json!({}));
@@ -4824,7 +4933,7 @@ mod tests {
         let info = h.ok("backup_create", json!({}));
         let source = PathBuf::from(info["path"].as_str().unwrap());
 
-        let status = h.ok("backup_restore", restore(&source));
+        let status = h.ok("backup_restore", restore(&h, &source));
 
         assert_eq!(status["restored_key_state"]["state"], "key_missing");
         assert_eq!(status["restored_key_state"]["key_id"], LOST_KEY);
@@ -4963,7 +5072,7 @@ mod tests {
         let source = backup_holding(&h._tmp, "restored");
         let (pid, task) = running_claude(&h);
 
-        let status = h.ok("backup_restore", restore(&source));
+        let status = h.ok("backup_restore", restore(&h, &source));
 
         assert_eq!(status["state"], "ready");
         assert_eq!(h.titles(), ["restored"]);

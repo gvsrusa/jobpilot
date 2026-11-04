@@ -7,7 +7,6 @@
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "core:event:allow-emit",
-    "core:window:allow-close",
-    "dialog:allow-open"
+    "core:window:allow-close"
   ]
 }
