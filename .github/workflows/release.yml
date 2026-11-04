@@ -32,10 +32,11 @@ jobs:
       # Tauri bundler would read an empty APPLE_* variable as "set".
       HAS_APPLE_SIGNING: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_SIGNING_IDENTITY != '' }}
       HAS_APPLE_NOTARIZATION: ${{ secrets.APPLE_ID != '' }}
-      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      # Only a presence flag at job level: the certificate and its password
+      # are mapped into the import step alone, so no other step sees them.
+      HAS_WINDOWS_SIGNING: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Decide release inputs
         id: plan
@@ -59,7 +60,7 @@ jobs:
           if [ "$RUNNER_OS_NAME" = "macOS" ] && [ "$HAS_APPLE_SIGNING" = "true" ] && [ "$HAS_APPLE_NOTARIZATION" = "true" ]; then
             signed=true
           fi
-          if [ "$RUNNER_OS_NAME" = "Windows" ] && [ -n "$WINDOWS_CERTIFICATE" ]; then
+          if [ "$RUNNER_OS_NAME" = "Windows" ] && [ "$HAS_WINDOWS_SIGNING" = "true" ]; then
             signed=true
           fi
           if [ "$signed" = "true" ]; then
@@ -70,15 +71,15 @@ jobs:
           fi
           echo "body=$body" >> "$GITHUB_OUTPUT"
 
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
         with:
           targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
-      - uses: swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
           cache: pnpm
@@ -86,8 +87,11 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       - name: Import Windows certificate
-        if: env.WINDOWS_CERTIFICATE != ''
+        if: env.HAS_WINDOWS_SIGNING == 'true'
         shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
           $pfx = Join-Path $env:RUNNER_TEMP 'jobpilot-signing.pfx'
           [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
@@ -105,12 +109,15 @@ jobs:
           $win | Add-Member -NotePropertyName timestampUrl -NotePropertyValue 'http://timestamp.digicert.com' -Force
           $conf | ConvertTo-Json -Depth 32 | Set-Content $confPath -Encoding utf8
 
+      # The updater key stays on these steps because tauri-action signs the
+      # updater artifacts while it builds. That action (pinned below) and the
+      # `beforeBuildCommand` it runs see the key; review-1.0.md S-3 records it.
       # Two build steps because an empty APPLE_* variable must not exist on an
       # unsigned build. Exactly one of them runs on macOS; on Windows the
       # unsigned-Apple step runs (it ignores Apple) and signs via the config.
       - name: Build and publish (Apple signing)
         if: env.HAS_APPLE_SIGNING == 'true'
-        uses: tauri-apps/tauri-action@v1
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -134,7 +141,7 @@ jobs:
 
       - name: Build and publish
         if: env.HAS_APPLE_SIGNING != 'true'
-        uses: tauri-apps/tauri-action@v1
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -162,7 +169,7 @@ jobs:
           fi
 
       - name: Verify Windows signature
-        if: runner.os == 'Windows' && env.WINDOWS_CERTIFICATE != ''
+        if: runner.os == 'Windows' && env.HAS_WINDOWS_SIGNING == 'true'
         shell: pwsh
         run: |
           $installer = Get-ChildItem -Path . -Recurse -Filter '*-setup.exe' |
