@@ -635,11 +635,11 @@ pub async fn stored_path_is_wrong(spec: &CliSpec, db: &Db) -> bool {
 
 /// A stored program path inside the data root is refused at use time. Everything there came
 /// from this app or from a restored backup, and a backup must never choose what runs (S-1).
-/// Both sides are resolved, so a link or `..` cannot step around the check; a path that cannot
-/// be resolved is compared as written.
+/// `AppPaths::is_inside_root` compares folders by device and inode, so a link, `..`, or a
+/// macOS firmlink alias cannot step around it, and a folder it cannot resolve counts as
+/// inside.
 pub fn outside_root(bin: PathBuf, db: &Db, source: &str) -> std::result::Result<PathBuf, String> {
-    let resolve = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if resolve(&bin).starts_with(resolve(db.paths().root())) {
+    if db.paths().is_inside_root(&bin) {
         Err(format!(
             "{source} points to {}, inside the JobPilot data folder, where no program may run \
              from. Set it again to the program's own install location.",
