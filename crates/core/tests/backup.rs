@@ -2119,10 +2119,11 @@ const CLAUDE_NAME: &str = "claude";
 const CLAUDE_NAME: &str = "claude.cmd";
 
 /// Every setting that names a program, plus the launch-time network check.
-const OWNED: [&str; 4] = [
+const OWNED: [&str; 5] = [
     "ai.claude_path",
     "ai.gemini_path",
     "ai.codex_path",
+    "ai.ollama_url",
     settings::UPDATES_CHECK_ON_LAUNCH,
 ];
 
@@ -2157,6 +2158,9 @@ async fn crafted_backup(tmp: &TempDir) -> PathBuf {
     settings::set(&db, settings::UPDATES_CHECK_ON_LAUNCH, &json!(true))
         .await
         .unwrap();
+    settings::set(&db, "ai.ollama_url", &json!("http://127.0.0.1:1"))
+        .await
+        .unwrap();
     let info = backup::create(&db, "cli").await.unwrap();
     db.close().await;
     info.path
@@ -2179,6 +2183,9 @@ async fn restore_keeps_the_live_program_paths_and_launch_check() {
     let mine = json!("/opt/mine/claude");
     settings::set(&db, "ai.claude_path", &mine).await.unwrap();
     settings::set(&db, settings::UPDATES_CHECK_ON_LAUNCH, &json!(false))
+        .await
+        .unwrap();
+    settings::set(&db, "ai.ollama_url", &json!("http://127.0.0.1:11434"))
         .await
         .unwrap();
     let before = owned_values(&db).await;
@@ -2281,5 +2288,161 @@ async fn a_program_path_inside_the_data_root_is_refused() {
         .await
         .unwrap_err();
     assert!(message.contains("data folder"), "{message}");
+
+    // The same file named through another path to the root: a macOS firmlink alias where
+    // there is one, else a link to the root from outside it.
+    let alias = aliased(&planted, &paths);
+    settings::set(
+        &db,
+        claude_code::PATH_SETTING,
+        &json!(alias.display().to_string()),
+    )
+    .await
+    .unwrap();
+    let message = claude_code::find_binary_quietly(Some(&db))
+        .await
+        .unwrap_err();
+    assert!(message.contains("data folder"), "{alias:?}: {message}");
     db.close().await;
+}
+
+/// `file` (inside the root) through a path that shares no prefix with the root's own.
+fn aliased(file: &Path, paths: &AppPaths) -> PathBuf {
+    let real = fs::canonicalize(file).unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        let firmlink = Path::new("/System/Volumes/Data").join(real.strip_prefix("/").unwrap());
+        if firmlink.exists() {
+            return firmlink;
+        }
+    }
+    let root = fs::canonicalize(paths.root()).unwrap();
+    let link = root.parent().unwrap().join("alias-of-root");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&root, &link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&root, &link).unwrap();
+    link.join(real.strip_prefix(&root).unwrap())
+}
+
+// Review 6a I-1: a backup must hold exactly the schema JobPilot's migrations build, so no
+// trigger or view of its own can run inside the restore or live on after it.
+
+/// Runs `sql` against the backup's database file, as a crafted backup would hold it.
+async fn tamper(backup: &Path, sql: &str) {
+    let options = SqliteConnectOptions::new()
+        .filename(backup.join("jobpilot.db"))
+        .journal_mode(SqliteJournalMode::Delete);
+    let pool = SqlitePool::connect_with(options).await.unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql.to_string()))
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+/// The live root: a program path of its own and the pause on. What the backup's objects try
+/// to undo.
+async fn guarded_root(paths: &AppPaths) -> Db {
+    let db = Db::open(paths).await.unwrap();
+    settings::set(&db, "ai.claude_path", &json!("/opt/mine/claude"))
+        .await
+        .unwrap();
+    pause::set(&db, "gui").await.unwrap();
+    db
+}
+
+async fn assert_refused_and_untouched(
+    paths: &AppPaths,
+    refused: Result<backup::RestoreReport, Error>,
+) {
+    let error = refused.expect_err("the restore is refused");
+    assert!(
+        matches!(&error, Error::InvalidBackup(why) if why.contains("schema differs")),
+        "{error}"
+    );
+    let db = Db::open(paths).await.unwrap();
+    assert!(pause::is_set(&db).await.unwrap());
+    assert_eq!(
+        settings::get(&db, "ai.claude_path").await.unwrap(),
+        Some(json!("/opt/mine/claude"))
+    );
+    let foreign: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'evil%'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(foreign, 0);
+    db.close().await;
+}
+
+async fn tampered_backup(tmp: &TempDir, sql: &str) -> PathBuf {
+    let source = crafted_backup(tmp).await;
+    tamper(&source, sql).await;
+    source
+}
+
+#[tokio::test]
+async fn a_backup_with_an_extra_trigger_on_settings_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tampered_backup(
+        &tmp,
+        "CREATE TRIGGER evil_path AFTER INSERT ON settings WHEN NEW.key = 'ai.claude_path' \
+         BEGIN UPDATE settings SET value = '\"/tmp/claude\"' WHERE key = NEW.key; END;",
+    )
+    .await;
+    let paths = AppPaths::new(tmp.path().join("live"));
+    let db = guarded_root(&paths).await;
+
+    let refused = backup::restore(db, &source, "gui").await;
+    assert_refused_and_untouched(&paths, refused).await;
+}
+
+#[tokio::test]
+async fn a_backup_with_an_extra_trigger_on_the_pause_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tampered_backup(
+        &tmp,
+        "CREATE TRIGGER evil_pause AFTER INSERT ON emergency_pause \
+         BEGIN DELETE FROM emergency_pause; END;",
+    )
+    .await;
+    let paths = AppPaths::new(tmp.path().join("live"));
+    let db = guarded_root(&paths).await;
+    db.close().await;
+
+    // The recovery screen's path is held to the same rule.
+    let refused = backup::restore_offline(&paths, &source, "gui").await;
+    assert_refused_and_untouched(&paths, refused).await;
+}
+
+#[tokio::test]
+async fn a_backup_with_an_extra_view_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tampered_backup(&tmp, "CREATE VIEW evil_view AS SELECT * FROM settings;").await;
+    let paths = AppPaths::new(tmp.path().join("live"));
+    let db = guarded_root(&paths).await;
+
+    let refused = backup::restore(db, &source, "gui").await;
+    assert_refused_and_untouched(&paths, refused).await;
+}
+
+/// A name in sqlx's own namespace is no pass: only its bookkeeping table is left out.
+#[tokio::test]
+async fn a_backup_with_a_trigger_named_like_sqlx_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tampered_backup(
+        &tmp,
+        "CREATE TRIGGER _sqlx_evil AFTER INSERT ON settings BEGIN SELECT 1; END;",
+    )
+    .await;
+    let paths = AppPaths::new(tmp.path().join("live"));
+    let db = guarded_root(&paths).await;
+
+    let refused = backup::restore(db, &source, "gui").await;
+    let error = refused.expect_err("the restore is refused");
+    assert!(
+        matches!(&error, Error::InvalidBackup(why) if why.contains("schema differs")),
+        "{error}"
+    );
 }
