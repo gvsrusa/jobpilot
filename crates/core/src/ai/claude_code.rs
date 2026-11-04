@@ -342,10 +342,12 @@ pub async fn find_binary_quietly(db: Option<&Db>) -> std::result::Result<Option<
     if let Some(bin) = std::env::var_os("JOBPILOT_CLAUDE_BIN").filter(|bin| !bin.is_empty()) {
         return checked(PathBuf::from(bin), "JOBPILOT_CLAUDE_BIN").map(Some);
     }
-    if let Some(bin) = path_setting(db).await.map(PathBuf::from)
+    if let Some(db) = db
+        && let Some(bin) = path_setting(Some(db)).await.map(PathBuf::from)
         && !is_gone(&bin)
     {
-        return checked(bin, PATH_SETTING).map(Some);
+        let bin = checked(bin, PATH_SETTING)?;
+        return child::outside_root(bin, db, PATH_SETTING).map(Some);
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
     Ok(search(

@@ -2110,3 +2110,176 @@ async fn a_kept_pause_is_audited_once_and_not_when_the_backup_already_had_it() {
     );
     db.close().await;
 }
+
+// S-1 (review-1.0): a restored backup must not choose which program runs.
+
+#[cfg(unix)]
+const CLAUDE_NAME: &str = "claude";
+#[cfg(windows)]
+const CLAUDE_NAME: &str = "claude.cmd";
+
+/// Every setting that names a program, plus the launch-time network check.
+const OWNED: [&str; 4] = [
+    "ai.claude_path",
+    "ai.gemini_path",
+    "ai.codex_path",
+    settings::UPDATES_CHECK_ON_LAUNCH,
+];
+
+/// An executable named like Claude Code in `dir`.
+fn plant_program(dir: &Path, name: &str) -> PathBuf {
+    fs::create_dir_all(dir).unwrap();
+    let path = dir.join(name);
+    fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path
+}
+
+/// The review's scenario: a backup made in root A names a program planted in its own
+/// documents folder, and turns the launch check on. Restored into root B, B keeps its own
+/// values, and an absent value stays absent.
+async fn crafted_backup(tmp: &TempDir) -> PathBuf {
+    let paths = AppPaths::new(tmp.path().join("crafted"));
+    let db = Db::open(&paths).await.unwrap();
+    let planted = plant_program(&paths.documents(), CLAUDE_NAME);
+    let gemini = plant_program(&paths.documents(), "gemini");
+    let path = json!(planted.display().to_string());
+    settings::set(&db, "ai.claude_path", &path).await.unwrap();
+    let gemini = json!(gemini.display().to_string());
+    settings::set(&db, "ai.gemini_path", &gemini).await.unwrap();
+    settings::set(&db, "ai.codex_path", &json!("/tmp/codex"))
+        .await
+        .unwrap();
+    settings::set(&db, settings::UPDATES_CHECK_ON_LAUNCH, &json!(true))
+        .await
+        .unwrap();
+    let info = backup::create(&db, "cli").await.unwrap();
+    db.close().await;
+    info.path
+}
+
+async fn owned_values(db: &Db) -> Vec<Option<Value>> {
+    let mut found = Vec::new();
+    for key in OWNED {
+        found.push(settings::get(db, key).await.unwrap());
+    }
+    found
+}
+
+#[tokio::test]
+async fn restore_keeps_the_live_program_paths_and_launch_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = crafted_backup(&tmp).await;
+    let paths = AppPaths::new(tmp.path().join("live"));
+    let db = Db::open(&paths).await.unwrap();
+    let mine = json!("/opt/mine/claude");
+    settings::set(&db, "ai.claude_path", &mine).await.unwrap();
+    settings::set(&db, settings::UPDATES_CHECK_ON_LAUNCH, &json!(false))
+        .await
+        .unwrap();
+    let before = owned_values(&db).await;
+
+    let db = backup::restore(db, &source, "gui").await.unwrap().db;
+
+    assert_eq!(owned_values(&db).await, before);
+    assert_eq!(before[1], None, "an absent path stays absent");
+    let entries = audit::recent(&db, 20).await.unwrap();
+    let kept: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.action == "settings_kept_by_restore")
+        .collect();
+    assert_eq!(kept.len(), 1, "{entries:?}");
+    assert_eq!(kept[0].detail["keys"], json!(OWNED));
+    db.close().await;
+}
+
+#[tokio::test]
+async fn offline_restore_keeps_the_live_program_paths_and_launch_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = crafted_backup(&tmp).await;
+    let paths = AppPaths::new(tmp.path().join("live"));
+    let db = Db::open(&paths).await.unwrap();
+    settings::set(&db, "ai.codex_path", &json!("/opt/mine/codex"))
+        .await
+        .unwrap();
+    let before = owned_values(&db).await;
+    db.close().await;
+
+    let db = backup::restore_offline(&paths, &source, "gui")
+        .await
+        .unwrap()
+        .db;
+
+    assert_eq!(owned_values(&db).await, before);
+    db.close().await;
+}
+
+/// A backup whose values match the live ones changes nothing, so it audits nothing.
+#[tokio::test]
+async fn restore_with_the_same_program_paths_audits_no_kept_setting() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    settings::set(&db, "ai.claude_path", &json!("/opt/mine/claude"))
+        .await
+        .unwrap();
+    let info = backup::create(&db, "cli").await.unwrap();
+
+    let db = backup::restore(db, &info.path, "gui").await.unwrap().db;
+
+    let entries = audit::recent(&db, 20).await.unwrap();
+    assert_eq!(audit_actions(&entries, "settings_kept_by_restore"), 0);
+    assert_eq!(
+        settings::get(&db, "ai.claude_path").await.unwrap(),
+        Some(json!("/opt/mine/claude"))
+    );
+    db.close().await;
+}
+
+/// Restored documents are data: nothing in them comes back executable.
+#[cfg(unix)]
+#[tokio::test]
+async fn restored_documents_lose_their_execute_bits() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let source = crafted_backup(&tmp).await;
+    let paths = AppPaths::new(tmp.path().join("live"));
+    let db = Db::open(&paths).await.unwrap();
+
+    let db = backup::restore(db, &source, "gui").await.unwrap().db;
+
+    let restored = paths.documents().join(CLAUDE_NAME);
+    let mode = fs::metadata(&restored).unwrap().permissions().mode();
+    assert_eq!(mode & 0o111, 0, "mode {mode:o}");
+    db.close().await;
+}
+
+/// The second wall: whatever a setting says, a program inside the data root never runs.
+#[tokio::test]
+async fn a_program_path_inside_the_data_root_is_refused() {
+    use jobpilot_core::ai::{child, claude_code};
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let planted = plant_program(&paths.documents(), CLAUDE_NAME);
+    let gemini = plant_program(&paths.documents().join("sub"), "gemini");
+    let path = json!(planted.display().to_string());
+    settings::set(&db, claude_code::PATH_SETTING, &path)
+        .await
+        .unwrap();
+    let path = json!(gemini.display().to_string());
+    settings::set(&db, child::GEMINI.setting, &path)
+        .await
+        .unwrap();
+
+    let claude = claude_code::find_binary_quietly(Some(&db)).await;
+    let message = claude.unwrap_err();
+    assert!(message.contains("data folder"), "{message}");
+    let message = child::find_cli_quick(&child::GEMINI, Some(&db))
+        .await
+        .unwrap_err();
+    assert!(message.contains("data folder"), "{message}");
+    db.close().await;
+}

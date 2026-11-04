@@ -41,7 +41,7 @@ use crate::db::{
 use crate::error::{Error, Result};
 use crate::paths::AppPaths;
 use crate::pause;
-use crate::{audit, secrets};
+use crate::{audit, secrets, settings};
 
 const DB_FILE: &str = "jobpilot.db";
 const DOCUMENTS: &str = "documents";
@@ -84,7 +84,12 @@ struct LiveRows {
     paused: Option<bool>,
     /// The endpoint address, to tell whether the backup swaps it for another.
     endpoint: Option<String>,
+    /// The raw values of `settings::KEPT_ON_RESTORE`, `None` inside for an absent key.
+    kept: Option<Vec<KeptSetting>>,
 }
+
+/// A setting key and its stored JSON text.
+type KeptSetting = (&'static str, Option<String>);
 
 /// What step 1 found in the source.
 struct Validated {
@@ -247,6 +252,7 @@ async fn prepare(db: &Db, source: &Path, migrator: &Migrator) -> Result<(Validat
         keys: Some(read_keys(&db.pool).await?),
         paused: Some(pause::is_set(db).await?),
         endpoint: read_endpoint(&db.pool).await,
+        kept: Some(read_kept(&db.pool).await?),
     };
     Ok((validated, live))
 }
@@ -382,6 +388,23 @@ async fn read_endpoint(pool: &SqlitePool) -> Option<String> {
     serde_json::from_str(&raw).ok()
 }
 
+async fn read_kept(pool: &SqlitePool) -> Result<Vec<KeptSetting>> {
+    let mut found = Vec::new();
+    for key in settings::KEPT_ON_RESTORE {
+        found.push((key, setting_text(pool, key).await?));
+    }
+    Ok(found)
+}
+
+async fn setting_text(pool: &SqlitePool, key: &str) -> Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(pool)
+            .await?,
+    )
+}
+
 async fn read_secrets(pool: &SqlitePool) -> Result<Vec<SecretRow>> {
     Ok(sqlx::query_as("SELECT name, created_at FROM secret_index")
         .fetch_all(pool)
@@ -474,6 +497,7 @@ async fn read_live(paths: &AppPaths) -> (Option<i64>, LiveRows) {
             keys: None,
             paused,
             endpoint: None,
+            kept: None,
         };
         return (None, live);
     };
@@ -483,6 +507,7 @@ async fn read_live(paths: &AppPaths) -> (Option<i64>, LiveRows) {
         keys: read_keys(&pool).await.ok(),
         paused: read_paused(&pool).await.ok(),
         endpoint: read_endpoint(&pool).await,
+        kept: read_kept(&pool).await.ok(),
     };
     pool.close().await;
     (version, live)
@@ -591,6 +616,7 @@ async fn migrate_and_fill(pool: &SqlitePool, plan: &Plan<'_>) -> Result<()> {
 
     revoke_external_consent(pool, plan.actor).await?;
     keep_pause(pool, plan).await?;
+    keep_owned_settings(pool, plan).await?;
 
     let target = plan.source.to_string_lossy();
     let mut detail = json!({});
@@ -636,6 +662,49 @@ async fn keep_pause(pool: &SqlitePool, plan: &Plan<'_>) -> Result<()> {
         audit::record_to(pool, plan.actor, action, None, detail).await?;
     }
     Ok(())
+}
+
+/// The live values of `settings::KEPT_ON_RESTORE` replace the backup's, and an absent one
+/// stays absent. Fails closed: when the live values could not be read, the backup's are
+/// dropped, which is discovery for a program and off for the launch check. One audit row
+/// names the keys the backup would have changed.
+async fn keep_owned_settings(pool: &SqlitePool, plan: &Plan<'_>) -> Result<()> {
+    let mut changed = Vec::new();
+    for key in settings::KEPT_ON_RESTORE {
+        let live = plan
+            .live
+            .kept
+            .iter()
+            .flatten()
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, value)| value.clone());
+        if setting_text(pool, key).await? == live {
+            continue;
+        }
+        sqlx::query("DELETE FROM settings WHERE key = ?")
+            .bind(key)
+            .execute(pool)
+            .await?;
+        if let Some(value) = &live {
+            sqlx::query(
+                "INSERT INTO settings (key, value, updated_at) \
+                 VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            )
+            .bind(key)
+            .bind(value)
+            .execute(pool)
+            .await?;
+        }
+        changed.push(key);
+    }
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let mut detail = json!({ "keys": changed });
+    if plan.live.kept.is_none() {
+        detail["why"] = json!("live_state_unreadable");
+    }
+    audit::record_to(pool, plan.actor, "settings_kept_by_restore", None, detail).await
 }
 
 /// A schema older than the pause has no such table, which is a pause that was never on. Any

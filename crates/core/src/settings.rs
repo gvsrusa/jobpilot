@@ -7,6 +7,17 @@ use crate::error::Result;
 /// a missing value means `false`, as the check is a network call.
 pub const UPDATES_CHECK_ON_LAUNCH: &str = "updates.check_on_launch";
 
+/// Settings only a person sets here, which a restore never takes from a backup: every path
+/// that names a program to run, and the launch-time network check. A backup is an old
+/// decision or someone else's file, so it must not choose what runs or turn on a network
+/// call (S-1). The live value stays, and an absent one stays absent.
+pub const KEPT_ON_RESTORE: [&str; 4] = [
+    crate::ai::claude_code::PATH_SETTING,
+    crate::ai::child::GEMINI.setting,
+    crate::ai::child::CODEX.setting,
+    UPDATES_CHECK_ON_LAUNCH,
+];
+
 pub async fn get(db: &Db, key: &str) -> Result<Option<serde_json::Value>> {
     let raw: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
         .bind(key)

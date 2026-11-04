@@ -370,9 +370,27 @@ pub fn copy_dir(from: &Path, to: &Path) -> io::Result<()> {
         if kind.is_dir() {
             copy_dir(&entry.path(), &target)?;
         } else if kind.is_file() {
-            fs::copy(entry.path(), target)?;
+            fs::copy(entry.path(), &target)?;
+            drop_execute_bits(&target)?;
         }
     }
+    Ok(())
+}
+
+/// Documents are data. A copied file never keeps an execute bit, so a backup cannot bring a
+/// program into the data root that is ready to run (S-1).
+#[cfg(unix)]
+fn drop_execute_bits(file: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(file)?.permissions().mode();
+    if mode & 0o111 != 0 {
+        fs::set_permissions(file, fs::Permissions::from_mode(mode & !0o111))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn drop_execute_bits(_file: &Path) -> io::Result<()> {
     Ok(())
 }
 
