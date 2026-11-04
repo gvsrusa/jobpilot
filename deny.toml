@@ -1,0 +1,67 @@
+# Supply-chain policy, checked in CI by the `supply-chain` job (cargo-deny).
+# Run locally: cargo install cargo-deny --locked && cargo deny check
+
+[graph]
+# The platforms the app ships on, plus Linux (the CI runner).
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+  "x86_64-unknown-linux-gnu",
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+# Each ignore needs a reason and a way out. Revisit when the parent crate moves.
+ignore = [
+  # zip 8.6.0 is pinned by docx-rs 0.4.22 (requires ^8.6), so 9.x cannot be used yet.
+  # These advisories are all in ZipArchive::extract / ZipStreamReader::extract. JobPilot
+  # never calls them: it only reads single entries with ZipArchive::new
+  # (crates/core/src/parse.rs) and writes zips in tests.
+  { id = "RUSTSEC-2026-0367", reason = "zip extract() only; JobPilot never extracts archives" },
+  { id = "RUSTSEC-2026-0368", reason = "zip extract() only; JobPilot never extracts archives" },
+  { id = "RUSTSEC-2026-0369", reason = "zip extract() only; JobPilot never extracts archives" },
+  { id = "RUSTSEC-2026-0429", reason = "zip extract() only; JobPilot never extracts archives" },
+
+  # Unmaintained, no vulnerability. Pulled in by Tauri's Linux GTK stack, keyring's
+  # Secret Service backend and the PDF crates; not ours to replace. Drop when they move on.
+  { id = "RUSTSEC-2024-0370", reason = "proc-macro-error: build-time macro via gtk3-rs/glib 0.18 (tauri on Linux)" },
+  { id = "RUSTSEC-2026-0192", reason = "ttf-parser: unmaintained font parser, no CVE" },
+  { id = "RUSTSEC-2026-0370", reason = "zvariant: merged into zbus 6; via keyring and tauri (Linux)" },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names: merged into zbus 6; via keyring and tauri (Linux)" },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: merged into zbus 6; via keyring and tauri (Linux)" },
+]
+
+[licenses]
+version = 2
+# Permissive licenses, plus MPL-2.0 (file-level copyleft: cssparser, selectors, dtoa-short,
+# option-ext). Unmodified MPL crates used as dependencies put no obligation on our code.
+# No GPL / AGPL / LGPL crate is allowed.
+unused-allowed-license = "allow"
+allow = [
+  "MIT",
+  "MIT-0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "0BSD",
+  "Unlicense",
+  "CC0-1.0",
+  "BSL-1.0",
+  "Unicode-3.0",
+  "MPL-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
