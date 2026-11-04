@@ -3,12 +3,14 @@ mod menu;
 mod native;
 mod pty;
 mod state;
+mod update;
 
 use jobpilot_core::AppPaths;
 use tauri::{AppHandle, Manager, RunEvent};
 
 use pty::PtyState;
 use state::AppState;
+use update::UpdateState;
 
 fn focus_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -52,7 +54,12 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         // Rust opens a stored https link. No capability gives the webview this plugin.
         .plugin(tauri_plugin_opener::init())
+        // Rust only: no capability gives the webview the updater or process plugin. The
+        // commands in `update` are the one path, and they verify against the pinned key.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(PtyState::default())
+        .manage(UpdateState::default())
         .menu(menu::build)
         .on_menu_event(menu::on_event)
         .on_window_event(pty::on_window_event)
@@ -65,6 +72,7 @@ pub fn run() {
             app.manage(state);
             sweep_orphans(app.handle().clone());
             watch_pause(app.handle().clone());
+            update::check_at_launch(app.handle().clone());
             Ok(())
         })
         .build(tauri::generate_context!())

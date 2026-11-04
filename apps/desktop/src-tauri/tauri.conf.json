@@ -24,6 +24,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["dmg", "nsis", "msi"],
     "externalBin": ["binaries/jobpilot"],
     "icon": [
@@ -35,6 +36,15 @@
     ],
     "macOS": {
       "signingIdentity": "-"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDlDMjc2NjMxMjQwRTNBMDQKUldRRU9nNGtNV1lublBtTWZTMGtoTlpZZXZhd09yZXVrVTRaQnZOTlZKRmxDdXRRWDdXRDl6N1AK",
+      "endpoints": ["https://github.com/gvsrusa/jobpilot/releases/latest/download/latest.json"],
+      "windows": {
+        "installMode": "passive"
+      }
     }
   }
 }

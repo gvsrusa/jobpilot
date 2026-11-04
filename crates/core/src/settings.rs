@@ -3,6 +3,10 @@ use sqlx::sqlite::SqliteExecutor;
 use crate::db::Db;
 use crate::error::Result;
 
+/// Whether the desktop app looks for an update when it starts. Off unless a person turns it on:
+/// a missing value means `false`, as the check is a network call.
+pub const UPDATES_CHECK_ON_LAUNCH: &str = "updates.check_on_launch";
+
 pub async fn get(db: &Db, key: &str) -> Result<Option<serde_json::Value>> {
     let raw: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
         .bind(key)

@@ -65,9 +65,10 @@ pub struct Exported {
     withheld: usize,
 }
 
-/// Settings core keeps for itself: what the router runs, and the recovery reminder's mark.
-/// The first has a command for each key, and the second is only ever core's to write.
-const OWNED_SETTINGS: &[&str] = &["ai.", "jobs.", "recovery_key_exported_"];
+/// Settings core keeps for itself: what the router runs, the recovery reminder's mark, and
+/// whether the app reaches the network at launch. The first and last have a command for each
+/// key, and the second is only ever core's to write.
+const OWNED_SETTINGS: &[&str] = &["ai.", "jobs.", "recovery_key_exported_", "updates."];
 
 pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
@@ -218,6 +219,11 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         crate::pty::pty_write,
         crate::pty::pty_resize,
         crate::pty::pty_close,
+        crate::update::update_check,
+        crate::update::update_pending,
+        crate::update::update_install,
+        crate::update::update_auto_get,
+        crate::update::update_auto_set,
     ]
 }
 
@@ -3466,6 +3472,11 @@ mod tests {
         "pty_write",
         "pty_resize",
         "pty_close",
+        "update_check",
+        "update_pending",
+        "update_install",
+        "update_auto_get",
+        "update_auto_set",
     ];
 
     fn registered_commands() -> Vec<String> {
@@ -4058,12 +4069,30 @@ mod tests {
             "ai.endpoint.url",
             "ai.anything_later",
             "recovery_key_exported_0123456789abcdef",
+            "updates.check_on_launch",
         ] {
             let args = json!({ "key": key, "value": "/tmp/evil/claude" });
             assert_eq!(h.code("settings_set", args), "refused", "{key}");
             assert_eq!(h.ok("settings_get", json!({ "key": key })), Value::Null);
         }
         h.ok("settings_set", json!({ "key": "theme", "value": "dark" }));
+    }
+
+    #[test]
+    fn the_launch_update_check_is_off_until_turned_on() {
+        let h = ready();
+        assert_eq!(h.ok("update_auto_get", json!({})), json!(false));
+        h.ok("update_auto_set", json!({ "on": true }));
+        assert_eq!(h.ok("update_auto_get", json!({})), json!(true));
+        h.ok("update_auto_set", json!({ "on": false }));
+        assert_eq!(h.ok("update_auto_get", json!({})), json!(false));
+    }
+
+    #[test]
+    fn an_install_is_refused_while_the_pause_is_on() {
+        let h = ready();
+        h.ok("pause_set", json!({}));
+        assert_eq!(h.code("update_install", json!({})), "update_blocked_by_run");
     }
 
     #[test]
@@ -6094,6 +6123,13 @@ mod tests {
         let app = apply_ready(h);
         let run = h.ok("apply_start", json!({ "applicationIds": [app] }));
         run.as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn an_install_is_refused_while_an_apply_run_has_not_ended() {
+        let h = ready();
+        ready_run(&h);
+        assert_eq!(h.code("update_install", json!({})), "update_blocked_by_run");
     }
 
     #[test]
