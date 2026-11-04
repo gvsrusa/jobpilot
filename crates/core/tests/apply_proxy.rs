@@ -883,7 +883,10 @@ async fn a_double_or_modified_click_on_submit_is_refused_and_not_counted() {
         json!({"target": "e14", "modifiers": ["ControlOrMeta"]}),
     ] {
         let (text, error) = s.call("browser_click", args.clone()).await;
-        assert!(error && text.contains("click_kind_refused"), "{args}: {text}");
+        assert!(
+            error && text.contains("click_kind_refused"),
+            "{args}: {text}"
+        );
     }
     assert!(m.named("browser_click").is_empty());
     assert_eq!(item(&w.db, &run, 0).await.submit_clicks, 0);

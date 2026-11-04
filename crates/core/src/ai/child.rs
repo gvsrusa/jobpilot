@@ -591,7 +591,8 @@ async fn find_cli_by(
         && let Some(bin) = path_setting(spec, Some(db)).await.map(PathBuf::from)
         && !is_gone(&bin, spec)
     {
-        return checked(bin, spec, spec.setting).and_then(|bin| outside_root(bin, db, spec.setting));
+        return checked(bin, spec, spec.setting)
+            .and_then(|bin| outside_root(bin, db, spec.setting));
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
     let env = |name: &str| std::env::var_os(name);
