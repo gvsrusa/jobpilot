@@ -359,8 +359,6 @@ pub async fn backup_create(state: State<'_, AppState>) -> Result<BackupInfo> {
     backup::create(ready(&slot)?, ACTOR).await
 }
 
-/// Needs no handle: the recovery screen's Restore lists snapshots from here. The read
-/// lock keeps it clear of a restore or delete changing `backups/`.
 /// The snapshot in the backups folder whose folder name is `name`, as `backup_list` lists
 /// it. A name with a separator or `..` matches none, so nothing outside is reached.
 async fn listed_snapshot(state: &AppState, paths: &AppPaths, name: &str) -> Result<PathBuf> {
@@ -373,6 +371,8 @@ async fn listed_snapshot(state: &AppState, paths: &AppPaths, name: &str) -> Resu
         .ok_or(Error::NotFound)
 }
 
+/// Needs no handle: the recovery screen's Restore lists snapshots from here. The read
+/// lock keeps it clear of a restore or delete changing `backups/`.
 #[tauri::command]
 pub async fn backup_list(state: State<'_, AppState>) -> Result<Vec<BackupInfo>> {
     let _slot = state.db.read().await;

@@ -826,6 +826,63 @@ async fn list_skips_invalid_folders() {
     assert_eq!(listed[0].schema_version, Some(app_schema_version()));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn list_skips_a_symlinked_snapshot() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let real = backup::create(&db, "cli").await.unwrap();
+    db.close().await;
+    let link = paths.backups().join("pre-restore-link");
+    std::os::unix::fs::symlink(&real.path, &link).unwrap();
+
+    let listed = backup::list(&paths).await.unwrap();
+
+    let found: Vec<_> = listed.iter().map(|info| &info.path).collect();
+    assert_eq!(found, [&real.path]);
+}
+
+/// Every `pre-migrate-<v>-` snapshot an upgrade writes restores through the schema check,
+/// migrates to the current schema, and keeps its rows.
+#[tokio::test]
+async fn a_pre_migrate_snapshot_of_an_older_schema_restores() {
+    for v in [1, 5, 11, 12, 15] {
+        let (_tmp, paths) = temp_root();
+        let older: Vec<Migration> = MIGRATOR
+            .iter()
+            .filter(|m| m.version <= v)
+            .cloned()
+            .collect();
+        let db = Db::open_with(&paths, &Migrator::with_migrations(older))
+            .await
+            .unwrap();
+        add_doc(&db, "old row").await;
+        db.close().await;
+        let db = Db::open(&paths).await.unwrap();
+        assert_eq!(db.schema_version().await.unwrap(), app_schema_version());
+        add_doc(&db, "new row").await;
+        let snapshot = snapshots(&paths, &format!("pre-migrate-{v}-"));
+        assert_eq!(snapshot.len(), 1, "schema {v}: one pre-migrate snapshot");
+
+        let restored = backup::restore(db, &snapshot[0], "gui")
+            .await
+            .unwrap_or_else(|e| panic!("schema {v}: restore failed: {e}"))
+            .db;
+
+        assert_eq!(
+            restored.schema_version().await.unwrap(),
+            app_schema_version(),
+            "schema {v}: migrated to current"
+        );
+        assert_eq!(
+            titles(&restored).await,
+            ["old row"],
+            "schema {v}: rows kept"
+        );
+        restored.close().await;
+    }
+}
+
 #[tokio::test]
 async fn list_of_a_root_with_no_backups_is_empty() {
     let (_tmp, paths) = temp_root();

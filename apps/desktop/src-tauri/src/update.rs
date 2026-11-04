@@ -297,6 +297,32 @@ mod tests {
     }
 
     #[test]
+    fn install_refused_during_an_active_copilot_run() {
+        tauri::async_runtime::block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = Db::open(&AppPaths::new(tmp.path().join("data")))
+                .await
+                .unwrap();
+            assert!(!super::blocked(&db).await.unwrap());
+            sqlx::query(
+                "INSERT INTO agent_runs (id, agent, state, actor, input, steps, heartbeat_at, \
+                 created_at) VALUES ('r1', 'browser_application', 'waiting_for_human', 'gui', \
+                 '{}', 1, '2099-01-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z')",
+            )
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            assert!(super::blocked(&db).await.unwrap());
+            sqlx::query("UPDATE agent_runs SET state = 'cancelled' WHERE id = 'r1'")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            assert!(!super::blocked(&db).await.unwrap());
+            db.close().await;
+        });
+    }
+
+    #[test]
     fn install_refused_while_paused_or_running() {
         assert!(install_blocked(true, 0));
         assert!(install_blocked(false, 1));

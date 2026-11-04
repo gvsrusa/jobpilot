@@ -150,7 +150,7 @@ A release is built by `.github/workflows/release.yml` (GitHub Actions on macOS a
 2. Check the build without releasing: run the workflow by hand (`workflow_dispatch`). It accepts only `dry_run: true`, builds the installers, and creates no release.
 3. Push a tag `v<version>`. The workflow builds a **draft** release with the `.dmg` (arm64 and x64), the `.msi`, the NSIS `.exe`, the updater `.sig` files, and `latest.json`. Read the draft, then publish it by hand.
 
-Signing is by what exists. macOS is signed and notarized when the `APPLE_*` secrets exist, Windows is Authenticode-signed when `WINDOWS_CERTIFICATE` exists, and anything else ships unsigned. The release body says which ("Signed and notarized" or "Unsigned: see README").
+Signing is by what exists. macOS is signed and notarized when the `APPLE_*` secrets exist, Windows is Authenticode-signed when `WINDOWS_CERTIFICATE` exists, and anything else ships unsigned. The release body is one neutral text for every platform (the platform jobs share one release), so check the draft's installers, not the body, for what is signed. A macOS build with an Apple certificate but no `APPLE_ID` is signed and not notarized.
 
 **Repository secrets**
 
@@ -172,7 +172,7 @@ Signing is by what exists. macOS is signed and notarized when the `APPLE_*` secr
 
 **Supply chain.** `deny.toml` configures `cargo-deny` (advisories, licenses, bans, sources). The `supply-chain` CI job runs `cargo-deny` and `pnpm audit --prod --audit-level high`; both must pass.
 
-**Upgrade tests.** The core tests open a database made by each earlier release (schemas 1, 5, 11, 12, 15, and 17) and check that it migrates to the current schema. Add a fixture when a release changes the schema.
+**Upgrade tests.** The core tests build a database at each earlier release's schema (1, 5, 11, 12, 15, and 17) from the current migrations up to that version and check that it migrates to the current schema. When a release changes the schema, add its version to the list in `every_earlier_release_upgrades_to_1_0`.
 
 ## Where data lives
 

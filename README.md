@@ -40,11 +40,11 @@ Memory refresh spends paid or subscription usage and only runs when you press it
 
 ## Installing
 
-Installers come from the GitHub Releases of this repository: `.dmg` (macOS, Apple silicon and Intel), `.msi` and an NSIS `.exe` (Windows x64). Each release says in its notes whether it is signed.
+Installers come from the GitHub Releases of this repository: `.dmg` (macOS, Apple silicon and Intel), `.msi` and an NSIS `.exe` (Windows x64). Each release says in its notes which platforms are signed.
 
-**Signed release** ("Signed and notarized" in the release notes): macOS builds are signed with a Developer ID certificate and notarized, and Windows installers carry an Authenticode signature. Open them normally, with no Gatekeeper or SmartScreen workaround. A build is signed only when the project's certificates exist; until then, releases are unsigned.
+**Signed release** (the release notes say where the build is signed): macOS builds are signed with a Developer ID certificate and notarized, and Windows installers carry an Authenticode signature. Open them normally, with no Gatekeeper or SmartScreen workaround. A build is signed only when the project's certificates exist; until then, releases are unsigned.
 
-**Unsigned release** ("Unsigned: see README" in the release notes). Expect OS warnings:
+**Unsigned installer**. Expect OS warnings:
 
 - macOS: the app is ad-hoc signed. Gatekeeper will refuse the first launch. Right-click the app, choose Open, then confirm. An ad-hoc build has a different code identity each time, so keychain prompts or denials can appear after an upgrade.
 - Windows: SmartScreen shows "Windows protected your PC". Choose More info, then Run anyway.

@@ -381,13 +381,18 @@ async fn run_active(db: &Db) -> Result<bool> {
     Ok(active_runs(db).await? > 0)
 }
 
-/// Apply runs not yet ended: `ready` or `running`. The desktop app refuses to update while
-/// any is, so no restart lands mid-application.
+/// Apply runs not yet ended: Claude Code runs `ready` or `running`, plus browser application
+/// runs (Copilot and autonomous) that are queued, running, or waiting for a person. The
+/// desktop app refuses to update while any is, so no restart lands mid-application.
 pub async fn active_runs(db: &Db) -> Result<usize> {
-    let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM apply_runs WHERE state IN ('ready', 'running')")
-            .fetch_one(&db.pool)
-            .await?;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM apply_runs WHERE state IN ('ready', 'running')) \
+         + (SELECT COUNT(*) FROM agent_runs WHERE agent = 'browser_application' \
+            AND state IN ('queued','checking','running','checkpointed','retrying',\
+                          'waiting_for_human'))",
+    )
+    .fetch_one(&db.pool)
+    .await?;
     Ok(usize::try_from(count).unwrap_or(0))
 }
 

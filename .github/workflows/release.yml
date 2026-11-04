@@ -31,7 +31,7 @@ jobs:
       # flag) into env. The Apple secrets are not mapped as APPLE_* here: the
       # Tauri bundler would read an empty APPLE_* variable as "set".
       HAS_APPLE_SIGNING: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_SIGNING_IDENTITY != '' }}
-      HAS_APPLE_NOTARIZATION: ${{ secrets.APPLE_ID != '' }}
+      HAS_APPLE_NOTARIZATION: ${{ secrets.APPLE_ID != '' && secrets.APPLE_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
       # Only a presence flag at job level: the certificate and its password
       # are mapped into the import step alone, so no other step sees them.
       HAS_WINDOWS_SIGNING: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
@@ -56,19 +56,9 @@ jobs:
           else
             echo "tag=" >> "$GITHUB_OUTPUT"
           fi
-          signed=false
-          if [ "$RUNNER_OS_NAME" = "macOS" ] && [ "$HAS_APPLE_SIGNING" = "true" ] && [ "$HAS_APPLE_NOTARIZATION" = "true" ]; then
-            signed=true
-          fi
-          if [ "$RUNNER_OS_NAME" = "Windows" ] && [ "$HAS_WINDOWS_SIGNING" = "true" ]; then
-            signed=true
-          fi
-          if [ "$signed" = "true" ]; then
-            body="Signed and notarized installers."
-            [ "$RUNNER_OS_NAME" = "Windows" ] && body="Signed installers (Authenticode)."
-          else
-            body="Unsigned: see README for the first-launch warnings."
-          fi
+          # One body for all three jobs: they write one release and tauri-action keeps
+          # the first body it sees, so the text must not depend on this job's platform.
+          body="Signed only where the project's certificates exist (macOS: Developer ID and notarization; Windows: Authenticode). An installer without a signature shows OS warnings: see the README."
           echo "body=$body" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
@@ -112,11 +102,13 @@ jobs:
       # The updater key stays on these steps because tauri-action signs the
       # updater artifacts while it builds. That action (pinned below) and the
       # `beforeBuildCommand` it runs see the key; review-1.0.md S-3 records it.
-      # Two build steps because an empty APPLE_* variable must not exist on an
-      # unsigned build. Exactly one of them runs on macOS; on Windows the
-      # unsigned-Apple step runs (it ignores Apple) and signs via the config.
-      - name: Build and publish (Apple signing)
-        if: env.HAS_APPLE_SIGNING == 'true'
+      # Three build steps because an empty APPLE_* variable must not exist: the
+      # bundler reads it as set. On macOS exactly one runs: signing and
+      # notarization, signing only (APPLE_ID, APPLE_PASSWORD, and APPLE_TEAM_ID
+      # are not exported), or unsigned. On Windows only the unsigned-Apple step
+      # runs, which ignores Apple and signs via the config.
+      - name: Build and publish (Apple signing and notarization)
+        if: runner.os == 'macOS' && env.HAS_APPLE_SIGNING == 'true' && env.HAS_APPLE_NOTARIZATION == 'true'
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -139,8 +131,29 @@ jobs:
           includeUpdaterJson: true
           args: ${{ matrix.args }}
 
+      - name: Build and publish (Apple signing, no notarization)
+        if: runner.os == 'macOS' && env.HAS_APPLE_SIGNING == 'true' && env.HAS_APPLE_NOTARIZATION != 'true'
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        with:
+          projectPath: apps/desktop
+          tauriScript: pnpm tauri
+          tagName: ${{ steps.plan.outputs.tag }}
+          releaseName: JobPilot AI ${{ steps.plan.outputs.tag }}
+          releaseBody: ${{ steps.plan.outputs.body }}
+          releaseDraft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          includeUpdaterJson: true
+          args: ${{ matrix.args }}
+
       - name: Build and publish
-        if: env.HAS_APPLE_SIGNING != 'true'
+        if: runner.os != 'macOS' || env.HAS_APPLE_SIGNING != 'true'
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

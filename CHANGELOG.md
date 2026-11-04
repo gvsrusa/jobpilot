@@ -21,7 +21,7 @@ Stable open-source distribution. See `docs/releases/1.0.0.md` for what was and w
 - S-3: release actions pinned and the Windows certificate scoped to its import step. Residual: the updater key is visible to the build step.
 - S-4: the webview capability is narrowed to what the frontend uses.
 - S-5: some consequential acts still need only an IPC call (residual, see the review).
-- S-6 and the final state of every finding: see the [review](docs/security/review-1.0.md).
+- S-6 (a restore takes no path from the webview) is fixed. The final state of every finding: see the [review](docs/security/review-1.0.md).
 - S-7: the data root is created user-only.
 - S-8: the threat-model register is corrected.
 

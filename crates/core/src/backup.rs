@@ -119,7 +119,7 @@ pub async fn create(db: &Db, actor: &str) -> Result<BackupInfo> {
     })
 }
 
-/// Newest first. A folder with no database or no readable manifest is not a snapshot:
+/// Newest first. A link to a folder is skipped. A folder with no database or no readable manifest is not a snapshot:
 /// `manifest.json` is not power-loss durable, so a torn one is skipped, not an error.
 pub async fn list(paths: &AppPaths) -> Result<Vec<BackupInfo>> {
     let entries = match fs::read_dir(paths.backups()) {
@@ -130,6 +130,10 @@ pub async fn list(paths: &AppPaths) -> Result<Vec<BackupInfo>> {
     let mut found = Vec::new();
     for entry in entries {
         let path = entry?.path();
+        // A link is no snapshot of ours: it could point at any folder.
+        if !fs::symlink_metadata(&path).is_ok_and(|found| found.is_dir()) {
+            continue;
+        }
         if !is_plain_file(&path.join(DB_FILE)) {
             continue;
         }
