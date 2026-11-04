@@ -38,14 +38,20 @@ Gemini CLI note: the CLI keeps a transcript of every prompt under `~/.gemini/tmp
 
 Memory refresh spends paid or subscription usage and only runs when you press it; it states the most calls it can make first. See [milestones](docs/milestones.md).
 
-## Installing (unsigned)
+## Installing
 
-0.x installers are not code-signed with a paid certificate (Decision D3). Expect OS warnings.
+Installers come from the GitHub Releases of this repository. Each release says in its notes whether it is signed.
 
-- macOS: the app is ad-hoc signed. Gatekeeper will refuse the first launch. Right-click the app, choose Open, then confirm. Each 0.x build has a different code identity, so keychain prompts or denials can appear after an upgrade.
+**Signed release** ("Signed and notarized" in the release notes): macOS builds are signed with a Developer ID certificate and notarized, and Windows installers carry an Authenticode signature. Open them normally, with no Gatekeeper or SmartScreen workaround.
+
+**Unsigned release** ("Unsigned: see README" in the release notes). Expect OS warnings:
+
+- macOS: the app is ad-hoc signed. Gatekeeper will refuse the first launch. Right-click the app, choose Open, then confirm. An ad-hoc build has a different code identity each time, so keychain prompts or denials can appear after an upgrade.
 - Windows: SmartScreen shows "Windows protected your PC". Choose More info, then Run anyway.
 
-Installers come from the draft GitHub Releases of this repository. Paid signing is planned for 1.0.
+### Updates
+
+JobPilot updates in the app. Open Status and choose Check for updates; the update is verified against the project's updater key before it installs. A check at launch is available but off by default, so the app makes no network call until you ask for one or turn it on.
 
 ## Building
 

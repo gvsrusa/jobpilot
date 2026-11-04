@@ -3,6 +3,12 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build the installers without creating a release (must stay true)
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -20,8 +26,49 @@ jobs:
           - os: windows-latest
             args: ''
     runs-on: ${{ matrix.os }}
+    env:
+      # Secrets cannot be read in `if:`, so the job maps them (or a presence
+      # flag) into env. The Apple secrets are not mapped as APPLE_* here: the
+      # Tauri bundler would read an empty APPLE_* variable as "set".
+      HAS_APPLE_SIGNING: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_SIGNING_IDENTITY != '' }}
+      HAS_APPLE_NOTARIZATION: ${{ secrets.APPLE_ID != '' }}
+      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
     steps:
       - uses: actions/checkout@v7
+
+      - name: Decide release inputs
+        id: plan
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          REF_NAME: ${{ github.ref_name }}
+          RUNNER_OS_NAME: ${{ runner.os }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$DRY_RUN" != "true" ]; then
+            echo "A manual run must be a dry run; push a v* tag to release." >&2
+            exit 1
+          fi
+          if [ "$EVENT" = "push" ]; then
+            echo "tag=$REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          fi
+          signed=false
+          if [ "$RUNNER_OS_NAME" = "macOS" ] && [ "$HAS_APPLE_SIGNING" = "true" ] && [ "$HAS_APPLE_NOTARIZATION" = "true" ]; then
+            signed=true
+          fi
+          if [ "$RUNNER_OS_NAME" = "Windows" ] && [ -n "$WINDOWS_CERTIFICATE" ]; then
+            signed=true
+          fi
+          if [ "$signed" = "true" ]; then
+            body="Signed and notarized installers."
+            [ "$RUNNER_OS_NAME" = "Windows" ] && body="Signed installers (Authenticode)."
+          else
+            body="Unsigned: see README for the first-launch warnings."
+          fi
+          echo "body=$body" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
@@ -38,15 +85,89 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      - uses: tauri-apps/tauri-action@v1
+      - name: Import Windows certificate
+        if: env.WINDOWS_CERTIFICATE != ''
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'jobpilot-signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $password = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          Remove-Item $pfx -Force
+          $confPath = 'apps/desktop/src-tauri/tauri.conf.json'
+          $conf = Get-Content $confPath -Raw | ConvertFrom-Json
+          if (-not $conf.bundle.PSObject.Properties['windows']) {
+            $conf.bundle | Add-Member -NotePropertyName windows -NotePropertyValue ([pscustomobject]@{})
+          }
+          $win = $conf.bundle.windows
+          $win | Add-Member -NotePropertyName certificateThumbprint -NotePropertyValue $cert.Thumbprint -Force
+          $win | Add-Member -NotePropertyName digestAlgorithm -NotePropertyValue 'sha256' -Force
+          $win | Add-Member -NotePropertyName timestampUrl -NotePropertyValue 'http://timestamp.digicert.com' -Force
+          $conf | ConvertTo-Json -Depth 32 | Set-Content $confPath -Encoding utf8
+
+      # Two build steps because an empty APPLE_* variable must not exist on an
+      # unsigned build. Exactly one of them runs on macOS; on Windows the
+      # unsigned-Apple step runs (it ignores Apple) and signs via the config.
+      - name: Build and publish (Apple signing)
+        if: env.HAS_APPLE_SIGNING == 'true'
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: apps/desktop
           tauriScript: pnpm tauri
-          tagName: ${{ github.ref_name }}
-          releaseName: JobPilot AI ${{ github.ref_name }}
-          releaseBody: Unsigned 0.x installers. See the README for the install warnings.
+          tagName: ${{ steps.plan.outputs.tag }}
+          releaseName: JobPilot AI ${{ steps.plan.outputs.tag }}
+          releaseBody: ${{ steps.plan.outputs.body }}
           releaseDraft: true
           prerelease: ${{ contains(github.ref_name, '-') }}
+          includeUpdaterJson: true
           args: ${{ matrix.args }}
+
+      - name: Build and publish
+        if: env.HAS_APPLE_SIGNING != 'true'
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/desktop
+          tauriScript: pnpm tauri
+          tagName: ${{ steps.plan.outputs.tag }}
+          releaseName: JobPilot AI ${{ steps.plan.outputs.tag }}
+          releaseBody: ${{ steps.plan.outputs.body }}
+          releaseDraft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          includeUpdaterJson: true
+          args: ${{ matrix.args }}
+
+      - name: Verify macOS signature
+        if: runner.os == 'macOS' && env.HAS_APPLE_SIGNING == 'true'
+        shell: bash
+        run: |
+          app=$(find . -path '*/release/bundle/macos/*.app' -maxdepth 8 -prune | head -n 1)
+          test -n "$app" || { echo "no .app bundle found" >&2; exit 1; }
+          codesign --verify --deep --strict --verbose=2 "$app"
+          if [ "$HAS_APPLE_NOTARIZATION" = "true" ]; then
+            spctl -a -vv -t exec "$app"
+          fi
+
+      - name: Verify Windows signature
+        if: runner.os == 'Windows' && env.WINDOWS_CERTIFICATE != ''
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem -Path . -Recurse -Filter '*-setup.exe' |
+            Where-Object { $_.FullName -match 'bundle[\\/]nsis' } | Select-Object -First 1
+          if (-not $installer) { throw 'no NSIS installer found' }
+          $sig = Get-AuthenticodeSignature $installer.FullName
+          Write-Host "$($installer.Name): $($sig.Status)"
+          if ($sig.Status -ne 'Valid') { throw "Authenticode status is $($sig.Status)" }
