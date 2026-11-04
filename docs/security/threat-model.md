@@ -324,7 +324,7 @@ Delete-all removes the entries for this root's key ids from the credential store
 
 | ID | Mitigation | Status | FR | Exit test |
 |---|---|---|---|---|
-| M-01 | Strict webview CSP, no remote content, no network in 0.1. Capabilities (`capabilities/default.json`): `core:default`, `core:window:allow-close`, and the dialog plugin's `dialog:allow-open`. `core:default` is wider than the frontend needs (menu, tray, image, path, and webview defaults); narrowing it to what the frontend uses is review-1.0 S-4. | Planned 0.1 | FR-12.2 | Part |
+| M-01 | Strict webview CSP, no remote content, no network in 0.1. Capabilities (`capabilities/default.json`) are only what the frontend uses: `core:event:allow-listen`, `core:event:allow-unlisten`, `core:event:allow-emit`, `core:window:allow-close`, and the dialog plugin's `dialog:allow-open`. No `core:default`, so no menu, tray, image, path, or webview permission (review-1.0 S-4); `tests/capabilities.rs` holds the list. | Planned 0.1 | FR-12.2 | Part |
 | M-02 | Every IPC command validates input in Rust. No command takes a free path, raw SQL, or a shell string. | Planned 0.1 | None of its own | None |
 | M-03 | No `secret_get` command. Secret values have no read path outside Rust callers, and stay out of logs, exports, and audit rows. Errors never echo them. A provider key enters through a Rust clipboard read behind a native dialog (or a hidden terminal prompt), is stored under `ai-key-<name>` only, and the `ai-key-` prefix is reserved from the generic secret commands. The recovery file (M-12), accepted under Decision D5, is the one exception. | Planned 0.1 | FR-2.9, FR-12.2 | Yes |
 | M-04 | Text from outside the app renders as inert text. No raw HTML rendering, no remote images. | Planned 0.1 | FR-12.3 | None |
