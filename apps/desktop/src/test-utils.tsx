@@ -154,6 +154,9 @@ export function backend(overrides: Record<string, Handler> = {}): Backend {
     pty_write: () => undefined,
     pty_resize: () => undefined,
     pty_close: () => undefined,
+    update_pending: () => null,
+    update_auto_get: () => false,
+    update_auto_set: () => undefined,
   };
   let current: Status | undefined;
   mockWindows("main");

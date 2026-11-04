@@ -1,9 +1,10 @@
-import { useQuery } from "@tanstack/react-query";
+import { useEffect } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CopyPath } from "@/components/CopyPath";
 import { ErrorAlert } from "@/components/ErrorAlert";
 import { PageHeading } from "@/components/PageHeading";
 import { Button } from "@/components/ui/button";
-import { ipc } from "@/lib/ipc";
+import { ipc, onUpdateAvailable, toAppError, type UpdateInfo } from "@/lib/ipc";
 import { describeKey, isLocked } from "@/lib/keys";
 import { useUiStore } from "@/lib/store";
 import { useStatus } from "@/lib/status";
@@ -53,6 +54,79 @@ export function StatusView() {
       <p className="text-sm text-muted-foreground">
         Same data is used by the <code>jobpilot</code> command line tool.
       </p>
+      <Updates version={s?.app_version} />
     </div>
+  );
+}
+
+const BLOCKED = "Not now: an apply run is active or the emergency pause is on. Update when it has ended.";
+
+/** A person's check and install. The only unprompted check is the opt-in one at launch. */
+function Updates({ version }: { version?: string }) {
+  const client = useQueryClient();
+  const pending = useQuery({ queryKey: ["update-pending"], queryFn: ipc.updatePending });
+  const auto = useQuery({ queryKey: ["update-auto"], queryFn: ipc.updateAutoGet });
+  const check = useMutation({
+    mutationFn: ipc.updateCheck,
+    onSuccess: (found) => client.setQueryData(["update-pending"], found),
+  });
+  const install = useMutation({ mutationFn: ipc.updateInstall });
+  const setAuto = useMutation({
+    mutationFn: ipc.updateAutoSet,
+    onSuccess: (_, on) => client.setQueryData(["update-auto"], on),
+  });
+  useEffect(() => {
+    const stop = onUpdateAvailable((info) => client.setQueryData<UpdateInfo | null>(["update-pending"], info));
+    return () => void stop.then((unlisten) => unlisten());
+  }, [client]);
+
+  const found = check.isError ? null : pending.data;
+  const blocked = install.isError && toAppError(install.error).code === "update_blocked_by_run";
+  return (
+    <section aria-labelledby="updates-heading" className="grid max-w-xl gap-3 text-sm">
+      <h2 id="updates-heading" className="font-medium">
+        Updates
+      </h2>
+      <p>Current version {version ?? "unknown"}</p>
+      <div>
+        <Button size="sm" variant="outline" disabled={check.isPending} onClick={() => check.mutate()}>
+          {check.isPending ? "Checking..." : "Check for updates"}
+        </Button>
+      </div>
+      {check.isError && (
+        <>
+          <p>Couldn't check for updates</p>
+          <ErrorAlert error={check.error} />
+        </>
+      )}
+      {check.isSuccess && !check.data && <p>JobPilot is up to date.</p>}
+      {found && (
+        <div className="grid gap-2">
+          <p>{`Version ${found.version} is available`}</p>
+          {found.notes && <p className="whitespace-pre-wrap text-muted-foreground">{found.notes}</p>}
+          <div>
+            <Button size="sm" disabled={install.isPending} onClick={() => install.mutate()}>
+              {install.isPending ? "Installing..." : "Install and restart"}
+            </Button>
+          </div>
+          {blocked ? <p>{BLOCKED}</p> : <ErrorAlert error={install.error} />}
+        </div>
+      )}
+      <label className="flex items-center gap-2">
+        <input
+          type="checkbox"
+          role="switch"
+          checked={auto.data ?? false}
+          disabled={auto.data === undefined || setAuto.isPending}
+          onChange={(e) => setAuto.mutate(e.target.checked)}
+        />
+        Check for updates when JobPilot starts
+      </label>
+      <p className="text-muted-foreground">
+        Off by default. When on, JobPilot asks GitHub for a newer version each time it starts. It never installs one
+        on its own.
+      </p>
+      <ErrorAlert error={auto.error ?? setAuto.error} />
+    </section>
   );
 }

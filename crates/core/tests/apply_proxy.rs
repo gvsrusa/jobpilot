@@ -867,6 +867,34 @@ async fn a_second_submit_click_pauses() {
     s.close().await.unwrap();
 }
 
+/// S-2 (review-1.0): a double click on a submit control would be one counted click and two on
+/// the page, and a middle or modified click opens a page the proxy does not watch.
+#[tokio::test]
+async fn a_double_or_modified_click_on_submit_is_refused_and_not_counted() {
+    let w = world().await;
+    let (run, _) = run_of(&w, &["Acme"]).await;
+    let m = mock(&w, &fixture("form.yml"), None);
+    let mut s = open(&w, &run, &m, None).await;
+    s.brief().await;
+    s.call("browser_snapshot", json!({})).await;
+    for args in [
+        json!({"target": "e14", "doubleClick": true}),
+        json!({"target": "e14", "button": "middle"}),
+        json!({"target": "e14", "modifiers": ["ControlOrMeta"]}),
+    ] {
+        let (text, error) = s.call("browser_click", args.clone()).await;
+        assert!(
+            error && text.contains("click_kind_refused"),
+            "{args}: {text}"
+        );
+    }
+    assert!(m.named("browser_click").is_empty());
+    assert_eq!(item(&w.db, &run, 0).await.submit_clicks, 0);
+    let view = apply::view(&w.db, &run).await.unwrap();
+    assert!(view.active_pause.is_none());
+    s.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_legal_checkbox_click_opens_a_pause() {
     let w = world().await;

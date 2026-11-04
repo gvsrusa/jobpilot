@@ -8,7 +8,7 @@ import { RestoreDialog, type RestoreTarget } from "@/components/RestoreDialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { ipc, pickFolder, type KeyState } from "@/lib/ipc";
+import { ipc, type KeyState } from "@/lib/ipc";
 import { isLocked, offersImportAndDiscard } from "@/lib/keys";
 import { useApplyStatus, useStatus } from "@/lib/status";
 import { baseName, formatDate } from "@/lib/utils";
@@ -34,10 +34,6 @@ function BackupsSection({ onRestore }: { onRestore(t: RestoreTarget): void }) {
     mutationFn: ipc.backupCreate,
     onSuccess: () => client.invalidateQueries(),
   });
-  const folder = useMutation({
-    mutationFn: pickFolder,
-    onSuccess: (path) => path && onRestore({ path }),
-  });
   return (
     <Section
       id="backups"
@@ -48,7 +44,7 @@ function BackupsSection({ onRestore }: { onRestore(t: RestoreTarget): void }) {
         </Button>
       }
     >
-      <ErrorAlert error={backups.error ?? create.error ?? folder.error} />
+      <ErrorAlert error={backups.error ?? create.error} />
       {backups.isSuccess && backups.data.length === 0 && (
         <p className="text-sm text-muted-foreground">
           No backups yet. Create one before you change anything important.
@@ -75,7 +71,7 @@ function BackupsSection({ onRestore }: { onRestore(t: RestoreTarget): void }) {
         ))}
       </ul>
       <div>
-        <Button variant="outline" size="sm" onClick={() => folder.mutate()}>
+        <Button variant="outline" size="sm" onClick={() => onRestore({})}>
           Restore from another folder...
         </Button>
       </div>

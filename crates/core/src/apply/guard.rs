@@ -400,6 +400,9 @@ pub fn refused_args(tool: &str, args: &Value, debug: bool) -> Option<&'static st
     if tool == "browser_type" && args.get("submit").and_then(Value::as_bool) == Some(true) {
         return Some("submit_key_refused");
     }
+    if tool == "browser_click" && !plain_click(args) {
+        return Some("click_kind_refused");
+    }
     if matches!(tool, "browser_navigate" | "browser_tabs")
         && let Some(url) = args.get("url")
     {
@@ -409,6 +412,22 @@ pub fn refused_args(tool: &str, args: &Value, debug: bool) -> Option<&'static st
         }
     }
     None
+}
+
+/// One left click with no modifier (S-2). A double click is two clicks on the page but one
+/// counted submit click, and a middle, right, or modified click can open a page the proxy's
+/// snapshot does not watch. Absent, `false`, `"left"`, and `[]` are the defaults.
+fn plain_click(args: &Value) -> bool {
+    let single = matches!(args.get("doubleClick"), None | Some(Value::Bool(false)));
+    let left = match args.get("button") {
+        None => true,
+        Some(button) => button.as_str() == Some("left"),
+    };
+    let unmodified = match args.get("modifiers") {
+        None => true,
+        Some(modifiers) => modifiers.as_array().is_some_and(Vec::is_empty),
+    };
+    single && left && unmodified
 }
 
 fn url_ok(url: &str, debug: bool) -> bool {

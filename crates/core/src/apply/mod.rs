@@ -378,11 +378,22 @@ fn blocked(error: Error) -> Result<DocState> {
 }
 
 async fn run_active(db: &Db) -> Result<bool> {
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM apply_runs WHERE state IN ('ready', 'running'))",
+    Ok(active_runs(db).await? > 0)
+}
+
+/// Apply runs not yet ended: Claude Code runs `ready` or `running`, plus browser application
+/// runs (Copilot and autonomous) that are queued, running, or waiting for a person. The
+/// desktop app refuses to update while any is, so no restart lands mid-application.
+pub async fn active_runs(db: &Db) -> Result<usize> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM apply_runs WHERE state IN ('ready', 'running')) \
+         + (SELECT COUNT(*) FROM agent_runs WHERE agent = 'browser_application' \
+            AND state IN ('queued','checking','running','checkpointed','retrying',\
+                          'waiting_for_human'))",
     )
     .fetch_one(&db.pool)
-    .await?)
+    .await?;
+    Ok(usize::try_from(count).unwrap_or(0))
 }
 
 /// A person's act. With `release_sealed`, each item records the fresh `Sensitive` answers that

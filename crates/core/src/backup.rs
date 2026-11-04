@@ -41,7 +41,7 @@ use crate::db::{
 use crate::error::{Error, Result};
 use crate::paths::AppPaths;
 use crate::pause;
-use crate::{audit, secrets};
+use crate::{audit, secrets, settings};
 
 const DB_FILE: &str = "jobpilot.db";
 const DOCUMENTS: &str = "documents";
@@ -84,7 +84,12 @@ struct LiveRows {
     paused: Option<bool>,
     /// The endpoint address, to tell whether the backup swaps it for another.
     endpoint: Option<String>,
+    /// The raw values of `settings::KEPT_ON_RESTORE`, `None` inside for an absent key.
+    kept: Option<Vec<KeptSetting>>,
 }
+
+/// A setting key and its stored JSON text.
+type KeptSetting = (&'static str, Option<String>);
 
 /// What step 1 found in the source.
 struct Validated {
@@ -114,7 +119,7 @@ pub async fn create(db: &Db, actor: &str) -> Result<BackupInfo> {
     })
 }
 
-/// Newest first. A folder with no database or no readable manifest is not a snapshot:
+/// Newest first. A link to a folder is skipped. A folder with no database or no readable manifest is not a snapshot:
 /// `manifest.json` is not power-loss durable, so a torn one is skipped, not an error.
 pub async fn list(paths: &AppPaths) -> Result<Vec<BackupInfo>> {
     let entries = match fs::read_dir(paths.backups()) {
@@ -125,6 +130,10 @@ pub async fn list(paths: &AppPaths) -> Result<Vec<BackupInfo>> {
     let mut found = Vec::new();
     for entry in entries {
         let path = entry?.path();
+        // A link is no snapshot of ours: it could point at any folder.
+        if !fs::symlink_metadata(&path).is_ok_and(|found| found.is_dir()) {
+            continue;
+        }
         if !is_plain_file(&path.join(DB_FILE)) {
             continue;
         }
@@ -247,6 +256,7 @@ async fn prepare(db: &Db, source: &Path, migrator: &Migrator) -> Result<(Validat
         keys: Some(read_keys(&db.pool).await?),
         paused: Some(pause::is_set(db).await?),
         endpoint: read_endpoint(&db.pool).await,
+        kept: Some(read_kept(&db.pool).await?),
     };
     Ok((validated, live))
 }
@@ -308,7 +318,7 @@ async fn validate(source: &Path, migrator: &Migrator) -> Result<Validated> {
         ));
     }
     // The manifest is only a claim, so the database's own version decides.
-    let (db, keys) = check_database(&database, manifest.wal).await?;
+    let (db, keys) = check_database(&database, manifest.wal, migrator).await?;
     if db > app {
         return Err(Error::SchemaTooNew { db, app });
     }
@@ -343,12 +353,20 @@ fn read_only(file: &Path, with_wal: bool) -> SqliteConnectOptions {
 }
 
 /// Returns the schema version and key rows of a healthy database, else `InvalidBackup`.
-async fn check_database(file: &Path, with_wal: bool) -> Result<(i64, Vec<KeyRow>)> {
+async fn check_database(
+    file: &Path,
+    with_wal: bool,
+    migrator: &Migrator,
+) -> Result<(i64, Vec<KeyRow>)> {
     let pool = SqlitePool::connect_with(read_only(file, with_wal))
         .await
         .map_err(|error| Error::InvalidBackup(format!("database: {error}")))?;
     let checked = match integrity_and_version(&pool).await {
-        Ok(version) => read_keys(&pool).await.map(|keys| (version, keys)),
+        Ok(version) if version > latest_version(migrator) => Ok((version, Vec::new())),
+        Ok(version) => match check_schema(&pool, migrator).await {
+            Ok(()) => read_keys(&pool).await.map(|keys| (version, keys)),
+            Err(error) => Err(error),
+        },
         Err(error) => Err(error),
     };
     pool.close().await;
@@ -380,6 +398,23 @@ async fn read_endpoint(pool: &SqlitePool) -> Option<String> {
             .await
             .ok()?;
     serde_json::from_str(&raw).ok()
+}
+
+async fn read_kept(pool: &SqlitePool) -> Result<Vec<KeptSetting>> {
+    let mut found = Vec::new();
+    for key in settings::KEPT_ON_RESTORE {
+        found.push((key, setting_text(pool, key).await?));
+    }
+    Ok(found)
+}
+
+async fn setting_text(pool: &SqlitePool, key: &str) -> Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(pool)
+            .await?,
+    )
 }
 
 async fn read_secrets(pool: &SqlitePool) -> Result<Vec<SecretRow>> {
@@ -474,6 +509,7 @@ async fn read_live(paths: &AppPaths) -> (Option<i64>, LiveRows) {
             keys: None,
             paused,
             endpoint: None,
+            kept: None,
         };
         return (None, live);
     };
@@ -483,6 +519,7 @@ async fn read_live(paths: &AppPaths) -> (Option<i64>, LiveRows) {
         keys: read_keys(&pool).await.ok(),
         paused: read_paused(&pool).await.ok(),
         endpoint: read_endpoint(&pool).await,
+        kept: read_kept(&pool).await.ok(),
     };
     pool.close().await;
     (version, live)
@@ -557,12 +594,14 @@ async fn build_new_database(temp: &Path, plan: &Plan<'_>) -> Result<()> {
     let built = migrate_and_fill(&pool, plan).await;
     pool.close().await;
     built?;
-    check_database(temp, false).await?;
+    check_database(temp, false, plan.migrator).await?;
     Ok(())
 }
 
 /// No `pre-migrate` snapshot: this is a copy, and `pre-restore` holds the live data.
 async fn migrate_and_fill(pool: &SqlitePool, plan: &Plan<'_>) -> Result<()> {
+    // Before anything writes: a trigger the backup brought would fire on the migrations.
+    check_schema(pool, plan.migrator).await?;
     run_migrations(pool, plan.migrator).await?;
     check_schema(pool, plan.migrator).await?;
 
@@ -591,6 +630,7 @@ async fn migrate_and_fill(pool: &SqlitePool, plan: &Plan<'_>) -> Result<()> {
 
     revoke_external_consent(pool, plan.actor).await?;
     keep_pause(pool, plan).await?;
+    keep_owned_settings(pool, plan).await?;
 
     let target = plan.source.to_string_lossy();
     let mut detail = json!({});
@@ -636,6 +676,49 @@ async fn keep_pause(pool: &SqlitePool, plan: &Plan<'_>) -> Result<()> {
         audit::record_to(pool, plan.actor, action, None, detail).await?;
     }
     Ok(())
+}
+
+/// The live values of `settings::KEPT_ON_RESTORE` replace the backup's, and an absent one
+/// stays absent. Fails closed: when the live values could not be read, the backup's are
+/// dropped, which is discovery for a program and off for the launch check. One audit row
+/// names the keys the backup would have changed.
+async fn keep_owned_settings(pool: &SqlitePool, plan: &Plan<'_>) -> Result<()> {
+    let mut changed = Vec::new();
+    for key in settings::KEPT_ON_RESTORE {
+        let live = plan
+            .live
+            .kept
+            .iter()
+            .flatten()
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, value)| value.clone());
+        if setting_text(pool, key).await? == live {
+            continue;
+        }
+        sqlx::query("DELETE FROM settings WHERE key = ?")
+            .bind(key)
+            .execute(pool)
+            .await?;
+        if let Some(value) = &live {
+            sqlx::query(
+                "INSERT INTO settings (key, value, updated_at) \
+                 VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            )
+            .bind(key)
+            .bind(value)
+            .execute(pool)
+            .await?;
+        }
+        changed.push(key);
+    }
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let mut detail = json!({ "keys": changed });
+    if plan.live.kept.is_none() {
+        detail["why"] = json!("live_state_unreadable");
+    }
+    audit::record_to(pool, plan.actor, "settings_kept_by_restore", None, detail).await
 }
 
 /// A schema older than the pause has no such table, which is a pause that was never on. Any
@@ -705,37 +788,68 @@ async fn run_migrations(pool: &SqlitePool, migrator: &Migrator) -> Result<()> {
         .map_err(|error| Error::MigrationFailed(error.to_string()))
 }
 
-/// A backup can claim a version without holding its tables, so it is compared with
-/// what the migrations build from nothing.
+/// One schema object: type, name, table, and its SQL with runs of whitespace collapsed.
+type SchemaItem = (String, String, String, Option<String>);
+
+/// The database's objects must be exactly what JobPilot's migrations build up to the
+/// version it records: nothing missing, changed, or extra. A backup is untrusted, and a
+/// trigger or view of its own would run inside the restore and live on after it, where it
+/// could undo the kept settings, the pause, or the consent revocation (review 6a I-1). So
+/// this runs before any write to the copy, and again after its migrations.
 async fn check_schema(pool: &SqlitePool, migrator: &Migrator) -> Result<()> {
+    let version = current_version(pool).await?;
+    let up_to: Vec<_> = migrator
+        .iter()
+        .filter(|migration| {
+            migration.version <= version && !migration.migration_type.is_down_migration()
+        })
+        .cloned()
+        .collect();
     let empty = SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(SqliteConnectOptions::new().in_memory(true))
         .await?;
-    let built = run_migrations(&empty, migrator).await;
+    let built = run_migrations(&empty, &Migrator::with_migrations(up_to)).await;
     let expected = schema_of(&empty).await;
     empty.close().await;
     built?;
+    let expected = expected?;
 
     let found = schema_of(pool).await?;
-    match expected?.into_iter().find(|item| !found.contains(item)) {
-        Some((name, _)) => Err(Error::InvalidBackup(format!("schema differs at {name}"))),
+    let differs = found
+        .iter()
+        .find(|item| !expected.contains(item))
+        .or_else(|| expected.iter().find(|item| !found.contains(item)));
+    match differs {
+        Some((_, name, ..)) => Err(Error::InvalidBackup(format!("schema differs at {name}"))),
         None => Ok(()),
     }
 }
 
-/// Only what JobPilot's migrations define. sqlx's bookkeeping, SQLite's internals,
-/// and FTS5's shadow tables are written by libraries whose DDL may change with a
-/// version bump, which would make every older backup unrestorable.
-async fn schema_of(pool: &SqlitePool) -> Result<Vec<(String, Option<String>)>> {
-    Ok(sqlx::query_as(
-        "SELECT name, sql FROM sqlite_master \
-         WHERE name NOT LIKE '\\_sqlx\\_%' ESCAPE '\\' \
-           AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
-           AND name NOT IN (SELECT name FROM pragma_table_list WHERE type = 'shadow')",
+/// Every object but the few that libraries write: sqlx's bookkeeping table, SQLite's
+/// automatic indexes and statistics tables, and FTS5's shadow tables, whose DDL may change
+/// with a version bump and would make every older backup unrestorable. Each is left out by
+/// type as well as name, so no trigger or view passes under one of those names.
+async fn schema_of(pool: &SqlitePool) -> Result<Vec<SchemaItem>> {
+    let rows: Vec<SchemaItem> = sqlx::query_as(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master \
+         WHERE NOT (type = 'table' AND name = '_sqlx_migrations') \
+           AND NOT (type = 'index' AND sql IS NULL AND name LIKE 'sqlite\\_autoindex\\_%' ESCAPE '\\') \
+           AND NOT (type = 'table' AND name IN ('sqlite_sequence', 'sqlite_stat1', 'sqlite_stat4')) \
+           AND NOT (type = 'table' AND name IN \
+                    (SELECT name FROM pragma_table_list WHERE type = 'shadow'))",
     )
     .fetch_all(pool)
-    .await?)
+    .await?;
+    let mut items: Vec<SchemaItem> = rows
+        .into_iter()
+        .map(|(kind, name, table, sql)| {
+            let sql = sql.map(|sql| sql.split_whitespace().collect::<Vec<_>>().join(" "));
+            (kind, name, table, sql)
+        })
+        .collect();
+    items.sort();
+    Ok(items)
 }
 
 /// Step 5 inside its marker, so a crash anywhere in it leaves `Db::swap_interrupted` true.

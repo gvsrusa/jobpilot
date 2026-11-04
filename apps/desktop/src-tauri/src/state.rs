@@ -34,6 +34,10 @@ pub struct AppState {
     /// The answer `apply_copy` last put on the clipboard, until its clear: the exit clears it
     /// when the timer has not.
     pub copied: Mutex<Option<jobpilot_core::secrets::Zeroizing<String>>>,
+    /// Held for writing by an update install, from its first check to the restart, and for
+    /// reading by a command while it starts a run. Neither waits: each refuses the other with
+    /// `update_blocked_by_run` (see `update::starting_run`).
+    pub installing: RwLock<()>,
 }
 
 /// A handle that stays open without the `db` lock, for as long as this is held. `db` is
@@ -156,6 +160,7 @@ impl AppState {
             pull: InFlight::default(),
             restored_key_state: Mutex::new(None),
             copied: Mutex::new(None),
+            installing: RwLock::new(()),
         }
     }
 

@@ -1,7 +1,7 @@
 // ponytail: hand-kept in sync with commands.rs; add tauri-specta when the command count makes drift a real problem.
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { open } from "@tauri-apps/plugin-dialog";
 
 /** What every failed command rejects with (jobpilot-core `Error`). */
 export type AppError = { code: string; message: string };
@@ -725,7 +725,9 @@ export const ipc = {
   settingsSet: (key: string, value: unknown) => invoke<void>("settings_set", { key, value }),
   backupCreate: () => invoke<BackupInfo>("backup_create"),
   backupList: () => invoke<BackupInfo[]>("backup_list"),
-  backupRestore: (source: string) => invoke<Status>("backup_restore", { source }),
+  /** `snapshot` names one `backupList` gave; `null` has Rust open a folder picker, and the
+   * call rejects with `cancelled` when the user closes it. The webview names no path. */
+  backupRestore: (snapshot: string | null) => invoke<Status>("backup_restore", { snapshot }),
   dataExport: () => invoke<Exported>("data_export"),
   dataDelete: (confirm: string, includeBackups: boolean) =>
     invoke<Status>("data_delete", { confirm, includeBackups }),
@@ -942,7 +944,22 @@ export const ipc = {
   autonomousRevoke: (connector: string) => invoke<void>("autonomous_revoke", { connector }),
   /** Rust decides first: an ineligible site (today, every site) is refused with no dialog. */
   autonomousStart: (applicationId: string) => invoke<ApplyRunView>("autonomous_start", { applicationId }),
+  /** A person's check: the one network call here. `update_check_failed` when it cannot answer. */
+  updateCheck: () => invoke<UpdateInfo | null>("update_check"),
+  /** What the last check, at launch or by a person, found. No network. */
+  updatePending: () => invoke<UpdateInfo | null>("update_pending"),
+  /** Downloads, verifies, installs, restarts. `update_blocked_by_run` during a run or the pause. */
+  updateInstall: () => invoke<void>("update_install"),
+  updateAutoGet: () => invoke<boolean>("update_auto_get"),
+  updateAutoSet: (on: boolean) => invoke<void>("update_auto_set", { on }),
 };
+
+/** A newer version, as the opt-in launch check found it. */
+export type UpdateInfo = { version: string; notes: string | null; date: string | null };
+
+export function onUpdateAvailable(cb: (info: UpdateInfo) => void): Promise<() => void> {
+  return listen<UpdateInfo>("update-available", (event) => cb(event.payload));
+}
 
 export function ptyOpen(cols: number, rows: number): Promise<void> {
   return invoke("pty_open", { cols, rows });
@@ -979,12 +996,6 @@ export function onPtyExit(cb: (code: number | null) => void): Promise<() => void
 /** Frees output credit once xterm.js has parsed `bytes`, so the PTY paces the child. */
 export function ptyAck(bytes: number): Promise<void> {
   return getCurrentWebviewWindow().emit("pty:ack", bytes);
-}
-
-/** The folder picker for a backup. Returns null when the user cancels. */
-export async function pickFolder(): Promise<string | null> {
-  const chosen = await open({ directory: true, multiple: false });
-  return typeof chosen === "string" ? chosen : null;
 }
 
 /** Anything a command can reject with, as `{code, message}`. */

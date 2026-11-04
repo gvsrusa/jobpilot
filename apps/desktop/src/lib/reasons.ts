@@ -118,6 +118,7 @@ const REASONS: [word: string, text: string][] = [
   ["no_browser_runtime", "The browser runtime is not set up. Press Set up browser, then start the run again."],
   ["claude_not_found", "Claude Code was not found. Install it, or choose its program on the AI screen."],
   ["apply_run_active", "Another apply run is still open. Let it end, or cancel it, then start this one."],
+  ["update_blocked_by_run", "An update is installing, and JobPilot restarts when it is done. Start the run after that."],
   ["apply_run_not_ready", "This run has already started or ended. Start a new run with what is left."],
   ["consent_required", "Your Claude Code consent does not cover what this run sends. Review it on the AI screen."],
   [

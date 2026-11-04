@@ -587,10 +587,12 @@ async fn find_cli_by(
     if let Some(bin) = std::env::var_os(spec.env_bin).filter(|bin| !bin.is_empty()) {
         return checked(PathBuf::from(bin), spec, spec.env_bin);
     }
-    if let Some(bin) = path_setting(spec, db).await.map(PathBuf::from)
+    if let Some(db) = db
+        && let Some(bin) = path_setting(spec, Some(db)).await.map(PathBuf::from)
         && !is_gone(&bin, spec)
     {
-        return checked(bin, spec, spec.setting);
+        return checked(bin, spec, spec.setting)
+            .and_then(|bin| outside_root(bin, db, spec.setting));
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
     let env = |name: &str| std::env::var_os(name);
@@ -623,8 +625,31 @@ pub async fn stored_path_is_wrong(spec: &CliSpec, db: &Db) -> bool {
     let overridden = std::env::var_os(spec.env_bin).is_some_and(|bin| !bin.is_empty());
     let stored = path_setting(spec, Some(db)).await.map(PathBuf::from);
     !overridden
-        && stored
-            .is_some_and(|bin| !is_gone(&bin, spec) && checked(bin, spec, spec.setting).is_err())
+        && stored.is_some_and(|bin| {
+            !is_gone(&bin, spec)
+                && checked(bin, spec, spec.setting)
+                    .and_then(|bin| outside_root(bin, db, spec.setting))
+                    .is_err()
+        })
+}
+
+/// A stored program path inside the data root is refused at use time. Everything there came
+/// from this app or from a restored backup, and a backup must never choose what runs (S-1).
+/// `AppPaths::is_inside_root` compares folders by device and inode, so a link, `..`, or a
+/// macOS firmlink alias cannot step around it, and a folder it cannot resolve counts as
+/// inside. The file itself is resolved first, so a link outside the root to a program inside
+/// it is refused too.
+pub fn outside_root(bin: PathBuf, db: &Db, source: &str) -> std::result::Result<PathBuf, String> {
+    let real = std::fs::canonicalize(&bin).unwrap_or_else(|_| bin.clone());
+    if db.paths().is_inside_root(&bin) || db.paths().is_inside_root(&real) {
+        Err(format!(
+            "{source} points to {}, inside the JobPilot data folder, where no program may run \
+             from. Set it again to the program's own install location.",
+            bin.display()
+        ))
+    } else {
+        Ok(bin)
+    }
 }
 
 fn is_gone(bin: &Path, spec: &CliSpec) -> bool {

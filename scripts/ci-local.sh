@@ -71,6 +71,13 @@ step 'format' cargo fmt --check
 step 'clippy' cargo clippy --workspace --all-targets -- -D warnings
 step 'rust tests' cargo test --workspace --no-fail-fast
 step 'windows type-check' windows_check
+# Supply-chain gates. cargo-deny is optional locally; CI always runs both.
+if command -v cargo-deny >/dev/null 2>&1; then
+  step 'cargo deny' cargo deny check
+else
+  printf '\nskip cargo deny (cargo install cargo-deny --locked)\n'
+fi
+step 'pnpm audit' pnpm audit --prod --audit-level high
 if [ "$fast" = false ]; then
   step 'keychain suites' keychain_suites
   step 'browser end to end' browser_e2e

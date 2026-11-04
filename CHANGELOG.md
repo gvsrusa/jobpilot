@@ -4,6 +4,31 @@ Format follows Keep a Changelog. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.0.0] - unreleased
+
+Stable open-source distribution. See `docs/releases/1.0.0.md` for what was and was not exercised.
+
+### Added
+- Verified auto-update: Status has Check for updates and Install and restart. Updates are minisign-verified against the pinned key. A launch check is opt-in and off by default. An install is refused while the emergency pause is set or an apply run is active, and is audited (`update_installed`, `update_install_failed`).
+- A release workflow: a `v*` tag builds a draft release with `.dmg` (arm64, x64), `.msi`, NSIS `.exe`, updater `.sig` files, and `latest.json`. It signs and notarizes when the `APPLE_*` secrets exist and Authenticode-signs when `WINDOWS_CERTIFICATE` exists; otherwise the build is unsigned and the release body says so. A manual run is a dry run. Actions are pinned to commit SHAs.
+- A supply-chain CI job: `cargo-deny` (`deny.toml`) and `pnpm audit --prod --audit-level high`.
+- Upgrade tests from every earlier release (schemas 1, 5, 11, 12, 15, 17).
+- `docs/security/review-1.0.md`, `SECURITY.md`, and a release process in `docs/development.md`.
+
+### Security
+- S-1: a restored backup can no longer choose which program runs as `claude`.
+- S-2: `browser_click` is one plain left click (no `doubleClick`).
+- S-3: release actions pinned and the Windows certificate scoped to its import step. Residual: the updater key is visible to the build step.
+- S-4: the webview capability is narrowed to what the frontend uses.
+- S-5: some consequential acts still need only an IPC call (residual, see the review).
+- S-6 (a restore takes no path from the webview) is fixed. The final state of every finding: see the [review](docs/security/review-1.0.md).
+- S-7: the data root is created user-only.
+- S-8: the threat-model register is corrected.
+
+### Changed
+- D3 (unsigned installers) is superseded for 1.0 by "signed when certificates exist".
+- Version 1.0.0.
+
 ## [0.6.0] - unreleased
 
 Browser automation. See `docs/releases/0.6.0.md` for what was and was not exercised.

@@ -826,6 +826,63 @@ async fn list_skips_invalid_folders() {
     assert_eq!(listed[0].schema_version, Some(app_schema_version()));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn list_skips_a_symlinked_snapshot() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let real = backup::create(&db, "cli").await.unwrap();
+    db.close().await;
+    let link = paths.backups().join("pre-restore-link");
+    std::os::unix::fs::symlink(&real.path, &link).unwrap();
+
+    let listed = backup::list(&paths).await.unwrap();
+
+    let found: Vec<_> = listed.iter().map(|info| &info.path).collect();
+    assert_eq!(found, [&real.path]);
+}
+
+/// Every `pre-migrate-<v>-` snapshot an upgrade writes restores through the schema check,
+/// migrates to the current schema, and keeps its rows.
+#[tokio::test]
+async fn a_pre_migrate_snapshot_of_an_older_schema_restores() {
+    for v in [1, 5, 11, 12, 15] {
+        let (_tmp, paths) = temp_root();
+        let older: Vec<Migration> = MIGRATOR
+            .iter()
+            .filter(|m| m.version <= v)
+            .cloned()
+            .collect();
+        let db = Db::open_with(&paths, &Migrator::with_migrations(older))
+            .await
+            .unwrap();
+        add_doc(&db, "old row").await;
+        db.close().await;
+        let db = Db::open(&paths).await.unwrap();
+        assert_eq!(db.schema_version().await.unwrap(), app_schema_version());
+        add_doc(&db, "new row").await;
+        let snapshot = snapshots(&paths, &format!("pre-migrate-{v}-"));
+        assert_eq!(snapshot.len(), 1, "schema {v}: one pre-migrate snapshot");
+
+        let restored = backup::restore(db, &snapshot[0], "gui")
+            .await
+            .unwrap_or_else(|e| panic!("schema {v}: restore failed: {e}"))
+            .db;
+
+        assert_eq!(
+            restored.schema_version().await.unwrap(),
+            app_schema_version(),
+            "schema {v}: migrated to current"
+        );
+        assert_eq!(
+            titles(&restored).await,
+            ["old row"],
+            "schema {v}: rows kept"
+        );
+        restored.close().await;
+    }
+}
+
 #[tokio::test]
 async fn list_of_a_root_with_no_backups_is_empty() {
     let (_tmp, paths) = temp_root();
@@ -2109,4 +2166,363 @@ async fn a_kept_pause_is_audited_once_and_not_when_the_backup_already_had_it() {
         Some("gui")
     );
     db.close().await;
+}
+
+// S-1 (review-1.0): a restored backup must not choose which program runs.
+
+#[cfg(unix)]
+const CLAUDE_NAME: &str = "claude";
+#[cfg(windows)]
+const CLAUDE_NAME: &str = "claude.cmd";
+#[cfg(unix)]
+const GEMINI_NAME: &str = "gemini";
+#[cfg(windows)]
+const GEMINI_NAME: &str = "gemini.cmd";
+
+/// Every setting that names a program, plus the launch-time network check.
+const OWNED: [&str; 5] = [
+    "ai.claude_path",
+    "ai.gemini_path",
+    "ai.codex_path",
+    "ai.ollama_url",
+    settings::UPDATES_CHECK_ON_LAUNCH,
+];
+
+/// An executable named like Claude Code in `dir`.
+fn plant_program(dir: &Path, name: &str) -> PathBuf {
+    fs::create_dir_all(dir).unwrap();
+    let path = dir.join(name);
+    fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path
+}
+
+/// The review's scenario: a backup made in root A names a program planted in its own
+/// documents folder, and turns the launch check on. Restored into root B, B keeps its own
+/// values, and an absent value stays absent.
+async fn crafted_backup(tmp: &TempDir) -> PathBuf {
+    let paths = AppPaths::new(tmp.path().join("crafted"));
+    let db = Db::open(&paths).await.unwrap();
+    let planted = plant_program(&paths.documents(), CLAUDE_NAME);
+    let gemini = plant_program(&paths.documents(), "gemini");
+    let path = json!(planted.display().to_string());
+    settings::set(&db, "ai.claude_path", &path).await.unwrap();
+    let gemini = json!(gemini.display().to_string());
+    settings::set(&db, "ai.gemini_path", &gemini).await.unwrap();
+    settings::set(&db, "ai.codex_path", &json!("/tmp/codex"))
+        .await
+        .unwrap();
+    settings::set(&db, settings::UPDATES_CHECK_ON_LAUNCH, &json!(true))
+        .await
+        .unwrap();
+    settings::set(&db, "ai.ollama_url", &json!("http://127.0.0.1:1"))
+        .await
+        .unwrap();
+    let info = backup::create(&db, "cli").await.unwrap();
+    db.close().await;
+    info.path
+}
+
+async fn owned_values(db: &Db) -> Vec<Option<Value>> {
+    let mut found = Vec::new();
+    for key in OWNED {
+        found.push(settings::get(db, key).await.unwrap());
+    }
+    found
+}
+
+#[tokio::test]
+async fn restore_keeps_the_live_program_paths_and_launch_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = crafted_backup(&tmp).await;
+    let paths = AppPaths::new(tmp.path().join("live"));
+    let db = Db::open(&paths).await.unwrap();
+    let mine = json!("/opt/mine/claude");
+    settings::set(&db, "ai.claude_path", &mine).await.unwrap();
+    settings::set(&db, settings::UPDATES_CHECK_ON_LAUNCH, &json!(false))
+        .await
+        .unwrap();
+    settings::set(&db, "ai.ollama_url", &json!("http://127.0.0.1:11434"))
+        .await
+        .unwrap();
+    let before = owned_values(&db).await;
+
+    let db = backup::restore(db, &source, "gui").await.unwrap().db;
+
+    assert_eq!(owned_values(&db).await, before);
+    assert_eq!(before[1], None, "an absent path stays absent");
+    let entries = audit::recent(&db, 20).await.unwrap();
+    let kept: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.action == "settings_kept_by_restore")
+        .collect();
+    assert_eq!(kept.len(), 1, "{entries:?}");
+    assert_eq!(kept[0].detail["keys"], json!(OWNED));
+    db.close().await;
+}
+
+#[tokio::test]
+async fn offline_restore_keeps_the_live_program_paths_and_launch_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = crafted_backup(&tmp).await;
+    let paths = AppPaths::new(tmp.path().join("live"));
+    let db = Db::open(&paths).await.unwrap();
+    settings::set(&db, "ai.codex_path", &json!("/opt/mine/codex"))
+        .await
+        .unwrap();
+    let before = owned_values(&db).await;
+    db.close().await;
+
+    let db = backup::restore_offline(&paths, &source, "gui")
+        .await
+        .unwrap()
+        .db;
+
+    assert_eq!(owned_values(&db).await, before);
+    db.close().await;
+}
+
+/// A backup whose values match the live ones changes nothing, so it audits nothing.
+#[tokio::test]
+async fn restore_with_the_same_program_paths_audits_no_kept_setting() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    settings::set(&db, "ai.claude_path", &json!("/opt/mine/claude"))
+        .await
+        .unwrap();
+    let info = backup::create(&db, "cli").await.unwrap();
+
+    let db = backup::restore(db, &info.path, "gui").await.unwrap().db;
+
+    let entries = audit::recent(&db, 20).await.unwrap();
+    assert_eq!(audit_actions(&entries, "settings_kept_by_restore"), 0);
+    assert_eq!(
+        settings::get(&db, "ai.claude_path").await.unwrap(),
+        Some(json!("/opt/mine/claude"))
+    );
+    db.close().await;
+}
+
+/// Restored documents are data: nothing in them comes back executable.
+#[cfg(unix)]
+#[tokio::test]
+async fn restored_documents_lose_their_execute_bits() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let source = crafted_backup(&tmp).await;
+    let paths = AppPaths::new(tmp.path().join("live"));
+    let db = Db::open(&paths).await.unwrap();
+
+    let db = backup::restore(db, &source, "gui").await.unwrap().db;
+
+    let restored = paths.documents().join(CLAUDE_NAME);
+    let mode = fs::metadata(&restored).unwrap().permissions().mode();
+    assert_eq!(mode & 0o111, 0, "mode {mode:o}");
+    db.close().await;
+}
+
+/// The second wall: whatever a setting says, a program inside the data root never runs.
+#[tokio::test]
+async fn a_program_path_inside_the_data_root_is_refused() {
+    use jobpilot_core::ai::{child, claude_code};
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let planted = plant_program(&paths.documents(), CLAUDE_NAME);
+    let gemini = plant_program(&paths.documents().join("sub"), GEMINI_NAME);
+    let path = json!(planted.display().to_string());
+    settings::set(&db, claude_code::PATH_SETTING, &path)
+        .await
+        .unwrap();
+    let path = json!(gemini.display().to_string());
+    settings::set(&db, child::GEMINI.setting, &path)
+        .await
+        .unwrap();
+
+    let claude = claude_code::find_binary_quietly(Some(&db)).await;
+    let message = claude.unwrap_err();
+    assert!(message.contains("data folder"), "{message}");
+    let message = child::find_cli_quick(&child::GEMINI, Some(&db))
+        .await
+        .unwrap_err();
+    assert!(message.contains("data folder"), "{message}");
+
+    // The same file named through another path to the root: a macOS firmlink alias where
+    // there is one, else a link to the root from outside it.
+    let alias = aliased(&planted, &paths);
+    settings::set(
+        &db,
+        claude_code::PATH_SETTING,
+        &json!(alias.display().to_string()),
+    )
+    .await
+    .unwrap();
+    let message = claude_code::find_binary_quietly(Some(&db))
+        .await
+        .unwrap_err();
+    assert!(message.contains("data folder"), "{alias:?}: {message}");
+
+    // A link outside the root whose last component points at the planted program.
+    #[cfg(unix)]
+    {
+        let outside = tempfile::tempdir().unwrap();
+        let link = outside.path().join(CLAUDE_NAME);
+        std::os::unix::fs::symlink(&planted, &link).unwrap();
+        settings::set(
+            &db,
+            claude_code::PATH_SETTING,
+            &json!(link.display().to_string()),
+        )
+        .await
+        .unwrap();
+        let message = claude_code::find_binary_quietly(Some(&db))
+            .await
+            .unwrap_err();
+        assert!(message.contains("data folder"), "{link:?}: {message}");
+    }
+    db.close().await;
+}
+
+/// `file` (inside the root) through a path that shares no prefix with the root's own.
+fn aliased(file: &Path, paths: &AppPaths) -> PathBuf {
+    let real = fs::canonicalize(file).unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        let firmlink = Path::new("/System/Volumes/Data").join(real.strip_prefix("/").unwrap());
+        if firmlink.exists() {
+            return firmlink;
+        }
+    }
+    let root = fs::canonicalize(paths.root()).unwrap();
+    let link = root.parent().unwrap().join("alias-of-root");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&root, &link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&root, &link).unwrap();
+    link.join(real.strip_prefix(&root).unwrap())
+}
+
+// Review 6a I-1: a backup must hold exactly the schema JobPilot's migrations build, so no
+// trigger or view of its own can run inside the restore or live on after it.
+
+/// Runs `sql` against the backup's database file, as a crafted backup would hold it.
+async fn tamper(backup: &Path, sql: &str) {
+    let options = SqliteConnectOptions::new()
+        .filename(backup.join("jobpilot.db"))
+        .journal_mode(SqliteJournalMode::Delete);
+    let pool = SqlitePool::connect_with(options).await.unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql.to_string()))
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+/// The live root: a program path of its own and the pause on. What the backup's objects try
+/// to undo.
+async fn guarded_root(paths: &AppPaths) -> Db {
+    let db = Db::open(paths).await.unwrap();
+    settings::set(&db, "ai.claude_path", &json!("/opt/mine/claude"))
+        .await
+        .unwrap();
+    pause::set(&db, "gui").await.unwrap();
+    db
+}
+
+async fn assert_refused_and_untouched(
+    paths: &AppPaths,
+    refused: Result<backup::RestoreReport, Error>,
+) {
+    let error = refused.expect_err("the restore is refused");
+    assert!(
+        matches!(&error, Error::InvalidBackup(why) if why.contains("schema differs")),
+        "{error}"
+    );
+    let db = Db::open(paths).await.unwrap();
+    assert!(pause::is_set(&db).await.unwrap());
+    assert_eq!(
+        settings::get(&db, "ai.claude_path").await.unwrap(),
+        Some(json!("/opt/mine/claude"))
+    );
+    let foreign: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'evil%'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(foreign, 0);
+    db.close().await;
+}
+
+async fn tampered_backup(tmp: &TempDir, sql: &str) -> PathBuf {
+    let source = crafted_backup(tmp).await;
+    tamper(&source, sql).await;
+    source
+}
+
+#[tokio::test]
+async fn a_backup_with_an_extra_trigger_on_settings_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tampered_backup(
+        &tmp,
+        "CREATE TRIGGER evil_path AFTER INSERT ON settings WHEN NEW.key = 'ai.claude_path' \
+         BEGIN UPDATE settings SET value = '\"/tmp/claude\"' WHERE key = NEW.key; END;",
+    )
+    .await;
+    let paths = AppPaths::new(tmp.path().join("live"));
+    let db = guarded_root(&paths).await;
+
+    let refused = backup::restore(db, &source, "gui").await;
+    assert_refused_and_untouched(&paths, refused).await;
+}
+
+#[tokio::test]
+async fn a_backup_with_an_extra_trigger_on_the_pause_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tampered_backup(
+        &tmp,
+        "CREATE TRIGGER evil_pause AFTER INSERT ON emergency_pause \
+         BEGIN DELETE FROM emergency_pause; END;",
+    )
+    .await;
+    let paths = AppPaths::new(tmp.path().join("live"));
+    let db = guarded_root(&paths).await;
+    db.close().await;
+
+    // The recovery screen's path is held to the same rule.
+    let refused = backup::restore_offline(&paths, &source, "gui").await;
+    assert_refused_and_untouched(&paths, refused).await;
+}
+
+#[tokio::test]
+async fn a_backup_with_an_extra_view_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tampered_backup(&tmp, "CREATE VIEW evil_view AS SELECT * FROM settings;").await;
+    let paths = AppPaths::new(tmp.path().join("live"));
+    let db = guarded_root(&paths).await;
+
+    let refused = backup::restore(db, &source, "gui").await;
+    assert_refused_and_untouched(&paths, refused).await;
+}
+
+/// A name in sqlx's own namespace is no pass: only its bookkeeping table is left out.
+#[tokio::test]
+async fn a_backup_with_a_trigger_named_like_sqlx_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tampered_backup(
+        &tmp,
+        "CREATE TRIGGER _sqlx_evil AFTER INSERT ON settings BEGIN SELECT 1; END;",
+    )
+    .await;
+    let paths = AppPaths::new(tmp.path().join("live"));
+    let db = guarded_root(&paths).await;
+
+    let refused = backup::restore(db, &source, "gui").await;
+    let error = refused.expect_err("the restore is refused");
+    assert!(
+        matches!(&error, Error::InvalidBackup(why) if why.contains("schema differs")),
+        "{error}"
+    );
 }

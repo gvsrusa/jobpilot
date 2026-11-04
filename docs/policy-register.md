@@ -26,7 +26,7 @@ Every vendor quote and verdict in this register stays as the record of what vend
 | Autonomous submission | `unknown` | Default off. No connector is enabled by these decisions. |
 | CAPTCHA, MFA, identity verification, legal declarations | n/a | Always pause (FR-9.16 to FR-9.21). |
 
-Other decisions recorded here: D3 accepts unsigned 0.x installers. D5 accepts the recovery-key file as the one exception to "secrets never reach exports". D6 chooses field-level AES-GCM with the key in the OS keychain.
+Other decisions recorded here: D3 accepts unsigned 0.x installers; for 1.0 it is superseded by "signed when certificates exist": the release workflow signs and notarizes macOS builds when the `APPLE_*` secrets exist and signs Windows installers when `WINDOWS_CERTIFICATE` exists, and otherwise ships unsigned and says so in the release body. D5 accepts the recovery-key file as the one exception to "secrets never reach exports". D6 chooses field-level AES-GCM with the key in the OS keychain.
 
 ### Owner decision 2026-11-01: Claude Code apply mode (Release 0.6)
 

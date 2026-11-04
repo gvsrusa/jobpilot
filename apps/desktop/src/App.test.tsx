@@ -170,7 +170,7 @@ describe("recovery", () => {
     await user.click(await screen.findByRole("button", { name: "Replace my data" }));
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("restored_not_opened"));
     expect(b.calls.find((c) => c.cmd === "backup_restore")?.args).toEqual({
-      source: "/home/me/jobpilot/backups/pre-restore-1",
+      snapshot: "pre-restore-1",
     });
     expect(document.body).toHaveTextContent("The restore finished");
   });

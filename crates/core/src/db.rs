@@ -143,7 +143,7 @@ impl Db {
 /// check comes before the marker check, so a second process racing a first open sees
 /// the marker with any file it saw, and is never refused.
 pub(crate) fn claim_root(paths: &AppPaths) -> Result<()> {
-    fs::create_dir_all(paths.root())?;
+    create_user_only(paths.root())?;
     let empty = fs::read_dir(paths.root())?.next().is_none();
     if paths.marker().is_file() {
         return Ok(());
@@ -160,6 +160,20 @@ pub(crate) fn claim_root(paths: &AppPaths) -> Result<()> {
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+/// The data root is user-only wherever it is (S-7, M-06): on Unix a root this creates is
+/// 0700, and so is any missing parent it creates. An existing folder keeps its mode. On
+/// Windows the user profile's ACL is what makes it user-only.
+fn create_user_only(root: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(root)
 }
 
 /// Takes the lock only if no other handle exists. `InUse` means one does.
@@ -370,9 +384,27 @@ pub fn copy_dir(from: &Path, to: &Path) -> io::Result<()> {
         if kind.is_dir() {
             copy_dir(&entry.path(), &target)?;
         } else if kind.is_file() {
-            fs::copy(entry.path(), target)?;
+            fs::copy(entry.path(), &target)?;
+            drop_execute_bits(&target)?;
         }
     }
+    Ok(())
+}
+
+/// Documents are data. A copied file never keeps an execute bit, so a backup cannot bring a
+/// program into the data root that is ready to run (S-1).
+#[cfg(unix)]
+fn drop_execute_bits(file: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(file)?.permissions().mode();
+    if mode & 0o111 != 0 {
+        fs::set_permissions(file, fs::Permissions::from_mode(mode & !0o111))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn drop_execute_bits(_file: &Path) -> io::Result<()> {
     Ok(())
 }
 

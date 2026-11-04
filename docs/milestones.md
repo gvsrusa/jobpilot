@@ -240,6 +240,8 @@ Exit tests not proven end to end:
 
 ## Release 1.0: Stable open-source distribution
 
+Status: built on `feat/v1.0-release`. The exit tests that need a real release are `PENDING-T8`; the table is below and in [release 1.0.0](releases/1.0.0.md#exit-tests).
+
 Scope: signing and notarization, auto-update, security review, public docs. FR-1.8 installers were first delivered unsigned in 0.1; 1.0 signs them.
 
 Requirements: FR-13.10, FR-13.11. The security review covers all of FR-12 as delivered in earlier releases.
@@ -253,3 +255,15 @@ Exit tests:
 - Release builds are produced by GitHub Actions on Windows and macOS.
 
 Gates: all five apply. Build means signed installers; migrations means upgrade tests from every earlier release; Windows and macOS means signing, notarization, and update verified on both.
+
+### 1.0 exit-test record
+
+| Exit test | Result |
+|---|---|
+| Installers are signed (Windows) and signed and notarized (macOS) | PENDING-T8 (signing waits on certificates; the workflow signs when they exist and says so in the release body) |
+| Auto-update delivers and verifies a new version | Built and unit-tested (minisign against the pinned key). Update delivered from a release candidate to 1.0: PENDING-T8. Windows update: PENDING-T8. |
+| Security review is complete and its findings are resolved or documented | Done: [review-1.0.md](security/review-1.0.md) |
+| Published docs: PRD, architecture, database schema, Connector SDK, security model, development guide, contribution guide, license, release notes | Done, all linked from the README |
+| License confirmed as Apache 2.0 | Done, unchanged |
+| Release builds are produced by GitHub Actions on Windows and macOS | Workflow written; first real run: PENDING-T8 |
+| Upgrade tests from every earlier release | Done (schemas 1, 5, 11, 12, 15, 17) |

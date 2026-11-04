@@ -176,18 +176,44 @@ describe("data", () => {
     expect(count(b, "backup_restore")).toBe(0);
   });
 
-  it("restore_from_another_folder_uses_directory_picker", async () => {
-    const b = backend({ "plugin:dialog|open": () => "/Volumes/usb/jp-backup" });
+  it("restore_from_another_folder_leaves_the_picker_to_rust", async () => {
+    const b = backend();
     const { user } = renderApp();
     await open(user, "Data");
     await user.click(screen.getByRole("button", { name: /Restore from another folder/ }));
     const dialog = await screen.findByRole("dialog");
-    expect(dialog).toHaveTextContent("/Volumes/usb/jp-backup");
+    expect(dialog).toHaveTextContent("You choose the folder next");
     await user.click(within(dialog).getByRole("button", { name: "Replace my data" }));
     await waitFor(() => expect(count(b, "backup_restore")).toBe(1));
-    expect(b.calls.find((c) => c.cmd === "plugin:dialog|open")?.args).toMatchObject({
-      options: { directory: true },
+    // The webview names no path: Rust opens the folder picker itself.
+    expect(b.calls.find((c) => c.cmd === "backup_restore")?.args).toEqual({ snapshot: null });
+    expect(b.calls.some((c) => c.cmd.startsWith("plugin:dialog"))).toBe(false);
+  });
+
+  it("restore_of_a_listed_backup_sends_its_name_only", async () => {
+    const b = backend({
+      backup_list: () => [
+        { path: "/home/me/jobpilot/backups/manual-1", created_at: "2026-11-01", schema_version: 1 },
+      ],
     });
+    const { user } = renderApp();
+    await open(user, "Data");
+    await user.click(await screen.findByRole("button", { name: /Restore.*manual-1/ }));
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: "Replace my data" }));
+    await waitFor(() => expect(count(b, "backup_restore")).toBe(1));
+    expect(b.calls.find((c) => c.cmd === "backup_restore")?.args).toEqual({ snapshot: "manual-1" });
+  });
+
+  it("closing_the_folder_picker_shows_no_error", async () => {
+    backend({ backup_restore: () => Promise.reject({ code: "cancelled", message: "cancelled" }) });
+    const { user } = renderApp();
+    await open(user, "Data");
+    await user.click(screen.getByRole("button", { name: /Restore from another folder/ }));
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: "Replace my data" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("restore_failure_shows_error_and_keeps_dialog", async () => {
