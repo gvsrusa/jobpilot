@@ -240,7 +240,7 @@ Exit tests not proven end to end:
 
 ## Release 1.0: Stable open-source distribution
 
-Status: built on `feat/v1.0-release`. The exit tests that need a real release are `PENDING-T8`; the table is below and in [release 1.0.0](releases/1.0.0.md#exit-tests).
+Status: released as v1.0.0 (2026-11-04). Signing waits on certificates, and the in-app update click-through and Windows update are owner hand-checks; the table is below and in [release 1.0.0](releases/1.0.0.md#exit-tests).
 
 Scope: signing and notarization, auto-update, security review, public docs. FR-1.8 installers were first delivered unsigned in 0.1; 1.0 signs them.
 
@@ -260,10 +260,10 @@ Gates: all five apply. Build means signed installers; migrations means upgrade t
 
 | Exit test | Result |
 |---|---|
-| Installers are signed (Windows) and signed and notarized (macOS) | PENDING-T8 (signing waits on certificates; the workflow signs when they exist and says so in the release body) |
-| Auto-update delivers and verifies a new version | Built and unit-tested (minisign against the pinned key). Update delivered from a release candidate to 1.0: PENDING-T8. Windows update: PENDING-T8. |
+| Installers are signed (Windows) and signed and notarized (macOS) | Not met yet: signing waits on certificates; the workflow signs when they exist |
+| Auto-update delivers and verifies a new version | Built and unit-tested (minisign against the pinned key). Published 1.0.0 manifest, download, and signature verified against the pinned key; macOS click-through and Windows update are owner hand-checks. |
 | Security review is complete and its findings are resolved or documented | Done: [review-1.0.md](security/review-1.0.md) |
 | Published docs: PRD, architecture, database schema, Connector SDK, security model, development guide, contribution guide, license, release notes | Done, all linked from the README |
 | License confirmed as Apache 2.0 | Done, unchanged |
-| Release builds are produced by GitHub Actions on Windows and macOS | Workflow written; first real run: PENDING-T8 |
+| Release builds are produced by GitHub Actions on Windows and macOS | Done: v1.0.0-rc.1 and v1.0.0 built on macOS (arm64, x64) and Windows |
 | Upgrade tests from every earlier release | Done (schemas 1, 5, 11, 12, 15, 17) |
