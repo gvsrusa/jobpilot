@@ -1622,3 +1622,34 @@ fn a_helper_button_does_not_cut_off_the_question() {
     assert_eq!(choice_guard(&info, "e2", &b), Err(Sensitive));
     assert_eq!(choice_guard(&info, "e3", &b), Ok(()));
 }
+
+/// S-2 (review-1.0): one counted click must be one click on the page, and must not open a
+/// page the proxy does not watch.
+#[test]
+fn a_click_is_one_plain_left_click() {
+    for args in [
+        json!({"target": "e14", "doubleClick": true}),
+        json!({"target": "e14", "button": "middle"}),
+        json!({"target": "e14", "button": "right"}),
+        json!({"target": "e14", "button": 1}),
+        json!({"target": "e14", "modifiers": ["Meta"]}),
+        json!({"target": "e14", "modifiers": ["Shift", "Control"]}),
+        json!({"target": "e14", "modifiers": "Shift"}),
+        json!({"target": "e14", "doubleClick": "yes"}),
+    ] {
+        assert_eq!(
+            refused_args("browser_click", &args, false),
+            Some("click_kind_refused"),
+            "{args}"
+        );
+    }
+    for args in [
+        json!({"target": "e14"}),
+        json!({"target": "e14", "doubleClick": false}),
+        json!({"target": "e14", "button": "left"}),
+        json!({"target": "e14", "modifiers": []}),
+        json!({"target": "e14", "button": "left", "modifiers": [], "doubleClick": false}),
+    ] {
+        assert_eq!(refused_args("browser_click", &args, false), None, "{args}");
+    }
+}
