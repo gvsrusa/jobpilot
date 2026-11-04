@@ -6,7 +6,7 @@ mod state;
 mod update;
 
 use jobpilot_core::AppPaths;
-use tauri::{AppHandle, Manager, RunEvent};
+use tauri::{AppHandle, Manager, RunEvent, Runtime};
 
 use pty::PtyState;
 use state::AppState;
@@ -41,6 +41,19 @@ fn sweep_orphans(app: AppHandle) {
             commands::sweep_at_start(&state).await;
         }
     });
+}
+
+/// The app's way out: the terminal closed, a copied answer cleared, running tasks ended. Run at
+/// `RunEvent::Exit`, and by a Windows update install, whose installer exits the process with no
+/// such event.
+pub(crate) async fn teardown<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(pty) = app.try_state::<PtyState>() {
+        pty.close();
+    }
+    commands::clear_copied(app).await;
+    if let Some(state) = app.try_state::<AppState>() {
+        state.shutdown().await;
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -79,11 +92,7 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if matches!(event, RunEvent::Exit) {
-                app.state::<PtyState>().close();
-                tauri::async_runtime::block_on(commands::clear_copied(app));
-                if let Some(state) = app.try_state::<AppState>() {
-                    tauri::async_runtime::block_on(state.shutdown());
-                }
+                tauri::async_runtime::block_on(teardown(app));
             }
         });
 }

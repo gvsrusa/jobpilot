@@ -1902,6 +1902,7 @@ pub async fn apply_start<R: Runtime>(
             .await?
             .ok_or(Error::Cancelled)?
     };
+    let _starting = crate::update::starting_run(&state)?;
     apply::start_confirmed(
         &*state.work().await?,
         ACTOR,
@@ -2123,6 +2124,7 @@ const COPILOT_HOLDS: &str = "a Copilot run holds this until you end its review s
 /// clicks submit.
 #[tauri::command]
 pub async fn copilot_start(state: State<'_, AppState>, application_id: String) -> Result<RunView> {
+    let _starting = crate::update::starting_run(&state)?;
     let running = state.ai.begin_as(Some(COPILOT_HOLDS))?;
     let db = state.work().await?;
     let router = Router::from_settings(&db).await?;
@@ -2166,6 +2168,8 @@ pub async fn autonomous_start<R: Runtime>(
     state: State<'_, AppState>,
     application_id: String,
 ) -> Result<RunView> {
+    // Held across the dialog too: an install refuses while a submission is being confirmed.
+    let _starting = crate::update::starting_run(&state)?;
     let application = agents::autonomous_check(&*state.work().await?, &application_id).await?;
     let message = format!(
         "Submit the application for {} at {} ({}) with no review by you?\n\nJobPilot fills \
@@ -2234,6 +2238,7 @@ mod tests {
             .manage(state)
             .manage(PtyState::default())
             .manage(NativeHook::default())
+            .manage(crate::update::UpdateState::default())
             .on_window_event(pty::on_window_event)
             .invoke_handler(handler())
             .build(mock_context(noop_assets()))
@@ -6123,6 +6128,49 @@ mod tests {
         let app = apply_ready(h);
         let run = h.ok("apply_start", json!({ "applicationIds": [app] }));
         run.as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn no_run_starts_while_an_update_installs() {
+        let h = ready();
+        let ready_id = ready_run(&h);
+        let fresh = apply_ready_with(&h, false);
+        let state = h.app.state::<AppState>();
+        let _installing = state.installing.try_write().unwrap();
+        for (cmd, args) in [
+            ("apply_start", json!({ "applicationIds": [fresh] })),
+            ("copilot_start", json!({ "applicationId": fresh })),
+            ("autonomous_start", json!({ "applicationId": fresh })),
+            (
+                "pty_open_apply",
+                json!({ "cols": 80, "rows": 24, "applyId": ready_id }),
+            ),
+        ] {
+            let error = h.call(cmd, args).unwrap_err();
+            assert_eq!(error["code"], "refused", "{cmd}");
+            assert!(
+                error["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("update_blocked_by_run"),
+                "{cmd}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_install_is_refused_while_a_run_is_starting() {
+        let h = ready();
+        let state = h.app.state::<AppState>();
+        let _starting = state.installing.try_read().unwrap();
+        assert_eq!(h.code("update_install", json!({})), "update_blocked_by_run");
+    }
+
+    #[test]
+    fn an_install_with_nothing_checked_fails_as_an_install_and_frees_runs() {
+        let h = ready();
+        assert_eq!(h.code("update_install", json!({})), "update_install_failed");
+        assert!(h.app.state::<AppState>().installing.try_write().is_ok());
     }
 
     #[test]

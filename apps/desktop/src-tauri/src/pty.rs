@@ -389,6 +389,7 @@ pub async fn pty_open_apply<R: Runtime>(
     apply_id: String,
 ) -> Result<()> {
     let size = checked_size(cols, rows)?;
+    drop(crate::update::starting_run(&app)?);
     let run = apply::view(&*app.work().await?, &apply_id).await?;
     if run.state != "ready" {
         return Err(Error::Refused("apply_run_not_ready".into()));
