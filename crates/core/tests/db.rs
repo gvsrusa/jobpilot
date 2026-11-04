@@ -634,11 +634,10 @@ async fn every_earlier_release_upgrades_to_1_0() {
             .unwrap();
         assert_eq!(docs, 1, "release {release}: document kept");
         if v >= 6 {
-            let apps: i64 =
-                sqlx::query_scalar("SELECT count(*) FROM applications WHERE id = 'a1'")
-                    .fetch_one(&db.pool)
-                    .await
-                    .unwrap();
+            let apps: i64 = sqlx::query_scalar("SELECT count(*) FROM applications WHERE id = 'a1'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
             assert_eq!(apps, 1, "release {release}: application kept");
         }
         let expected = usize::from(v < 17);
