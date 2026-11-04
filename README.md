@@ -4,9 +4,9 @@ JobPilot AI is a personal, non-commercial, open-source, local-first desktop appl
 
 Your data stays on your machine. There are no mandatory API keys, no API credits, no hosted backend, and no proprietary cloud account. The network use in 0.5 is a local Ollama server on this machine, the `claude` and optional `gemini` programs you already have installed, and, only if you add your own key and consent, a hosted provider's API (OpenAI, Anthropic, Google, or OpenRouter) or a server you name on your own computer. Release 0.5 adds one more: when you press Fetch, JobPilot reads a job source's public listings (see below). Release 0.6 adds browser automation: when you set it up and start a run, JobPilot downloads the Playwright browser runtime and Chromium once, and a visible browser opens application forms (see below). Every one of these is off until you turn it on or press it.
 
-## What works today (0.6)
+## What works today (1.0)
 
-Release 0.1 is the foundation. Release 0.2 adds your candidate profile and a first resume tool. Release 0.3 adds application tracking, career memory, a workflow runner with agent logs, a small analytics report, and an emergency pause. Release 0.4 adds more AI backends, all optional and all behind your consent. Release 0.5 adds job discovery and a job store with a score you can read. Release 0.6 adds application automation: Manual, Copilot, an Autonomous gate that nothing passes yet, and a Claude Code apply mode. The 0.6 build is a candidate: its tests pass, but every apply test ran on local fixture forms with a scripted stand-in for `claude`, no real site was opened, and several things were never run by a person (see the [0.6 release notes](docs/releases/0.6.0.md), the [0.5 release notes](docs/releases/0.5.0.md), the [0.4 release notes](docs/releases/0.4.0.md), the [0.3 release notes](docs/releases/0.3.0.md), and the [0.2 release notes](docs/releases/0.2.0.md)).
+Release 0.1 is the foundation. Release 0.2 adds your candidate profile and a first resume tool. Release 0.3 adds application tracking, career memory, a workflow runner with agent logs, a small analytics report, and an emergency pause. Release 0.4 adds more AI backends, all optional and all behind your consent. Release 0.5 adds job discovery and a job store with a score you can read. Release 0.6 adds application automation: Manual, Copilot, an Autonomous gate that nothing passes yet, and a Claude Code apply mode. Release 1.0 adds signed-when-certificates-exist installers built by GitHub Actions, verified in-app updates, a security review, and the public docs. Every apply test ran on local fixture forms with a scripted stand-in for `claude`, no real site was opened, and several things were never run by a person (see the [1.0 release notes](docs/releases/1.0.0.md), the [0.6 release notes](docs/releases/0.6.0.md), the [0.5 release notes](docs/releases/0.5.0.md), the [0.4 release notes](docs/releases/0.4.0.md), the [0.3 release notes](docs/releases/0.3.0.md), and the [0.2 release notes](docs/releases/0.2.0.md)).
 
 - Desktop app with status, documents, data, recovery, profile, resumes, AI, applications, memory, and agents views (Ctrl/Cmd+1 to 9), a Jobs view (Ctrl/Cmd+0), and a terminal panel (Ctrl+` shows it, F6 leaves it).
 - Applications you track by hand: status, history, and notes, offline. A summary of counts and rates on request.
@@ -40,9 +40,9 @@ Memory refresh spends paid or subscription usage and only runs when you press it
 
 ## Installing
 
-Installers come from the GitHub Releases of this repository. Each release says in its notes whether it is signed.
+Installers come from the GitHub Releases of this repository: `.dmg` (macOS, Apple silicon and Intel), `.msi` and an NSIS `.exe` (Windows x64). Each release says in its notes whether it is signed.
 
-**Signed release** ("Signed and notarized" in the release notes): macOS builds are signed with a Developer ID certificate and notarized, and Windows installers carry an Authenticode signature. Open them normally, with no Gatekeeper or SmartScreen workaround.
+**Signed release** ("Signed and notarized" in the release notes): macOS builds are signed with a Developer ID certificate and notarized, and Windows installers carry an Authenticode signature. Open them normally, with no Gatekeeper or SmartScreen workaround. A build is signed only when the project's certificates exist; until then, releases are unsigned.
 
 **Unsigned release** ("Unsigned: see README" in the release notes). Expect OS warnings:
 
@@ -51,7 +51,11 @@ Installers come from the GitHub Releases of this repository. Each release says i
 
 ### Updates
 
-JobPilot updates in the app. Open Status and choose Check for updates; the update is verified against the project's updater key before it installs. A check at launch is available but off by default, so the app makes no network call until you ask for one or turn it on.
+JobPilot updates in the app. Open Status and choose **Check for updates**, then **Install and restart**. The update is verified (minisign) against the updater key pinned in the app before it installs. An install is refused while the emergency pause is set or an apply run is active, and the result is written to the audit log (`update_installed`, `update_install_failed`). A check at launch is available but off by default, so the app makes no network call until you ask for one or turn it on. An installer signed with a key other than the one your copy ships with is rejected; see [development](docs/development.md#releasing) for key rotation.
+
+## Security
+
+Report a vulnerability through a GitHub private advisory; see [SECURITY.md](SECURITY.md). The 1.0 review and its findings are in [docs/security/review-1.0.md](docs/security/review-1.0.md).
 
 ## Building
 
@@ -62,14 +66,17 @@ See [docs/development.md](docs/development.md) and [CONTRIBUTING.md](CONTRIBUTIN
 - [Master spec](docs/superpowers/specs/2026-11-01-jobpilot-master-spec.md)
 - [Architecture and foundation plan](docs/superpowers/plans/2026-11-01-jobpilot-architecture-and-foundation.md)
 - [PRD](docs/prd.md)
+- [Architecture](docs/architecture.md)
+- [Database schema](docs/database-schema.md)
 - [Milestones](docs/milestones.md)
 - [Connector SDK](docs/connector-sdk.md)
-- [Release notes 0.6.0](docs/releases/0.6.0.md)
-- [Release notes 0.5.0](docs/releases/0.5.0.md)
-- [Release notes 0.4.0](docs/releases/0.4.0.md)
-- [Release notes 0.3.0](docs/releases/0.3.0.md)
-- [Release notes 0.2.0](docs/releases/0.2.0.md)
-- [AI providers](docs/ai-providers.md) and [threat model](docs/security/threat-model.md)
+- [Agent workflows](docs/agents.md)
+- [AI providers](docs/ai-providers.md)
+- [Policy register](docs/policy-register.md)
+- [Threat model](docs/security/threat-model.md) and [1.0 security review](docs/security/review-1.0.md)
+- [Security policy](SECURITY.md)
+- [Development guide](docs/development.md) and [contributing](CONTRIBUTING.md)
+- Release notes: [1.0.0](docs/releases/1.0.0.md), [0.6.0](docs/releases/0.6.0.md), [0.5.0](docs/releases/0.5.0.md), [0.4.0](docs/releases/0.4.0.md), [0.3.0](docs/releases/0.3.0.md), [0.2.0](docs/releases/0.2.0.md)
 - [Changelog](CHANGELOG.md)
 
 ## Stack

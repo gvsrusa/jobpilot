@@ -142,6 +142,38 @@ PATH="$STUB:$PATH" CC_x86_64_pc_windows_gnu="$STUB/x86_64-w64-mingw32-gcc" \
 ```
 
 
+## Releasing
+
+A release is built by `.github/workflows/release.yml` (GitHub Actions on macOS and Windows; every action is pinned to a commit SHA).
+
+1. Bump the version in `Cargo.toml` (workspace), `apps/desktop/package.json`, and `apps/desktop/src-tauri/tauri.conf.json`, run `cargo update -w`, and write `docs/releases/<version>.md` and the changelog entry.
+2. Check the build without releasing: run the workflow by hand (`workflow_dispatch`). It accepts only `dry_run: true`, builds the installers, and creates no release.
+3. Push a tag `v<version>`. The workflow builds a **draft** release with the `.dmg` (arm64 and x64), the `.msi`, the NSIS `.exe`, the updater `.sig` files, and `latest.json`. Read the draft, then publish it by hand.
+
+Signing is by what exists. macOS is signed and notarized when the `APPLE_*` secrets exist, Windows is Authenticode-signed when `WINDOWS_CERTIFICATE` exists, and anything else ships unsigned. The release body says which ("Signed and notarized" or "Unsigned: see README").
+
+**Repository secrets**
+
+| Secret | Used for |
+|---|---|
+| `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Signs the updater artifacts (minisign). Required for `latest.json` and the `.sig` files. |
+| `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY` | Developer ID signing of the macOS build. |
+| `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` | Notarization. |
+| `WINDOWS_CERTIFICATE`, `WINDOWS_CERTIFICATE_PASSWORD` | Authenticode signing of the Windows installers. |
+
+`GITHUB_TOKEN` is supplied by Actions. The updater key is visible to the build step (see S-3 in the [security review](security/review-1.0.md)).
+
+**Rotating the updater key**
+
+1. Generate a new pair: `pnpm tauri signer generate`.
+2. Replace `plugins.updater.pubkey` in `apps/desktop/src-tauri/tauri.conf.json` with the new public key.
+3. Set the repository secrets `TAURI_SIGNING_PRIVATE_KEY` (and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`) to the new private key.
+4. An installed copy verifies an update only against the key it ships with. A build signed with the new key cannot be installed by an older copy. Rotation therefore needs a **bridge release**: sign one release with the OLD key whose `tauri.conf.json` already carries the NEW public key, publish it, and sign later releases with the new key. Users who skip the bridge must install by hand.
+
+**Supply chain.** `deny.toml` configures `cargo-deny` (advisories, licenses, bans, sources). The `supply-chain` CI job runs `cargo-deny` and `pnpm audit --prod --audit-level high`; both must pass.
+
+**Upgrade tests.** The core tests open a database made by each earlier release (schemas 1, 5, 11, 12, 15, and 17) and check that it migrates to the current schema. Add a fixture when a release changes the schema.
+
 ## Where data lives
 
 All files live under one root: `JOBPILOT_HOME` if set, else the platform data directory for `io.github.gvsrusa.jobpilot`.

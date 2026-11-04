@@ -289,7 +289,7 @@ These two rules are taken verbatim from the spec and are not negotiable in any r
 | Job discovery through connectors | No |
 | Company research from the web | No |
 | Browser application automation against live sites | No |
-| Auto-update and release checks | No |
+| Auto-update and release checks | No by default. The launch check is opt-in (`updates.check_on_launch`, off); Check for updates in Status is a press. Neither runs unless asked. |
 
 ## 8. Success metrics
 
