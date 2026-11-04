@@ -2303,6 +2303,25 @@ async fn a_program_path_inside_the_data_root_is_refused() {
         .await
         .unwrap_err();
     assert!(message.contains("data folder"), "{alias:?}: {message}");
+
+    // A link outside the root whose last component points at the planted program.
+    #[cfg(unix)]
+    {
+        let outside = tempfile::tempdir().unwrap();
+        let link = outside.path().join(CLAUDE_NAME);
+        std::os::unix::fs::symlink(&planted, &link).unwrap();
+        settings::set(
+            &db,
+            claude_code::PATH_SETTING,
+            &json!(link.display().to_string()),
+        )
+        .await
+        .unwrap();
+        let message = claude_code::find_binary_quietly(Some(&db))
+            .await
+            .unwrap_err();
+        assert!(message.contains("data folder"), "{link:?}: {message}");
+    }
     db.close().await;
 }
 
