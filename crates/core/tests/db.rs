@@ -649,3 +649,15 @@ async fn every_earlier_release_upgrades_to_1_0() {
         db.close().await;
     }
 }
+
+/// S-7 (review-1.0): a root the app creates is user-only, wherever `JOBPILOT_HOME` points.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_new_data_root_is_user_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    let mode = fs::metadata(paths.root()).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o700, "mode {mode:o}");
+    db.close().await;
+}

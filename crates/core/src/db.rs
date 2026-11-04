@@ -143,7 +143,7 @@ impl Db {
 /// check comes before the marker check, so a second process racing a first open sees
 /// the marker with any file it saw, and is never refused.
 pub(crate) fn claim_root(paths: &AppPaths) -> Result<()> {
-    fs::create_dir_all(paths.root())?;
+    create_user_only(paths.root())?;
     let empty = fs::read_dir(paths.root())?.next().is_none();
     if paths.marker().is_file() {
         return Ok(());
@@ -160,6 +160,20 @@ pub(crate) fn claim_root(paths: &AppPaths) -> Result<()> {
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+/// The data root is user-only wherever it is (S-7, M-06): on Unix a root this creates is
+/// 0700, and so is any missing parent it creates. An existing folder keeps its mode. On
+/// Windows the user profile's ACL is what makes it user-only.
+fn create_user_only(root: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(root)
 }
 
 /// Takes the lock only if no other handle exists. `InUse` means one does.
