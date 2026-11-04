@@ -25,7 +25,7 @@
   "bundle": {
     "active": true,
     "createUpdaterArtifacts": true,
-    "targets": ["dmg", "nsis", "msi"],
+    "targets": ["app", "dmg", "nsis", "msi"],
     "externalBin": ["binaries/jobpilot"],
     "icon": [
       "icons/32x32.png",
