@@ -4,6 +4,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -66,7 +67,14 @@ impl Fake {
     /// Routes sharing a path form a queue, served in order. The last reply repeats.
     /// A path with no route answers 404.
     pub fn start(routes: Vec<(&'static str, Canned)>) -> Fake {
-        Fake::serving(routes, None)
+        Fake::serving(routes, None, None)
+    }
+
+    /// The browser tests' site: `GET /<name>` answers `<dir>/<name>.html`, `GET /done` a fixed
+    /// confirmation page, `POST /form` a `303` to `/done`, and any other `POST` a `204`. Every
+    /// request is recorded, so a form's body reads back through [`Fake::bodies`].
+    pub fn pages(dir: &Path) -> Fake {
+        Fake::serving(Vec::new(), None, Some(dir.to_path_buf()))
     }
 
     /// One path, answered by `answer` from each request's body. Any other path answers 404.
@@ -75,10 +83,14 @@ impl Fake {
         answer: impl Fn(&Value) -> Canned + Send + Sync + 'static,
     ) -> Fake {
         let unused = Canned::json(500, &Value::Null);
-        Fake::serving(vec![(path, unused)], Some(Arc::new(answer)))
+        Fake::serving(vec![(path, unused)], Some(Arc::new(answer)), None)
     }
 
-    fn serving(routes: Vec<(&'static str, Canned)>, answer: Option<Answer>) -> Fake {
+    fn serving(
+        routes: Vec<(&'static str, Canned)>,
+        answer: Option<Answer>,
+        pages: Option<PathBuf>,
+    ) -> Fake {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let seen: Seen = Arc::default();
@@ -97,7 +109,10 @@ impl Fake {
                 let queues = queues.clone();
                 let log = log.clone();
                 let answer = answer.clone();
-                std::thread::spawn(move || serve(stream, &queues, &log, answer.as_ref()));
+                let pages = pages.clone();
+                std::thread::spawn(move || {
+                    serve(stream, &queues, &log, answer.as_ref(), pages.as_deref())
+                });
             }
         });
         Fake { url, seen }
@@ -109,6 +124,13 @@ impl Fake {
         let hits = seen.iter().filter(|(p, _, _)| p == path);
         hits.map(|(_, _, body)| serde_json::from_str(body).unwrap_or(Value::Null))
             .collect()
+    }
+
+    /// The raw bodies sent to `path`, oldest first, read as text.
+    pub fn bodies(&self, path: &str) -> Vec<String> {
+        let seen = self.seen.lock().unwrap();
+        let hits = seen.iter().filter(|(p, _, _)| p == path);
+        hits.map(|(_, _, body)| body.clone()).collect()
     }
 
     /// Every request header line sent to `path`, lowercased, across all hits.
@@ -129,7 +151,50 @@ impl Fake {
     }
 }
 
-fn serve(mut stream: std::net::TcpStream, queues: &Queues, log: &Seen, answer: Option<&Answer>) {
+const DONE: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+    <title>Thank you</title></head><body><main><h1>Thank you</h1>\
+    <p>Your application was received.</p></main></body></html>";
+
+fn html(status: u16, body: String) -> Canned {
+    Canned {
+        status,
+        headers: vec![("Content-Type", "text/html; charset=utf-8".into())],
+        body,
+        hold: Duration::ZERO,
+        announced: None,
+    }
+}
+
+/// The reply of the [`Fake::pages`] site. A name is one plain word, so no path leaves `dir`.
+fn page(dir: &Path, method: &str, path: &str) -> Canned {
+    let empty = |status: u16| Canned {
+        headers: Vec::new(),
+        ..html(status, String::new())
+    };
+    match (method, path) {
+        ("POST", "/form") => empty(303).with_header("Location", "/done"),
+        ("POST", _) => empty(204),
+        ("GET", "/done") => html(200, DONE.into()),
+        ("GET", path) => {
+            let name = path.trim_start_matches('/');
+            let plain =
+                !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+            match plain.then(|| std::fs::read_to_string(dir.join(format!("{name}.html")))) {
+                Some(Ok(body)) => html(200, body),
+                _ => empty(404),
+            }
+        }
+        _ => empty(405),
+    }
+}
+
+fn serve(
+    mut stream: std::net::TcpStream,
+    queues: &Queues,
+    log: &Seen,
+    answer: Option<&Answer>,
+    pages: Option<&Path>,
+) {
     let mut raw = Vec::new();
     let mut buf = [0u8; 4096];
     let head_end = loop {
@@ -160,6 +225,7 @@ fn serve(mut stream: std::net::TcpStream, queues: &Queues, log: &Seen, answer: O
         raw.extend_from_slice(&buf[..n]);
     }
     let body = String::from_utf8_lossy(&raw[head_end..]).to_string();
+    let method = head.split_whitespace().next().unwrap_or("").to_string();
     let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
     let parsed = answer.map(|_| serde_json::from_str(&body).unwrap_or(Value::Null));
     log.lock().unwrap().push((path.clone(), head, body));
@@ -180,6 +246,10 @@ fn serve(mut stream: std::net::TcpStream, queues: &Queues, log: &Seen, answer: O
     let canned = match (canned, answer, parsed) {
         (Some(_), Some(answer), Some(body)) => Some(answer(&body)),
         (canned, ..) => canned,
+    };
+    let canned = match pages {
+        Some(dir) => Some(page(dir, &method, &path)),
+        None => canned,
     };
     let Some(canned) = canned else {
         let _ = stream.write_all(

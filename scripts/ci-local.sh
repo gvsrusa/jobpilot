@@ -45,7 +45,23 @@ keychain_suites() {
   # One thread: parallel keychain runs have hung here and shown macOS dialogs.
   JOBPILOT_SECRET_SERVICE=jobpilot-test cargo test --workspace -- --ignored \
     --skip real_claude --skip real_gemini --skip real_tls --skip make_fixtures \
-    --test-threads=1
+    --skip browser_e2e --skip serve_fixtures --test-threads=1
+}
+
+# The real Playwright server and a visible Chromium on the fixture forms. The runtime goes
+# under a temporary root, never the data folder.
+browser_e2e() {
+  local home status
+  home=$(mktemp -d)
+  cargo build -p jobpilot-cli &&
+    JOBPILOT_HOME="$home" JOBPILOT_SECRET_SERVICE=jobpilot-test \
+      ./target/debug/jobpilot browser setup &&
+    JOBPILOT_E2E_RUNTIME="$home/browser-runtime" JOBPILOT_SECRET_SERVICE=jobpilot-test \
+      cargo test -p jobpilot-core --test apply_browser -- --ignored --test-threads=1 \
+      --skip serve_fixtures
+  status=$?
+  rm -rf "$home"
+  return $status
 }
 
 step 'install' pnpm install --frozen-lockfile
@@ -57,6 +73,7 @@ step 'rust tests' cargo test --workspace --no-fail-fast
 step 'windows type-check' windows_check
 if [ "$fast" = false ]; then
   step 'keychain suites' keychain_suites
+  step 'browser end to end' browser_e2e
   step 'sidecar' pnpm --filter desktop sidecar
   step 'tauri build' pnpm tauri build --no-bundle
 fi

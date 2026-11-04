@@ -159,9 +159,16 @@ fn no_source_holds_a_bypass() {
         for word in banned {
             // `.no_proxy()` is the opposite of `proxy(`: it is the rule being kept.
             let hit = code.replace("no_proxy(", "").contains(word);
-            // The app has a CAPTCHA pause state in 0.6 only as a stop for a person: a word in
-            // an identifier or a string that says "stop" is still a name for it.
-            if hit {
+            // The apply guard and the proxy's `apply_pause` kinds name the CAPTCHA page as a stop
+            // for a person. Only that word.
+            let stop_word = word == "captcha"
+                && [
+                    "crates/core/src/apply/guard.rs",
+                    "crates/core/src/apply/proxy.rs",
+                ]
+                .iter()
+                .any(|file| path.ends_with(file));
+            if hit && !stop_word {
                 hits.push(format!("{path}: {word}"));
             }
         }

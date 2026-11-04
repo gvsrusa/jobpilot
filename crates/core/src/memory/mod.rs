@@ -17,8 +17,8 @@ pub use classify::{
 pub use search::{MemoryHit, index_missing, search};
 
 pub use usage::{
-    AppliedAnswer, AuthorizationAnswer, UsedAnswer, application_answers, authorization_for,
-    confirm_use, use_answer,
+    AppliedAnswer, ApprovedRow, AuthorizationAnswer, UsedAnswer, application_answers, approved_for,
+    authorization_for, confirm_use, use_answer,
 };
 
 use std::collections::HashMap;
@@ -264,6 +264,21 @@ fn clean_answer(text: &str) -> Result<&str> {
 /// The text of a question is untrusted: it is normalized, and what was hidden in it is
 /// reported. A `country` comes only from the caller, never from the words.
 pub async fn add_question(db: &Db, text: &str, country: Option<&str>) -> Result<Question> {
+    insert_question(db, text, country, "user").await
+}
+
+/// A question a form asked, kept with `form` provenance and no answer. One already in memory
+/// under the same key comes back as it is.
+pub async fn add_form_question(db: &Db, text: &str, country: Option<&str>) -> Result<Question> {
+    insert_question(db, text, country, "form").await
+}
+
+async fn insert_question(
+    db: &Db,
+    text: &str,
+    country: Option<&str>,
+    source: &str,
+) -> Result<Question> {
     let (text, findings) = knowledge::normalize(text);
     let text = text.trim();
     if text.chars().count() > QUESTION_LIMIT {
@@ -282,21 +297,38 @@ pub async fn add_question(db: &Db, text: &str, country: Option<&str>) -> Result<
     let row: Option<StoredQuestion> = sqlx::query_as(concat!(
         "INSERT INTO memory_questions (id, key, text, class, class_source, country, source, \
          findings, created_at, updated_at) \
-         VALUES (lower(hex(randomblob(16))), ?, ?, ?, 'rules', ?, 'user', ?, ",
+         VALUES (lower(hex(randomblob(16))), ?, ?, ?, 'rules', ?, ?, ?, ",
         now!(),
         ", ",
         now!(),
         ") ON CONFLICT(key) DO NOTHING RETURNING ",
         question_columns!()
     ))
-    .bind(key)
+    .bind(&key)
     .bind(text)
     .bind(rules::classify(text).as_str())
     .bind(country)
+    .bind(source)
     .bind(findings)
     .fetch_optional(&mut *write)
     .await?;
-    let row = row.ok_or_else(|| bad("this question is already in your memory"))?;
+    let row = match row {
+        Some(row) => row,
+        None if source == "form" => {
+            write.rollback().await?;
+            return sqlx::query_as::<_, StoredQuestion>(concat!(
+                "SELECT ",
+                question_columns!(),
+                " FROM memory_questions WHERE key = ?"
+            ))
+            .bind(&key)
+            .fetch_optional(&db.pool)
+            .await?
+            .ok_or_else(changed)?
+            .question();
+        }
+        None => return Err(bad("this question is already in your memory")),
+    };
     search::reindex(&mut write, &row.id).await?;
     write.commit().await?;
     row.question()

@@ -3,7 +3,9 @@
 mod agents;
 mod ai;
 mod analytics;
+mod apply;
 mod apps;
+mod browser_cmd;
 mod data;
 mod jobs;
 mod memory;
@@ -78,9 +80,21 @@ pub enum Command {
     /// AI providers, models, and consent.
     #[command(subcommand)]
     Ai(ai::AiCommand),
+    /// The browser runtime that automation drives.
+    #[command(subcommand)]
+    Browser(browser_cmd::BrowserCommand),
     /// Stop all automation.
     #[command(subcommand)]
     Pause(pause::PauseCommand),
+    /// Claude Code apply runs.
+    #[command(subcommand)]
+    Apply(apply::ApplyCommand),
+    /// The MCP server an apply session talks to. Started by the session, not by hand.
+    #[command(hide = true)]
+    ApplyMcp {
+        #[arg(long)]
+        dir: std::path::PathBuf,
+    },
     /// Restricted prompt used by the app's terminal panel.
     Shell,
 }
@@ -93,6 +107,8 @@ impl Command {
     /// ever takes something away.
     pub fn refused_in_panel(&self) -> bool {
         use ai::{AiCommand, ConsentCommand};
+        use apply::ApplyCommand;
+        use browser_cmd::BrowserCommand;
         use data::{BackupCommand, DataCommand};
         use jobs::JobCommand;
         use memory::MemoryCommand;
@@ -121,6 +137,17 @@ impl Command {
                         | DataCommand::DiscardLocked { .. }
                 )
                 | Command::Pause(PauseCommand::Clear)
+                | Command::Browser(BrowserCommand::Setup)
+                | Command::Apply(
+                    ApplyCommand::Start { .. }
+                        | ApplyCommand::Session { .. }
+                        | ApplyCommand::Copilot { .. }
+                        | ApplyCommand::Autonomous(
+                            apply::AutonomousCommand::Grant { .. }
+                                | apply::AutonomousCommand::Run { .. }
+                        )
+                )
+                | Command::ApplyMcp { .. }
                 | Command::Kb(KbCommand::Reveal { .. })
                 | Command::Memory(
                     MemoryCommand::Approve { .. }
@@ -295,6 +322,14 @@ fn message(error: &Error) -> String {
         Error::Paused => "Emergency pause is on, so nothing automated runs. Clear it with \
                           `jobpilot pause clear` in an ordinary terminal, or from the title bar."
             .into(),
+        Error::ManualRequired(reason) if reason == "no_node" => {
+            "Install Node 20 or later (nodejs.org), then run `jobpilot browser setup`.".into()
+        }
+        Error::ManualRequired(reason) if reason == "node_too_old" => {
+            "The Node on this computer is older than 20. Install Node 20 or later, then run \
+             `jobpilot browser setup`. `jobpilot browser status` shows the version found."
+                .into()
+        }
         Error::ManualRequired(reason) if reason == "no_evidence" => {
             "There is no approved knowledge to work from. Add an item with `jobpilot kb add \
              <kind> <text>`, approve it with `jobpilot kb approve <id>` (`jobpilot kb list` \
@@ -380,6 +415,17 @@ fn message(error: &Error) -> String {
         Error::ManualRequired(reason) if reason == "no_api_model" => {
             "No model is chosen for this provider. Set one with `jobpilot ai model <provider> \
              <id>`, or on the AI screen."
+                .into()
+        }
+        Error::Refused(reason) if reason == "copilot_blocked" => {
+            "The policy register blocks filling forms on this site, so Copilot started \
+             nothing. Apply on the site yourself (Manual mode)."
+                .into()
+        }
+        Error::Refused(reason) if reason == "copilot_unknown" => {
+            "The policy register has no clear answer on whether tools may fill forms on this \
+             site, so Copilot treats it as blocked and started nothing. Apply on the site \
+             yourself (Manual mode)."
                 .into()
         }
         Error::Refused(reason) if source_reason(reason).is_some() => {
@@ -474,7 +520,13 @@ async fn with_db(db: &Db, command: Command) -> Result<Output> {
         Command::Agents(command) => agents::agents(db, command).await,
         Command::Analytics(command) => analytics::analytics(db, command).await,
         Command::Ai(command) => ai::ai(db, command).await,
+        Command::Browser(command) => browser_cmd::browser(db, command).await,
         Command::Pause(command) => pause::pause(db, command).await,
+        Command::Apply(command) => apply::apply(db, command).await,
+        Command::ApplyMcp { dir } => {
+            apply::mcp(db, &dir).await?;
+            out(serde_json::json!(null), String::new())
+        }
         // `main` and the shell handle this before any command runs.
         Command::Shell => Err(Error::PanelRefused),
     }
@@ -597,6 +649,30 @@ mod tests {
         ("agents resume r", false),
         ("analytics report", false),
         ("analytics show", false),
+        ("browser status", false),
+        ("browser setup", true),
+        ("apply preflight i", false),
+        ("apply start i --release-sealed", true),
+        ("apply start i", true),
+        ("apply session i", true),
+        ("apply-mcp --dir d", true),
+        ("apply status", false),
+        ("apply show r", false),
+        ("apply resolve p continue", false),
+        ("apply resolve p take-over", false),
+        ("apply settle r", false),
+        ("apply cancel r", false),
+        ("apply material a", false),
+        ("apply copilot a", true),
+        ("apply autonomous list", false),
+        ("apply autonomous grant c", true),
+        ("apply autonomous revoke c", false),
+        ("apply autonomous run a", true),
+        ("apply record a --outcome applied", false),
+        (
+            "apply record a --outcome applied --on 2026-11-02 --note n",
+            false,
+        ),
         ("pause set", false),
         ("pause status", false),
         ("pause clear", true),

@@ -1,0 +1,12 @@
+- generic [ref=e1]:
+  - heading "Software Engineer" [level=1] [ref=e2]
+  - textbox "Full name *" [ref=e3]: Alex Doe
+  - textbox "Email *" [ref=e4]: prefill@x.io
+  - textbox "Phone" [ref=e5]
+  - combobox "Country" [ref=e8]:
+    - option "United States"
+    - option "Canada"
+  - checkbox "Send me job alerts" [checked] [ref=e10]
+  - button "Resume" [ref=e12]
+  - button "Apply now" [ref=e13]
+  - button "Submit application" [ref=e14]

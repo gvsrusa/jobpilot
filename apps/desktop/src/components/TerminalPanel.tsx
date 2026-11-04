@@ -2,9 +2,11 @@ import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ErrorAlert } from "@/components/ErrorAlert";
 import { Button } from "@/components/ui/button";
-import { onPtyData, onPtyExit, ptyAck, ptyClose, ptyOpen, ptyResize, ptyWrite } from "@/lib/ipc";
+import { ipc, onPtyData, onPtyExit, ptyAck, ptyClose, ptyOpen, ptyOpenApply, ptyResize, ptyWrite } from "@/lib/ipc";
+import { useUiStore } from "@/lib/store";
 import { cn } from "@/lib/utils";
 
 /** Output is untrusted, so a link in it (OSC 8) must never open anything. */
@@ -14,10 +16,21 @@ export const TERMINAL_OPTIONS = {
   linkHandler: { activate: () => undefined },
 };
 
+/** A run left `ready` with no session would block the next one: end it. */
+function dropRun(id: string) {
+  void ipc.applyCancel(id).catch(() => undefined);
+  const { applyRun, applyHost, setApplyRun } = useUiStore.getState();
+  if (applyHost && applyRun === id) setApplyRun(null);
+}
+
 /**
  * The bottom panel. A session starts when the panel first opens and lives until Close panel,
  * Restart, or unmount: hiding the panel keeps it, so Ctrl+` cannot end a Claude session.
  * Scrollback lives in this memory only and is never stored.
+ *
+ * With `applyRun` set, the session is that run's host, opened by `ptyOpenApply` with the run
+ * id alone. A shell already open is ended only after the owner says so. Nothing reads the
+ * output: the run reports through its own rows.
  */
 export function TerminalPanel({ open, onClose }: { open: boolean; onClose(): void }) {
   const host = useRef<HTMLDivElement>(null);
@@ -32,6 +45,33 @@ export function TerminalPanel({ open, onClose }: { open: boolean; onClose(): voi
   const [writeError, setWriteError] = useState<unknown>(null);
   const [ended, setEnded] = useState(false);
   const [typed, setTyped] = useState(false);
+  // Only a run marked for hosting reaches the panel: a view-only one is not its business.
+  const applyRun = useUiStore((s) => (s.applyHost ? s.applyRun : null));
+  // The run the next open hosts, read once: a reopen after it is a shell.
+  const launch = useRef<string | null>(null);
+  // The run the current session hosts, for the header.
+  const [hosting, setHosting] = useState<string | null>(null);
+  // Runs this panel has hosted: never opened again, and never cancelled from here.
+  const hosted = useRef(new Set<string>());
+  // A run waiting for the owner to end the open session.
+  const [asking, setAsking] = useState<string | null>(null);
+  // A session is open and has not ended.
+  const live = useRef(false);
+
+  useEffect(() => {
+    if (!applyRun) {
+      launch.current = null;
+      return;
+    }
+    if (hosted.current.has(applyRun)) return;
+    if (live.current) {
+      setAsking(applyRun);
+    } else {
+      launch.current = applyRun;
+      setWanted(true);
+      setRun((n) => n + 1);
+    }
+  }, [applyRun]);
 
   useEffect(() => {
     if (!open) return;
@@ -54,17 +94,35 @@ export function TerminalPanel({ open, onClose }: { open: boolean; onClose(): voi
     let stopped = false;
     let finished = false;
     const unlisten: (() => void)[] = [];
+    // Taken once the open is tried, not here: StrictMode runs this twice in development.
+    const target = launch.current;
+    setHosting(target);
     const opened = turn.current.then(async () => {
       if (stopped) return;
       unlisten.push(
         await onPtyData((bytes) => term.write(bytes, () => void ptyAck(bytes.length))),
         await onPtyExit(() => {
           finished = true;
+          live.current = false;
           setEnded(true);
         }),
       );
       await ptyClose();
-      if (!stopped) await ptyOpen(term.cols, term.rows);
+      if (stopped) return;
+      if (target) {
+        if (launch.current === target) launch.current = null;
+        try {
+          await ptyOpenApply(term.cols, term.rows, target);
+        } catch (error) {
+          // A run that never had a session would block the next one.
+          if (!hosted.current.has(target)) dropRun(target);
+          throw error;
+        }
+        hosted.current.add(target);
+      } else {
+        await ptyOpen(term.cols, term.rows);
+      }
+      if (!stopped && !finished) live.current = true;
     });
     opened.catch((error: unknown) => {
       finished = true;
@@ -88,6 +146,7 @@ export function TerminalPanel({ open, onClose }: { open: boolean; onClose(): voi
 
     return () => {
       stopped = true;
+      live.current = false;
       window.removeEventListener("resize", refit);
       key.dispose();
       input.dispose();
@@ -117,8 +176,15 @@ export function TerminalPanel({ open, onClose }: { open: boolean; onClose(): voi
   };
 
   const closePanel = () => {
+    launch.current = null;
     setWanted(false);
     onClose();
+  };
+
+  // A run's host cannot be opened again once it has started: Restart goes back to the shell.
+  const restart = () => {
+    launch.current = null;
+    setRun((n) => n + 1);
   };
 
   return (
@@ -131,12 +197,12 @@ export function TerminalPanel({ open, onClose }: { open: boolean; onClose(): voi
       <header className="flex items-center justify-between gap-4 border-b px-4 py-1">
         <span className="flex items-baseline gap-3">
           <span className="font-semibold">Terminal</span>
-          <span className="text-sm text-muted-foreground">jobpilot CLI only</span>
+          <span className="text-sm text-muted-foreground">{hosting ? "Claude Code apply run" : "jobpilot CLI only"}</span>
         </span>
         <span className="flex items-center gap-2">
           {ended && <span role="status" className="text-sm text-muted-foreground">Session ended.</span>}
           {(failure || ended) && (
-            <Button size="sm" onClick={() => setRun((n) => n + 1)}>
+            <Button size="sm" onClick={restart}>
               Restart
             </Button>
           )}
@@ -160,6 +226,27 @@ export function TerminalPanel({ open, onClose }: { open: boolean; onClose(): voi
       <footer className="border-t px-4 py-1 text-sm text-muted-foreground">
         Runs the same services as the app. Output is not saved.
       </footer>
+      {asking && (
+        <ConfirmDialog
+          title="Start the apply run here?"
+          confirmLabel="End session"
+          busyLabel="Ending..."
+          confirmVariant="default"
+          pending={false}
+          onConfirm={() => {
+            setAsking(null);
+            launch.current = asking;
+            setWanted(true);
+            setRun((n) => n + 1);
+          }}
+          onCancel={() => {
+            setAsking(null);
+            dropRun(asking);
+          }}
+        >
+          <p>This ends the terminal session.</p>
+        </ConfirmDialog>
+      )}
     </section>
   );
 }

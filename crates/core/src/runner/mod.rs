@@ -20,7 +20,7 @@ use crate::pause;
 use crate::render::Template;
 
 mod perms;
-pub(crate) mod store;
+pub mod store;
 
 pub use perms::{AgentSpec, Permission, spec_of};
 
@@ -32,7 +32,7 @@ const HEARTBEAT: Duration = Duration::from_secs(2);
 /// How long a step has to end after its token fires. Then it is dropped, which kills any child.
 const GRACE: Duration = Duration::from_secs(5);
 /// A row quiet for this long lost its process. Far above `HEARTBEAT`, so a slow beat is safe.
-const STALE: Duration = Duration::from_secs(30);
+pub(crate) const STALE: Duration = Duration::from_secs(30);
 /// Reasons a model task can end on beside the router's own.
 const MANUAL_REASONS: &[&str] = &["no_ai", "no_evidence"];
 const RUN_STEP: &str = "run";
@@ -52,6 +52,8 @@ pub enum Agent {
     Discovery,
     Matching,
     Research,
+    BrowserApplication,
+    ClaudeApply,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +117,10 @@ pub enum RunInput {
         application_id: String,
         status: String,
         on: Option<String>,
+        /// A Manual-mode record, whose `applied` also writes the submission row. A flag, so
+        /// the row holds no text; older rows read false.
+        #[serde(default)]
+        manual: bool,
     },
     Analytics,
     Discovery {
@@ -128,6 +134,13 @@ pub enum RunInput {
     /// A hex company id: no text.
     Research {
         company_id: String,
+    },
+    /// A hex apply-run id: the items and their files live in `apply_runs`.
+    BrowserApply {
+        apply_id: String,
+    },
+    ClaudeApply {
+        apply_id: String,
     },
 }
 

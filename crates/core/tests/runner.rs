@@ -467,6 +467,43 @@ fn permission_sets_match_the_spec_table() {
             ],
             Duration::from_secs(10 * 60),
         ),
+        (
+            Agent::ClaudeApply,
+            &[
+                ReadProfileBasic,
+                ReadCareerMemory,
+                ReadSensitive,
+                ReadApplications,
+                WriteApplications,
+                WriteCareerMemory,
+                ReadJobText,
+                BrowserDrive,
+                BrowserFill,
+                BrowserUpload,
+                BrowserSubmit,
+            ],
+            Duration::from_secs(8 * 60 * 60),
+        ),
+        (
+            Agent::BrowserApplication,
+            &[
+                ReadProfileBasic,
+                ReadCareerMemory,
+                ReadSensitive,
+                ReadApplications,
+                WriteApplications,
+                WriteCareerMemory,
+                ReadJobText,
+                BrowserDrive,
+                BrowserFill,
+                BrowserUpload,
+                BrowserSubmit,
+                ApplyOpenLink,
+                ApplySupply,
+                Model(TaskType::MapFormField),
+            ],
+            Duration::from_secs(2 * 60 * 60),
+        ),
     ];
     for (agent, permissions, timeout) in table {
         let spec = spec_of(*agent);
@@ -498,6 +535,7 @@ fn no_permission_names_a_forbidden_power() {
         Model(TaskType::Embed),
         Model(TaskType::SemanticMatch),
         Model(TaskType::SummarizeCompany),
+        Model(TaskType::MapFormField),
         EmbedLocal,
         ReadMatches,
         WriteJobs,
@@ -511,6 +549,38 @@ fn no_permission_names_a_forbidden_power() {
         for word in ["shell", "secret", "approve", "path", "browser", "pause"] {
             assert!(!name.contains(word), "{name}");
         }
+    }
+    // The 0.6 names say "browser" on purpose; none of them names any other forbidden power.
+    let browser = [
+        ApplyOpenLink,
+        ApplySupply,
+        BrowserDrive,
+        BrowserFill,
+        BrowserUpload,
+        BrowserSubmit,
+    ];
+    for permission in browser {
+        let name = format!("{permission:?}").to_lowercase();
+        for word in ["shell", "secret", "approve", "path", "pause"] {
+            assert!(!name.contains(word), "{name}");
+        }
+    }
+    // Copilot may ask `map_form_field` to name an answer by its id, and no other task. The
+    // Claude Code session asks the router nothing.
+    for (agent, model) in [
+        (Agent::ClaudeApply, None),
+        (Agent::BrowserApplication, Some(TaskType::MapFormField)),
+    ] {
+        let held = spec_of(agent).permissions;
+        assert!(
+            !held.iter().any(|p| matches!(p, NetConnector | EmbedLocal)
+                || matches!(p, Model(task) if Some(*task) != model)),
+            "{agent:?}"
+        );
+        assert!(
+            held.iter().all(|p| !matches!(p, WriteDrafts | WriteJobs)),
+            "{agent:?}"
+        );
     }
 }
 
@@ -702,8 +772,9 @@ async fn a_cancel_requested_elsewhere_stops_the_run() {
     let done = done.unwrap();
     assert_eq!(done.state, RunState::Cancelled);
     assert!(cancel.is_cancelled(), "the token fires for the step");
+    // ponytail: 2 s, not 1: a Windows CI runner measured 1.03 s (the watch polls every 250 ms).
     assert!(
-        clock.elapsed() < Duration::from_secs(1),
+        clock.elapsed() < Duration::from_secs(2),
         "{:?}",
         clock.elapsed()
     );
@@ -1549,4 +1620,145 @@ async fn a_newer_generation_fires_the_token_of_the_old_process() {
     assert!(cancel.is_cancelled());
     assert_eq!(done.unwrap().reason.as_deref(), Some("taken_over"));
     assert!(!workflow.abandoned.load(Ordering::SeqCst));
+}
+
+/// An apply run does not resume: a live page cannot (decision 21).
+#[test]
+fn an_apply_run_input_round_trips_by_kind() {
+    let input = RunInput::ClaudeApply {
+        apply_id: ID.into(),
+    };
+    let text = serde_json::to_string(&input).unwrap();
+    assert!(text.contains("\"kind\":\"claude_apply\""), "{text}");
+    let input = RunInput::BrowserApply {
+        apply_id: ID.into(),
+    };
+    let text = serde_json::to_string(&input).unwrap();
+    assert!(text.contains("\"kind\":\"browser_apply\""), "{text}");
+}
+
+#[tokio::test]
+async fn an_apply_run_does_not_resume() {
+    let (_tmp, db) = setup().await;
+    for (agent, kind) in [
+        (Agent::ClaudeApply, "claude_apply"),
+        (Agent::BrowserApplication, "browser_apply"),
+    ] {
+        let id = format!("{:0>32}", kind.len());
+        sqlx::query(
+            "INSERT INTO agent_runs (id, agent, state, actor, input, step, steps, heartbeat_at, \
+             created_at) VALUES (?, ?, 'halted', 'gui', ?, 0, 1, \
+             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(&id)
+        .bind(serde_json::to_string(&agent).unwrap().trim_matches('"'))
+        .bind(format!("{{\"kind\":\"{kind}\",\"apply_id\":\"{ID}\"}}"))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let router = jobpilot_core::ai::router::Router::from_settings(&db)
+            .await
+            .unwrap();
+        let error = agents::resume_run(&db, &router, "gui", &id, token())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::Validation(m) if m == "an apply run does not resume; start a new run"),
+            "{kind}: {error:?}"
+        );
+    }
+}
+
+/// A run waiting for a person is still the process's run: a pause halts it and a cancel
+/// ends it, instead of reading as lost.
+async fn waiting_run(db: &Db, workflow: &Script, cancel: CancellationToken) -> runner::Finished {
+    let other = Db::open(db.paths()).await.unwrap();
+    let meddle = async {
+        wait_for_running(db).await;
+        let id = run_id(db).await;
+        runner::store::set_waiting(&other, &id, true).await.unwrap();
+        let state: String = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "waiting_for_human");
+        other
+    };
+    let (done, other) = tokio::join!(
+        runner::start_with(db, "gui", workflow, cancel, hurried()),
+        meddle
+    );
+    other.close().await;
+    done.unwrap()
+}
+
+#[tokio::test]
+async fn a_run_waiting_for_a_person_can_be_halted_and_cancelled() {
+    let (_tmp, db) = setup().await;
+    let workflow = script(Agent::Tracking, ONE, |ctx, _| Box::pin(until_stopped(ctx)));
+    let cancel = token();
+    let (done, ()) = tokio::join!(waiting_run(&db, &workflow, cancel.clone()), async {
+        wait_for(
+            &db,
+            "SELECT count(*) FROM agent_runs WHERE state = 'waiting_for_human'",
+        )
+        .await;
+        jobpilot_core::pause::set(&db, "cli").await.unwrap();
+    });
+    assert_eq!(done.state, RunState::Halted);
+    assert_eq!(done.reason.as_deref(), Some("paused"));
+    jobpilot_core::pause::clear(&db, "cli").await.unwrap();
+
+    let workflow = script(Agent::Tracking, ONE, |ctx, _| Box::pin(until_stopped(ctx)));
+    let (done, ()) = tokio::join!(waiting_run(&db, &workflow, token()), async {
+        wait_for(
+            &db,
+            "SELECT count(*) FROM agent_runs WHERE state = 'waiting_for_human'",
+        )
+        .await;
+        let id = run_id(&db).await;
+        agents::cancel_run(&db, "gui", &id).await.unwrap();
+    });
+    assert_eq!(done.state, RunState::Cancelled);
+}
+
+#[tokio::test]
+async fn set_waiting_moves_only_a_live_run_and_leaves_a_log_row_with_no_text() {
+    let (_tmp, db) = setup().await;
+    let workflow = script(Agent::Tracking, ONE, |ctx, _| Box::pin(until_stopped(ctx)));
+    let cancel = token();
+    let stop = cancel.clone();
+    let (done, ()) = tokio::join!(
+        runner::start_with(&db, "gui", &workflow, cancel, hurried()),
+        async {
+            wait_for_running(&db).await;
+            let id = run_id(&db).await;
+            runner::store::set_waiting(&db, &id, true).await.unwrap();
+            runner::store::set_waiting(&db, &id, false).await.unwrap();
+            let log = runner::get(&db, &id).await.unwrap().log;
+            let states: Vec<RunState> = log.iter().map(|row| row.state).collect();
+            assert!(states.contains(&RunState::WaitingForHuman), "{states:?}");
+            let waiting = log
+                .iter()
+                .find(|row| row.state == RunState::WaitingForHuman)
+                .unwrap();
+            assert_eq!(waiting.outcome, "waiting");
+            assert_eq!(waiting.provider, None);
+            assert!(waiting.data_categories.is_empty());
+            stop.cancel();
+        }
+    );
+    let done = done.unwrap();
+    assert_eq!(done.state, RunState::Cancelled);
+    // A finished run is not moved back.
+    runner::store::set_waiting(&db, &done.run_id, true)
+        .await
+        .unwrap();
+    let state: String = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+        .bind(&done.run_id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "cancelled");
 }

@@ -464,10 +464,13 @@ async fn a_short_wait_is_slept_and_a_long_one_is_refused() {
     let (_t, db) = open().await;
     let fake = Fake::start(vec![(FEED, ok())]);
     let fetcher = Fetcher::for_test(&fake.url).unwrap();
-    go(&fetcher, &db, &conn(&SLOW)).await.unwrap();
+    // The slot counts from the first request's stamp, so the clock starts before that
+    // request: measured from after it, a slow first request made the sleep look short. The
+    // wall clock the stamp uses may differ a little from this one: 20% short is allowed.
     let began = Instant::now();
     go(&fetcher, &db, &conn(&SLOW)).await.unwrap();
-    assert!(began.elapsed() >= Duration::from_millis(300));
+    go(&fetcher, &db, &conn(&SLOW)).await.unwrap();
+    assert!(began.elapsed() >= Duration::from_millis(320));
     assert_eq!(fake.paths().len(), 2);
     go(&fetcher, &db, &conn(&HOURLY)).await.unwrap();
     assert!(matches!(

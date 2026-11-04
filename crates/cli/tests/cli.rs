@@ -3500,3 +3500,431 @@ async fn a_cut_job_list_says_how_many_are_shown() {
     let few = stdout_of(&run(&home, &["job", "search", "199"]));
     assert!(!few.contains(" shown."), "{few}");
 }
+
+// ---- Claude Code apply runs ----
+
+/// A saved application with an uploaded resume and letter, and the consent a run needs.
+async fn apply_ready_home(home: &Path) -> String {
+    use jobpilot_core::ai::claude_code::PROVIDER;
+    use jobpilot_core::ai::{DataCategory, consent};
+    use jobpilot_core::applications::{self, ApplicationInput};
+    use jobpilot_core::drafts;
+    use jobpilot_core::render::{Entry, ResumeDoc, Section};
+    let db = Db::open(&AppPaths::new(home)).await.unwrap();
+    let doc = |title: &str| ResumeDoc {
+        name: "Ada Lovelace".into(),
+        contact: vec!["ada@example.com".into()],
+        summary: Vec::new(),
+        sections: vec![Section {
+            heading: "Experience".into(),
+            entries: vec![Entry {
+                bullets: vec![title.into()],
+                ..Entry::default()
+            }],
+        }],
+    };
+    let mut drafts_made = Vec::new();
+    for kind in ["resume", "cover_letter"] {
+        let title = format!("Acme {kind}");
+        let made = drafts::create_version(
+            &db,
+            kind,
+            None,
+            "uploaded",
+            &title,
+            None,
+            None,
+            doc(&title),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        drafts_made.push(made.id);
+    }
+    let input = ApplicationInput {
+        company: "Acme".into(),
+        role: "Engineer".into(),
+        link: "https://boards.greenhouse.io/acme/jobs/1".into(),
+        resume_draft_id: Some(drafts_made[0].clone()),
+        letter_draft_id: Some(drafts_made[1].clone()),
+        ..ApplicationInput::default()
+    };
+    let app = applications::add(&db, "cli", input).await.unwrap().id;
+    let categories = [
+        DataCategory::JobText,
+        DataCategory::ProfileBasic,
+        DataCategory::CareerMemory,
+    ];
+    consent::give(&db, PROVIDER, &categories, "2026-11-01", "cli")
+        .await
+        .unwrap();
+    db.close().await;
+    app
+}
+
+fn node_bin() -> PathBuf {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .flat_map(|dir| ["node", "node.exe"].map(|name| dir.join(name)))
+        .find(|candidate| candidate.is_file())
+        .expect("node is needed for this test")
+}
+
+/// The scripted fake `claude` behind a wrapper with its variables, and the fake Playwright
+/// server. Returns the wrapper, the fake's record file, and the Playwright entry.
+fn fake_apply_claude(dir: &Path, steps: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let core = Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/tests");
+    let snapshot = dir.join("snapshot.yml");
+    std::fs::copy(core.join("fixtures/forms/snapshots/form.yml"), &snapshot).unwrap();
+    let scenario = dir.join("scenario.json");
+    std::fs::write(&scenario, steps).unwrap();
+    let record = dir.join("record.jsonl");
+    let server = core.join("mock-mcp/server.mjs");
+    let url = format!("file://{}", server.display()).replace('\\', "/");
+    let script = format!(
+        "process.env.MOCK_SNAPSHOT = {};\nawait import({});\n",
+        serde_json::json!(snapshot.display().to_string()),
+        serde_json::json!(url),
+    );
+    let playwright = dir.join("playwright.mjs");
+    std::fs::write(&playwright, script).unwrap();
+    let vars = [
+        ("JOBPILOT_FAKE_SCENARIO", scenario.display().to_string()),
+        ("JOBPILOT_FAKE_RECORD", record.display().to_string()),
+        (
+            "JOBPILOT_FAKE_REPLIES",
+            dir.join("replies.jsonl").display().to_string(),
+        ),
+        ("JOBPILOT_PLAYWRIGHT_CLI", playwright.display().to_string()),
+        ("JOBPILOT_NODE_BIN", node_bin().display().to_string()),
+        ("JOBPILOT_SECRET_SERVICE", "jobpilot-test".to_string()),
+    ];
+    #[cfg(unix)]
+    let bin = {
+        use std::os::unix::fs::PermissionsExt;
+        let mut text = String::from("#!/bin/sh\n");
+        for (name, value) in &vars {
+            text.push_str(&format!("export {name}='{value}'\n"));
+        }
+        text.push_str(&format!(
+            "exec '{}' '{}' \"$@\"\n",
+            node_bin().display(),
+            core.join("mock-claude-apply/claude").display()
+        ));
+        let bin = dir.join("claude");
+        std::fs::write(&bin, text).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    };
+    #[cfg(windows)]
+    let bin = {
+        let mut text = String::from("@echo off\r\n");
+        for (name, value) in &vars {
+            text.push_str(&format!("set \"{name}={value}\"\r\n"));
+        }
+        text.push_str(&format!(
+            "call \"{}\" %*\r\nexit /b %ERRORLEVEL%\r\n",
+            core.join("mock-claude-apply/claude.cmd").display()
+        ));
+        let bin = dir.join("claude.cmd");
+        std::fs::write(&bin, text).unwrap();
+        bin
+    };
+    (bin, record, playwright)
+}
+
+#[tokio::test]
+async fn apply_start_runs_a_scripted_session_from_an_ordinary_terminal() {
+    let (dir, home) = fresh_home();
+    let app = apply_ready_home(&home).await;
+    let steps = r#"[{"tool": "apply_next"}, {"tool": "browser_snapshot"},
+        {"tool": "browser_click", "args": {"target": "e14"}},
+        {"tool": "apply_result", "args": {"outcome": "submitted"}},
+        {"tool": "apply_next"}]"#;
+    let (bin, record, playwright) = fake_apply_claude(dir.path(), steps);
+    let bin = bin.display().to_string();
+    let playwright = playwright.display().to_string();
+    let env = [
+        ("JOBPILOT_CLAUDE_BIN", bin.as_str()),
+        ("JOBPILOT_PLAYWRIGHT_CLI", playwright.as_str()),
+    ];
+
+    let output = run_env(&home, &["apply", "start", &app], &env);
+
+    assert!(output.status.success(), "{}", stderr_text(&output));
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(text.contains("browser runtime: ready"), "{text}");
+    assert!(
+        text.contains("1. boards.greenhouse.io: submitted"),
+        "{text}"
+    );
+    assert!(text.contains(": ended"), "{text}");
+    let shown = stdout_json(&run(&home, &["app", "show", &app, "--json"]));
+    assert_eq!(shown["status"], "applied", "{shown}");
+    let status = stdout_json(&run(&home, &["apply", "status", "--json"]));
+    assert_eq!(status["state"], "ended");
+    let runs = home.join("apply");
+    let left: Vec<String> = std::fs::read_dir(&runs)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, ["session"], "only the session folder stays");
+    let recorded = std::fs::read_to_string(record).unwrap();
+    assert!(recorded.contains("\"purge\""), "{recorded}");
+}
+
+#[tokio::test]
+async fn apply_resolve_ends_a_pause_from_the_cli() {
+    let (_dir, home) = fresh_home();
+    let app = apply_ready_home(&home).await;
+    let db = Db::open(&AppPaths::new(&home)).await.unwrap();
+    let run_id = jobpilot_core::apply::start(&db, "cli", std::slice::from_ref(&app), false)
+        .await
+        .unwrap();
+    let view = jobpilot_core::apply::view(&db, &run_id).await.unwrap();
+    let pause: String = sqlx::query_scalar(
+        "INSERT INTO apply_pauses (id, item_id, kind, origin, excerpt, created_at) \
+         VALUES (lower(hex(randomblob(16))), ?, 'login', 'page', 'Sign in', \
+         strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) RETURNING id",
+    )
+    .bind(&view.items[0].id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    db.close().await;
+
+    let shown = stdout_of(&run(&home, &["apply", "show", &run_id]));
+    assert!(shown.contains(&format!("pause {pause} (login)")), "{shown}");
+    ok(&home, &["apply", "resolve", &pause, "continue"]);
+    let again = run(&home, &["apply", "resolve", &pause, "take-over"]);
+    assert!(
+        stderr_text(&again).starts_with("error[validation]"),
+        "{}",
+        stderr_text(&again)
+    );
+    let status = stdout_json(&run(&home, &["apply", "show", &run_id, "--json"]));
+    assert!(status["active_pause"].is_null(), "{status}");
+
+    let db = Db::open(&AppPaths::new(&home)).await.unwrap();
+    let resolution: String = sqlx::query_scalar("SELECT resolution FROM apply_pauses WHERE id = ?")
+        .bind(&pause)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    db.close().await;
+    assert_eq!(resolution, "continue");
+    ok(&home, &["apply", "cancel", &run_id]);
+    let status = stdout_json(&run(&home, &["apply", "status", "--json"]));
+    assert_eq!(status["state"], "ended");
+}
+
+#[test]
+fn apply_start_session_and_mcp_are_refused_in_the_panel() {
+    let (_dir, home) = fresh_home();
+    let panel = [("JOBPILOT_PANEL", "1")];
+    for args in [
+        vec!["apply", "start", "x"],
+        vec!["apply", "start", "x", "--release-sealed"],
+        vec!["apply", "session", "x"],
+        vec!["apply-mcp", "--dir", "/x/apply/y"],
+    ] {
+        let refused = run_env(&home, &args, &panel);
+        assert_eq!(refused.status.code(), Some(1), "{args:?}");
+        assert!(
+            stderr_text(&refused).starts_with("error[panel_refused]"),
+            "{args:?}: {}",
+            stderr_text(&refused)
+        );
+        assert!(refused.stdout.is_empty(), "{args:?}");
+    }
+    let allowed = run_env(&home, &["apply", "status"], &panel);
+    assert!(allowed.status.success(), "{}", stderr_text(&allowed));
+}
+
+/// A closed terminal or a quitting app sends the host SIGHUP. It winds up as a Ctrl-C does:
+/// the run ends, its folder goes, and so does every process the session started.
+#[cfg(unix)]
+#[tokio::test]
+async fn apply_start_winds_up_on_sighup() {
+    use std::time::{Duration, Instant};
+    let (dir, home) = fresh_home();
+    let app = apply_ready_home(&home).await;
+    let steps = r#"[{"tool": "apply_next"}, {"tool": "browser_snapshot"}]"#;
+    let (bin, record, playwright) = fake_apply_claude(dir.path(), steps);
+    let mut host = Command::new(env!("CARGO_BIN_EXE_jobpilot"))
+        .args(["apply", "start", &app])
+        .env("JOBPILOT_HOME", &home)
+        .env("JOBPILOT_SECRET_SERVICE", "jobpilot-test")
+        .env("JOBPILOT_CLAUDE_BIN", &bin)
+        .env("JOBPILOT_PLAYWRIGHT_CLI", &playwright)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let replies = dir.path().join("replies.jsonl");
+    let begun = Instant::now();
+    while !std::fs::read_to_string(&replies)
+        .unwrap_or_default()
+        .contains("\"browser_snapshot\"")
+    {
+        assert!(begun.elapsed() < Duration::from_secs(60), "a snapshot");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let session: serde_json::Value = std::fs::read_to_string(&record)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|entry| {
+            entry["argv"]
+                .as_array()
+                .is_some_and(|a| a.contains(&"--mcp-config".into()))
+        })
+        .unwrap();
+    let claude = session["pid"].as_u64().unwrap().to_string();
+
+    // Only the host this test started is signalled.
+    let sent = Command::new("kill")
+        .args(["-HUP", &host.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(sent.success());
+    let begun = Instant::now();
+    while host.try_wait().unwrap().is_none() {
+        assert!(begun.elapsed() < Duration::from_secs(30), "the host ends");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let status = stdout_json(&run(&home, &["apply", "status", "--json"]));
+    assert_eq!(status["state"], "ended", "{status}");
+    assert_eq!(status["items"][0]["state"], "skipped", "{status}");
+    let left: Vec<String> = std::fs::read_dir(home.join("apply"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, ["session"], "only the session folder stays");
+    let probe = Command::new("kill").args(["-0", &claude]).status().unwrap();
+    assert!(!probe.success(), "claude is gone");
+}
+
+/// A Copilot refused by the register says so in words about filling, and nothing before it
+/// says Copilot is filling the form.
+#[tokio::test]
+async fn apply_copilot_on_a_blocked_site_says_filling_and_nothing_else() {
+    use jobpilot_core::applications::{self, ApplicationInput};
+    let (_dir, home) = fresh_home();
+    let db = Db::open(&AppPaths::new(&home)).await.unwrap();
+    let input = ApplicationInput {
+        company: "Acme".into(),
+        role: "Engineer".into(),
+        link: "https://www.indeed.com/viewjob?jk=1".into(),
+        ..ApplicationInput::default()
+    };
+    let app = applications::add(&db, "cli", input).await.unwrap().id;
+    db.close().await;
+
+    let output = run(&home, &["apply", "copilot", &app]);
+    assert!(!output.status.success());
+    let text = stderr_text(&output);
+    assert!(!text.contains("Copilot is filling"), "{text}");
+    assert!(text.contains("error[refused]"), "{text}");
+    assert!(text.contains("filling"), "{text}");
+    assert!(!text.contains("reading"), "{text}");
+}
+
+/// A site the register has no clear answer for is not called blocked: Copilot is refused
+/// with words that say so (final re-review F8).
+#[tokio::test]
+async fn apply_copilot_on_an_unknown_site_says_unclear_not_blocked() {
+    use jobpilot_core::applications::{self, ApplicationInput};
+    let (_dir, home) = fresh_home();
+    let db = Db::open(&AppPaths::new(&home)).await.unwrap();
+    let input = ApplicationInput {
+        company: "Acme".into(),
+        role: "Engineer".into(),
+        link: "https://acme.wd1.myworkdayjobs.com/en-US/careers/job/1".into(),
+        ..ApplicationInput::default()
+    };
+    let app = applications::add(&db, "cli", input).await.unwrap().id;
+    db.close().await;
+
+    let output = run(&home, &["apply", "copilot", &app]);
+    assert!(!output.status.success());
+    let text = stderr_text(&output);
+    assert!(!text.contains("Copilot is filling"), "{text}");
+    assert!(!text.contains("blocks"), "{text}");
+    assert!(text.contains("no clear answer"), "{text}");
+}
+
+#[tokio::test]
+async fn apply_material_and_record_are_manual_mode_from_the_cli() {
+    let (_dir, home) = fresh_home();
+    let app = apply_ready_home(&home).await;
+
+    let text = stdout_of(&run(&home, &["apply", "material", &app]));
+    assert!(text.contains("manual: available."), "{text}");
+    assert!(
+        text.contains("copilot: available. No clause found for this site. You review and submit."),
+        "{text}"
+    );
+    assert!(text.contains("resume: "), "{text}");
+    assert!(
+        text.contains("work authorization: not stated by you (no country)"),
+        "{text}"
+    );
+    let json = stdout_json(&run(&home, &["apply", "material", &app, "--json"]));
+    assert_eq!(json["modes"].as_array().unwrap().len(), 4);
+    assert!(json["resume"].as_str().unwrap().ends_with(".pdf"));
+    // The panel may run this: the stated work-authorization values stay out.
+    let authorization = json["authorization"].as_object().unwrap();
+    let mut keys: Vec<&str> = authorization.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["country", "stated"], "{json}");
+
+    let saved = stdout_json(&run(
+        &home,
+        &[
+            "apply",
+            "record",
+            &app,
+            "--outcome",
+            "applied",
+            "--on",
+            "2026-11-02",
+            "--json",
+        ],
+    ));
+    assert_eq!(saved["status"], "applied");
+    assert_eq!(saved["applied_on"], "2026-11-02");
+    let runs = stdout_json(&run(&home, &["apply", "status", "--json"]));
+    assert!(runs.is_null(), "Manual mode starts no run: {runs}");
+}
+
+#[tokio::test]
+async fn apply_autonomous_run_is_refused_with_no_run_while_no_site_is_eligible() {
+    let (_dir, home) = fresh_home();
+    let app = apply_ready_home(&home).await;
+    {
+        let db = Db::open(&AppPaths::new(&home)).await.unwrap();
+        sqlx::query("UPDATE applications SET link = 'https://jobs.lever.co/acme/1' WHERE id = ?")
+            .bind(&app)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    ok(&home, &["apply", "autonomous", "grant", "lever"]);
+    let refused = run(&home, &["apply", "autonomous", "run", &app]);
+    assert!(!refused.status.success());
+    let said = stderr_text(&refused);
+    // `policy_unknown`, in words.
+    assert!(said.contains("error[refused]"), "{said}");
+    assert!(
+        said.contains("policy register has no clear answer"),
+        "{said}"
+    );
+    let status = stdout_json(&run(&home, &["apply", "status", "--json"]));
+    assert!(status.is_null(), "{status}");
+    assert!(
+        !home.join("apply").exists() || std::fs::read_dir(home.join("apply")).unwrap().count() == 0
+    );
+}

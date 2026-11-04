@@ -1,0 +1,445 @@
+[
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false,
+      "title": "Handle a dialog"
+    },
+    "description": "Handle a dialog",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "accept": {
+          "description": "Whether to accept the dialog.",
+          "type": "boolean"
+        },
+        "promptText": {
+          "description": "The text of the prompt in case of a prompt dialog.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "accept"
+      ],
+      "type": "object"
+    },
+    "name": "browser_handle_dialog"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false,
+      "title": "Upload files"
+    },
+    "description": "Upload one or multiple files",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "paths": {
+          "description": "The absolute paths to the files to upload. Can be single file or multiple files. If omitted, file chooser is cancelled.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "name": "browser_file_upload"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false,
+      "title": "Fill form"
+    },
+    "description": "Fill multiple form fields",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "fields": {
+          "description": "Fields to fill in",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "element": {
+                "description": "Human-readable element description used to obtain permission to interact with the element",
+                "type": "string"
+              },
+              "name": {
+                "description": "Human-readable field name",
+                "type": "string"
+              },
+              "target": {
+                "description": "Exact target element reference from the page snapshot, or a unique element selector",
+                "type": "string"
+              },
+              "type": {
+                "description": "Type of the field",
+                "enum": [
+                  "textbox",
+                  "checkbox",
+                  "radio",
+                  "combobox",
+                  "slider"
+                ],
+                "type": "string"
+              },
+              "value": {
+                "description": "Value to fill in the field. If the field is a checkbox, the value should be `true` or `false`. If the field is a combobox, the value should be the text of the option.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "target",
+              "name",
+              "type",
+              "value"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "fields"
+      ],
+      "type": "object"
+    },
+    "name": "browser_fill_form"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false,
+      "title": "Press a key"
+    },
+    "description": "Press a key on the keyboard",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "description": "Name of the key to press or a character to generate, such as `ArrowLeft` or `a`",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "type": "object"
+    },
+    "name": "browser_press_key"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false,
+      "title": "Type text"
+    },
+    "description": "Type text into editable element",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "element": {
+          "description": "Human-readable element description used to obtain permission to interact with the element",
+          "type": "string"
+        },
+        "slowly": {
+          "description": "Whether to type one character at a time. Useful for triggering key handlers in the page. By default entire text is filled in at once.",
+          "type": "boolean"
+        },
+        "submit": {
+          "description": "Whether to submit entered text (press Enter after)",
+          "type": "boolean"
+        },
+        "target": {
+          "description": "Exact target element reference from the page snapshot, or a unique element selector",
+          "type": "string"
+        },
+        "text": {
+          "description": "Text to type into the element",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target",
+        "text"
+      ],
+      "type": "object"
+    },
+    "name": "browser_type"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false,
+      "title": "Navigate to a URL"
+    },
+    "description": "Navigate to a URL",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "description": "The URL to navigate to",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    },
+    "name": "browser_navigate"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false,
+      "title": "Go back"
+    },
+    "description": "Go back to the previous page in the history",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "name": "browser_navigate_back"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": true,
+      "title": "Page snapshot"
+    },
+    "description": "Capture accessibility snapshot of the current page, this is better than screenshot",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "boxes": {
+          "description": "Include each element's bounding box as [box=x,y,width,height] in the snapshot. Coordinates are viewport-relative, in CSS pixels (Element.getBoundingClientRect)",
+          "type": "boolean"
+        },
+        "depth": {
+          "description": "Limit the depth of the snapshot tree",
+          "type": "number"
+        },
+        "filename": {
+          "description": "Save snapshot to a file instead of returning it in the response. Relative file names are resolved against the workspace root.",
+          "type": "string"
+        },
+        "target": {
+          "description": "Exact target element reference from the page snapshot, or a unique element selector",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "browser_snapshot"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false,
+      "title": "Click"
+    },
+    "description": "Perform click on a web page",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "button": {
+          "description": "Button to click, defaults to left",
+          "enum": [
+            "left",
+            "right",
+            "middle"
+          ],
+          "type": "string"
+        },
+        "doubleClick": {
+          "description": "Whether to perform a double click instead of a single click",
+          "type": "boolean"
+        },
+        "element": {
+          "description": "Human-readable element description used to obtain permission to interact with the element",
+          "type": "string"
+        },
+        "modifiers": {
+          "description": "Modifier keys to press",
+          "items": {
+            "enum": [
+              "Alt",
+              "Control",
+              "ControlOrMeta",
+              "Meta",
+              "Shift"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "target": {
+          "description": "Exact target element reference from the page snapshot, or a unique element selector",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "type": "object"
+    },
+    "name": "browser_click"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false,
+      "title": "Hover mouse"
+    },
+    "description": "Hover over element on page",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "element": {
+          "description": "Human-readable element description used to obtain permission to interact with the element",
+          "type": "string"
+        },
+        "target": {
+          "description": "Exact target element reference from the page snapshot, or a unique element selector",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "type": "object"
+    },
+    "name": "browser_hover"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false,
+      "title": "Select option"
+    },
+    "description": "Select an option in a dropdown",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "element": {
+          "description": "Human-readable element description used to obtain permission to interact with the element",
+          "type": "string"
+        },
+        "target": {
+          "description": "Exact target element reference from the page snapshot, or a unique element selector",
+          "type": "string"
+        },
+        "values": {
+          "description": "Array of values to select in the dropdown. This can be a single value or multiple values.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "target",
+        "values"
+      ],
+      "type": "object"
+    },
+    "name": "browser_select_option"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false,
+      "title": "Manage tabs"
+    },
+    "description": "List, create, close, or select a browser tab.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "description": "Operation to perform",
+          "enum": [
+            "list",
+            "new",
+            "close",
+            "select"
+          ],
+          "type": "string"
+        },
+        "index": {
+          "description": "Tab index, used for close/select. If omitted for close, current tab is closed.",
+          "type": "number"
+        },
+        "isolatedContext": {
+          "description": "Name of an isolated browser context to create the new tab in, used for new. Tabs in the same isolated context share cookies and storage, tabs in different contexts are fully isolated. If omitted or \"default\", the tab is created in the default context.",
+          "type": "string"
+        },
+        "url": {
+          "description": "URL to navigate to in the new tab, used for new.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    },
+    "name": "browser_tabs"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": true,
+      "title": "Wait for"
+    },
+    "description": "Wait for text to appear or disappear or a specified time to pass. When both text and textGone are provided, waits for the first one to happen",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "description": "The text to wait for",
+          "type": "string"
+        },
+        "textGone": {
+          "description": "The text to wait for to disappear",
+          "type": "string"
+        },
+        "time": {
+          "description": "The time to wait in seconds, at most 30. When combined with text or textGone, serves as a timeout for them instead of the default action timeout",
+          "type": "number"
+        }
+      },
+      "type": "object"
+    },
+    "name": "browser_wait_for"
+  }
+]

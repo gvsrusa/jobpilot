@@ -1,0 +1,5 @@
+- generic [ref=e1]:
+  - heading "One more step" [level=1] [ref=e2]
+  - iframe "reCAPTCHA challenge" [ref=e3]
+  - text: Please verify you are human
+  - dialog "Cookie settings" [ref=e9]

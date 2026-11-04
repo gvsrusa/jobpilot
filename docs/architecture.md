@@ -1,6 +1,6 @@
 # JobPilot AI: Architecture
 
-Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md), [PRD](prd.md), and [milestone plan](milestones.md). Requirement IDs (`FR-<section>.<n>`) come from the PRD. Releases 0.1 to 0.5 are built; this document describes 0.1 in detail, adds the 0.2 to 0.5 modules, and names later pieces only as extension points.
+Status: draft for owner approval. Source: [master spec](superpowers/specs/2026-11-01-jobpilot-master-spec.md), [PRD](prd.md), and [milestone plan](milestones.md). Requirement IDs (`FR-<section>.<n>`) come from the PRD. Releases 0.1 to 0.6 are built; this document describes 0.1 in detail, adds the 0.2 to 0.6 modules, and names later pieces only as extension points.
 
 Related documents: [AI providers](ai-providers.md), [policy register](policy-register.md), [threat model](security/threat-model.md), [agents](agents.md). They own connector, AI, security, and agent design. This document does not specify those designs. The database is described in [database-schema.md](database-schema.md).
 
@@ -199,7 +199,39 @@ Modules added in 0.5:
 
 Two task types, `semantic_match` and `summarize_company`, join the router ([AI providers](ai-providers.md#as-built-in-05)). Nothing else in `ai` changes.
 
-The permissions engine for browser automation is a later module (0.6). Its design belongs to the documents listed at the top and is not decided here.
+Modules added in 0.6:
+
+| Module | Responsibility | Requirements |
+|---|---|---|
+| `permissions` | The permissions engine: `Mode` (Manual, Copilot, Autonomous, ClaudeCode), `Action` (OpenLink, Supply, Drive, Fill, Upload, Submit), `Site`, `decide` and `decide_on` against the build-time register, the verified list (`VERIFIED`, empty), and the stored grant. `link_allowed` and `site_of` read a posting link; fixture sites on `127.0.0.1` exist only in debug builds. Autonomous grants (`grant`, `revoke`, `granted`) are a person's act and audited. | FR-9.5, FR-9.6, M-36 |
+| `browser` | `runtime`: the pinned `@playwright/mcp` 0.0.84 (`assets/browser-runtime/package.json` and its lockfile), Node lookup (20 or later), `setup` (`npm ci --ignore-scripts`, then Chromium), `playwright_config` (visible, `chromium`, no anti-detection flag, downloads off, page tools off). `mcp`: a newline JSON-RPC MCP client over the server's stdio. `sweep`: `kill_marked`, which kills every process whose argv names a run folder, by `sysinfo`, on every OS. | FR-9.1, M-35 |
+| `apply` | Run preparation and the Claude Code apply mode. `mod`: `preflight`, `start` (with the sealed release), `view`, `resolve_pause`, `cancel`, `settle`, `finish_items`, and Manual mode's `material` and `record_outcome`. `brief`: one application's facts and its two staged files. `guard`: the 13 browser tools, `scan` for the mandatory stops, `value_ok`, `field_guard`, `choice_guard`, `upload_ok`. `proxy`: `apply-mcp`, the MCP server `claude` sees, which forwards checked calls to Playwright. `session`: the `claude` argv, environment, and system prompt, the host's run, `cleanup` (sweep, delete, `claude purge`), and `sweep_orphans` at startup. | FR-9.7 to FR-9.21, M-37, M-38, M-39 |
+| `forms` | `parse_snapshot` reads Playwright's accessibility snapshot into fields (no injected JavaScript), `map_rules` maps them by rules (FR-3.22), and `map_field` asks `map_form_field` for the rest. | FR-3.22, FR-9.7 to FR-9.9 |
+| `agents::{browser, claude_apply}` | `browser`: the browser application workflow for Copilot and Autonomous on the runner. `claude_apply`: the Claude Code apply workflow (`prepare`, then `session`). | FR-11.6 |
+
+`apply/mod.rs` and `apply/session.rs` hold the run's wind-up, which every ending shares: finish the items, settle their status, sweep, delete the run folder, and purge. The data root gains `<root>/browser-runtime/` (the installed server and Chromium) and `<root>/apply/` (one folder per run holding `mcp.json`, `playwright.json`, `files/`, `output/`, and the browser `profile/`, deleted at the end; and `apply/session/`, the fixed folder the interactive `claude` runs in, purged at the end). Backup and export skip both.
+
+How a Claude Code apply run is put together. Rust chooses every process; the webview sends only an id and a terminal size.
+
+```mermaid
+flowchart LR
+    app[JobPilot app<br/>or jobpilot apply start]
+    host[jobpilot apply session<br/>run host on the runner,<br/>in the PTY or a terminal]
+    claude[claude<br/>no tools of its own,<br/>one MCP server]
+    proxy[jobpilot apply-mcp<br/>3 apply tools, 13 browser tools,<br/>guards, scan, pauses]
+    pw[Playwright MCP server<br/>Node, pinned 0.0.84]
+    chrome[Chromium<br/>visible, fresh profile]
+    db[(jobpilot.db)]
+    app -->|starts| host
+    host -->|starts, inherits the terminal| claude
+    claude -->|stdio MCP| proxy
+    proxy -->|stdio MCP, checked calls only| pw
+    pw --> chrome
+    host --> db
+    proxy --> db
+```
+
+Emergency pause reaches every box on the right by three paths: the host's 250 ms watch, the desktop closing the apply PTY before it writes the pause row, and the proxy refusing every call while the flag is set. Each then sweeps the run folder.
 
 ### 6.2 `crates/cli` (`jobpilot`)
 
@@ -254,6 +286,21 @@ The 0.5 CLI adds the `job` surface (alias `job src` for `job source`):
 
 `pay.period` is `hour`, `day`, `week`, `month`, or `year`, and is `null` when the source names none. `authorized` and `needs_sponsorship` are `not_stated`, `yes`, or `no`. `points` is `null` for a criterion that was not compared. `by` is always `rules`: the model's number is only in `semantic.fit`.
 
+The 0.6 CLI adds `browser` and `apply`. Each has a row in `PANEL`:
+
+| Command | Does | In the panel |
+|---|---|---|
+| `browser status`, `browser setup` | Show the runtime's state (Node, pin, Chromium); download it. | status allowed; setup refused (it starts a download, as `ai pull` does) |
+| `apply preflight <ids>` | Check up to 25 applications: runtime, `claude`, consent, documents, answers ready, sealed counts, blocks. It releases nothing, but it renders each application's resume and letter PDFs under `exports/apply/<application>/` and writes an `export` audit row, because export is the only path with every claim guard. | allowed |
+| `apply start <ids> [--release-sealed]` | Start a Claude Code apply run and host it here. | refused |
+| `apply session <id>`, `apply-mcp --dir <d>` | The run host and the proxy. Started by Rust, hidden. | refused |
+| `apply status`, `apply show <run>` | Read a run. | allowed |
+| `apply resolve <pause> continue\|take-over` | A person ends a pause. | allowed |
+| `apply settle <run>`, `apply cancel <run>` | Write a submitted item's status after a pause; cancel a run. | allowed |
+| `apply material <a>`, `apply record <a> --outcome <s> [--on d] [--note t]` | Manual mode: the material (no sealed value, and work authorization only as stated or not), and the outcome a person records. | allowed |
+| `apply copilot <a>` | Run Copilot on one application. | refused |
+| `apply autonomous list`, `grant <c>`, `revoke <c>`, `run <a>` | Autonomous grants, and its run, refused while no site is eligible. | list and revoke allowed; grant and run refused |
+
 The 0.3 CLI adds `app` (add, list, show, history, edit, status, note, answers, remove), `memory` (add-question, add-answer, list, show, edit-answer, approve, unapprove, reviewed, set-class, reveal, confirm, use, authorization, remove-question, remove-answer, search, refresh), `agents` (list, show, log, cancel, resume), `analytics` (report, show), and `pause` (set, status, clear). Each has a row in the `PANEL` table, and what its GUI twin confirms natively (for example `pause clear`) is refused in the terminal panel.
 
 The 0.2 CLI adds `profile`, `prefs`, `kb`, `job`, `resume`, `letter`, `ai`, and the `data recovery-key` commands, plus `jobpilot shell`, the restricted line interpreter the terminal panel runs. The desktop bundles this binary as a sidecar (`externalBin: binaries/jobpilot`). `apps/desktop/scripts/sidecar.mjs` builds it and copies it to `binaries/jobpilot-<target triple>`; `beforeBuildCommand` runs it, with `TAURI_ENV_TARGET_TRIPLE` set under `tauri build --target`, and CI runs it as its own step. Under `tauri dev` the script is not run, so build the CLI first.
@@ -265,6 +312,8 @@ Holds `AppState`, which contains the `AppPaths`, an `RwLock<Option<Db>>` slot, a
 `backup_restore` and `data_delete` take the write lock, take the `Db` out of its slot, call core, and always reopen before returning. There is deliberately no `secret_get` command, so secret values never cross IPC. The adapter uses the single-instance plugin so a second launch focuses the existing window, and the dialog plugin with only `dialog:allow-open` permission to pick a backup folder. The webview Content Security Policy and capabilities are locked down in plan Task B1.
 
 In 0.2 the adapter also holds `pty.rs`, which runs the sidecar in a PTY (`portable-pty`) for the panel with a marker in its environment so core can refuse the commands M-14 lists; `native.rs`, which owns the native dialogs for recovery files and destructive confirmations so those paths never cross the webview; and the AI commands. The webview cannot set `ai.claude_path`, give consent, or enable a provider through the panel. Exit cancels in-flight tasks and waits up to 5 seconds before leaving.
+
+In 0.6 the adapter adds `pty_open_apply(cols, rows, apply_id)`, which opens the PTY on `jobpilot apply session <id>` for a run in state `ready` only, without the panel marker; `PtyState::close_apply`, which ends that session and sweeps its run folder; and the apply, browser, Copilot, and Autonomous commands (`browser_status`, `browser_setup`, `apply_preflight`, `apply_start`, `apply_view`, `apply_latest`, `apply_resolve_pause`, `apply_settle`, `apply_cancel`, `apply_material`, `apply_open`, `apply_record`, `apply_copy`, `copilot_start`, `autonomous_grants`, `autonomous_grant`, `autonomous_revoke`, `autonomous_start`). `apply_start` asks the sealed release in a native dialog, so the webview cannot release anything. `pause_now` and `stop_if_paused` close the apply PTY and sweep before the pause row is written. Startup runs `sweep_orphans` once, off the setup thread.
 
 In 0.3 the adapter adds `menu.rs`, which builds the native menu with a `Safety` submenu whose Emergency pause item carries the `CmdOrCtrl+Shift+H` accelerator, and the pause watcher, which polls the stored flag and fires the in-flight tokens. Commands for applications, memory, agents, analytics, and pause go in `handler()` and in the `ALLOWED_COMMANDS` list the tests compare, and the destructive ones (confirming a sensitive use, clearing the pause) ask through `native.rs`.
 
@@ -288,6 +337,8 @@ Built with Vite, Tailwind CSS, shadcn/ui, Zustand for client state, and TanStack
 | Memory view | `src/views/MemoryView.tsx` | Questions, answers, classes, approval, search, and the refresh with its call count (0.3). |
 | Agents view | `src/views/AgentsView.tsx` | Runs and their logs, with resume and cancel (0.3). |
 | Jobs view | `src/views/JobsView.tsx`, `src/views/JobDetail.tsx` | Ctrl+0. Sources with their read status and a Fetch button, filters, the job list, paste, preferences, and the job detail with its explained score (0.5). It holds no scoring logic: Rust scores. |
+| Application review | `src/views/ApplicationReview.tsx`, `src/views/CopilotRun.tsx` | Wireframe 11: the four modes with Rust's fixed notes, material, answers copied by Rust, Open the form, Record outcome, and Copilot's run (0.6). |
+| Apply run | `src/views/ApplyRun.tsx`, `src/components/PausePanel.tsx` | Wireframe 19: Setup needed, Preflight, Running, Ended, and the pause panel (0.6). Page text renders inert. |
 | Title bar | `src/components/TitleBar.tsx` | First in the page on every screen: the Emergency pause button, the paused notice, and Clear pause (0.3). |
 
 Screen layouts are in the UI wireframes (plan Task A5) and are not repeated here.
@@ -327,4 +378,4 @@ These are named so that 0.1 does not block them. They are not designed here.
 | AI task router and providers | 0.2, 0.4 | [ai-providers.md](ai-providers.md) |
 | Connector SDK and policy review | 0.5 (built) | [connector-sdk.md](connector-sdk.md), [policy-register.md](policy-register.md) |
 | Threat model and prompt-injection controls | 0.1 onward | [security/threat-model.md](security/threat-model.md) |
-| Agents and workflow runner | 0.3, 0.5, 0.6 | [agents.md](agents.md) |
+| Agents and workflow runner | 0.3, 0.5, 0.6 (built) | [agents.md](agents.md) |

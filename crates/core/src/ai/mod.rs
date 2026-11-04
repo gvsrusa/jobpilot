@@ -75,6 +75,11 @@ pub const RUN_REASONS: &[&str] = &[
     "network",
     "no_sources",
     "company_gone",
+    "browser_gone",
+    "session_ended",
+    "no_browser_runtime",
+    "claude_not_found",
+    "claude_exited",
 ];
 
 /// Absent capabilities are false: a declaration lists only what the provider proves.
@@ -112,6 +117,7 @@ pub enum TaskType {
     Embed,
     SemanticMatch,
     SummarizeCompany,
+    MapFormField,
 }
 
 #[derive(Debug)]
@@ -176,6 +182,15 @@ static SUMMARIZE_COMPANY: TaskSpec = TaskSpec {
     categories: &[DataCategory::CompanyText, DataCategory::JobText],
     attempts: 2,
 };
+/// A form label and the ids and questions of approved answers, never an answer's text. The
+/// reply is one listed id or null, checked by Rust, which then fills the value itself.
+static MAP_FORM_FIELD: TaskSpec = TaskSpec {
+    task: TaskType::MapFormField,
+    schema: include_str!("../../schemas/map_form_field.json"),
+    required: DRAFTING,
+    categories: &[DataCategory::JobText, DataCategory::CareerMemory],
+    attempts: 2,
+};
 static EMBED: TaskSpec = TaskSpec {
     task: TaskType::Embed,
     schema: "",
@@ -194,6 +209,7 @@ pub fn spec(task: TaskType) -> &'static TaskSpec {
         TaskType::Embed => &EMBED,
         TaskType::SemanticMatch => &SEMANTIC_MATCH,
         TaskType::SummarizeCompany => &SUMMARIZE_COMPANY,
+        TaskType::MapFormField => &MAP_FORM_FIELD,
     }
 }
 
@@ -428,13 +444,14 @@ pub struct Sharing {
 }
 
 /// `Embed` is local only, so it never reaches a consent screen.
-const COMPLETION_TASKS: [TaskType; 6] = [
+const COMPLETION_TASKS: [TaskType; 7] = [
     TaskType::ParseJob,
     TaskType::DraftResume,
     TaskType::DraftCoverLetter,
     TaskType::ClassifyAnswer,
     TaskType::SemanticMatch,
     TaskType::SummarizeCompany,
+    TaskType::MapFormField,
 ];
 
 pub async fn sharing(db: &Db, name: &str) -> Result<Sharing> {

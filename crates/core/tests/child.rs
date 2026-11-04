@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use jobpilot_core::ai::child::{
     CODEX, ChildRun, GEMINI, accepts_name, bin_names, child_env, child_env_from, child_path,
-    cli_dirs, run_piped, spec_for,
+    cli_dirs, run_piped, spec_for, system_env,
 };
 
 fn no_env(_: &str) -> Option<OsString> {
@@ -154,6 +154,49 @@ fn sign_in_variables_pass_and_vertex_and_other_keys_do_not() {
             .iter()
             .all(|(name, _)| !name.starts_with("CLAUDE"))
     );
+}
+
+#[test]
+fn the_windows_system_list_is_exactly_these_names() {
+    assert_eq!(
+        system_env(true),
+        [
+            "SystemRoot",
+            "SystemDrive",
+            "windir",
+            "TEMP",
+            "TMP",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "PATHEXT",
+            "ComSpec",
+        ]
+    );
+    // macOS and Linux children get nothing more than before.
+    assert!(system_env(false).is_empty());
+}
+
+/// On Windows a child gets the system names it needs, once each; elsewhere it gets none of
+/// the three that only Windows adds.
+#[test]
+fn a_child_gets_the_system_names_of_its_os_once() {
+    let get = |name: &str| Some(format!("v-{name}"));
+    let names: Vec<String> = child_env_from(&[], &get)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    for added in ["SystemDrive", "windir", "PATHEXT"] {
+        assert_eq!(
+            names.iter().any(|name| name == added),
+            cfg!(windows),
+            "{added}"
+        );
+    }
+    let mut unique = names.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), names.len(), "{names:?}");
 }
 
 fn test_binary() -> PathBuf {

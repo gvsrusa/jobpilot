@@ -1,0 +1,180 @@
+#!/usr/bin/env node
+// Stands in for an interactive `claude` apply session in tests: nothing here starts a real one.
+// Each test's wrapper sets JOBPILOT_FAKE_*, because the session's environment is an allow-list.
+//
+// --version          prints the mock version.
+// purge <dir> --yes  is recorded, sleeps JOBPILOT_FAKE_PURGE_SLEEP_MS (default 0), then exits
+//                    with JOBPILOT_FAKE_PURGE_EXIT (default 0).
+// anything else      is a session: it records argv, env, and the text of --system-prompt-file
+//                    to JOBPILOT_FAKE_RECORD, starts the
+//                    `jobpilot` server from --mcp-config with that server's env over its own,
+//                    sends initialize and tools/list, then runs JOBPILOT_FAKE_SCENARIO (a JSON
+//                    file, or inline JSON) step by step: {"tool", "args"}, {"sleep_ms"},
+//                    {"exit"}. A tool step with "nowait": true is sent and not awaited. Each reply is appended to JOBPILOT_FAKE_REPLIES. After the last
+//                    step it idles, as an interactive session does, until it is killed. SIGTERM
+//                    and SIGHUP are ignored.
+//                    In a step's args, the string "@ref:<name>" is the ref of the element named
+//                    exactly <name> (or "<name>#<n>", the n-th) among the controls on a browser_snapshot taken just before the step (its reply
+//                    is recorded with "auto": true), and
+//                    "@brief:<a.b.0>" is that field of the last apply_next reply. Real pages
+//                    give refs only at run time; a name that matches nothing stays as written.
+"use strict";
+const fs = require("node:fs");
+const { spawn } = require("node:child_process");
+const readline = require("node:readline");
+
+const argv = process.argv.slice(2);
+const env = process.env;
+
+if (argv[0] === "--version") {
+  console.log("2.1.316 (mock)");
+  process.exit(0);
+}
+
+function append(file, entry) {
+  if (file) fs.appendFileSync(file, JSON.stringify(entry) + "\n");
+}
+
+// The run folder goes with the run: the prompt is read now, as the real `claude` reads it.
+const promptAt = argv.indexOf("--system-prompt-file");
+const system_prompt = promptAt >= 0 ? fs.readFileSync(argv[promptAt + 1], "utf8") : null;
+append(env.JOBPILOT_FAKE_RECORD, { pid: process.pid, argv, env: { ...env }, cwd: process.cwd(), system_prompt });
+
+if (argv[0] === "purge") {
+  const exit = () => process.exit(Number(env.JOBPILOT_FAKE_PURGE_EXIT || 0));
+  setTimeout(exit, Number(env.JOBPILOT_FAKE_PURGE_SLEEP_MS || 0));
+  return;
+}
+
+process.on("SIGTERM", () => {});
+process.on("SIGHUP", () => {});
+setInterval(() => {}, 1 << 30);
+
+const at = argv.indexOf("--mcp-config");
+const config = JSON.parse(fs.readFileSync(argv[at + 1], "utf8"));
+const server = config.mcpServers.jobpilot;
+const child = spawn(server.command, server.args, {
+  env: { ...env, ...(server.env || {}) },
+  stdio: ["pipe", "pipe", "inherit"],
+});
+child.stdin.on("error", () => {});
+append(env.JOBPILOT_FAKE_RECORD, { server_pid: child.pid });
+
+const pending = new Map();
+let next = 1;
+readline.createInterface({ input: child.stdout }).on("line", (line) => {
+  let message;
+  try {
+    message = JSON.parse(line);
+  } catch {
+    return;
+  }
+  const answer = pending.get(message.id);
+  if (answer) {
+    pending.delete(message.id);
+    answer(message);
+  }
+});
+child.on("exit", () => {
+  for (const answer of pending.values()) answer(null);
+  pending.clear();
+});
+
+function call(method, params) {
+  const id = next++;
+  return new Promise((resolve) => {
+    if (child.exitCode !== null) return resolve(null);
+    pending.set(id, resolve);
+    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+  });
+}
+
+function scenario() {
+  const text = env.JOBPILOT_FAKE_SCENARIO;
+  if (!text) return [];
+  return JSON.parse(text.trim().startsWith("[") ? text : fs.readFileSync(text, "utf8"));
+}
+
+function textOf(reply) {
+  const content = reply && reply.result && reply.result.content;
+  return (content && content[0] && content[0].text) || "";
+}
+
+let snapshot = "";
+let brief = null;
+
+// Only a control is a target, as a model would choose: a table cell can carry its label's name.
+const CONTROLS = ["textbox", "searchbox", "combobox", "button", "link", "checkbox", "radio", "option", "switch", "tab", "spinbutton", "slider"];
+
+// "<name>#<n>" is the n-th control of that name, counted from 1.
+function refOf(wanted) {
+  const nth = wanted.match(/^(.*)#(\d+)$/);
+  const name = nth ? nth[1] : wanted;
+  let skip = nth ? Number(nth[2]) - 1 : 0;
+  for (const line of snapshot.split("\n")) {
+    const found = line.match(/^\s*- ([\w-]+) "((?:[^"\\]|\\.)*)".*\[ref=([^\]]+)\]/);
+    if (!found || !CONTROLS.includes(found[1])) continue;
+    let seen;
+    try {
+      seen = JSON.parse('"' + found[2] + '"');
+    } catch {
+      continue;
+    }
+    if (seen === name && skip-- === 0) return found[3];
+  }
+  return undefined;
+}
+
+function briefAt(path) {
+  let at = brief;
+  for (const key of path.split(".")) at = at == null ? undefined : at[key];
+  return typeof at === "string" ? at : undefined;
+}
+
+function resolve(value) {
+  if (typeof value === "string" && value.startsWith("@ref:")) return refOf(value.slice(5)) ?? value;
+  if (typeof value === "string" && value.startsWith("@brief:")) return briefAt(value.slice(7)) ?? value;
+  if (Array.isArray(value)) return value.map(resolve);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, v]) => [key, resolve(v)]));
+  }
+  return value;
+}
+
+async function tool(name, args, auto = false) {
+  const reply = await call("tools/call", { name, arguments: args });
+  if (name === "browser_snapshot") snapshot = textOf(reply);
+  if (name === "apply_next") {
+    try {
+      brief = JSON.parse(textOf(reply));
+    } catch {
+      brief = null;
+    }
+  }
+  append(env.JOBPILOT_FAKE_REPLIES, { tool: name, args, reply, auto });
+  return reply;
+}
+
+(async () => {
+  await call("initialize", {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "fake-claude", version: "0.0.0" },
+  });
+  child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+  const listed = await call("tools/list", {});
+  append(env.JOBPILOT_FAKE_REPLIES, { tools: listed });
+  for (const step of scenario()) {
+    if (step.sleep_ms !== undefined) {
+      await new Promise((resolve) => setTimeout(resolve, step.sleep_ms));
+    } else if (step.exit !== undefined) {
+      process.exit(step.exit);
+    } else if (step.tool !== undefined && step.nowait) {
+      // Sent, and not waited for: the next step runs while the server still holds it.
+      call("tools/call", { name: step.tool, arguments: resolve(step.args || {}) });
+    } else if (step.tool !== undefined) {
+      if (JSON.stringify(step.args || {}).includes('"@ref:')) await tool("browser_snapshot", {}, true);
+      await tool(step.tool, resolve(step.args || {}));
+    }
+  }
+})();

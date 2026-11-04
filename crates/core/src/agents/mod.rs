@@ -10,6 +10,8 @@ use crate::error::{Error, Result};
 use crate::runner::{self, Finished, RunInput, RunState, Workflow, store};
 
 pub mod analytics;
+pub mod browser;
+pub mod claude_apply;
 pub mod discovery;
 pub mod draft;
 pub mod matching;
@@ -19,6 +21,12 @@ pub mod tracking;
 
 use crate::analytics::Report;
 use analytics::Analytics;
+pub use browser::{BrowserWorkflow, autonomous, autonomous_check, copilot, copilot_check};
+#[doc(hidden)]
+pub use browser::{autonomous_with, copilot_with};
+#[doc(hidden)]
+pub use claude_apply::claude_apply_with;
+pub use claude_apply::{ClaudeApply, claude_apply};
 use discovery::DiscoveryWorkflow;
 pub use discovery::{DiscoveryReport, SourceResult, discover, discover_with};
 use draft::DraftWorkflow;
@@ -42,13 +50,27 @@ pub async fn set_status(
     note: &str,
     cancel: CancellationToken,
 ) -> Result<Application> {
-    applications::get(db, application_id).await?;
+    set_status_with(db, actor, application_id, status, on, note, false, cancel).await
+}
+
+/// [`set_status`], and for a `manual` record of `applied`, an `application_submitted` row in
+/// the status write's own transaction, when no such row exists for the application.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn set_status_with(
+    db: &Db,
+    actor: &str,
+    application_id: &str,
+    status: &str,
+    on: Option<&str>,
+    note: &str,
+    manual: bool,
+    cancel: CancellationToken,
+) -> Result<Application> {
+    let app = applications::get(db, application_id).await?;
     applications::check_change(db, status, on, note).await?;
-    let workflow = Tracking {
-        application_id: application_id.to_owned(),
-        status: status.to_owned(),
-        on: on.map(str::to_owned),
-        note: note.to_owned(),
+    let workflow = match manual {
+        true => Tracking::manual(&app, status, on, note),
+        false => Tracking::new(application_id, status, on, note),
     };
     runner::start(db, actor, &workflow, cancel)
         .await?
@@ -113,6 +135,7 @@ async fn resume_from(
             application_id,
             status,
             on,
+            manual,
         } => {
             let current = applications::get(db, &application_id).await?;
             if current.status != status
@@ -123,11 +146,14 @@ async fn resume_from(
                     "this application's status changed after the run began; cancel the run".into(),
                 ));
             }
-            let workflow = Tracking {
-                application_id,
-                status,
-                on,
-                note: String::new(),
+            // A Manual record is checked again as `record_outcome` checks it, and its
+            // submission row is rebuilt from the application as it is now.
+            let workflow = match manual {
+                true => {
+                    crate::apply::refuse_in_a_run(db, &application_id).await?;
+                    Tracking::manual(&current, &status, on.as_deref(), "")
+                }
+                false => Tracking::new(&application_id, &status, on.as_deref(), ""),
             };
             runner::resume(db, actor, run_id, &workflow, cancel).await
         }
@@ -167,6 +193,9 @@ async fn resume_from(
             let workflow = ResearchWorkflow::new(router, company_id, true);
             runner::resume(db, actor, run_id, &workflow, cancel).await
         }
+        RunInput::BrowserApply { .. } | RunInput::ClaudeApply { .. } => Err(Error::Validation(
+            "an apply run does not resume; start a new run".into(),
+        )),
         RunInput::MemoryRefresh => {
             let workflow = MemoryWorkflow::new(router, true);
             runner::resume(db, actor, run_id, &workflow, cancel).await

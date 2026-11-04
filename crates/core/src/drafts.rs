@@ -1192,6 +1192,37 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
 /// the draft cannot then be shown free of it. Neither writes a file. The file is
 /// `<title-slug>-v<version>.<docx|pdf>` under `out_dir`, replacing one of that name.
 // ponytail: two lineages with one title share a file name, and the later export wins.
+/// [`export`]'s claim guard alone: it renders nothing and writes no row. Its answer is live,
+/// as evidence, profile, and marks can change after a file was written.
+pub async fn export_check(db: &Db, draft_id: &str) -> Result<()> {
+    guard(db, &get(db, draft_id).await?).await
+}
+
+async fn guard(db: &Db, draft: &Draft) -> Result<()> {
+    if holds_generated_text(db, draft).await? {
+        // First, so sealed text that cannot be read refuses before `claims` looks past it.
+        let stated = owned_field_states(db, &draft.doc, WhenLocked::Refuse).await?;
+        let claims = claims(db, &draft.id).await?;
+        let aligned = claims.iter().map(|c| &c.text).eq(lines(&draft.doc).iter());
+        let flagged = claims.iter().any(|claim| claim.status != "ok");
+        if !aligned || flagged || stated {
+            return Err(Error::Refused("claims_blocked".into()));
+        }
+    }
+    Ok(())
+}
+
+/// The name [`export`] gives a draft's file. A draft never changes once stored, so one name
+/// is one content.
+pub fn export_file_name(draft: &Draft, format: ExportFormat) -> String {
+    format!(
+        "{}-v{}.{}",
+        slug(&draft.title),
+        draft.version,
+        format.extension()
+    )
+}
+
 pub async fn export(
     db: &Db,
     draft_id: &str,
@@ -1216,23 +1247,8 @@ pub async fn export_signalling(
     started: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<PathBuf> {
     let draft = get(db, draft_id).await?;
-    if holds_generated_text(db, &draft).await? {
-        // First, so sealed text that cannot be read refuses before `claims` looks past it.
-        let stated = owned_field_states(db, &draft.doc, WhenLocked::Refuse).await?;
-        let claims = claims(db, draft_id).await?;
-        let aligned = claims.iter().map(|c| &c.text).eq(lines(&draft.doc).iter());
-        let flagged = claims.iter().any(|claim| claim.status != "ok");
-        if !aligned || flagged || stated {
-            return Err(Error::Refused("claims_blocked".into()));
-        }
-    }
-    let name = format!(
-        "{}-v{}.{}",
-        slug(&draft.title),
-        draft.version,
-        format.extension()
-    );
-    let path = out_dir.join(name);
+    guard(db, &draft).await?;
+    let path = out_dir.join(export_file_name(&draft, format));
     // Rendering and the file write run off the async threads: a runner step shares its
     // overseer's task, and a stretch that never yields would stall its timeout and heartbeat.
     // The audit row is written by a task of its own, so a cancel that drops this future past

@@ -33,6 +33,7 @@ const TASKS: Record<TaskSharing["task"], string> = {
   classify_answer: "Sorting an answer",
   semantic_match: "Comparing a job with your résumé",
   summarize_company: "Summarizing a company",
+  map_form_field: "Matching a form field to your answers",
 };
 
 /** The part of the consent key after the slash, in words. */

@@ -1,5 +1,7 @@
-//! The terminal panel's PTY: one session of the bundled `jobpilot shell`, never a system
-//! shell. `pty_open` takes a size and nothing else, so the webview cannot choose what runs.
+//! The terminal panel's PTY: one session of the bundled `jobpilot shell`, or of `jobpilot apply
+//! session <id>` for a `ready` apply run, never a system shell. `pty_open` takes a size and
+//! nothing else, and `pty_open_apply` a size and a run id, so the webview cannot choose what
+//! runs.
 //! Keystrokes are bytes on a queue, because a write can block for as long as the child
 //! ignores its input and commands run on the main thread. Output and the exit code go out
 //! as events to the window that opened the session, and output is paced by acks from the
@@ -17,10 +19,12 @@ use std::time::Duration;
 use std::time::Instant;
 
 use jobpilot_core::ai::claude_code::ClaudeCode;
-use jobpilot_core::{Error, Result};
+use jobpilot_core::browser::sweep::kill_marked;
+use jobpilot_core::{AppPaths, Error, Result, apply};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tauri::{
-    Emitter, EventTarget, Listener, Manager, Runtime, State, WebviewWindow, Window, WindowEvent,
+    AppHandle, Emitter, EventTarget, Listener, Manager, Runtime, State, WebviewWindow, Window,
+    WindowEvent,
 };
 
 use crate::state::AppState;
@@ -43,7 +47,8 @@ const DRAIN: Duration = Duration::from_millis(500);
 
 /// What the panel's child inherits beyond the headless adapter's list: an interactive
 /// session and the login-shell lookup for `claude` want them. Still no API keys or tokens.
-const PANEL_ENV: &[&str] = &["SHELL", "LOGNAME", "USERNAME", "PATHEXT"];
+/// One list, the apply host's own.
+const PANEL_ENV: &[&str] = jobpilot_core::apply::session::TERMINAL_ENV;
 /// A Finder launch has only the system folders on `PATH`. Besides `claude`, which the shell
 /// also finds through `ai.claude_path`, a session needs what `claude` itself runs.
 #[cfg(unix)]
@@ -58,30 +63,71 @@ pub struct PtyState {
     ending: Mutex<Vec<JoinHandle<()>>>,
 }
 
+/// What the session runs. The webview names at most a run id; Rust builds the command.
+pub enum Launch {
+    Shell,
+    /// `jobpilot apply session <id>`, for a run checked `ready` first.
+    Apply(String),
+}
+
+/// The apply run a session hosts: its id, and its folder, which every process of the run
+/// names on its command line.
+struct Hosted {
+    id: String,
+    dir: PathBuf,
+}
+
 pub struct Session {
     id: u64,
+    apply: Option<Hosted>,
     master: Box<dyn MasterPty + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     input: SyncSender<Vec<u8>>,
     output: Arc<Output>,
-    #[cfg(any(unix, test))]
+    /// The child's pid: the apply host matches its own claim by it.
     pid: Option<u32>,
 }
 
 impl Session {
     /// Ends the child and whatever it runs. Blocks for up to the grace period, and on Windows
     /// until the pseudoconsole has closed: that close is what ends the attached processes,
-    /// and the reader keeps draining meanwhile. A failed kill means the child has gone.
+    /// and the reader keeps draining meanwhile. A failed kill means the child has gone. An
+    /// apply host's browser runs in a group of its own, so its run folder is swept after.
     fn end(mut self) {
         self.output.silence();
         #[cfg(unix)]
-        let groups = [
-            self.master.process_group_leader(),
-            self.pid.and_then(|pid| libc::pid_t::try_from(pid).ok()),
-        ];
+        let groups = self.groups();
         let _ = self.killer.kill();
         #[cfg(unix)]
         kill_groups_after_grace(groups);
+        if let Some(hosted) = &self.apply {
+            kill_marked(&hosted.dir);
+        }
+    }
+
+    /// The emergency pause's end: no hangup and no grace, so the host cannot write a state of
+    /// its own before the pause row lands, then the run folder's processes.
+    fn kill_now(mut self) {
+        self.output.silence();
+        #[cfg(unix)]
+        let groups = self.groups();
+        #[cfg(unix)]
+        for group in groups.iter().flatten().copied().filter(|group| *group > 1) {
+            // SAFETY: `kill` takes plain integers and touches no memory; never 0 or 1.
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+        }
+        let _ = self.killer.kill();
+        if let Some(hosted) = &self.apply {
+            kill_marked(&hosted.dir);
+        }
+    }
+
+    #[cfg(unix)]
+    fn groups(&self) -> [Option<libc::pid_t>; 2] {
+        [
+            self.master.process_group_leader(),
+            self.pid.and_then(|pid| libc::pid_t::try_from(pid).ok()),
+        ]
     }
 }
 
@@ -183,21 +229,54 @@ impl PtyState {
     }
 
     /// For the main thread: stops the output now and leaves the grace period to a thread.
-    fn close_soon(&self) {
-        let session = self.slot().take();
-        if let Some(session) = session {
-            session.output.silence();
-            self.ending().push(thread::spawn(move || session.end()));
-        }
+    /// For an apply session, the run's id and word of when the end is done.
+    fn close_soon(&self) -> Option<(String, Option<u32>, mpsc::Receiver<()>)> {
+        let session = self.slot().take()?;
+        session.output.silence();
+        let host_pid = session.pid;
+        let hosted = session.apply.as_ref().map(|hosted| hosted.id.clone());
+        let (done, ended) = mpsc::channel();
+        self.ending().push(thread::spawn(move || {
+            session.end();
+            let _ = done.send(());
+        }));
+        hosted.map(|id| (id, host_pid, ended))
     }
 
     fn ending(&self) -> MutexGuard<'_, Vec<JoinHandle<()>>> {
         self.ending.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// For the emergency pause: ends an apply session at once, off the async runtime, with
+    /// everything its run folder names, the browser included, which runs in a process group
+    /// of its own. Returns once they are signalled, with the run's id. A plain shell session
+    /// is left alone: what the owner runs there is the owner's (M-14).
+    pub async fn close_apply(&self) -> Option<String> {
+        let session = {
+            let mut slot = self.slot();
+            slot.as_ref()?.apply.as_ref()?;
+            slot.take()?
+        };
+        session.output.silence();
+        let id = session.apply.as_ref()?.id.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || session.kill_now()).await;
+        Some(id)
+    }
+
     #[cfg(test)]
     pub fn pid(&self) -> Option<u32> {
         self.slot().as_ref()?.pid
+    }
+
+    /// Stands an open shell session in for an apply session, as a real one needs a browser.
+    #[cfg(test)]
+    pub fn mark_apply(&self, paths: &AppPaths, apply_id: &str) {
+        if let Some(session) = self.slot().as_mut() {
+            session.apply = Some(Hosted {
+                id: apply_id.to_owned(),
+                dir: paths.apply().join(apply_id),
+            });
+        }
     }
 }
 
@@ -219,11 +298,13 @@ fn find_sidecar(exe: &Path, debug: bool) -> Result<PathBuf> {
 }
 
 /// The child's whole environment. `base` is the allow-list, so the app's own variables
-/// stay behind; `service` is the debug-only test keychain.
+/// stay behind; `service` is the debug-only test keychain. `marker` sets `JOBPILOT_PANEL`,
+/// which an apply host must not have: the CLI refuses `apply session` under it.
 fn panel_env(
     base: Vec<(String, String)>,
     root: &Path,
     service: Option<String>,
+    marker: bool,
 ) -> BTreeMap<String, String> {
     let mut env: BTreeMap<_, _> = base.into_iter().collect();
     #[cfg(unix)]
@@ -234,7 +315,9 @@ fn panel_env(
         "JOBPILOT_HOME".to_owned(),
         root.to_string_lossy().into_owned(),
     );
-    env.insert("JOBPILOT_PANEL".to_owned(), "1".to_owned());
+    if marker {
+        env.insert("JOBPILOT_PANEL".to_owned(), "1".to_owned());
+    }
     env.insert("TERM".to_owned(), "xterm-256color".to_owned());
     if let Some(service) = service {
         env.insert("JOBPILOT_SECRET_SERVICE".to_owned(), service);
@@ -291,6 +374,35 @@ pub async fn pty_open<R: Runtime>(
     rows: u16,
 ) -> Result<()> {
     let size = checked_size(cols, rows)?;
+    open_session(window, &app, &state, size, Launch::Shell)
+}
+
+/// Hosts a `ready` apply run's session. The id is checked against the store here, and the
+/// command line is Rust's: the webview names the run and the size, and nothing else.
+#[tauri::command]
+pub async fn pty_open_apply<R: Runtime>(
+    window: WebviewWindow<R>,
+    app: State<'_, AppState>,
+    state: State<'_, PtyState>,
+    cols: u16,
+    rows: u16,
+    apply_id: String,
+) -> Result<()> {
+    let size = checked_size(cols, rows)?;
+    let run = apply::view(&*app.work().await?, &apply_id).await?;
+    if run.state != "ready" {
+        return Err(Error::Refused("apply_run_not_ready".into()));
+    }
+    open_session(window, &app, &state, size, Launch::Apply(run.id))
+}
+
+fn open_session<R: Runtime>(
+    window: WebviewWindow<R>,
+    app: &AppState,
+    state: &PtyState,
+    size: PtySize,
+    launch: Launch,
+) -> Result<()> {
     let root = app.known_root()?.root().to_path_buf();
     let sidecar = sidecar_path()?;
     let mut slot = state.slot();
@@ -300,7 +412,16 @@ pub async fn pty_open<R: Runtime>(
 
     let pair = native_pty_system().openpty(size).map_err(pty_error)?;
     let mut command = CommandBuilder::new(sidecar);
-    command.arg("shell");
+    let apply_id = match launch {
+        Launch::Shell => {
+            command.arg("shell");
+            None
+        }
+        Launch::Apply(id) => {
+            command.args(["apply", "session", id.as_str()]);
+            Some(id)
+        }
+    };
     command.env_clear();
     let mut base = ClaudeCode::child_env();
     base.extend(
@@ -311,7 +432,7 @@ pub async fn pty_open<R: Runtime>(
     let service = std::env::var("JOBPILOT_SECRET_SERVICE")
         .ok()
         .filter(|_| cfg!(debug_assertions));
-    for (name, value) in panel_env(base, &root, service) {
+    for (name, value) in panel_env(base, &root, service, apply_id.is_none()) {
         command.env(name, value);
     }
     let mut child = pair.slave.spawn_command(command).map_err(pty_error)?;
@@ -324,7 +445,6 @@ pub async fn pty_open<R: Runtime>(
     let output = Arc::new(Output::default());
     let id = state.next_id.fetch_add(1, Ordering::Relaxed);
     let killer = child.clone_killer();
-    #[cfg(any(unix, test))]
     let pid = child.process_id();
 
     thread::spawn(move || write_input(queue, writer));
@@ -339,22 +459,37 @@ pub async fn pty_open<R: Runtime>(
         let code = child.wait().ok().map(|status| status.exit_code());
         // `None`: `close` took it, so nobody is waiting for an exit.
         if let Some(session) = window.state::<PtyState>().take(id) {
+            let hosted = session.apply.as_ref().map(|hosted| hosted.id.clone());
+            let host_pid = session.pid;
             // Windows only ends the reader when the pseudoconsole closes.
             drop(session);
             let _ = drained.recv_timeout(DRAIN);
             ended.silence();
             let _ = window.emit_to(target(&window), "pty:exit", code);
+            // A host that exits with nobody closing the panel is gone all the same: its run is
+            // ended as on a close, so nothing it started outlives it.
+            if let (Some(apply_id), Some(app)) = (hosted, window.try_state::<AppState>()) {
+                tauri::async_runtime::block_on(async {
+                    if let Ok(db) = app.work().await {
+                        end_closed_run(&db, &apply_id, host_pid).await;
+                    }
+                });
+            }
         }
         window.unlisten(acks);
     });
 
+    let apply = apply_id.map(|id| Hosted {
+        dir: AppPaths::new(&root).apply().join(&id),
+        id,
+    });
     *slot = Some(Session {
         id,
+        apply,
         master: pair.master,
         killer,
         input,
         output,
-        #[cfg(any(unix, test))]
         pid,
     });
     Ok(())
@@ -429,11 +564,81 @@ pub fn pty_resize(state: State<'_, PtyState>, cols: u16, rows: u16) -> Result<()
 }
 
 /// Fine with no session: the panel calls this before every open, to clear one a page
-/// reload left behind with nobody listening.
+/// reload left behind with nobody listening. Closing an apply run's session is a person's
+/// act: once the host and its browser are gone, the run is ended and wound up, so nothing
+/// waits for a heartbeat to go stale.
 #[tauri::command]
-pub fn pty_close(state: State<'_, PtyState>) -> Result<()> {
-    state.close_soon();
+pub fn pty_close<R: Runtime>(app: AppHandle<R>, state: State<'_, PtyState>) -> Result<()> {
+    if let Some((apply_id, host_pid, ended)) = state.close_soon() {
+        tauri::async_runtime::spawn(async move {
+            let _ =
+                tauri::async_runtime::spawn_blocking(move || ended.recv_timeout(END_WAIT)).await;
+            let state = app.state::<AppState>();
+            if let Ok(db) = state.work().await {
+                end_closed_run(&db, &apply_id, host_pid).await;
+            }
+        });
+    }
     Ok(())
+}
+
+/// How long a closed session's end may take before its run is ended anyway.
+const END_WAIT: Duration = Duration::from_secs(5);
+
+/// The host is gone: the agent run it held is halted, then the person's close cancels a run
+/// no host ever claimed. A claim another host holds is left to it.
+async fn end_closed_run(db: &jobpilot_core::Db, apply_id: &str, host_pid: Option<u32>) {
+    if let Ok(apply::HostGone::Unclaimed) = apply::host_gone(db, apply_id, "closed", host_pid).await
+    {
+        let _ = apply::cancel(db, "gui", apply_id).await;
+    }
+}
+
+/// A browser as Playwright starts one, for tests: the run folder on its command line, and
+/// on Unix deaf to SIGTERM.
+#[cfg(test)]
+pub mod test_support {
+    use std::path::Path;
+    use std::process::{Child, Command};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    pub fn marked_browser(dir: &Path) -> Child {
+        let flag = format!("--user-data-dir={}", dir.join("profile").display());
+        let child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "trap '' TERM; while :; do sleep 1; done",
+                "browser",
+                &flag,
+            ])
+            .spawn()
+            .unwrap();
+        // Until the shell has read its trap and the system shows its arguments.
+        thread::sleep(Duration::from_millis(200));
+        child
+    }
+
+    /// `rem` ends the line, so the folder is an argument and nothing reads it.
+    #[cfg(windows)]
+    pub fn marked_browser(dir: &Path) -> Child {
+        let flag = format!("--user-data-dir={}", dir.join("profile").display());
+        let child = Command::new("cmd")
+            .args(["/c", "ping -n 30 127.0.0.1 >nul & rem", &flag])
+            .spawn()
+            .unwrap();
+        thread::sleep(Duration::from_millis(500));
+        child
+    }
+
+    pub fn gone_within_two_seconds(child: &mut Child) {
+        let until = Instant::now() + Duration::from_secs(2);
+        while child.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < until, "process {} survived", child.id());
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -443,6 +648,8 @@ mod tests {
     use tauri::test::MockRuntime;
     use tauri::{App, WebviewWindowBuilder};
 
+    #[cfg(unix)]
+    use super::test_support::{gone_within_two_seconds, marked_browser};
     use super::*;
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -452,7 +659,7 @@ mod tests {
 
     #[test]
     fn panel_env_carries_the_marker_root_and_terminal() {
-        let found = panel_env(env(&[("TERM", "dumb")]), Path::new("/data"), None);
+        let found = panel_env(env(&[("TERM", "dumb")]), Path::new("/data"), None, true);
         assert_eq!(found["JOBPILOT_PANEL"], "1");
         assert_eq!(found["JOBPILOT_HOME"], "/data");
         assert_eq!(found["TERM"], "xterm-256color");
@@ -461,7 +668,12 @@ mod tests {
 
     #[test]
     fn panel_env_passes_only_what_it_was_given() {
-        let found = panel_env(env(&[("USER", "me")]), Path::new("/data"), Some("t".into()));
+        let found = panel_env(
+            env(&[("USER", "me")]),
+            Path::new("/data"),
+            Some("t".into()),
+            true,
+        );
         assert_eq!(found["USER"], "me");
         assert_eq!(found["JOBPILOT_SECRET_SERVICE"], "t");
         assert!(!found.contains_key("ANTHROPIC_API_KEY"));
@@ -472,7 +684,7 @@ mod tests {
     #[test]
     fn panel_path_reaches_the_usual_tools_on_a_finder_launch() {
         let base = env(&[("PATH", "/usr/bin:/bin"), ("HOME", "/Users/me")]);
-        let path = panel_env(base, Path::new("/data"), None)["PATH"].clone();
+        let path = panel_env(base, Path::new("/data"), None, true)["PATH"].clone();
         assert!(path.starts_with("/usr/bin:/bin:"), "{path}");
         for dir in [
             "/opt/homebrew/bin",
@@ -487,7 +699,7 @@ mod tests {
     #[test]
     fn panel_path_adds_nothing_twice() {
         let base = env(&[("PATH", "/opt/homebrew/bin:/usr/local/bin")]);
-        let path = panel_env(base, Path::new("/data"), None)["PATH"].clone();
+        let path = panel_env(base, Path::new("/data"), None, true)["PATH"].clone();
         assert_eq!(path, "/opt/homebrew/bin:/usr/local/bin");
     }
 
@@ -618,6 +830,19 @@ mod tests {
         pid: i32,
     }
 
+    /// The stand-in ignores SIGHUP, so nothing else ends it: a test that never closes its
+    /// session, or panics before it does, would leave it running for ever. It also ends once
+    /// the test process is gone (it watches the test's pid, not its parent, so a regression in
+    /// `close` is still caught by `assert_gone`).
+    #[cfg(unix)]
+    impl Drop for Stubborn {
+        fn drop(&mut self) {
+            self.app.state::<PtyState>().close();
+            // SAFETY: `kill` takes plain integers; the pid is this test's own stand-in.
+            unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        }
+    }
+
     #[cfg(unix)]
     impl Stubborn {
         fn start() -> Self {
@@ -629,8 +854,9 @@ mod tests {
             let claude = bin.join("claude");
             let pid_file = tmp.path().join("claude.pid");
             let body = format!(
-                "#!/bin/sh\ntrap '' HUP\necho $$ > {}\necho claude-ready\nwhile :; do sleep 1; done\n",
-                pid_file.display()
+                "#!/bin/sh\ntrap '' HUP\necho $$ > {}\necho claude-ready\nwhile kill -0 {} 2>/dev/null; do sleep 1; done\n",
+                pid_file.display(),
+                std::process::id()
             );
             std::fs::write(&claude, body).unwrap();
             std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -723,9 +949,124 @@ mod tests {
     fn close_waits_for_a_pty_close_still_under_way() {
         let session = Stubborn::start();
         let started = std::time::Instant::now();
-        pty_close(session.app.state()).unwrap();
+        pty_close(session.app.handle().clone(), session.app.state()).unwrap();
         session.app.state::<PtyState>().close();
         assert!(started.elapsed() >= HANGUP_GRACE, "close did not wait");
+        session.assert_gone();
+    }
+
+    #[test]
+    fn panel_env_leaves_the_marker_out_for_an_apply_host() {
+        let found = panel_env(env(&[("USER", "me")]), Path::new("/data"), None, false);
+        assert!(!found.contains_key("JOBPILOT_PANEL"));
+        assert_eq!(found["JOBPILOT_HOME"], "/data");
+        assert_eq!(PANEL_ENV, jobpilot_core::apply::session::TERMINAL_ENV);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn close_apply_kills_a_fake_claude_and_a_marked_browser() {
+        let session = Stubborn::start();
+        let state = session.app.state::<PtyState>();
+        let paths = AppPaths::new(session._tmp.path().join("data"));
+        let id = "0123abcd";
+        state.mark_apply(&paths, id);
+        let mut browser = marked_browser(&paths.apply().join(id));
+
+        let closed = tauri::async_runtime::block_on(state.close_apply());
+
+        assert_eq!(closed.as_deref(), Some(id));
+        assert!(state.pid().is_none());
+        session.assert_gone();
+        gone_within_two_seconds(&mut browser);
+    }
+
+    /// The host of a run exits with nobody closing the panel (here: killed outright). The app
+    /// reacts as to a close: the agent run it held is halted and the run is wound up.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_that_exits_on_its_own_ends_its_run() {
+        let session = Stubborn::start();
+        let state = session.app.state::<PtyState>();
+        let paths = AppPaths::new(session._tmp.path().join("data"));
+        let (id, agent_run) = ("0123abcd", "feedface");
+        let host_pid = state.pid().unwrap();
+        let db = tauri::async_runtime::block_on(async {
+            session
+                .app
+                .state::<AppState>()
+                .db
+                .read()
+                .await
+                .clone()
+                .unwrap()
+        });
+        tauri::async_runtime::block_on(async {
+            sqlx::query(
+                "INSERT INTO agent_runs (id, agent, state, actor, input, steps, heartbeat_at, \
+                 created_at) VALUES (?, 'claude_apply', 'running', 'gui', '{}', 2, \
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            )
+            .bind(agent_run)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO apply_runs (id, agent_run_id, mode, actor, state, created_at) \
+                 VALUES (?, ?, 'claude_code', 'gui', 'running', \
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            )
+            .bind(id)
+            .bind(agent_run)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        });
+        let dir = paths.apply().join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        apply::record_host(&dir, host_pid, agent_run).unwrap();
+        state.mark_apply(&paths, id);
+
+        // SAFETY: `kill` takes plain integers; the pid is the session's own child.
+        unsafe { libc::kill(host_pid as libc::pid_t, libc::SIGKILL) };
+
+        let run_state = || {
+            tauri::async_runtime::block_on(
+                sqlx::query_scalar::<_, String>("SELECT state FROM apply_runs WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&db.pool),
+            )
+            .unwrap()
+        };
+        let until = Instant::now() + Duration::from_secs(20);
+        while run_state() != "ended" && Instant::now() < until {
+            thread::sleep(Duration::from_millis(50));
+        }
+        // SAFETY: as above; the stand-in `claude` ignores the hangup, so it goes first.
+        unsafe { libc::kill(session.pid, libc::SIGKILL) };
+        session.assert_gone();
+        assert_eq!(run_state(), "ended");
+        assert!(!dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn close_apply_leaves_a_plain_shell_session_alone() {
+        let session = Stubborn::start();
+        let state = session.app.state::<PtyState>();
+        let pid = state.pid();
+
+        assert!(tauri::async_runtime::block_on(state.close_apply()).is_none());
+
+        thread::sleep(HANGUP_GRACE * 2);
+        assert_eq!(state.pid(), pid);
+        // SAFETY: `kill` takes plain integers; signal 0 only asks if the process exists.
+        assert_eq!(
+            unsafe { libc::kill(session.pid, 0) },
+            0,
+            "claude must still run"
+        );
+        state.close();
         session.assert_gone();
     }
 

@@ -1,0 +1,4 @@
+- generic [ref=e1]:
+  - textbox "Full name *" [ref=e3]: Alex Doe
+  - checkbox "I certify that my answers are true and complete" [ref=e6]
+  - button "Submit application" [ref=e7]

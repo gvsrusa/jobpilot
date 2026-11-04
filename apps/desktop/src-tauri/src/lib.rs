@@ -19,15 +19,24 @@ fn focus_main_window(app: &AppHandle) {
     }
 }
 
-/// A `jobpilot pause set` from the CLI ends a download or an index started here, within a
-/// second. Runs are ended by their own poll in core.
+/// A `jobpilot pause set` from the CLI ends a download, an index, or an apply session started
+/// here, within a second. Runs are ended by their own poll in core.
 fn watch_pause(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             if let Some(state) = app.try_state::<AppState>() {
-                commands::stop_if_paused(&state).await;
+                commands::stop_if_paused(&state, &app.state::<PtyState>()).await;
             }
+        }
+    });
+}
+
+/// Once: what an apply host that died left behind. Off the setup thread, as a purge can wait.
+fn sweep_orphans(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        if let Some(state) = app.try_state::<AppState>() {
+            commands::sweep_at_start(&state).await;
         }
     });
 }
@@ -54,6 +63,7 @@ pub fn run() {
                 Err(error) => AppState::no_root(&error),
             };
             app.manage(state);
+            sweep_orphans(app.handle().clone());
             watch_pause(app.handle().clone());
             Ok(())
         })
@@ -62,6 +72,7 @@ pub fn run() {
         .run(|app, event| {
             if matches!(event, RunEvent::Exit) {
                 app.state::<PtyState>().close();
+                tauri::async_runtime::block_on(commands::clear_copied(app));
                 if let Some(state) = app.try_state::<AppState>() {
                     tauri::async_runtime::block_on(state.shutdown());
                 }

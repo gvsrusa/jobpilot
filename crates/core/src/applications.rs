@@ -315,6 +315,21 @@ pub async fn set_status(
     on: Option<&str>,
     note: &str,
 ) -> Result<Application> {
+    set_status_with(db, actor, id, status, on, note, None).await
+}
+
+/// [`set_status`], and with `submission`, an `application_submitted` audit row in the same
+/// transaction, unless one already exists for this application: one submission is recorded
+/// once, whoever recorded it first.
+pub(crate) async fn set_status_with(
+    db: &Db,
+    actor: &str,
+    id: &str,
+    status: &str,
+    on: Option<&str>,
+    note: &str,
+    submission: Option<&serde_json::Value>,
+) -> Result<Application> {
     // Public, so it gates itself: the tracking agent is one caller, not the only possible one.
     pause::ensure_off(db).await?;
     check_change(db, status, on, note).await?;
@@ -331,19 +346,23 @@ pub async fn set_status(
     .ok_or(Error::NotFound)?;
     if current.status == status {
         // No status event, but a note the person typed is not dropped.
-        if note.is_empty() {
+        if note.is_empty() && submission.is_none() {
             return Ok(current);
         }
-        let app: Application = sqlx::query_as(concat!(
-            "UPDATE applications SET updated_at = ",
-            now!(),
-            " WHERE id = ? RETURNING ",
-            columns!()
-        ))
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
-        event(&mut tx, id, actor, "note", None, None, note).await?;
+        let mut app = current;
+        if !note.is_empty() {
+            app = sqlx::query_as(concat!(
+                "UPDATE applications SET updated_at = ",
+                now!(),
+                " WHERE id = ? RETURNING ",
+                columns!()
+            ))
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+            event(&mut tx, id, actor, "note", None, None, note).await?;
+        }
+        submitted(&mut tx, actor, id, submission).await?;
         tx.commit().await?;
         return Ok(app);
     }
@@ -370,8 +389,38 @@ pub async fn set_status(
         note,
     )
     .await?;
+    submitted(&mut tx, actor, id, submission).await?;
     tx.commit().await?;
     Ok(app)
+}
+
+async fn submitted(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    actor: &str,
+    id: &str,
+    submission: Option<&serde_json::Value>,
+) -> Result<()> {
+    let Some(detail) = submission else {
+        return Ok(());
+    };
+    let recorded: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM audit_log \
+         WHERE action = 'application_submitted' AND target = ?)",
+    )
+    .bind(id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !recorded {
+        crate::audit::record_to(
+            &mut **tx,
+            actor,
+            "application_submitted",
+            Some(id),
+            detail.clone(),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// `since` is a stored timestamp, so the two compare as text. The same millisecond counts.

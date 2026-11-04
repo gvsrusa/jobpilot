@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { CopilotStop } from "@/components/CopilotStop";
 import { ErrorAlert } from "@/components/ErrorAlert";
 import { TerminalPanel } from "@/components/TerminalPanel";
 import { TitleBar } from "@/components/TitleBar";
@@ -37,6 +38,12 @@ function Shell({ root }: { root: string }) {
   const nav = useRef<HTMLElement>(null);
   const main = useRef<HTMLElement>(null);
   const [terminal, setTerminal] = useState(false);
+  // A run started from the screen is hosted in the panel, so the panel opens for it.
+  const applyRun = useUiStore((s) => s.applyRun);
+  const applyHost = useUiStore((s) => s.applyHost);
+  useEffect(() => {
+    if (applyRun && applyHost) setTerminal(true);
+  }, [applyRun, applyHost]);
 
   // On a view change, focus moves to the main view heading. Not on launch: that would put
   // the first tab stop past Emergency pause.
@@ -117,6 +124,7 @@ function Shell({ root }: { root: string }) {
           ))}
         </nav>
         <main ref={main} className="flex-1 p-6">
+          <CopilotStop />
           {view === "status" && <StatusView />}
           {view === "documents" && <DocumentsView />}
           {view === "data" && <DataView />}

@@ -1,5 +1,6 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
+import { useUiStore } from "./lib/store";
 import { backend, count, READY, recovery, renderApp } from "./test-utils";
 
 describe("shell", () => {
@@ -29,6 +30,19 @@ describe("shell", () => {
 
 describe("terminal panel", () => {
   const panel = () => screen.queryByText("jobpilot CLI only");
+
+  it("setting a run opens the panel", async () => {
+    const api = backend();
+    renderApp();
+    await screen.findByRole("heading", { name: "Status" });
+    expect(panel()).not.toBeVisible();
+
+    act(() => useUiStore.getState().setApplyRun("run1", true));
+
+    expect(await screen.findByText("Claude Code apply run")).toBeVisible();
+    await waitFor(() => expect(count(api, "pty_open_apply")).toBe(1));
+    expect(count(api, "pty_open")).toBe(0);
+  });
 
   it("ctrl_backquote_toggles_the_panel_and_keeps_the_session", async () => {
     const api = backend();

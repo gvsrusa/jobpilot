@@ -119,7 +119,7 @@ The names below are the Rust names in `crates/core/src/ai/`. The vocabulary abov
 | Contract term | 0.2 code |
 |---|---|
 | `TaskRouter` | `Router` (`router.rs`). `Router::from_settings(&Db)` builds it from the user's order and enabled flags; `run(db, task, prompt, cancel)` and `embed(...)` take the `Db`, so the router holds none. |
-| Task types | `TaskType::{ParseJob, DraftResume, DraftCoverLetter, ClassifyAnswer, Embed}` with one `TaskSpec` each (`mod.rs`). `ClassifyAnswer` arrived in 0.3, and `SemanticMatch` and `SummarizeCompany` in 0.5 (see [As built in 0.5](#as-built-in-05)). `map_form_field` has no task yet. |
+| Task types | `TaskType::{ParseJob, DraftResume, DraftCoverLetter, ClassifyAnswer, Embed}` with one `TaskSpec` each (`mod.rs`). `ClassifyAnswer` arrived in 0.3, `SemanticMatch` and `SummarizeCompany` in 0.5 (see [As built in 0.5](#as-built-in-05)), and `MapFormField` in 0.6 (see [As built in 0.6](#as-built-in-06)). |
 | Provider | trait `Provider` (`declaration`, `available`, `complete`, `embed`). Implementations: `Ollama`, `ClaudeCode`, `NoAi`. `ProviderId` has exactly those three variants, so a provider the owner decisions leave out has no way in. |
 | Results | `Outcome::{Ok, ManualRequired, Cancelled, Failed}`. |
 | Cancellation | one `CancellationToken` type, polled every 100 ms. Revoking consent, Ctrl-C, and app exit fire it, and a dropped attempt kills its child. |
@@ -363,3 +363,16 @@ What Rust does with each reply, because model output is data:
 - **Truncation and bad replies.** `unusable_reply` and `output_truncated` end the task as `manual_required`. The rules score and any earlier summary stay.
 - **Ceiling.** An AI press states its most calls first: the external providers that declare `no_tools` and hold a consent covering the task's categories, times the task's attempts. The matching press covers at most 20 jobs (`MATCH_BATCH`).
 - **Run log.** `agent_run_log.dropped` (migration 0015) counts the values Rust dropped from model output. It holds a number, never text.
+
+## As built in 0.6
+
+One task type arrives with browser automation, in `crates/core/src/ai/mod.rs`. It requires `structured_output` and `no_tools`, carries untrusted form text, and is in `COMPLETION_TASKS`, so the consent screen lists it.
+
+| Task | Categories | Schema | Attempts | Reply |
+|---|---|---|---|---|
+| `map_form_field` | `job_text`, `career_memory` | `schemas/map_form_field.json` | 2 | `answer_id`: one of the listed ids, or `null`. |
+
+- **What the model sees.** The prompt (`generate::map_field_prompt`) holds the field's label in one marked block and `id: question` lines for the candidate answers in a second, both neutralised. Candidates are Normal, approved, fresh answers only. No answer text, no Sensitive or Legal answer, and no work-authorization value is in the prompt.
+- **What Rust does with the reply.** `Router::run_checked` accepts `null` or a listed id, and Rust checks the id again before it fills that answer's value itself. A foreign id is refused (`map_form_field_never_sees_an_answer_value_and_a_foreign_id_is_refused`). The task is `reviewed`: only Copilot calls it, at most 20 fields a run (`MAX_MODEL_FIELDS`), and the person reviews and submits. Autonomous calls no model.
+
+**The Claude Code apply session is not a router task (decision 6 of the 0.6 plan).** It is a user-visible interactive `claude` session the owner starts, in the terminal panel or a plain terminal, and it runs on the owner's own `claude` and sign-in like the D1 terminal session. It holds page text beside the facts of one application, so the `no_tools` rule cannot hold for it; its tools are only those of JobPilot's `apply-mcp` proxy, and the [threat model](security/threat-model.md#7-cli-adapters-and-untrusted-text) records this as an exception for this mode only, under the owner's decision of 2026-11-01. The router never sends it work, and nothing is retried or routed to another provider. **Consent is checked at start:** `apply start` requires an active consent for `claude_code/cli_login` covering `job_text`, `profile_basic`, and `career_memory`, and, when the owner releases sealed answers, `sensitive` (`start_needs_consent_for_the_categories_and_sensitive_only_on_release`). Each run writes one `ai_external_call` audit row naming the provider and the categories. No provider row in the register changed, so no consent record is suspended by this release.

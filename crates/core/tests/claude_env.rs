@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
+use jobpilot_core::ai::child::system_env;
 use jobpilot_core::ai::claude_code::ClaudeCode;
 use jobpilot_core::ai::{CancellationToken, Prompt, Provider};
 
@@ -58,7 +59,11 @@ async fn child_env_is_an_allow_list() {
 
     let listed = ClaudeCode::child_env();
     for (name, _) in &listed {
-        assert!(KEPT.contains(&name.as_str()), "{name} is not on the list");
+        let system = system_env(cfg!(windows));
+        assert!(
+            KEPT.contains(&name.as_str()) || system.contains(&name.as_str()),
+            "{name} is not on the list"
+        );
     }
     for name in ["PATH", "USER", "CLAUDE_CONFIG_DIR"] {
         assert!(listed.iter().any(|(n, _)| n == name), "{name} was dropped");

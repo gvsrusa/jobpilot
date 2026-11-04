@@ -408,7 +408,8 @@ export type TaskSharing = {
     | "draft_cover_letter"
     | "classify_answer"
     | "semantic_match"
-    | "summarize_company";
+    | "summarize_company"
+    | "map_form_field";
   categories: DataCategory[];
   runs: boolean;
   skipped_because: string | null;
@@ -616,6 +617,100 @@ export type CompanyResearch = {
 };
 export type MatchPrefs = { min_pay: PayWish | null; seniority: string | null };
 
+/** `browser status`: the pinned Playwright runtime and the Node it runs on. */
+export type BrowserStatus = {
+  state: "no_node" | "node_too_old" | "not_installed" | "wrong_version" | "ready";
+  found: string | null;
+  playwright_mcp: string;
+};
+export type DocState = "ready" | "missing" | { blocked: string };
+export type AuthorizationState = "stated" | "not_stated" | "no_country";
+/** One application as the preflight checked it. Counts only: no answer text. */
+export type ItemCheck = {
+  application_id: string;
+  company: string;
+  role: string;
+  host: string;
+  country: string;
+  resume: DocState;
+  letter: DocState;
+  answers: number;
+  stale_left_out: number;
+  sealed: number;
+  authorization: AuthorizationState;
+  blocks: string[];
+};
+export type Preflight = {
+  items: ItemCheck[];
+  runtime: BrowserStatus["state"];
+  claude: string | null;
+  consent_missing: DataCategory[];
+  sealed_total: number;
+  /** Without it nothing sealed can be released, so Rust does not ask. */
+  sensitive_consent: boolean;
+};
+export type ApplyItem = {
+  id: string;
+  run_id: string;
+  application_id: string | null;
+  position: number;
+  host: string;
+  state: string;
+  submit_clicks: number;
+  auth_released: boolean;
+  resume_path: string | null;
+  letter_path: string | null;
+  policy_note: string | null;
+  /** The page's own words, untrusted: shown as plain text only. */
+  confirmation_text: string | null;
+  confirmation_url: string | null;
+  status_written: boolean;
+  reason: string | null;
+  released_answers: string[];
+};
+export type PauseKind = "legal" | "sensitive" | "identity" | "captcha" | "mfa" | "login" | "other";
+export type ApplyPause = {
+  id: string;
+  item_id: string;
+  kind: PauseKind;
+  origin: string;
+  /** Page text, untrusted: shown as plain text only. */
+  excerpt: string;
+  created_at: string;
+};
+export type ApplyRunView = {
+  id: string;
+  mode: string;
+  state: "ready" | "running" | "ended";
+  items: ApplyItem[];
+  active_pause: ApplyPause | null;
+  created_at: string;
+  ended_at: string | null;
+};
+
+/** One automation mode on this application's site. `note` is fixed copy from Rust. */
+export type ModeChoice = {
+  mode: "manual" | "copilot" | "autonomous" | "claude_code";
+  available: boolean;
+  note: string;
+};
+/** An approved answer this application can use. It never holds the answer's text. */
+export type MaterialRow = {
+  answer_id: string;
+  question: string;
+  class: MemoryClass;
+  stale: boolean;
+  needs_confirmation: boolean;
+};
+/** Manual mode's material for one application. No answer text. */
+export type Material = {
+  modes: ModeChoice[];
+  resume: string | null;
+  letter: string | null;
+  answers: MaterialRow[];
+  authorization: AuthorizationAnswer;
+};
+
 export const ipc = {
   status: () => invoke<Status>("status"),
   retryOpen: () => invoke<Status>("retry_open"),
@@ -815,10 +910,47 @@ export const ipc = {
   recoveryKeyImport: () => invoke<KeyState>("recovery_key_import"),
   /** Rust confirms in a native dialog naming the key id. */
   discardLockedFields: () => invoke<KeyState>("discard_locked_fields"),
+
+  browserStatus: () => invoke<BrowserStatus>("browser_status"),
+  /** Downloads the pinned server and Chromium. */
+  browserSetup: () => invoke<BrowserStatus>("browser_setup"),
+  applyPreflight: (applicationIds: string[]) =>
+    invoke<Preflight>("apply_preflight", { applicationIds }),
+  /** Rust asks in a native dialog whether sealed answers go to the run: nothing here can. */
+  applyStart: (applicationIds: string[]) => invoke<string>("apply_start", { applicationIds }),
+  applyView: (id: string) => invoke<ApplyRunView>("apply_view", { id }),
+  applyLatest: () => invoke<ApplyRunView | null>("apply_latest"),
+  /** Only these two answers exist, and only a person's press sends one. */
+  applyResolvePause: (pauseId: string, resolution: "continue" | "take_over") =>
+    invoke<void>("apply_resolve_pause", { pauseId, resolution }),
+  applySettle: (id: string) => invoke<number>("apply_settle", { id }),
+  applyCancel: (id: string) => invoke<void>("apply_cancel", { id }),
+  applyMaterial: (applicationId: string) => invoke<Material>("apply_material", { applicationId }),
+  /** Rust reads the stored link, checks it, and opens it in the system browser. */
+  applyOpen: (applicationId: string) => invoke<void>("apply_open", { applicationId }),
+  applyRecord: (applicationId: string, outcome: ApplicationStatus, on: string | null, note: string) =>
+    invoke<Application>("apply_record", { applicationId, outcome, on, note }),
+  /** Rust puts the answer on the clipboard. The text never comes here. */
+  applyCopy: (applicationId: string, answerId: string) =>
+    invoke<{ stale: boolean }>("apply_copy", { applicationId, answerId }),
+  /** Copilot on one application. Resolves when the run ends: after the person's review. */
+  copilotStart: (applicationId: string) => invoke<ApplyRunView>("copilot_start", { applicationId }),
+  /** Connectors the owner authorized for Autonomous mode. A grant alone makes no site eligible. */
+  autonomousGrants: () => invoke<string[]>("autonomous_grants"),
+  /** Rust asks a native yes first; `confirmation_required` when the owner says no. */
+  autonomousGrant: (connector: string) => invoke<void>("autonomous_grant", { connector }),
+  autonomousRevoke: (connector: string) => invoke<void>("autonomous_revoke", { connector }),
+  /** Rust decides first: an ineligible site (today, every site) is refused with no dialog. */
+  autonomousStart: (applicationId: string) => invoke<ApplyRunView>("autonomous_start", { applicationId }),
 };
 
 export function ptyOpen(cols: number, rows: number): Promise<void> {
   return invoke("pty_open", { cols, rows });
+}
+
+/** Hosts a `ready` apply run's session. Rust checks the id and builds the command. */
+export function ptyOpenApply(cols: number, rows: number, applyId: string): Promise<void> {
+  return invoke("pty_open_apply", { cols, rows, applyId });
 }
 
 /** `Array.from`: `invoke` JSON-encodes a `Uint8Array` as a map, which `Vec<u8>` refuses. */

@@ -245,6 +245,21 @@ async fn delete_all_removes_data_and_can_keep_backups() {
 }
 
 #[tokio::test]
+async fn delete_all_removes_the_apply_and_browser_runtime_folders() {
+    let (_tmp, paths) = temp_root();
+    let db = Db::open(&paths).await.unwrap();
+    for folder in [paths.apply(), paths.browser_runtime()] {
+        fs::create_dir_all(folder.join("inner")).unwrap();
+        fs::write(folder.join("inner/file.txt"), "x").unwrap();
+    }
+
+    transfer::delete_all(db, "DELETE", true).await.unwrap();
+
+    assert!(fs::symlink_metadata(paths.apply()).is_err());
+    assert!(fs::symlink_metadata(paths.browser_runtime()).is_err());
+}
+
+#[tokio::test]
 async fn delete_all_removes_what_a_crashed_restore_left_and_nothing_foreign() {
     let (_tmp, paths) = temp_root();
     let db = Db::open(&paths).await.unwrap();

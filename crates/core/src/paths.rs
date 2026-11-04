@@ -42,6 +42,16 @@ impl AppPaths {
         self.root.join("exports")
     }
 
+    /// One folder per apply run: its browser profile, copied files, and config.
+    pub fn apply(&self) -> PathBuf {
+        self.root.join("apply")
+    }
+
+    /// The pinned Playwright MCP install and its Chromium. Backups and exports skip it.
+    pub fn browser_runtime(&self) -> PathBuf {
+        self.root.join("browser-runtime")
+    }
+
     pub fn lock(&self) -> PathBuf {
         self.root.join("jobpilot.lock")
     }
@@ -71,6 +81,18 @@ impl AppPaths {
             return true;
         };
         is_under(&parent, &self.root).unwrap_or(true)
+    }
+
+    /// [`is_inside_root`](Self::is_inside_root) leaning the other way: a folder that cannot be
+    /// resolved counts as outside. For a file that must come from the root.
+    pub fn is_surely_inside_root(&self, path: &Path) -> bool {
+        let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+            return false;
+        };
+        let Ok(parent) = parent.canonicalize() else {
+            return false;
+        };
+        is_under(&parent, &self.root).unwrap_or(false)
     }
 }
 
@@ -116,6 +138,8 @@ mod tests {
         assert_eq!(paths.documents(), root.join("documents"));
         assert_eq!(paths.backups(), root.join("backups"));
         assert_eq!(paths.exports(), root.join("exports"));
+        assert_eq!(paths.apply(), root.join("apply"));
+        assert_eq!(paths.browser_runtime(), root.join("browser-runtime"));
         assert_eq!(paths.lock(), root.join("jobpilot.lock"));
         assert_eq!(paths.marker(), root.join(".jobpilot-root"));
         assert_eq!(paths.swap_marker(), root.join(".jobpilot-swap"));

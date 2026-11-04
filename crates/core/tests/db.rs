@@ -326,11 +326,11 @@ async fn a_0_2_database_upgrades_to_0_3() {
 }
 
 #[tokio::test]
-async fn a_fresh_database_is_schema_15() {
+async fn a_fresh_database_is_schema_17() {
     let (_tmp, paths) = temp_root();
     let db = Db::open(&paths).await.unwrap();
-    assert_eq!(db.schema_version().await.unwrap(), 15);
-    assert_eq!(app_schema_version(), 15);
+    assert_eq!(db.schema_version().await.unwrap(), 17);
+    assert_eq!(app_schema_version(), 17);
     db.close().await;
 }
 
@@ -360,7 +360,7 @@ async fn a_0_3_database_upgrades_to_0_4() {
 
     let db = Db::open(&paths).await.unwrap();
 
-    assert_eq!(db.schema_version().await.unwrap(), 15);
+    assert_eq!(db.schema_version().await.unwrap(), 17);
     assert_eq!(snapshots(&paths, "pre-migrate-11-").len(), 1);
     let kept: (String, String) = sqlx::query_as("SELECT provider, register_row FROM consent")
         .fetch_one(&db.pool)
@@ -457,7 +457,7 @@ async fn a_0_4_database_upgrades_to_0_5() {
 
     let db = Db::open(&paths).await.unwrap();
 
-    assert_eq!(db.schema_version().await.unwrap(), 15);
+    assert_eq!(db.schema_version().await.unwrap(), 17);
     assert_eq!(snapshots(&paths, "pre-migrate-12-").len(), 1);
     let draft: String = sqlx::query_scalar("SELECT job_text_id FROM drafts WHERE id = 'dr1'")
         .fetch_one(&db.pool)
@@ -521,5 +521,62 @@ async fn a_0_4_database_upgrades_to_0_5() {
         .await
         .unwrap();
     assert!(text.normalized.starts_with("We need Rust"));
+    db.close().await;
+}
+
+// A 0.5 database (schema 15) holds an application and a job text. Opening it with 0.6 snapshots
+// first, keeps every row, and adds the automation tables empty.
+#[tokio::test]
+async fn a_0_5_database_upgrades_to_0_6() {
+    let (_tmp, paths) = temp_root();
+    let release_0_5: Vec<Migration> = MIGRATOR
+        .iter()
+        .filter(|m| m.version <= 15)
+        .cloned()
+        .collect();
+    let db = Db::open_with(&paths, &Migrator::with_migrations(release_0_5))
+        .await
+        .unwrap();
+    assert_eq!(db.schema_version().await.unwrap(), 15);
+    for sql in [
+        "INSERT INTO job_texts (id, title, raw, normalized, created_at) \
+         VALUES ('j1', 'Dev', 'raw posting', 'We need Rust', '2026-10-01T00:00:00.000Z')",
+        "INSERT INTO applications (id, company, role, status, created_at, updated_at) \
+         VALUES ('a1', 'Acme', 'Dev', 'saved', 't', 't')",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    db.close().await;
+
+    let db = Db::open(&paths).await.unwrap();
+
+    assert_eq!(db.schema_version().await.unwrap(), 17);
+    assert_eq!(snapshots(&paths, "pre-migrate-15-").len(), 1);
+    let kept: (String, String) = sqlx::query_as("SELECT id, company FROM applications")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(kept, ("a1".to_string(), "Acme".to_string()));
+    let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM job_texts WHERE id = 'j1'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(jobs, 1);
+    for table in [
+        "apply_runs",
+        "apply_items",
+        "apply_pauses",
+        "autonomous_grants",
+    ] {
+        let rows: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0, "{table}");
+    }
     db.close().await;
 }

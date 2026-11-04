@@ -1,0 +1,51 @@
+<!doctype html>
+<!-- A synthetic fixture for the apply browser tests: invented names, no brand asset. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Careers - Oakhollow Logistics</title>
+</head>
+<body>
+<main>
+<h1>Software Engineer II</h1>
+<p>Oakhollow Logistics. Requisition 4471.</p>
+<form action="/form" method="post" enctype="multipart/form-data">
+<table>
+<tr><td><label for="name">Full name</label></td><td><input id="name" name="name" type="text" autocomplete="off"></td></tr>
+<tr><td><label for="email">Email</label></td><td><input id="email" name="email" type="email" autocomplete="off"></td></tr>
+<tr><td><label for="why">Why this role?</label></td><td><textarea id="why" name="why" rows="3"></textarea></td></tr>
+<tr><td><span id="office-label">Preferred office</span></td><td>
+<button type="button" id="office-button" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="office-label">Select one</button>
+<ul id="office-list" role="listbox" aria-labelledby="office-label" hidden>
+<li role="option" data-value="lis" aria-selected="false">Lisbon</li>
+<li role="option" data-value="opo" aria-selected="false">Porto</li>
+</ul>
+<input type="hidden" id="office" name="office" value="">
+</td></tr>
+<tr><td><label for="resume">Resume</label></td><td><input id="resume" name="resume" type="file"></td></tr>
+<tr><td><label for="letter">Cover letter</label></td><td><input id="letter" name="letter" type="file"></td></tr>
+</table>
+<p><button type="submit">Submit application</button></p>
+</form>
+</main>
+<script>
+// A dropdown built from a button and a listbox, as many applicant systems draw one.
+const button = document.getElementById("office-button");
+const list = document.getElementById("office-list");
+button.addEventListener("click", () => {
+  list.hidden = !list.hidden;
+  button.setAttribute("aria-expanded", String(!list.hidden));
+});
+for (const option of list.querySelectorAll("[role=option]")) {
+  option.addEventListener("click", () => {
+    for (const other of list.querySelectorAll("[role=option]")) other.setAttribute("aria-selected", "false");
+    option.setAttribute("aria-selected", "true");
+    document.getElementById("office").value = option.dataset.value;
+    button.textContent = option.textContent;
+    list.hidden = true;
+    button.setAttribute("aria-expanded", "false");
+  });
+}
+</script>
+</body>
+</html>

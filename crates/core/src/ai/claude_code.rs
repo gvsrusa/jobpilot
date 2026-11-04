@@ -326,20 +326,7 @@ fn is_release(path: &Path, name: &str) -> bool {
 /// error, never a silent fall through. One that is well formed and whose file is gone is
 /// skipped: an update removes the release it named, and discovery is what an unset path gets.
 pub async fn find_binary(db: Option<&Db>) -> std::result::Result<PathBuf, String> {
-    if let Some(bin) = std::env::var_os("JOBPILOT_CLAUDE_BIN").filter(|bin| !bin.is_empty()) {
-        return checked(PathBuf::from(bin), "JOBPILOT_CLAUDE_BIN");
-    }
-    if let Some(bin) = path_setting(db).await.map(PathBuf::from)
-        && !is_gone(&bin)
-    {
-        return checked(bin, PATH_SETTING);
-    }
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    if let Some(found) = search(
-        absolute_dirs(&path)
-            .into_iter()
-            .chain(fallback_dirs(home_dir())),
-    ) {
+    if let Some(found) = find_binary_quietly(db).await? {
         return Ok(found);
     }
     #[cfg(unix)]
@@ -347,6 +334,25 @@ pub async fn find_binary(db: Option<&Db>) -> std::result::Result<PathBuf, String
         return Ok(found);
     }
     Err(not_found())
+}
+
+/// [`find_binary`] with no login shell: it starts no process, so a screen may ask it on
+/// every open. `Ok(None)` where `find_binary` would go on to the shell.
+pub async fn find_binary_quietly(db: Option<&Db>) -> std::result::Result<Option<PathBuf>, String> {
+    if let Some(bin) = std::env::var_os("JOBPILOT_CLAUDE_BIN").filter(|bin| !bin.is_empty()) {
+        return checked(PathBuf::from(bin), "JOBPILOT_CLAUDE_BIN").map(Some);
+    }
+    if let Some(bin) = path_setting(db).await.map(PathBuf::from)
+        && !is_gone(&bin)
+    {
+        return checked(bin, PATH_SETTING).map(Some);
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    Ok(search(
+        absolute_dirs(&path)
+            .into_iter()
+            .chain(fallback_dirs(home_dir())),
+    ))
 }
 
 /// A path that could be Claude Code's, and that the file system says is not there. A path it

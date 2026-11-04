@@ -7,6 +7,7 @@ use tauri::menu::{Menu, MenuEvent, MenuItem, MenuItemBuilder, SubmenuBuilder};
 use tauri::{AppHandle, Manager, Runtime};
 
 use crate::commands;
+use crate::pty::PtyState;
 use crate::state::AppState;
 
 pub const PAUSE_ID: &str = "emergency_pause";
@@ -44,7 +45,7 @@ fn pause<R: Runtime>(app: &AppHandle<R>) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
-        if let Err(error) = commands::pause_now(&state).await {
+        if let Err(error) = commands::pause_now(&state, &app.state::<PtyState>()).await {
             // No data is open then, so nothing runs that the pause could stop.
             eprintln!("emergency pause: {error}");
         }

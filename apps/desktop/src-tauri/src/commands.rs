@@ -22,8 +22,10 @@ use jobpilot_core::ai::{
 use jobpilot_core::ai::{api, child, claude_code};
 use jobpilot_core::analytics::{self, Report};
 use jobpilot_core::applications::{self, Application, ApplicationEvent, ApplicationInput};
+use jobpilot_core::apply::{self, Material, Preflight, Resolution, RunView};
 use jobpilot_core::audit::{self, AuditEntry};
 use jobpilot_core::backup::{self, BackupInfo};
+use jobpilot_core::browser::runtime::{self as browser_runtime, PLAYWRIGHT_MCP, RuntimeState};
 use jobpilot_core::connectors::{self, SourceStatus};
 use jobpilot_core::crypto::{self, KeyState};
 use jobpilot_core::documents::{self, Document, SearchHit};
@@ -45,12 +47,13 @@ use jobpilot_core::recovery::{self, RecoveryReceipt};
 use jobpilot_core::render::{ResumeDoc, Template};
 use jobpilot_core::runner::{self, ExportChoice, RunDetail, RunSummary};
 use jobpilot_core::secrets::Zeroizing;
-use jobpilot_core::{Db, Error, Result, agents, secrets, settings, transfer};
+use jobpilot_core::{Db, Error, Result, agents, permissions, secrets, settings, transfer};
 use serde_json::{Value, json};
 use tauri::ipc::Invoke;
-use tauri::{AppHandle, Runtime, State};
+use tauri::{AppHandle, Manager, Runtime, State};
 
 use crate::native::{self, FileDialog};
+use crate::pty::PtyState;
 use crate::state::{AppState, StartupError, Status};
 
 const ACTOR: &str = "gui";
@@ -192,7 +195,26 @@ pub fn handler<R: Runtime>() -> impl Fn(Invoke<R>) -> bool + Send + Sync + 'stat
         recovery_key_export,
         recovery_key_import,
         discard_locked_fields,
+        browser_status,
+        browser_setup,
+        apply_preflight,
+        apply_start,
+        apply_view,
+        apply_latest,
+        apply_resolve_pause,
+        apply_settle,
+        apply_cancel,
+        apply_material,
+        apply_open,
+        apply_record,
+        apply_copy,
+        copilot_start,
+        autonomous_grants,
+        autonomous_grant,
+        autonomous_revoke,
+        autonomous_start,
         crate::pty::pty_open,
+        crate::pty::pty_open_apply,
         crate::pty::pty_write,
         crate::pty::pty_resize,
         crate::pty::pty_close,
@@ -1580,27 +1602,57 @@ pub async fn ai_cancel(state: State<'_, AppState>) -> Result<()> {
 /// What the command and the menu item both run. The tokens fire first, whatever comes
 /// after, so a running task stops even with no data open. The write goes through the `db`
 /// read lock and not [`AppState::work`]: it must not queue behind a task holding the gate.
-pub async fn pause_now(state: &AppState) -> Result<PauseState> {
+/// An apply session in the panel is closed, with its browser, before the row: the row can
+/// fail, and the session must not outlive the press. Once the row is in, the run the session
+/// hosted is ended `halted`, off this path.
+pub async fn pause_now(state: &AppState, pty: &PtyState) -> Result<PauseState> {
     // Before the tokens, so a run that ends on its token knows why while the row is pending.
     pause::announce(&state.paths);
     state.ai.cancel();
+    let closed = pty.close_apply().await;
     state.pull.cancel();
-    let slot = state.db.read().await;
-    pause::set(ready(&slot)?, ACTOR).await
+    let db = state.db.read().await.clone().ok_or(Error::Unavailable)?;
+    let set = pause::set(&db, ACTOR).await?;
+    if let Some(apply_id) = closed {
+        halt_hosted(db, apply_id);
+    }
+    Ok(set)
+}
+
+/// The host the pause killed cannot write its own end: its agent run is halted with reason
+/// `paused`, and the run is wound up. Spawned, as a purge can wait.
+fn halt_hosted(db: Arc<Db>, apply_id: String) {
+    tauri::async_runtime::spawn(async move {
+        let _ = apply::host_gone(&db, &apply_id, "paused", None).await;
+    });
 }
 
 /// For a pause set by another process, such as `jobpilot pause set`: its running tasks are
-/// not this app's to find, but a download or an index started here is. True when it is on.
-pub async fn stop_if_paused(state: &AppState) -> bool {
-    let on = match state.db.read().await.as_deref() {
+/// not this app's to find, but a download or an index started here is, and so is an apply
+/// session in the panel. True when it is on.
+pub async fn stop_if_paused(state: &AppState, pty: &PtyState) -> bool {
+    let db = state.db.read().await.clone();
+    let on = match &db {
         Some(db) => pause::is_set(db).await.unwrap_or(false),
         None => false,
     };
     if on {
         state.ai.cancel();
+        let closed = pty.close_apply().await;
         state.pull.cancel();
+        if let (Some(db), Some(apply_id)) = (db, closed) {
+            halt_hosted(db, apply_id);
+        }
     }
     on
+}
+
+/// Once at startup: what a dead apply host left, its processes, folders, and a run that
+/// would block the next one. A failure here only waits for the next sweep.
+pub async fn sweep_at_start(state: &AppState) {
+    if let Ok(db) = state.work().await {
+        let _ = apply::session::sweep_orphans(&db).await;
+    }
 }
 
 #[tauri::command]
@@ -1610,8 +1662,8 @@ pub async fn pause_status(state: State<'_, AppState>) -> Result<PauseState> {
 }
 
 #[tauri::command]
-pub async fn pause_set(state: State<'_, AppState>) -> Result<PauseState> {
-    pause_now(&state).await
+pub async fn pause_set(state: State<'_, AppState>, pty: State<'_, PtyState>) -> Result<PauseState> {
+    pause_now(&state, &pty).await
 }
 
 /// Only a dialog Rust opens clears it, with no lock held while it waits. The shortcut and
@@ -1761,6 +1813,370 @@ pub async fn discard_locked_fields<R: Runtime>(
     let discarded = recovery::discard_locked(&*state.work().await?, &key_id, ACTOR).await?;
     state.set_restored_key_state(None);
     Ok(discarded)
+}
+
+/// The browser runtime, as `jobpilot browser status` reports it.
+#[derive(serde::Serialize)]
+pub struct BrowserStatus {
+    /// `no_node`, `node_too_old`, `not_installed`, `wrong_version`, or `ready`.
+    state: &'static str,
+    /// The Node or server version found, when it is the wrong one.
+    found: Option<String>,
+    playwright_mcp: &'static str,
+}
+
+async fn browser_state(db: &Db) -> Result<BrowserStatus> {
+    let (state, found) = match browser_runtime::state(db).await? {
+        RuntimeState::NoNode => ("no_node", None),
+        RuntimeState::NodeTooOld(found) => ("node_too_old", Some(found)),
+        RuntimeState::NotInstalled => ("not_installed", None),
+        RuntimeState::WrongVersion(found) => ("wrong_version", Some(found)),
+        RuntimeState::Ready(_) => ("ready", None),
+    };
+    Ok(BrowserStatus {
+        state,
+        found,
+        playwright_mcp: PLAYWRIGHT_MCP,
+    })
+}
+
+#[tauri::command]
+pub async fn browser_status(state: State<'_, AppState>) -> Result<BrowserStatus> {
+    browser_state(&*state.work().await?).await
+}
+
+/// A download the owner starts with the button, in the download slot: emergency pause and
+/// app exit cancel it as they cancel a model pull.
+#[tauri::command]
+pub async fn browser_setup(state: State<'_, AppState>) -> Result<BrowserStatus> {
+    let running = state.pull.begin()?;
+    let db = state.work().await?;
+    browser_runtime::setup(&db, ACTOR, running.token.clone()).await?;
+    browser_state(&db).await
+}
+
+/// Reads and exports only: nothing is released and no run is written.
+#[tauri::command]
+pub async fn apply_preflight(
+    state: State<'_, AppState>,
+    application_ids: Vec<String>,
+) -> Result<Preflight> {
+    apply_preflight_of(&*state.work().await?, &application_ids).await
+}
+
+/// Whether sealed values go to this run is asked here, in Rust's own dialog, and nowhere
+/// else: the webview has no argument that releases them. `Leave them out` starts the run with
+/// nothing released; closing the dialog starts nothing. With no consent for `Sensitive`
+/// nothing sealed can go, so nothing is asked. Core counts again, and refuses a release whose
+/// count moved while the dialog was open.
+#[tauri::command]
+pub async fn apply_start<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    application_ids: Vec<String>,
+) -> Result<String> {
+    let checked = apply_preflight_of(&*state.work().await?, &application_ids).await?;
+    let sealed = checked.sealed_total;
+    let release_sealed = if sealed == 0 || !checked.sensitive_consent {
+        false
+    } else {
+        let applications = checked.items.iter().filter(|item| item.sealed > 0).count();
+        let what = match sealed {
+            1 => "1 sensitive answer or work-authorization row".to_owned(),
+            n => format!("{n} sensitive answers and work-authorization rows"),
+        };
+        let whom = match applications {
+            1 => "1 application".to_owned(),
+            n => format!("{n} applications"),
+        };
+        let message = format!("Release {what} to this run for {whom}?");
+        let release = "Release to this run";
+        let leave = "Leave them out";
+        native::choose(&app, "Sealed answers", message, release, leave)
+            .await?
+            .ok_or(Error::Cancelled)?
+    };
+    apply::start_confirmed(
+        &*state.work().await?,
+        ACTOR,
+        &application_ids,
+        release_sealed,
+        sealed,
+    )
+    .await
+}
+
+/// At most a run's worth: each application renders two documents.
+async fn apply_preflight_of(db: &Db, application_ids: &[String]) -> Result<Preflight> {
+    if application_ids.len() > apply::MAX_RUN_ITEMS {
+        return Err(Error::Validation(format!(
+            "a run takes at most {} applications",
+            apply::MAX_RUN_ITEMS
+        )));
+    }
+    apply::preflight(db, application_ids).await
+}
+
+#[tauri::command]
+pub async fn apply_view(state: State<'_, AppState>, id: String) -> Result<RunView> {
+    apply::view_swept(&*state.work().await?, &id).await
+}
+
+#[tauri::command]
+pub async fn apply_latest(state: State<'_, AppState>) -> Result<Option<RunView>> {
+    apply::latest_swept(&*state.work().await?).await
+}
+
+/// A person's act, from the pause panel's buttons. Page text never reaches this.
+#[tauri::command]
+pub async fn apply_resolve_pause(
+    state: State<'_, AppState>,
+    pause_id: String,
+    resolution: String,
+) -> Result<()> {
+    let resolution = match resolution.as_str() {
+        "continue" => Resolution::Continue,
+        "take_over" => Resolution::TakeOver,
+        _ => {
+            return Err(Error::Validation(
+                "a pause is resolved with continue or take_over".into(),
+            ));
+        }
+    };
+    apply::resolve_pause(&*state.work().await?, ACTOR, &pause_id, resolution).await
+}
+
+#[tauri::command]
+pub async fn apply_settle(state: State<'_, AppState>, id: String) -> Result<usize> {
+    apply::settle(&*state.work().await?, ACTOR, &id).await
+}
+
+#[tauri::command]
+pub async fn apply_cancel(state: State<'_, AppState>, id: String) -> Result<()> {
+    apply::cancel(&*state.work().await?, ACTOR, &id).await
+}
+
+/// Manual mode's review screen: files, approved answers with no text, and each mode's note.
+#[tauri::command]
+pub async fn apply_material(
+    state: State<'_, AppState>,
+    application_id: String,
+) -> Result<Material> {
+    apply::material(&*state.work().await?, &application_id).await
+}
+
+/// The webview names an application, never a link. Rust reads the stored one, opens it only
+/// when it passes `permissions::link_allowed` and Manual mode may open it, and hands it to the
+/// system browser. Nothing here requests it.
+#[tauri::command]
+pub async fn apply_open<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    application_id: String,
+) -> Result<()> {
+    let url = {
+        let db = state.work().await?;
+        applications::get(&db, &application_id).await?.link
+    };
+    let url = url.trim();
+    if !permissions::link_allowed(url) {
+        return Err(Error::Refused(link_refusal(url).into()));
+    }
+    let grant = permissions::Grant {
+        owner_started: true,
+        authorized: false,
+    };
+    let site = permissions::site_of(url)?;
+    if let permissions::Decision::Refuse(reason) = permissions::decide(
+        permissions::Mode::Manual,
+        site,
+        permissions::Action::OpenLink,
+        &grant,
+    ) {
+        return Err(Error::Refused(reason.into()));
+    }
+    native::open_url(&app, url).await
+}
+
+/// Why `permissions::link_allowed` refused a link, for the person to fix it.
+// ponytail: reads only the authority's shape, as a reason for a refusal already made. An
+// IPv6 host in brackets reads its colons as no port.
+fn link_refusal(url: &str) -> &'static str {
+    if url.is_empty() {
+        return "link_empty";
+    }
+    let Some((_, rest)) = url.split_once("://") else {
+        return "link_not_https";
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = match authority.rsplit_once('@') {
+        Some(_) => return "link_userinfo",
+        None => authority,
+    };
+    let host = host.rsplit_once(']').map_or(host, |(_, after)| after);
+    if host.contains(':') {
+        "link_port"
+    } else {
+        "link_not_https"
+    }
+}
+
+/// How long a copied answer stays on the clipboard before Rust clears it.
+#[cfg(not(test))]
+const CLIPBOARD_CLEAR: std::time::Duration = std::time::Duration::from_secs(60);
+#[cfg(test)]
+const CLIPBOARD_CLEAR: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// What a person did after applying by hand, through the tracking agent.
+#[tauri::command]
+pub async fn apply_record(
+    state: State<'_, AppState>,
+    application_id: String,
+    outcome: String,
+    on: Option<String>,
+    note: String,
+) -> Result<Application> {
+    apply::record_outcome(
+        &*state.work().await?,
+        ACTOR,
+        &application_id,
+        &outcome,
+        on.as_deref(),
+        &note,
+        CancellationToken::new(),
+    )
+    .await
+}
+
+/// Puts one answer's text on the system clipboard from Rust, so it never crosses into the
+/// webview. Core refuses a sealed class with no current confirmation, which only
+/// `memory_confirm_use`'s native dialog gives. The reply says only whether it is stale.
+#[tauri::command]
+pub async fn apply_copy<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    application_id: String,
+    answer_id: String,
+) -> Result<Copied> {
+    let used =
+        memory::use_answer(&*state.work().await?, ACTOR, &answer_id, &application_id).await?;
+    let stale = used.stale;
+    let text = Zeroizing::new(used.text);
+    native::write_clipboard(&app, text.clone()).await?;
+    *lock(&state.copied) = Some(text.clone());
+    // Cleared only while it still holds this answer: what the person copied since is theirs.
+    // A quit before the timer is cleared by `clear_copied` at exit.
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(CLIPBOARD_CLEAR).await;
+        let mine = {
+            let state = app.state::<AppState>();
+            let mut slot = lock(&state.copied);
+            // A newer copy owns the slot and its own timer.
+            match slot.as_ref() == Some(&text) {
+                true => slot.take(),
+                false => None,
+            }
+        };
+        if mine.is_some() && native::clear_clipboard(&app, &text).await.is_err() {
+            eprintln!("apply_copy: the clipboard could not be cleared");
+        }
+    });
+    Ok(Copied { stale })
+}
+
+/// At exit: clears an answer `apply_copy` left on the clipboard, if it still holds it.
+pub async fn clear_copied<R: Runtime>(app: &AppHandle<R>) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let pending = lock(&state.copied).take();
+    if let Some(text) = pending
+        && native::clear_clipboard(app, &text).await.is_err()
+    {
+        eprintln!("exit: the clipboard could not be cleared");
+    }
+}
+
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[derive(serde::Serialize)]
+pub struct Copied {
+    pub stale: bool,
+}
+
+/// What a task refused while Copilot runs is told.
+const COPILOT_HOLDS: &str = "a Copilot run holds this until you end its review stop";
+
+/// Copilot on one application: the webview names it, and Rust reads its link, decides, starts
+/// the browser, and fills. The run holds in the AI slot until the person ends its review stop
+/// on the pause panel, so Cancel, the emergency pause, and app exit all reach it. It never
+/// clicks submit.
+#[tauri::command]
+pub async fn copilot_start(state: State<'_, AppState>, application_id: String) -> Result<RunView> {
+    let running = state.ai.begin_as(Some(COPILOT_HOLDS))?;
+    let db = state.work().await?;
+    let router = Router::from_settings(&db).await?;
+    agents::copilot(&db, &router, ACTOR, &application_id, running.token.clone()).await
+}
+
+/// The connectors the owner authorized for Autonomous mode.
+#[tauri::command]
+pub async fn autonomous_grants(state: State<'_, AppState>) -> Result<Vec<String>> {
+    permissions::grants(&*state.work().await?).await
+}
+
+/// Authorizing widens what may run, so it asks a native yes that script in the webview cannot
+/// give. A grant alone makes no site eligible: the site also needs an allowed register row and
+/// a verified submit. Core refuses an unknown connector, so that is checked before the dialog.
+#[tauri::command]
+pub async fn autonomous_grant<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    connector: String,
+) -> Result<()> {
+    let connector = permissions::known_connector(&connector)?;
+    let message = format!(
+        "Authorize Autonomous submission on {connector}?\n\nOn a site that also has an allowed \
+         register row and a verified submit, JobPilot would fill and submit an application \
+         there with no review by you. No site has both today."
+    );
+    native::confirmed(&app, "Authorize Autonomous", message, "Authorize").await?;
+    permissions::grant(&*state.work().await?, ACTOR, connector).await
+}
+
+const AUTONOMOUS_HOLDS: &str = "an Autonomous run holds this until it ends";
+
+/// Autonomous on one application: the webview names it, and Rust decides first, so a site
+/// that is not eligible (today, every site) is refused with no dialog, no run row, and no
+/// browser. Only an eligible one asks a native yes for this submission, then runs in the AI
+/// slot, so Cancel, the emergency pause, and app exit reach it.
+#[tauri::command]
+pub async fn autonomous_start<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    application_id: String,
+) -> Result<RunView> {
+    let application = agents::autonomous_check(&*state.work().await?, &application_id).await?;
+    let message = format!(
+        "Submit the application for {} at {} ({}) with no review by you?\n\nJobPilot fills \
+         the form, stops for anything it cannot fill or check, and clicks submit once.",
+        application.role, application.company, application.link
+    );
+    native::confirmed(&app, "Autonomous submission", message, "Submit").await?;
+    let running = state.ai.begin_as(Some(AUTONOMOUS_HOLDS))?;
+    let db = state.work().await?;
+    agents::autonomous(&db, ACTOR, &application_id, running.token.clone()).await
+}
+
+/// Revoking only takes something away, so it does not ask. A run in progress stops at its
+/// next step.
+#[tauri::command]
+pub async fn autonomous_revoke(state: State<'_, AppState>, connector: String) -> Result<()> {
+    permissions::revoke(&*state.work().await?, ACTOR, &connector).await
 }
 
 #[cfg(test)]
@@ -3027,7 +3443,26 @@ mod tests {
         "recovery_key_export",
         "recovery_key_import",
         "discard_locked_fields",
+        "browser_status",
+        "browser_setup",
+        "apply_preflight",
+        "apply_start",
+        "apply_view",
+        "apply_latest",
+        "apply_resolve_pause",
+        "apply_settle",
+        "apply_cancel",
+        "apply_material",
+        "apply_open",
+        "apply_record",
+        "apply_copy",
+        "copilot_start",
+        "autonomous_grants",
+        "autonomous_grant",
+        "autonomous_revoke",
+        "autonomous_start",
         "pty_open",
+        "pty_open_apply",
         "pty_write",
         "pty_resize",
         "pty_close",
@@ -5569,7 +6004,8 @@ mod tests {
         let h = ready();
         let state = h.app.state::<AppState>();
         let (ai, pull) = (state.ai.begin().unwrap(), state.pull.begin().unwrap());
-        assert!(!block_on(super::stop_if_paused(&state)));
+        let pty = h.app.state::<PtyState>();
+        assert!(!block_on(super::stop_if_paused(&state, &pty)));
         assert!(!ai.token.is_cancelled());
 
         // A second handle stands for the CLI.
@@ -5579,8 +6015,643 @@ mod tests {
             other.close().await;
         });
 
-        assert!(block_on(super::stop_if_paused(&state)));
+        assert!(block_on(super::stop_if_paused(&state, &pty)));
         assert!(ai.token.is_cancelled() && pull.token.is_cancelled());
+    }
+
+    // ---- Claude Code apply runs ----
+
+    /// A saved application with a resume and a letter, and the consent a run needs. Returns
+    /// the application's id.
+    fn apply_ready(h: &Harness) -> String {
+        apply_ready_with(h, true)
+    }
+
+    /// As [`apply_ready`], with consent for `Sensitive` only when `sensitive`.
+    fn apply_ready_with(h: &Harness, sensitive: bool) -> String {
+        use jobpilot_core::ai::claude_code::PROVIDER;
+        use jobpilot_core::ai::{DataCategory, consent};
+        use jobpilot_core::applications::{self, ApplicationInput};
+        use jobpilot_core::drafts;
+        use jobpilot_core::render::{Entry, ResumeDoc, Section};
+        with_db(h, |db| async move {
+            let doc = |title: &str| ResumeDoc {
+                name: "Ada Lovelace".into(),
+                contact: vec!["ada@example.com".into()],
+                summary: Vec::new(),
+                sections: vec![Section {
+                    heading: "Experience".into(),
+                    entries: vec![Entry {
+                        bullets: vec![title.into()],
+                        ..Entry::default()
+                    }],
+                }],
+            };
+            let mut made = Vec::new();
+            for kind in ["resume", "cover_letter"] {
+                let title = format!("Acme {kind}");
+                let draft = drafts::create_version(
+                    &db,
+                    kind,
+                    None,
+                    "uploaded",
+                    &title,
+                    None,
+                    None,
+                    doc(&title),
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+                made.push(draft.id);
+            }
+            let input = ApplicationInput {
+                company: "Acme".into(),
+                role: "Engineer".into(),
+                link: "https://boards.greenhouse.io/acme/jobs/1".into(),
+                resume_draft_id: Some(made[0].clone()),
+                letter_draft_id: Some(made[1].clone()),
+                ..ApplicationInput::default()
+            };
+            let app = applications::add(&db, "gui", input).await.unwrap().id;
+            let mut categories = vec![
+                DataCategory::JobText,
+                DataCategory::ProfileBasic,
+                DataCategory::CareerMemory,
+            ];
+            if sensitive {
+                categories.push(DataCategory::Sensitive);
+            }
+            consent::give(&db, PROVIDER, &categories, "2026-11-01", "gui")
+                .await
+                .unwrap();
+            app
+        })
+    }
+
+    /// A `ready` run over one fresh application, started through the command.
+    fn ready_run(h: &Harness) -> String {
+        let app = apply_ready(h);
+        let run = h.ok("apply_start", json!({ "applicationIds": [app] }));
+        run.as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn pty_open_apply_takes_only_a_size_and_an_id() {
+        let source = include_str!("pty.rs");
+        let (_, rest) = source
+            .split_once("pub async fn pty_open_apply<R: Runtime>(")
+            .unwrap();
+        let (arguments, _) = rest.split_once(") -> ").unwrap();
+        let names: Vec<&str> = arguments
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, _)| name.trim())
+            .collect();
+        assert_eq!(
+            names,
+            ["window", "app", "state", "cols", "rows", "apply_id"]
+        );
+    }
+
+    #[test]
+    fn pty_open_apply_refuses_a_run_that_is_not_ready() {
+        let h = ready();
+        let (cols, rows) = SIZE;
+        let open = |id: &str| {
+            invoke(
+                &h.window,
+                "pty_open_apply",
+                json!({ "cols": cols, "rows": rows, "applyId": id }),
+            )
+        };
+        assert_eq!(code_of(open("0123abcd")), "not_found");
+        let run = ready_run(&h);
+        h.ok("apply_cancel", json!({ "id": run }));
+        let refused = open(&run).unwrap_err();
+        assert_eq!(refused["code"], "refused");
+        assert!(
+            refused["message"]
+                .as_str()
+                .unwrap()
+                .contains("apply_run_not_ready"),
+            "{refused}"
+        );
+        assert!(h.app.state::<PtyState>().pid().is_none());
+        let refused = invoke(
+            &h.window,
+            "pty_open_apply",
+            json!({ "cols": 0, "rows": rows, "applyId": run }),
+        );
+        assert_eq!(code_of(refused), "validation");
+    }
+
+    /// The host runs with no panel marker, or the CLI would refuse `apply session`. With no
+    /// browser runtime in a fresh data folder it stops at `prepare`, before any `claude`.
+    #[test]
+    fn the_apply_child_has_no_panel_marker_and_runs_apply_session() {
+        let h = ready();
+        let run = ready_run(&h);
+        let panel = Panel::listening(&h);
+        let (cols, rows) = SIZE;
+        invoke(
+            &h.window,
+            "pty_open_apply",
+            json!({ "cols": cols, "rows": rows, "applyId": run }),
+        )
+        .expect("build the CLI first: cargo build -p jobpilot-cli");
+        let text = panel.wait_for(&format!("run {run}"));
+        assert!(!text.contains("panel_refused"), "{text}");
+        wait_until(|| !panel.exits.lock().unwrap().is_empty());
+        let shown = h.ok("apply_view", json!({ "id": run }));
+        assert_eq!(shown["state"], "ended", "{shown}");
+    }
+
+    /// In recovery the row cannot be written, and the session still goes: it is closed first.
+    #[test]
+    fn pause_set_closes_the_apply_session_before_the_row() {
+        use crate::pty::test_support::{gone_within_two_seconds, marked_browser};
+        let h = recovery(OPENS);
+        let panel = Panel::open(&h);
+        let pty = h.app.state::<PtyState>();
+        let pid = pty.pid().unwrap();
+        pty.mark_apply(&h.paths, "0123abcd");
+        let mut browser = marked_browser(&h.paths.apply().join("0123abcd"));
+
+        assert_eq!(h.code("pause_set", json!({})), "unavailable");
+
+        assert!(pty.pid().is_none());
+        wait_gone(pid);
+        gone_within_two_seconds(&mut browser);
+        drop(panel);
+
+        // With data open: closed, and the pause is on.
+        let h = ready();
+        let panel = Panel::open(&h);
+        let pty = h.app.state::<PtyState>();
+        let pid = pty.pid().unwrap();
+        pty.mark_apply(&h.paths, "0123abcd");
+        assert_eq!(h.ok("pause_set", json!({}))["paused"], true);
+        assert!(pty.pid().is_none());
+        wait_gone(pid);
+        drop(panel);
+    }
+
+    #[test]
+    fn a_pause_set_by_another_process_closes_the_apply_session() {
+        use crate::pty::test_support::{gone_within_two_seconds, marked_browser};
+        let h = ready();
+        let panel = Panel::open(&h);
+        let state = h.app.state::<AppState>();
+        let pty = h.app.state::<PtyState>();
+        let pid = pty.pid().unwrap();
+        pty.mark_apply(&h.paths, "0123abcd");
+        let mut browser = marked_browser(&h.paths.apply().join("0123abcd"));
+        assert!(!block_on(super::stop_if_paused(&state, &pty)));
+        assert_eq!(pty.pid(), Some(pid));
+
+        block_on(async {
+            let other = Db::open(&h.paths).await.unwrap();
+            jobpilot_core::pause::set(&other, "cli").await.unwrap();
+            other.close().await;
+        });
+
+        assert!(block_on(super::stop_if_paused(&state, &pty)));
+        assert!(pty.pid().is_none());
+        wait_gone(pid);
+        gone_within_two_seconds(&mut browser);
+        drop(panel);
+    }
+
+    /// One sealed answer serves every country: a normal question raised to sensitive.
+    fn sealed_answer(h: &Harness) {
+        let question = h.ok(
+            "memory_add_question",
+            json!({ "text": "Your current salary?", "country": null }),
+        );
+        let question = question["id"].as_str().unwrap().to_owned();
+        let answer = h.ok(
+            "memory_add_answer",
+            json!({ "questionId": question, "text": "Ninety", "sourceRef": null }),
+        );
+        with_db(h, |db| async move {
+            sqlx::query(
+                "UPDATE memory_answers SET approved = 1, \
+                 reviewed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+            )
+            .bind(answer["id"].as_str().unwrap())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            sqlx::query("UPDATE memory_questions SET class = 'sensitive' WHERE id = ?")
+                .bind(&question)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn apply_start_asks_natively_and_the_webview_cannot_release() {
+        let h = ready();
+        let app = apply_ready(&h);
+        sealed_answer(&h);
+        let preflight = h.ok("apply_preflight", json!({ "applicationIds": [app] }));
+        assert_eq!(preflight["sealed_total"], 1, "{preflight}");
+
+        // The webview's own word for a release is not an argument at all.
+        h.answer(false);
+        let args =
+            json!({ "applicationIds": [app], "releaseSealed": true, "release_sealed": true });
+        let run = h.ok("apply_start", args);
+        let asked = h.asked();
+        assert_eq!(
+            asked.last().unwrap(),
+            "Sealed answers: Release 1 sensitive answer or work-authorization row to this run \
+             for 1 application?"
+        );
+        let hook = h.app.state::<NativeHook>();
+        assert_eq!(
+            hook.buttons.lock().unwrap().last().unwrap(),
+            &(
+                "Release to this run".to_owned(),
+                "Leave them out".to_owned()
+            )
+        );
+        let shown = h.ok("apply_view", json!({ "id": run }));
+        assert_eq!(shown["items"][0]["released_answers"], json!([]), "{shown}");
+        assert!(audited(&h, "sensitive_released").is_empty());
+        h.ok("apply_cancel", json!({ "id": run }));
+
+        h.answer(true);
+        let run = h.ok("apply_start", json!({ "applicationIds": [app] }));
+        let shown = h.ok("apply_view", json!({ "id": run }));
+        assert_eq!(
+            shown["items"][0]["released_answers"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(audited(&h, "sensitive_released"), ["gui"]);
+        assert_eq!(h.asked().len(), 2);
+    }
+
+    #[test]
+    fn apply_start_with_nothing_sealed_asks_nothing() {
+        let h = ready();
+        let run = ready_run(&h);
+        assert!(h.asked().is_empty());
+        let latest = h.ok("apply_latest", json!({}));
+        assert_eq!(latest["id"], run.as_str());
+        assert_eq!(latest["state"], "ready");
+        assert_eq!(audited(&h, "apply_run_created"), ["gui"]);
+        let status = h.ok("browser_status", json!({}));
+        assert_ne!(status["state"], "ready", "{status}");
+        assert_eq!(h.ok("apply_settle", json!({ "id": run })), 0);
+    }
+
+    #[test]
+    fn apply_resolve_pause_audits_as_gui() {
+        let h = ready();
+        let run = ready_run(&h);
+        let shown = h.ok("apply_view", json!({ "id": run }));
+        let item = shown["items"][0]["id"].as_str().unwrap().to_owned();
+        let pause: String = with_db(&h, |db| async move {
+            sqlx::query_scalar(
+                "INSERT INTO apply_pauses (id, item_id, kind, origin, excerpt, created_at) \
+                 VALUES (lower(hex(randomblob(16))), ?, 'login', 'page', 'Sign in', \
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) RETURNING id",
+            )
+            .bind(&item)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+        });
+        let shown = h.ok("apply_view", json!({ "id": run }));
+        assert_eq!(shown["active_pause"]["id"], pause.as_str());
+
+        let bad = json!({ "pauseId": pause, "resolution": "ended_by_page" });
+        assert_eq!(h.code("apply_resolve_pause", bad), "validation");
+        h.ok(
+            "apply_resolve_pause",
+            json!({ "pauseId": pause, "resolution": "continue" }),
+        );
+        assert_eq!(audited(&h, "apply_pause_resolved"), ["gui"]);
+        let shown = h.ok("apply_view", json!({ "id": run }));
+        assert!(shown["active_pause"].is_null(), "{shown}");
+    }
+
+    /// Esc or the close button is not an answer: nothing starts, and the screen stays put.
+    #[test]
+    fn dismissing_the_release_dialog_starts_nothing() {
+        let h = ready();
+        let app = apply_ready(&h);
+        sealed_answer(&h);
+        let hook = h.app.state::<NativeHook>();
+        hook.dismiss.store(true, Ordering::SeqCst);
+        assert_eq!(
+            h.code("apply_start", json!({ "applicationIds": [app] })),
+            "cancelled"
+        );
+        assert_eq!(h.ok("apply_latest", json!({})), Value::Null);
+    }
+
+    /// With no consent for `Sensitive` nothing sealed can go, so nothing is asked.
+    #[test]
+    fn with_no_sensitive_consent_the_release_is_not_asked() {
+        let h = ready();
+        let app = apply_ready_with(&h, false);
+        sealed_answer(&h);
+        let preflight = h.ok("apply_preflight", json!({ "applicationIds": [app] }));
+        assert_eq!(preflight["sensitive_consent"], false, "{preflight}");
+        let run = h.ok("apply_start", json!({ "applicationIds": [app] }));
+        assert!(h.asked().is_empty(), "{:?}", h.asked());
+        let shown = h.ok("apply_view", json!({ "id": run }));
+        assert_eq!(shown["items"][0]["released_answers"], json!([]));
+    }
+
+    /// An answer approved while the dialog is open is not released uncounted.
+    #[test]
+    fn a_release_whose_count_moved_under_the_dialog_is_refused() {
+        let h = ready();
+        let app = apply_ready(&h);
+        sealed_answer(&h);
+        let paths = h.paths.clone();
+        let hook = h.app.state::<NativeHook>();
+        *hook.on_ask.lock().unwrap() = Some(Box::new(move || {
+            let paths = paths.clone();
+            Box::pin(async move {
+                let db = Db::open(&paths).await.unwrap();
+                use jobpilot_core::memory;
+                let question = memory::add_question(&db, "Notice period?", None)
+                    .await
+                    .unwrap();
+                let answer = memory::add_answer(&db, &question.id, "Thirty", None)
+                    .await
+                    .unwrap();
+                memory::approve(&db, "cli", &answer.id, true).await.unwrap();
+                sqlx::query("UPDATE memory_questions SET class = 'sensitive' WHERE id = ?")
+                    .bind(&question.id)
+                    .execute(&db.pool)
+                    .await
+                    .unwrap();
+                db.close().await;
+            })
+        }));
+        h.answer(true);
+        let refused = h.call("apply_start", json!({ "applicationIds": [app] }));
+        let refused = refused.unwrap_err();
+        assert_eq!(refused["code"], "refused");
+        assert!(
+            refused["message"]
+                .as_str()
+                .unwrap()
+                .contains("release_changed")
+        );
+        assert_eq!(h.ok("apply_latest", json!({})), Value::Null);
+    }
+
+    #[test]
+    fn apply_preflight_takes_at_most_a_run() {
+        let h = ready();
+        let ids: Vec<String> = (0..26).map(|n| format!("a{n}")).collect();
+        assert_eq!(
+            h.code("apply_preflight", json!({ "applicationIds": ids })),
+            "validation"
+        );
+    }
+
+    /// On every system, ConPTY included: the pause leaves the owner's own shell running.
+    #[test]
+    fn close_apply_leaves_a_plain_shell_session_alone_in_the_panel() {
+        let h = ready();
+        let panel = Panel::open(&h);
+        let pty = h.app.state::<PtyState>();
+        let pid = pty.pid().unwrap();
+        assert!(block_on(pty.close_apply()).is_none());
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(pty.pid(), Some(pid));
+        assert!(running(pid));
+        drop(panel);
+    }
+
+    /// Closing the panel is a person's act: the browser goes at once and the run ends.
+    #[test]
+    fn closing_the_panel_ends_the_apply_run_and_its_browser() {
+        use crate::pty::test_support::{gone_within_two_seconds, marked_browser};
+        let h = ready();
+        let run = ready_run(&h);
+        let panel = Panel::open(&h);
+        let pty = h.app.state::<PtyState>();
+        pty.mark_apply(&h.paths, &run);
+        let mut browser = marked_browser(&h.paths.apply().join(&run));
+
+        panel.close();
+
+        gone_within_two_seconds(&mut browser);
+        wait_until(|| h.ok("apply_view", json!({ "id": run }))["state"] == "ended");
+    }
+
+    /// Run `run` as `running`, claimed by an active agent run whose host recorded `pid`.
+    fn claimed_by(h: &Harness, run: &str, pid: u32) -> String {
+        let run = run.to_owned();
+        let dir = h.paths.apply().join(&run);
+        with_db(h, |db| async move {
+            let agent: String = sqlx::query_scalar(
+                "INSERT INTO agent_runs (id, agent, state, actor, input, steps, heartbeat_at, \
+                 created_at) VALUES (lower(hex(randomblob(16))), 'claude_apply', 'running', \
+                 'cli', '{}', 2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) RETURNING id",
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            sqlx::query("UPDATE apply_runs SET state = 'running', agent_run_id = ? WHERE id = ?")
+                .bind(&agent)
+                .bind(&run)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            jobpilot_core::apply::record_host(&dir, pid, &agent).unwrap();
+            agent
+        })
+    }
+
+    fn agent_state(h: &Harness, agent: &str) -> (String, Option<String>) {
+        let agent = agent.to_owned();
+        with_db(h, |db| async move {
+            sqlx::query_as("SELECT state, reason FROM agent_runs WHERE id = ?")
+                .bind(&agent)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap()
+        })
+    }
+
+    /// Another terminal's host won the claim: closing the panel's session leaves its run be.
+    #[test]
+    fn closing_the_panel_leaves_a_run_another_host_holds() {
+        let h = ready();
+        let run = ready_run(&h);
+        let panel = Panel::open(&h);
+        let pty = h.app.state::<PtyState>();
+        let pid = pty.pid().unwrap();
+        pty.mark_apply(&h.paths, &run);
+        let agent = claimed_by(&h, &run, pid + 1);
+
+        panel.close();
+        wait_gone(pid);
+        std::thread::sleep(Duration::from_millis(1500));
+
+        assert_eq!(agent_state(&h, &agent).0, "running");
+        assert_eq!(h.ok("apply_view", json!({ "id": run }))["state"], "running");
+    }
+
+    /// The claim is the closed session's own: its agent run is halted and the run ends.
+    #[test]
+    fn closing_the_panel_halts_the_run_its_own_host_held() {
+        let h = ready();
+        let run = ready_run(&h);
+        let panel = Panel::open(&h);
+        let pty = h.app.state::<PtyState>();
+        let pid = pty.pid().unwrap();
+        pty.mark_apply(&h.paths, &run);
+        let agent = claimed_by(&h, &run, pid);
+
+        panel.close();
+
+        wait_until(|| h.ok("apply_view", json!({ "id": run }))["state"] == "ended");
+        assert_eq!(
+            agent_state(&h, &agent),
+            ("halted".to_owned(), Some("closed".to_owned()))
+        );
+    }
+
+    /// The real host under the panel, with the fake `claude` and a fake browser runtime: the
+    /// pause kills it, and the run reads halted and ended without waiting for a stale heartbeat.
+    #[cfg(unix)]
+    #[test]
+    fn an_emergency_pause_ends_a_hosted_run_halted() {
+        let h = ready();
+        let run = ready_run(&h);
+        hosted_runtime(&h);
+        let panel = Panel::listening(&h);
+        let (cols, rows) = SIZE;
+        invoke(
+            &h.window,
+            "pty_open_apply",
+            json!({ "cols": cols, "rows": rows, "applyId": run }),
+        )
+        .expect("build the CLI first: cargo build -p jobpilot-cli");
+        let active = || {
+            let shown = h.ok("apply_view", json!({ "id": run }));
+            shown["state"] == "running" && shown["items"][0]["state"] == "active"
+        };
+        let until = Instant::now() + PTY_WAIT;
+        while !active() {
+            assert!(Instant::now() < until, "never active: {}", panel.text());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // The host recorded itself under the pid the panel knows it by.
+        let pid = h.app.state::<PtyState>().pid().unwrap();
+        let recorded = jobpilot_core::apply::recorded_host(&h.paths.apply().join(&run));
+        assert_eq!(recorded.map(|(found, _)| found), Some(pid));
+
+        h.ok("pause_set", json!({}));
+
+        let agent = || {
+            let id = run.clone();
+            with_db(&h, |db| async move {
+                sqlx::query_as::<_, (String, Option<String>)>(
+                    "SELECT a.state, a.reason FROM agent_runs a \
+                     JOIN apply_runs r ON r.agent_run_id = a.id WHERE r.id = ?",
+                )
+                .bind(&id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap()
+            })
+        };
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            let ended = h.ok("apply_view", json!({ "id": run }))["state"] == "ended";
+            if ended && agent().0 == "halted" {
+                break;
+            }
+            assert!(Instant::now() < until, "{:?}", agent());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(agent(), ("halted".to_owned(), Some("paused".to_owned())));
+        drop(panel);
+    }
+
+    /// An installed browser runtime as `runtime::state` reads one, whose server is the mock,
+    /// and `ai.claude_path` set to the scripted fake.
+    #[cfg(unix)]
+    fn hosted_runtime(h: &Harness) {
+        use jobpilot_core::browser::runtime::PLAYWRIGHT_MCP;
+        let core = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../crates/core/tests");
+        let core = core.canonicalize().unwrap();
+        let runtime = h.paths.root().join("browser-runtime");
+        let mcp = runtime.join("node_modules/@playwright/mcp");
+        fs::create_dir_all(&mcp).unwrap();
+        fs::create_dir_all(runtime.join("browsers")).unwrap();
+        let snapshot = h._tmp.path().join("snapshot.yml");
+        fs::copy(core.join("fixtures/forms/snapshots/form.yml"), &snapshot).unwrap();
+        let manifest =
+            json!({ "name": "@playwright/mcp", "version": PLAYWRIGHT_MCP, "type": "module" });
+        fs::write(mcp.join("package.json"), manifest.to_string()).unwrap();
+        let server = format!("file://{}", core.join("mock-mcp/server.mjs").display());
+        let script = format!(
+            "process.env.MOCK_SNAPSHOT = {};\nawait import({});\n",
+            json!(snapshot.display().to_string()),
+            json!(server),
+        );
+        fs::write(mcp.join("cli.js"), script).unwrap();
+        let scenario = h._tmp.path().join("scenario.json");
+        fs::write(
+            &scenario,
+            r#"[{"tool": "apply_next"}, {"tool": "browser_snapshot"}]"#,
+        )
+        .unwrap();
+        let node = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join("node"))
+            .find(|node| node.is_file())
+            .expect("node is needed for this test");
+        fake_claude(
+            h,
+            &format!(
+                "export JOBPILOT_FAKE_SCENARIO='{}'\nexec '{}' '{}' \"$@\"",
+                scenario.display(),
+                node.display(),
+                core.join("mock-claude-apply/claude").display()
+            ),
+        );
+    }
+
+    /// Startup ends a `ready` run nobody opened a session for, so the next can start.
+    #[test]
+    fn the_startup_sweep_ends_a_stale_ready_run() {
+        let h = ready();
+        let run = ready_run(&h);
+        let id = run.clone();
+        with_db(&h, |db| async move {
+            sqlx::query(
+                "UPDATE apply_runs SET created_at = '2026-01-01T00:00:00.000Z' WHERE id = ?",
+            )
+            .bind(&id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        });
+        block_on(super::sweep_at_start(&h.app.state::<AppState>()));
+        let shown = h.ok("apply_view", json!({ "id": run }));
+        assert_eq!(shown["state"], "ended");
+        // With no data open it does nothing and does not fail.
+        let h = recovery(OPENS);
+        block_on(super::sweep_at_start(&h.app.state::<AppState>()));
     }
 
     fn import_job(h: &Harness, url: Option<&str>) -> Value {
@@ -5847,5 +6918,285 @@ mod tests {
 
     fn code_of(result: Result<Value, Value>) -> String {
         result.unwrap_err()["code"].as_str().unwrap().to_owned()
+    }
+
+    // ---- Manual mode ----
+
+    fn arguments_of(signature: &str) -> Vec<String> {
+        let source = include_str!("commands.rs");
+        let (_, rest) = source.split_once(signature).unwrap();
+        let (arguments, _) = rest.split_once(") -> ").unwrap();
+        arguments
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, _)| name.trim().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn apply_open_takes_only_an_id_and_refuses_a_link_that_is_not_https() {
+        assert_eq!(
+            arguments_of("pub async fn apply_open<R: Runtime>("),
+            ["app", "state", "application_id"]
+        );
+        let h = ready();
+        let app = apply_ready(&h);
+        let hook = h.app.state::<NativeHook>();
+        for (bad, code) in [
+            ("http://boards.greenhouse.io/acme/jobs/1", "link_not_https"),
+            ("ftp://boards.greenhouse.io/acme/jobs/1", "link_not_https"),
+            (
+                "https://user@boards.greenhouse.io/acme/jobs/1",
+                "link_userinfo",
+            ),
+            ("https://boards.greenhouse.io:8443/acme/jobs/1", "link_port"),
+            ("  ", "link_empty"),
+            ("", "link_empty"),
+        ] {
+            let link = bad.to_owned();
+            let id = app.clone();
+            with_db(&h, |db| async move {
+                sqlx::query("UPDATE applications SET link = ? WHERE id = ?")
+                    .bind(link)
+                    .bind(id)
+                    .execute(&db.pool)
+                    .await
+                    .unwrap();
+            });
+            let refused = h.call("apply_open", json!({ "applicationId": app }));
+            assert_eq!(
+                refused.unwrap_err()["message"],
+                format!("refused: {code}"),
+                "{bad}"
+            );
+        }
+        assert!(hook.opened.lock().unwrap().is_empty());
+
+        let id = app.clone();
+        with_db(&h, |db| async move {
+            sqlx::query(
+                "UPDATE applications SET link = 'https://jobs.lever.co/acme/1' WHERE id = ?",
+            )
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        });
+        h.ok("apply_open", json!({ "applicationId": app }));
+        assert_eq!(
+            *hook.opened.lock().unwrap(),
+            ["https://jobs.lever.co/acme/1"]
+        );
+    }
+
+    #[test]
+    fn apply_material_shows_no_answer_text_and_apply_record_tracks_as_manual() {
+        let h = ready();
+        let (answer, app) = waiting_sensitive_answer(&h);
+        let material = h.ok("apply_material", json!({ "applicationId": app }));
+        assert_eq!(material["modes"].as_array().unwrap().len(), 4);
+        assert_eq!(material["answers"][0]["answer_id"], answer.as_str());
+        assert_eq!(material["answers"][0]["needs_confirmation"], true);
+        assert!(!material.to_string().contains("ZXQ-CANARY"));
+
+        let saved = h.ok(
+            "apply_record",
+            json!({ "applicationId": app, "outcome": "applied", "on": "2026-11-02", "note": "" }),
+        );
+        assert_eq!(saved["status"], "applied");
+        let log = h.ok("audit_recent", json!({ "limit": 20 }));
+        let submitted = log
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["action"] == "application_submitted")
+            .unwrap_or_else(|| panic!("{log}"));
+        assert_eq!(submitted["actor"], "gui");
+        assert!(
+            submitted["detail"].to_string().contains("manual"),
+            "{submitted}"
+        );
+    }
+
+    #[test]
+    fn apply_copy_puts_a_confirmed_answer_on_the_clipboard_and_never_in_the_reply() {
+        assert_eq!(
+            arguments_of("pub async fn apply_copy<R: Runtime>("),
+            ["app", "state", "application_id", "answer_id"]
+        );
+        let h = ready();
+        let (answer, app) = waiting_sensitive_answer(&h);
+        let args = json!({ "applicationId": app, "answerId": answer });
+        let hook = h.app.state::<NativeHook>();
+
+        assert_eq!(
+            code_of(h.call("apply_copy", args.clone())),
+            "confirmation_required"
+        );
+        assert!(hook.clipboard.lock().unwrap().is_none());
+
+        h.answer(true);
+        h.ok(
+            "memory_confirm_use",
+            json!({ "answerId": answer, "applicationId": app }),
+        );
+        let copied = h.ok("apply_copy", args);
+        assert!(!copied.to_string().contains("ZXQ-CANARY"), "{copied}");
+        assert_eq!(copied["stale"], false);
+        assert_eq!(
+            hook.clipboard.lock().unwrap().as_deref(),
+            Some("ZXQ-CANARY")
+        );
+
+        // It is cleared once the time is up, while it still holds the answer.
+        std::thread::sleep(super::CLIPBOARD_CLEAR * 3);
+        assert!(hook.clipboard.lock().unwrap().is_none());
+
+        // Something the person copied since is theirs, and stays.
+        h.ok(
+            "apply_copy",
+            json!({ "applicationId": app, "answerId": answer }),
+        );
+        *hook.clipboard.lock().unwrap() = Some("mine".into());
+        std::thread::sleep(super::CLIPBOARD_CLEAR * 3);
+        assert_eq!(hook.clipboard.lock().unwrap().as_deref(), Some("mine"));
+    }
+
+    #[test]
+    fn a_copied_answer_is_cleared_when_the_app_exits() {
+        let h = ready();
+        let (answer, app) = waiting_sensitive_answer(&h);
+        let hook = h.app.state::<NativeHook>();
+        h.answer(true);
+        h.ok(
+            "memory_confirm_use",
+            json!({ "answerId": answer, "applicationId": app }),
+        );
+        let args = json!({ "applicationId": app, "answerId": answer });
+
+        // The app quits well before the timer: the exit clears it.
+        h.ok("apply_copy", args.clone());
+        tauri::async_runtime::block_on(super::clear_copied(h.app.handle()));
+        assert!(hook.clipboard.lock().unwrap().is_none());
+
+        // What the person copied since is theirs, at exit too.
+        h.ok("apply_copy", args);
+        *hook.clipboard.lock().unwrap() = Some("mine".into());
+        tauri::async_runtime::block_on(super::clear_copied(h.app.handle()));
+        assert_eq!(hook.clipboard.lock().unwrap().as_deref(), Some("mine"));
+    }
+
+    // ---- Copilot ----
+
+    #[test]
+    fn copilot_start_takes_only_an_id_and_starts_nothing_on_a_blocked_site() {
+        // One line as formatted, so read by its commas.
+        let source = include_str!("commands.rs");
+        let (_, rest) = source.split_once("pub async fn copilot_start(").unwrap();
+        let (arguments, _) = rest.split_once(") -> ").unwrap();
+        let names: Vec<&str> = arguments
+            .split(", ")
+            .filter_map(|argument| argument.split_once(':'))
+            .map(|(name, _)| name.trim())
+            .collect();
+        assert_eq!(names, ["state", "application_id"]);
+        let h = ready();
+        let app = apply_ready(&h);
+        let id = app.clone();
+        with_db(&h, |db| async move {
+            sqlx::query("UPDATE applications SET link = ? WHERE id = ?")
+                .bind("https://www.indeed.com/viewjob?jk=1")
+                .bind(id)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        });
+        let refused = h.call("copilot_start", json!({ "applicationId": app }));
+        assert_eq!(refused.unwrap_err()["message"], "refused: policy_blocked");
+        let started = with_db(&h, |db| async move {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM apply_runs")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap()
+        });
+        assert_eq!(started, 0);
+    }
+
+    #[test]
+    fn a_task_refused_while_copilot_runs_says_so() {
+        let slot = crate::state::InFlight::default();
+        let held = slot.begin_as(Some(super::COPILOT_HOLDS)).unwrap();
+        let refused = slot.begin().err().unwrap();
+        assert!(
+            matches!(&refused, Error::Refused(why)
+                if why.starts_with("another_task_is_running: a Copilot run holds")),
+            "{refused:?}"
+        );
+        drop(held);
+        let plain = slot.begin().unwrap();
+        let refused = slot.begin().err().unwrap();
+        assert!(matches!(&refused, Error::Refused(why) if why == "another_task_is_running"));
+        drop(plain);
+    }
+
+    // ---- Autonomous ----
+
+    #[test]
+    fn autonomous_start_is_refused_with_no_dialog_and_no_run_while_no_site_is_eligible() {
+        let h = ready();
+        let app = apply_ready(&h);
+        let id = app.clone();
+        with_db(&h, |db| async move {
+            sqlx::query("UPDATE applications SET link = ? WHERE id = ?")
+                .bind("https://jobs.lever.co/acme/1")
+                .bind(id)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        });
+        h.answer(true);
+        h.call("autonomous_grant", json!({ "connector": "lever" }))
+            .unwrap();
+        let asked = h.asked().len();
+        let refused = h.call("autonomous_start", json!({ "applicationId": app }));
+        assert_eq!(refused.unwrap_err()["message"], "refused: policy_unknown");
+        assert_eq!(h.asked().len(), asked, "no dialog for a refused run");
+        let started = with_db(&h, |db| async move {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM apply_runs")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap()
+        });
+        assert_eq!(started, 0);
+    }
+
+    #[test]
+    fn autonomous_grant_asks_natively_and_revoke_does_not() {
+        let h = ready();
+        assert_eq!(h.call("autonomous_grants", json!({})).unwrap(), json!([]));
+        // Declined: nothing stored.
+        h.answer(false);
+        let declined = h.call("autonomous_grant", json!({ "connector": "lever" }));
+        assert_eq!(declined.unwrap_err()["code"], "confirmation_required");
+        assert_eq!(h.asked().len(), 1);
+        assert!(h.asked()[0].contains("lever"), "{:?}", h.asked());
+        assert_eq!(h.call("autonomous_grants", json!({})).unwrap(), json!([]));
+        // Yes: stored.
+        h.answer(true);
+        h.call("autonomous_grant", json!({ "connector": "lever" }))
+            .unwrap();
+        assert_eq!(
+            h.call("autonomous_grants", json!({})).unwrap(),
+            json!(["lever"])
+        );
+        // An unknown connector is refused before anyone is asked.
+        let unknown = h.call("autonomous_grant", json!({ "connector": "acme" }));
+        assert_eq!(unknown.unwrap_err()["code"], "validation");
+        assert_eq!(h.asked().len(), 2);
+        // Revoking only takes something away: no dialog.
+        h.call("autonomous_revoke", json!({ "connector": "lever" }))
+            .unwrap();
+        assert_eq!(h.asked().len(), 2);
+        assert_eq!(h.call("autonomous_grants", json!({})).unwrap(), json!([]));
     }
 }

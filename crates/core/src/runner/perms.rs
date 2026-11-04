@@ -30,6 +30,14 @@ pub enum Permission {
     WriteJobFields,
     /// Reads a connector's declared endpoints, through the `Fetcher` only: no other socket.
     NetConnector,
+    /// Open a posting's link in the owner's own browser. No automation.
+    ApplyOpenLink,
+    /// Show or copy prepared files and approved text to the owner.
+    ApplySupply,
+    BrowserDrive,
+    BrowserFill,
+    BrowserUpload,
+    BrowserSubmit,
 }
 
 use Permission::*;
@@ -117,6 +125,47 @@ static RESEARCH: AgentSpec = AgentSpec {
     run_timeout: Duration::from_secs(10 * 60),
 };
 
+/// What the Claude Code apply session may hold. A mode's narrower set is `permissions::decide`'s
+/// job, not the runner's.
+static CLAUDE_APPLY: AgentSpec = AgentSpec {
+    agent: Agent::ClaudeApply,
+    permissions: &[
+        ReadProfileBasic,
+        ReadCareerMemory,
+        ReadSensitive,
+        ReadApplications,
+        WriteApplications,
+        WriteCareerMemory,
+        ReadJobText,
+        BrowserDrive,
+        BrowserFill,
+        BrowserUpload,
+        BrowserSubmit,
+    ],
+    run_timeout: Duration::from_secs(8 * 60 * 60),
+};
+
+static BROWSER_APPLICATION: AgentSpec = AgentSpec {
+    agent: Agent::BrowserApplication,
+    permissions: &[
+        ReadProfileBasic,
+        ReadCareerMemory,
+        ReadSensitive,
+        ReadApplications,
+        WriteApplications,
+        WriteCareerMemory,
+        ReadJobText,
+        BrowserDrive,
+        BrowserFill,
+        BrowserUpload,
+        BrowserSubmit,
+        ApplyOpenLink,
+        ApplySupply,
+        Model(TaskType::MapFormField),
+    ],
+    run_timeout: Duration::from_secs(2 * 60 * 60),
+};
+
 pub fn spec_of(agent: Agent) -> &'static AgentSpec {
     match agent {
         Agent::Resume => &RESUME,
@@ -127,5 +176,7 @@ pub fn spec_of(agent: Agent) -> &'static AgentSpec {
         Agent::Discovery => &DISCOVERY,
         Agent::Matching => &MATCHING,
         Agent::Research => &RESEARCH,
+        Agent::ClaudeApply => &CLAUDE_APPLY,
+        Agent::BrowserApplication => &BROWSER_APPLICATION,
     }
 }

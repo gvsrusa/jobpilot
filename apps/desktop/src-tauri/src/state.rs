@@ -31,6 +31,9 @@ pub struct AppState {
     /// A model download, which can outlast many tasks and is cancelled on its own.
     pub pull: InFlight,
     restored_key_state: Mutex<Option<KeyState>>,
+    /// The answer `apply_copy` last put on the clipboard, until its clear: the exit clears it
+    /// when the timer has not.
+    pub copied: Mutex<Option<jobpilot_core::secrets::Zeroizing<String>>>,
 }
 
 /// A handle that stays open without the `db` lock, for as long as this is held. `db` is
@@ -51,7 +54,10 @@ impl std::ops::Deref for Work<'_> {
 /// The token of the one running task. One slot means one task: a second token here would
 /// leave the first run beyond the reach of Cancel, consent revoke, and app exit.
 #[derive(Default)]
-pub struct InFlight(Mutex<Option<CancellationToken>>);
+pub struct InFlight(
+    Mutex<Option<CancellationToken>>,
+    Mutex<Option<&'static str>>,
+);
 
 /// Frees the slot when the task ends, however it ends.
 pub struct Running<'a> {
@@ -67,13 +73,28 @@ impl InFlight {
     /// Before [`AppState::work`], so a cancel that comes while the task waits for its handle
     /// is not lost.
     pub fn begin(&self) -> Result<Running<'_>> {
+        self.begin_as(None)
+    }
+
+    /// `begin`, naming what holds the slot, so a task refused meanwhile says why: a Copilot
+    /// run holds it until the person ends its review stop.
+    pub fn begin_as(&self, holder: Option<&'static str>) -> Result<Running<'_>> {
         let mut slot = self.token();
         if slot.is_some() {
-            return Err(Error::Refused("another_task_is_running".into()));
+            let reason = match *self.holder() {
+                Some(holder) => format!("another_task_is_running: {holder}"),
+                None => "another_task_is_running".into(),
+            };
+            return Err(Error::Refused(reason));
         }
         let token = CancellationToken::new();
         *slot = Some(token.clone());
+        *self.holder() = holder;
         Ok(Running { slot: self, token })
+    }
+
+    fn holder(&self) -> MutexGuard<'_, Option<&'static str>> {
+        self.1.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn cancel(&self) {
@@ -85,6 +106,7 @@ impl InFlight {
 
 impl Drop for Running<'_> {
     fn drop(&mut self) {
+        *self.slot.holder() = None;
         *self.slot.token() = None;
     }
 }
@@ -133,6 +155,7 @@ impl AppState {
             ai: InFlight::default(),
             pull: InFlight::default(),
             restored_key_state: Mutex::new(None),
+            copied: Mutex::new(None),
         }
     }
 

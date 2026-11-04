@@ -27,6 +27,11 @@ tokio = { version = "1", features = ["sync", "time"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Already in the tree through the clipboard plugin, whose API cannot keep a copy out of
+# clipboard history. The same version and features.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+arboard = { version = "=3.7.0", features = ["wayland-data-control"] }
+
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }
 sqlx = { version = "0.9", default-features = false, features = ["sqlite"] }

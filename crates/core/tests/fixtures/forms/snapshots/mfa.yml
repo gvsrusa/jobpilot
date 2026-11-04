@@ -1,0 +1,4 @@
+- generic [ref=e1]:
+  - heading "Check your email" [level=1] [ref=e2]
+  - textbox "Enter the 6-digit Verification Code" [ref=e3]
+  - button "Continue" [ref=e4]

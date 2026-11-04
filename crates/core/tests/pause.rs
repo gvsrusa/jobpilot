@@ -696,7 +696,7 @@ fn applications_updates(files: &[(PathBuf, String)]) -> Vec<(String, String, Str
 }
 
 /// Every route to a status write. The only statement that sets the column is inside
-/// `set_status`, which gates itself before it. A new one, however it is spelled, fails here
+/// `set_status_with`, which gates itself before it. A new one, however it is spelled, fails here
 /// until it is looked at: `force_status`, `SET updated_at = 'x', status = ...`, `set status`.
 #[test]
 fn every_route_to_a_status_write_passes_the_gate() {
@@ -717,19 +717,19 @@ fn every_route_to_a_status_write_passes_the_gate() {
     assert_eq!(writes.len(), 1, "one statement sets status: {writes:?}");
     assert_eq!(
         (writes[0].0.as_str(), writes[0].1.as_str()),
-        ("applications.rs", "set_status")
+        ("applications.rs", "set_status_with")
     );
 
-    // That function refuses first.
+    // That function refuses first. `set_status` is its wrapper with no submission row.
     let (_, text) = files
         .iter()
         .find(|(path, _)| path.ends_with("src/applications.rs"))
         .unwrap();
     let body = flat(text);
-    let body = &body[body.find("pub async fn set_status").unwrap()..];
+    let body = &body[body.find("pub(crate) async fn set_status_with").unwrap()..];
     let gate = body
         .find("pause::ensure_off(db)")
-        .expect("set_status gates itself");
+        .expect("set_status_with gates itself");
     assert!(gate < body.find("update applications").unwrap());
 
     // Nothing but the gated function and the agent that runs it names it.
@@ -737,19 +737,33 @@ fn every_route_to_a_status_write_passes_the_gate() {
         let mut found: Vec<String> = files
             .iter()
             .filter(|(_, text)| flat(text).contains(needle))
-            .map(|(path, _)| path.file_name().unwrap().to_string_lossy().into_owned())
+            .map(|(path, _)| {
+                // A `mod.rs` is named with its folder, so a move to another module shows.
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                match path.parent().and_then(|p| p.file_name()) {
+                    Some(dir) if name == "mod.rs" => format!("{}/mod.rs", dir.to_string_lossy()),
+                    _ => name,
+                }
+            })
             .collect();
         found.sort();
         found
     };
-    // The gated store function: the tracking step, which also runs behind `runner::start`.
+    // The gated store function. The tracking step, which also runs behind `runner::start`,
+    // reaches it through `set_status_with`, which can add Manual mode's submission row.
     assert_eq!(
         reaching("applications::set_status("),
-        ["crypto.rs", "tracking.rs"],
+        ["crypto.rs"],
         "crypto.rs is a unit test"
     );
-    // The agent, whose `start` is a gate: the CLI's `app status` and the desktop command.
-    assert_eq!(reaching("agents::set_status("), ["apps.rs", "commands.rs"]);
+    assert_eq!(reaching("applications::set_status_with("), ["tracking.rs"]);
+    assert_eq!(reaching("agents::set_status_with("), ["apply/mod.rs"]);
+    // The agent, whose `start` is a gate: the CLI's `app status`, the desktop command, and
+    // `apply::settle` (apply/mod.rs), which records an apply run's submissions.
+    assert_eq!(
+        reaching("agents::set_status("),
+        ["apply/mod.rs", "apps.rs", "commands.rs"]
+    );
 }
 
 /// The scan reads statements the way the guard needs, whatever the case or the spelling.
