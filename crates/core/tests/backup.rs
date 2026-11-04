@@ -2117,6 +2117,10 @@ async fn a_kept_pause_is_audited_once_and_not_when_the_backup_already_had_it() {
 const CLAUDE_NAME: &str = "claude";
 #[cfg(windows)]
 const CLAUDE_NAME: &str = "claude.cmd";
+#[cfg(unix)]
+const GEMINI_NAME: &str = "gemini";
+#[cfg(windows)]
+const GEMINI_NAME: &str = "gemini.cmd";
 
 /// Every setting that names a program, plus the launch-time network check.
 const OWNED: [&str; 5] = [
@@ -2271,7 +2275,7 @@ async fn a_program_path_inside_the_data_root_is_refused() {
     let (_tmp, paths) = temp_root();
     let db = Db::open(&paths).await.unwrap();
     let planted = plant_program(&paths.documents(), CLAUDE_NAME);
-    let gemini = plant_program(&paths.documents().join("sub"), "gemini");
+    let gemini = plant_program(&paths.documents().join("sub"), GEMINI_NAME);
     let path = json!(planted.display().to_string());
     settings::set(&db, claude_code::PATH_SETTING, &path)
         .await
