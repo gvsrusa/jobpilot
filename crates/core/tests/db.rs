@@ -580,3 +580,73 @@ async fn a_0_5_database_upgrades_to_0_6() {
     }
     db.close().await;
 }
+
+// Every earlier release's schema upgrades to the current one: snapshot first (except when already
+// current), rows kept.
+#[tokio::test]
+async fn every_earlier_release_upgrades_to_1_0() {
+    for (release, v) in [
+        ("0.1", 1),
+        ("0.2", 5),
+        ("0.3", 11),
+        ("0.4", 12),
+        ("0.5", 15),
+        ("0.6", 17),
+    ] {
+        let (_tmp, paths) = temp_root();
+        let migrations: Vec<Migration> = MIGRATOR
+            .iter()
+            .filter(|m| m.version <= v)
+            .cloned()
+            .collect();
+        let db = Db::open_with(&paths, &Migrator::with_migrations(migrations))
+            .await
+            .unwrap();
+        assert_eq!(db.schema_version().await.unwrap(), v, "release {release}");
+        let mut inserts = vec![
+            "INSERT INTO documents (id, title, body, created_at, updated_at) \
+             VALUES ('d1', 'Doc', 'body', 't', 't')",
+        ];
+        if v >= 6 {
+            inserts.push(
+                "INSERT INTO applications (id, company, role, status, created_at, updated_at) \
+                 VALUES ('a1', 'Acme', 'Dev', 'saved', 't', 't')",
+            );
+        }
+        for sql in inserts {
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&db.pool)
+                .await
+                .unwrap_or_else(|e| panic!("release {release}: insert failed: {e}"));
+        }
+        db.close().await;
+
+        let db = Db::open(&paths).await.unwrap();
+
+        assert_eq!(
+            db.schema_version().await.unwrap(),
+            jobpilot_core::db::app_schema_version(),
+            "release {release}: reaches the current schema"
+        );
+        let docs: i64 = sqlx::query_scalar("SELECT count(*) FROM documents WHERE id = 'd1'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(docs, 1, "release {release}: document kept");
+        if v >= 6 {
+            let apps: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM applications WHERE id = 'a1'")
+                    .fetch_one(&db.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(apps, 1, "release {release}: application kept");
+        }
+        let expected = usize::from(v < 17);
+        assert_eq!(
+            snapshots(&paths, &format!("pre-migrate-{v}-")).len(),
+            expected,
+            "release {release}: pre-migrate snapshot count"
+        );
+        db.close().await;
+    }
+}
